@@ -603,7 +603,10 @@ impl Ctx {
             }
             pb::SubscribeVoiceAssistantRequest::ID => {
                 if let Some(req) = decode::<pb::SubscribeVoiceAssistantRequest>(msg) {
-                    if req.subscribe && req.flags & 1 == 0 {
+                    // api.proto defines VOICE_ASSISTANT_SUBSCRIBE_API_AUDIO = 1,
+                    // but aioesphomeapi 46.6.0 (HA 2026.10.4) sends
+                    // `VoiceAssistantSubscriptionFlag.API_AUDIO = 1 << 2`.
+                    if req.subscribe && req.flags & (1 | 4) == 0 {
                         log::warn!(
                             "esphome-api: HA subscribed without API_AUDIO; audio needs the API path"
                         );
