@@ -1,0 +1,16 @@
+name: Validate research bootstrap
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check POSIX shell syntax
+        run: sh -n tools/probe/probe.sh
+      - name: Check research files and Markdown links
+        run: python3 tools/check_docs.py
