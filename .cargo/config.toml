@@ -1,0 +1,5 @@
+# The TV userland is 32-bit ARM EABI5 softfp (see docs/discovery/c3-a/D0-D1-runtime.md).
+# rustc's armv7 musl target defaults to soft-float; this selects the softfp
+# equivalent (VFPv3 + NEON registers, soft-float calling convention).
+[target.armv7-unknown-linux-musleabi]
+rustflags = ["-C", "target-feature=-soft-float,+vfp3,+neon"]

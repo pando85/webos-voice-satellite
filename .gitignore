@@ -25,3 +25,6 @@ target/
 dist/
 .DS_Store
 .venv/
+.zig-cache/
+zig-out/
+local.mk

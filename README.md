@@ -30,6 +30,6 @@ An experimental, local-first Home Assistant voice satellite for **rooted LG webO
 4. Follow [experiment protocol](docs/experiments/README.md); file device-specific findings in [compatibility](docs/compatibility/README.md).
 5. Implement in the order of the [roadmap](docs/project/roadmap.md); each phase closes against the [feasibility gates](docs/project/requirements.md) and their evidence.
 
-**Architecture:** [overview](docs/architecture/overview.md) (provisional, partly superseded by the ADRs) · **Backlog:** [post-Phase-5 ideas](docs/project/backlog.md) · **Agent skills:** [.agents/skills](.agents/skills) · **CI:** [documentation checks](.github/workflows/validate.yml)
+**Development:** [build, cross-compile and deploy](docs/development.md) · **Architecture:** [overview](docs/architecture/overview.md) (provisional, partly superseded by the ADRs) · **Backlog:** [post-Phase-5 ideas](docs/project/backlog.md) · **Agent skills:** [.agents/skills](.agents/skills) · **CI:** [documentation checks](.github/workflows/validate.yml), [Rust](.github/workflows/rust.yml)
 
 This is an independent community project, not endorsed by LG or Home Assistant.

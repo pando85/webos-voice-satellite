@@ -1,0 +1,48 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/satellite",
+    "crates/capture",
+    "crates/dsp",
+    "crates/esphome-api",
+    "crates/playback",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+
+[workspace.dependencies]
+# Internal crates
+webos-capture = { path = "crates/capture" }
+webos-dsp = { path = "crates/dsp" }
+webos-esphome-api = { path = "crates/esphome-api" }
+webos-playback = { path = "crates/playback" }
+# External crates (pure Rust: the TV build is static musl, no system libs)
+rustix = { version = "1", default-features = false, features = ["std", "system", "param", "process"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "warn"
+expect_used = "warn"
+dbg_macro = "warn"
+doc_markdown = "allow"
+module_name_repetitions = "allow"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[profile.dev]
+panic = "unwind"

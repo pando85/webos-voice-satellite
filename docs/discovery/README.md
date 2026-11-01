@@ -11,9 +11,12 @@ Device discovery results, one directory per TV. Each log states the date, firmwa
 | [D0-D1-runtime.md](c3-a/D0-D1-runtime.md) | Baseline and runtime: firmware, root method, mounts, 32-bit ARM soft-float glibc 2.31 userland, init system |
 | [D2-audio-stack.md](c3-a/D2-audio-stack.md) | Audio stack and LG voice services inventory, including the kernel oops incident |
 | [D3-mic-identification.md](c3-a/D3-mic-identification.md) | Built-in mic identification (`hw:LGSIC,0`), capture characterization, offline Home Assistant (Wyoming) check |
+| [P1-runtime-smoke.md](c3-a/P1-runtime-smoke.md) | Roadmap 1.1 smoke test: static armv7/aarch64 Rust binaries from `/tmp`, UDP 5353 and TCP 6053 situation, firewall |
 | [rooted-tv-improvements.md](c3-a/rooted-tv-improvements.md) | Hardening and hygiene backlog for the rooted TV (documented only, not applied) |
 
 Not yet done: D4 (behaviour while the TV plays sound, echo, SpeakerFeedback as reference) and D5 (power states). They are scheduled in [roadmap](../project/roadmap.md) Phases 2 and 3.
+
+Naming: `D<n>-*` files are roadmap discovery steps; `P1-*` files are Phase 1 validation runs of the implementation on the target.
 ## Naming convention
 
 - In committed documents a TV is named by an anonymous label: `c3-a` is the first LG C3, the second C3 is proposed to be `c3-b`. No serial numbers, MAC addresses, IP addresses, account names or network names appear in committed text.
