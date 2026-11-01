@@ -17,7 +17,7 @@ Read `AGENTS.md` and `docs/research/README.md` first. Work on one bounded techni
 
 ## REA escalation
 
-Only use [REA](https://github.com/morluto/rea) when a bounded question requires analysis of **shipped proprietary binary/runtime** behavior, not for ordinary source code review. Agent-local REA skill installation is optional; the skill alone does not configure its MCP or decompiler. Read its native-artifact and runtime-observation guides when applicable. Keep file hashes, firmware identifiers, symbol offsets, evidence and unsupported inferences separate. Do not upload or commit proprietary LG files.
+Read [REA setup and escalation guide](../../../docs/tools/rea.md). Only use REA when a bounded question requires analysis of **shipped proprietary binary/runtime** behavior, not for ordinary source code review. Agent-local REA skill installation is optional; the skill alone does not configure its MCP or decompiler. Keep file hashes, firmware identifiers, symbol offsets, evidence and unsupported inferences separate. Do not upload or commit proprietary LG files.
 
 ## Finished means
 
