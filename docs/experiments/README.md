@@ -4,25 +4,20 @@ All experiments start from a **read-only** baseline. The user must explicitly ap
 
 ## Execution rules
 
-1. Create an experiment record from [TEMPLATE.md](TEMPLATE.md); include bounded question, exact device and firmware, and risk class.
-2. Collect a system inventory first (see [probe](../../tools/probe/README.md)).
-3. State the expected evidence and what would *disprove* the hypothesis before running commands.
-4. Do not collect ambient PCM without explicit consent. Use short controlled phrases and delete files.
-5. Record observations separately for each TV, input source, power state and firmware version.
-6. Redact raw outputs; never commit any full diagnostic dump, recording, credential or proprietary binary.
-7. Update the associated research document and compatibility matrix, leaving conclusions `INCONCLUSIVE` where appropriate.
+1. Use the numbered protocols below and [TEMPLATE.md](TEMPLATE.md) for dated results; record one device/firmware/state per result.
+2. State falsifiable hypotheses, signals, failure interpretations and safe rollback before running commands.
+3. Use the read-only [probe](../../tools/probe/README.md) for baseline observations.
+4. Do not collect ambient PCM without consent. Prefer short controlled phrases and delete files afterward.
+5. Redact identifiers and do not commit raw dumps, firmware, logs with private identifiers, audio or secrets.
+6. Update research, compatibility and linked issue based on the actual outcome; keep `INCONCLUSIVE` outcomes visible.
 
-## Initial experiment catalogue
-
-| ID | Experiment | Phase | Gate |
-| --- | --- | --- | --- |
-| EXP-001 | Runtime, ALSA and service inventory | 0 | F0 |
-| EXP-002 | Built-in microphone mapping and PCM capture | 1 | F1 |
-| EXP-003 | Concurrent LG services, DSP and TV playback | 1 | F2 |
-| EXP-004 | Lifecycle: apps, screen off, Always Ready, standby | 0/3 | F0/F6 |
-| EXP-005 | TTS/native mixing with Netflix, HDMI, eARC | 3 | F4 |
-| EXP-006 | Echo reference and AEC feasibility | 3 | F5 |
-| EXP-007 | Wake word and Assist roundtrip | 2 | F3 |
-| EXP-008 | AirPlay/Music Assistant playback | 3 | F8 |
-
-Create separate dated results per model/firmware, not one global 'pass'.
+| ID | Experiment | Gate |
+| --- | --- | --- |
+| [EXP-001](EXP-001-runtime-inventory.md) | Runtime and audio inventory | F0 |
+| [EXP-002](EXP-002-microphone-mapping.md) | Built-in microphone mapping and PCM capture | F1 |
+| [EXP-003](EXP-003-concurrency.md) | Concurrent LG services, DSP and TV playback | F2 |
+| [EXP-004](EXP-004-power-lifecycle.md) | Apps, screen off, Always Ready and standby | F0/F6 |
+| [EXP-005](EXP-005-native-playback.md) | TTS and native audio mixing | F4 |
+| [EXP-006](EXP-006-aec-reference.md) | Echo reference and AEC feasibility | F5 |
+| [EXP-007](EXP-007-assist-pipeline.md) | Wake word and Assist roundtrip | F3 |
+| [EXP-008](EXP-008-airplay-media.md) | Music Assistant and AirPlay | F8 |

@@ -20,35 +20,35 @@ Documentation from **webOS OSE** is not proof that the same API is exposed on **
 2. Search official docs, relevant open source implementations, and existing findings **before** reverse engineering binaries.
 3. Record each claim as `documented`, `observed-on-other-device`, `hypothesis`, or `verified-on-target` with source, model, firmware, date, and experiment ID where applicable.
 4. Write a minimal experiment with prerequisites, commands, expected signals, failure interpretation, and rollback before requesting execution.
-5. Make read-only observations first. Compare at least two device and playback/power states where relevant.
+5. Make read-only observations first. Compare device and playback/power states where relevant.
 6. Record negative or inconclusive results explicitly; never silently turn them into support.
-7. Update relevant documents, compatibility records, and the linked issue/PR with the evidence and residual unknowns.
+7. Update relevant documents, compatibility records, and the linked issue/PR with evidence and residual unknowns.
 
 ## Device safety and privacy
 
 - Assume root privileges can render a TV unusable. No firmware writes, service disabling, mounts, persistence, reboots, or audio recording without explicit authorization.
-- Probe output may reveal Wi-Fi IDs, serial numbers, MACs, account details, addresses, device paths, process arguments, and tokens. **Do not commit raw probe output.**
+- Probe output may reveal identifiers or other machine-specific information. **Do not commit raw probe output.**
 - Audio recordings are opt-in, short, local, and never committed. Obtain consent from anyone whose voice may be captured.
-- Never log ambient speech or credentials by default; restrict server access, validate TLS, prefer short-lived credentials, and document microphone mute/recording indicators.
+- Never log ambient speech or credentials by default; restrict server access, validate TLS, and document microphone mute/listening indicators.
 - Don't execute remote install pipes or arbitrary binaries on the TVs. Inspect scripts before running them.
 - Maintain rollback paths and avoid changing native LG voice services during discovery.
 
 ## When to use REA
 
-Use the optional [REA reverse-engineering tool](https://github.com/morluto/rea) **only** where a question depends on proprietary shipped binaries, decompilation, or runtime evidence not established by source. Read [the repository RE skill](.agents/skills/webos-research/SKILL.md). Installing a skill alone does not install the REA MCP service or native analysis engines. Never treat REA findings as device validation without a corresponding experiment.
+Use the optional [REA reverse-engineering tool](https://github.com/morluto/rea) **only** where a question depends on proprietary shipped binaries, decompilation, or runtime evidence not established by source. Read [the repository RE skill](.agents/skills/webos-research/SKILL.md) and [REA guide](docs/tools/rea.md). Installing a skill alone does not install the REA MCP service or native analysis engines. Never treat REA findings as device validation without a corresponding experiment.
 
 ## Implementation principles
 
 - Native background daemon is a **provisional** design choice, not a proven standby capability.
 - Keep capture, preprocessing/AEC, activation, Assist transport, playback, power lifecycle, and media control separable.
 - Prefer stable public interfaces. Never hard-code `hw:1,0`, private Luna endpoints, model names, or ALSA indexes as universal truths.
-- Home Assistant owns STT/conversation/TTS in the MVP. Wake word location is still open.
-- The existing TV AirPlay receiver / Music Assistant is a **candidate for music**, not the path for conversational TTS.
+- Home Assistant owns STT/conversation/TTS in MVP. Wake word location is still open.
+- Existing TV AirPlay receiver / Music Assistant is a **candidate for music**, not the path for conversational TTS.
 - Don't invent unverified API calls, provider behavior, latency, audio channels, or wake-word compatibility.
 
 ## Deliverables and quality gates
 
-- PRs contain a summary, evidence and scope, verification steps, rollback/risk notes, and explicitly open questions.
+- PRs contain summary, evidence and scope, verification steps, rollback/risk notes, and open questions.
 - Include tests for tooling where feasible; `sh -n tools/probe/probe.sh` and `python3 tools/check_docs.py` are initial checks.
 - Keep repository content in English. Never commit generated dumps, tokens, recordings, firmware, or third-party binaries.
 - If blocked on hardware, provide a precise experiment for the user/agent; do not claim the feature works.
