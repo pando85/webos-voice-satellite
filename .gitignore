@@ -24,3 +24,4 @@ __pycache__/
 target/
 dist/
 .DS_Store
+.venv/

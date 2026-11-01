@@ -25,7 +25,8 @@ for name in REQUIRED + [f"docs/research/{n}" for n in RESEARCH]:
         errors.append(f"missing: {name}")
 
 for path in ROOT.rglob("*.md"):
-    if any(part.startswith(".git") for part in path.parts):
+    rel_parts = path.relative_to(ROOT).parts
+    if any(part.startswith(".git") or part in {".venv", "artifacts", "node_modules"} for part in rel_parts):
         continue
     content = path.read_text(encoding="utf-8")
     if not content.startswith("# ") and not (path.name == "SKILL.md" and content.startswith("---")):
