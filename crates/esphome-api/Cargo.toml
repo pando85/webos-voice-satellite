@@ -1,10 +1,32 @@
 [package]
 name = "webos-esphome-api"
-description = "webos-voice-satellite: esphome-api crate"
+description = "webos-voice-satellite: ESPHome native API device-side server (voice satellite)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
+# proto/ holds MIT-licensed ESPHome .proto files (see proto/LICENSE-ESPHOME-MIT).
+
+[features]
+default = ["mdns"]
+# `_esphomelib._tcp` advertisement through the pure-Rust `mdns-sd` crate.
+mdns = ["dep:mdns-sd"]
+
+[dependencies]
+base64 = "0.22"
+log = "0.4"
+mdns-sd = { version = "0.21", optional = true, default-features = false }
+prost = { version = "0.14", default-features = false, features = ["std", "derive"] }
+snow = { version = "0.10", default-features = false, features = ["use-chacha20poly1305", "use-sha2", "use-curve25519", "use-getrandom"] }
+tokio = { version = "1.54", default-features = false, features = ["rt", "net", "sync", "time", "macros", "io-util"] }
+
+[build-dependencies]
+prost-build = { version = "0.14", default-features = false }
+protox = "0.10"
+
+[dev-dependencies]
+snow = { version = "0.10", default-features = false, features = ["use-chacha20poly1305", "use-sha2", "use-curve25519", "use-getrandom"] }
+tokio = { version = "1.54", default-features = false, features = ["rt", "net", "sync", "time", "macros", "io-util", "io-std"] }
 
 [lints]
 workspace = true

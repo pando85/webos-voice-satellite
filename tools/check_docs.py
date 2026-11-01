@@ -26,7 +26,7 @@ for name in REQUIRED + [f"docs/research/{n}" for n in RESEARCH]:
 
 for path in ROOT.rglob("*.md"):
     rel_parts = path.relative_to(ROOT).parts
-    if any(part.startswith(".git") or part in {".venv", "artifacts", "node_modules"} for part in rel_parts):
+    if any(part.startswith(".git") or part in {".venv", "artifacts", "node_modules", "target"} for part in rel_parts):
         continue
     content = path.read_text(encoding="utf-8")
     if not content.startswith("# ") and not (path.name == "SKILL.md" and content.startswith("---")):
