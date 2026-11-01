@@ -13,8 +13,7 @@ Device discovery results, one directory per TV. Each log states the date, firmwa
 | [D3-mic-identification.md](c3-a/D3-mic-identification.md) | Built-in mic identification (`hw:LGSIC,0`), capture characterization, offline Home Assistant (Wyoming) check |
 | [rooted-tv-improvements.md](c3-a/rooted-tv-improvements.md) | Hardening and hygiene backlog for the rooted TV (documented only, not applied) |
 
-Not yet done: D4 (behaviour while the TV plays sound, echo, SpeakerFeedback as reference) and D5 (power states). They are scheduled in [roadmap](../project/roadmap.md) Phases 2 and 3. The D3 log's section "Step 5b: Hands-free" still says PENDING although the hands-free PCM ownership is recorded in the capture section of the same log; treat the capture section as the newer record until the log is tidied.
-
+Not yet done: D4 (behaviour while the TV plays sound, echo, SpeakerFeedback as reference) and D5 (power states). They are scheduled in [roadmap](../project/roadmap.md) Phases 2 and 3.
 ## Naming convention
 
 - In committed documents a TV is named by an anonymous label: `c3-a` is the first LG C3, the second C3 is proposed to be `c3-b`. No serial numbers, MAC addresses, IP addresses, account names or network names appear in committed text.

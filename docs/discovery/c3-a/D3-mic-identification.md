@@ -38,11 +38,25 @@ Observations: **verified** for the status transitions, holders and `hw_params` a
 
 ## 3. Step 5b: Hands-free ("Hi LG")
 
-**Status: PENDING.**
+**Status: done 2026-11-01. One run, one power state (TV on), owner-enabled hands-free.**
 
-Planned: enable hands-free on the TV only with owner consent. Use the same watcher as 5a, extended to log which capture PCMs are opened and by whom. Keep the run short. Run the hands-free test with the TV-side playback as in step 5a, or with silence as the default. Hands-free activation state is recorded before and after from `voiceinput/setting/getActivation`, read-only.
+**Method.** On 2026-11-01 the owner enabled LG hands-free voice recognition in Settings while a read-only watcher ran for 240 s. The watcher polled `/proc/asound/card*/pcm*/sub0/status` every 0.2 s and, on any change, dumped `hw_params` and scanned `/proc/*/fd` for `/dev/snd/pcm*` holders. Times are seconds since boot. Raw log: `devices/private/c3-a/D3/step5b-handsfree.txt` (gitignored, not committed).
 
-Expected signal if the built-in array feeds hands-free: a capture PCM on `card*` held by `voiceinput` or `audiod`, with non-trivial `hw_params`. Failure interpretation: no capture PCM opened during the wake phrase means the wake path is not ALSA-based, or hands-free did not trigger. Record the trigger outcome either way.
+**Observations.**
+
+| t (s) | Observation | Holder | `hw_params` |
+| --- | --- | --- | --- |
+| ≈942 | `card1 pcm0c` ("WoV PDM Mic") and `card1 pcm1c` ("SpeakerFeedback") opened, both RUNNING | `voiceinput` | pcm0c: RW_INTERLEAVED, S24_LE, 2 ch, 16000 Hz, period 256, buffer 8192. pcm1c: S32_LE, 8 ch, 48000 Hz, period 256, buffer 8192 |
+| 953.9–967.6 | `card0 pcm6p` playback, the LG response after "Hi LG" was spoken | `pulseaudio` | S16_LE, 2 ch, 44100 Hz, period 441, buffer 882 |
+
+Both capture PCMs stayed RUNNING from ≈942 s until hands-free was switched off. No other capture PCM was opened on any card.
+
+**Conclusions.**
+
+- **(a) WoV PDM Mic is the built-in far-field mic used by LG's wake word.** Confidence: **verified on target**.
+- **(b) SpeakerFeedback is captured alongside the mic and is a likely AEC reference.** Confidence: **inferred**; untested with TV playback.
+- **(c) With hands-free ON the mic is held exclusively and continuously; OFF releases it: verified on target.** `voiceinput` held both PCMs RUNNING from t≈942 s; at t≈1055 s both PCM `info` files showed `subdevices_count: 1`, `subdevices_avail: 0`. After the owner switched hands-free off, all PCMs were closed and `voiceinput` held no `/dev/snd` fds (t≈1190 s). Follow-up check outputs are appended to the raw log.
+- **(d) The MVP requires hands-free off.** See [ADR 0004](../../decisions/0004-mvp-capture-device-and-lg-handsfree-off.md).
 
 ## Mic capture with external stimulus — run 1 (sweep, -30 dBFS, JBL)
 
@@ -198,7 +212,7 @@ Outputs: `d3r2_speech_linearity.json` and `.png` in `devices/private/c3-a/D3/ana
 1. Which capture path, if any, carries the built-in far-field array? Not answered by 5a.
 2. Is the Magic Remote Bluetooth voice path visible from `remote.monitor` or another service log? **unknown**.
 3. What are the two playback bursts per press (earcon and response)? **unknown**.
-4. Does hands-free ("Hi LG") open an ALSA capture PCM? Pending 5b.
+4. ~~Does hands-free ("Hi LG") open an ALSA capture PCM?~~ Answered in Step 5b: yes, WoV PDM Mic plus SpeakerFeedback, exclusively.
 5. Is the PulseAudio default sink route (`card0 pcm6p`) stable across power states, and usable for our TTS? **hypothesis**, not tested.
 6. Does the `dapm_widget` denylist need to cover any other ASoC debug paths for this firmware? Carried over from D2.
 

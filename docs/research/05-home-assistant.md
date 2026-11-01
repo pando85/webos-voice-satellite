@@ -1,5 +1,7 @@
 # Home Assistant protocol
 
+> **Superseded hypothesis.** The "prototype Assist WebSocket first" hypothesis below is superseded by [ADR 0001](../decisions/0001-esphome-native-api.md) (ESPHome native API) and the research in [esphome-rust-satellite.md](esphome-rust-satellite.md). The Assist pipeline details below remain as reference only.
+
 ## Core questions
 
 How should the TV authenticate, register a satellite, send streaming PCM, handle audio events, TTS and follow-up conversations? How to reconcile Assist pipeline WebSocket with ESPHome API and Assist Satellite entity capabilities?
