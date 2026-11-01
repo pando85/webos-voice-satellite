@@ -1,0 +1,33 @@
+name: Research or feasibility experiment
+description: Propose one bounded research question, evidence gap or device experiment.
+title: "[Research] "
+labels: []
+body:
+  - type: textarea
+    id: question
+    attributes:
+      label: Question and why it matters
+      description: Include the affected feasibility gate or research document.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Existing evidence and limitations
+      description: Link official docs, other-model observations, and outstanding assumptions.
+    validations:
+      required: true
+  - type: textarea
+    id: experiment
+    attributes:
+      label: Minimum safe verification
+      description: Include target model, firmware, states, consent and rollback.
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: What makes the result confirmed, rejected or inconclusive?
+    validations:
+      required: true

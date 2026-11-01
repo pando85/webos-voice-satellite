@@ -1,0 +1,26 @@
+# Sensitive and machine-specific captures
+devices/private/
+reports/
+artifacts/
+*.pcm
+*.raw
+*.wav
+*.flac
+*.pcap
+*.pcapng
+*.core
+core.*
+*.dump
+*.bin
+*.img
+*.elf
+*.ipk
+.env
+.env.*
+!.env.example
+# Tooling
+__pycache__/
+.pytest_cache/
+target/
+dist/
+.DS_Store
