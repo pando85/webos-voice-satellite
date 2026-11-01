@@ -1,10 +1,33 @@
 [package]
 name = "webos-capture"
-description = "webos-voice-satellite: capture crate"
+description = "webos-voice-satellite: microphone capture (raw ALSA PCM ioctls, no alsa-lib)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
-[lints]
-workspace = true
+[dependencies]
+thiserror = "2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+# Mirrors [workspace.lints] except `unsafe_code`: the raw ALSA ioctls need
+# `unsafe`, which is confined to `src/sys.rs` (the only `#[allow(unsafe_code)]`).
+# Keep the rest in sync with the root Cargo.toml.
+[lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"
+unreachable_pub = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "warn"
+expect_used = "warn"
+dbg_macro = "warn"
+doc_markdown = "allow"
+module_name_repetitions = "allow"
+
+[dev-dependencies]
+webos-dsp = { workspace = true }

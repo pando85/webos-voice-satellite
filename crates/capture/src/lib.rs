@@ -1,43 +1,40 @@
-//! ALSA capture (stub).
+//! Microphone capture for the webOS voice satellite.
 //!
-//! Phase 1.2 implements capture from the sound card selected by name (never by
-//! index) with the parameters recorded in the discovery logs. This stub only
-//! fixes the shape of the configuration so other crates can depend on it.
+//! - [`AudioSource`]: the blocking source trait the rest of the program uses.
+//!   Samples are interleaved `i32` holding sign-extended signed 24-bit values.
+//! - [`AlsaCapture`] (Linux): reads an ALSA capture PCM through raw ioctls on
+//!   `/dev/snd/pcmC{card}D{dev}c`. It does **not** use alsa-lib, because the
+//!   TV's `asound.conf` routes `default` through PulseAudio and the TV build is
+//!   a static musl binary. The card is resolved by **id** and the PCM by
+//!   **name** from `/proc/asound`; indexes are never assumed.
+//! - [`FileSource`]: raw S24_LE interleaved files (what `arecord -t raw` writes),
+//!   optionally paced in real time, for tests on a PC.
+//! - [`list_pcms`]: `/proc/asound` listing for diagnostics.
+//!
+//! Verified facts for the LG C3 (c3-a), see
+//! `docs/discovery/c3-a/D3-mic-identification.md` and
+//! `docs/discovery/c3-a/P1-capture-validation.md`: the PCM is exclusive and
+//! returns `EBUSY` while LG hands-free voice holds it ([`CaptureError::MicBusy`]);
+//! it accepts only period 256 / buffer 8192 at S24_LE, 2 ch, 16 kHz; the first
+//! ~5 ms are a full-scale burst, so [`CaptureConfig::discard_ms`] frames are
+//! dropped after every start and every overrun recovery.
+//!
+//! `unsafe` is confined to the private `sys` module (ioctl struct layouts and
+//! calls); the rest of the crate is safe code.
 
-/// Configuration for opening a capture device.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CaptureConfig {
-    /// ALSA card name, resolved through `/proc/asound/cards` at runtime.
-    pub card_name: String,
-    /// PCM device number on the card.
-    pub device: u32,
-    /// Sample rate in Hz.
-    pub rate_hz: u32,
-    /// Number of interleaved channels the device delivers.
-    pub channels: u32,
-}
+mod error;
+mod file;
+mod proc;
+mod source;
 
-impl CaptureConfig {
-    /// Creates a configuration for the given card name with 16 kHz, 2 channels.
-    #[must_use]
-    pub fn new(card_name: impl Into<String>) -> Self {
-        Self {
-            card_name: card_name.into(),
-            device: 0,
-            rate_hz: 16_000,
-            channels: 2,
-        }
-    }
-}
+#[cfg(target_os = "linux")]
+mod alsa;
+#[cfg(target_os = "linux")]
+mod sys;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn default_shape() {
-        let c = CaptureConfig::new("example");
-        assert_eq!(c.card_name, "example");
-        assert_eq!((c.device, c.rate_hz, c.channels), (0, 16_000, 2));
-    }
-}
+#[cfg(target_os = "linux")]
+pub use alsa::{AlsaCapture, CaptureConfig};
+pub use error::CaptureError;
+pub use file::FileSource;
+pub use proc::{PcmInfo, list_pcms};
+pub use source::AudioSource;

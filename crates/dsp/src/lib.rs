@@ -1,23 +1,21 @@
-//! Audio conversion (stub).
+//! Microphone front-end: S24 stereo capture frames to 16 kHz mono S16.
 //!
-//! Phase 1.2 implements S24 to S16 conversion with fixed gain and saturation,
-//! channel selection and a high-pass filter. The function below fixes the API
-//! style and gives the test harness something to exercise.
+//! The built-in mic of the LG C3 delivers near-raw 24-bit samples (see
+//! `docs/discovery/c3-a/D3-mic-identification.md`): DC is already removed, the
+//! gain is fixed and speech at about 1 m is quiet. [`Frontend`] therefore does
+//! four cheap things, in this order, on every frame:
+//!
+//! 1. channel selection ([`ChannelMode`]) and S24 sign-extension,
+//! 2. a 2nd-order Butterworth high-pass filter (biquad) to remove rumble,
+//! 3. a fixed digital gain,
+//! 4. conversion to S16 with hard saturation (clipped samples are counted).
+//!
+//! There is no resampling: the output rate equals the input rate, and the
+//! caller must capture at the rate the consumer needs (16 kHz).
+//!
+//! The crate is pure Rust, contains no `unsafe` code, and does not allocate in
+//! the hot path other than growing the caller's output `Vec`.
 
-/// Sign-extends a 24-bit sample held in the low bits of an `i32`.
-#[must_use]
-pub fn sign_extend_s24(raw: i32) -> i32 {
-    (raw << 8) >> 8
-}
+mod frontend;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn sign_extension() {
-        assert_eq!(sign_extend_s24(0x00_7F_FF_FF), 0x7F_FFFF);
-        assert_eq!(sign_extend_s24(0x00_FF_FF_FF), -1);
-        assert_eq!(sign_extend_s24(0x00_80_00_00), -0x80_0000);
-    }
-}
+pub use frontend::{ChannelMode, Frontend, FrontendConfig, Stats, sign_extend_s24};
