@@ -4,6 +4,8 @@
 
 Implement an open, local-first Home Assistant voice satellite for **rooted LG webOS TVs**. The repository is currently in **research/feasibility phase**, not product development. Prioritize evidence collection and small, reversible experiments over code volume.
 
+> **Note (2026-11-01):** discovery on c3-a is largely done and the owner has accepted decisions (ESPHome native API, Rust, server-side wake word for the MVP, capture from `hw:LGSIC,0` with LG hands-free off). Work now follows the phases in [the roadmap](docs/project/roadmap.md) (Phase 1, silent build and integration, is current) and the [ADRs](docs/decisions/README.md). The evidence, labelling and device-safety rules below still apply to all phases, including running any binary on a TV (owner authorization required).
+
 ## Sources of truth
 
 1. `docs/project/requirements.md` — scope and feasibility gates.
@@ -42,7 +44,7 @@ Use the optional [REA reverse-engineering tool](https://github.com/morluto/rea) 
 - Native background daemon is a **provisional** design choice, not a proven standby capability.
 - Keep capture, preprocessing/AEC, activation, Assist transport, playback, power lifecycle, and media control separable.
 - Prefer stable public interfaces. Never hard-code `hw:1,0`, private Luna endpoints, model names, or ALSA indexes as universal truths.
-- Home Assistant owns STT/conversation/TTS in MVP. Wake word location is still open.
+- Home Assistant owns STT/conversation/TTS in MVP. Wake word runs server-side (HA openWakeWord) for the MVP per [ADR 0003](docs/decisions/0003-server-side-wake-word-for-mvp.md); on-TV wake word is a later improvement.
 - Existing TV AirPlay receiver / Music Assistant is a **candidate for music**, not the path for conversational TTS.
 - Don't invent unverified API calls, provider behavior, latency, audio channels, or wake-word compatibility.
 

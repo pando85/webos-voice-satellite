@@ -1,6 +1,6 @@
 # Provisional architecture
 
-**Status: proposal, not implementation contract.**
+**Status: proposal, not implementation contract. Partly superseded on 2026-11-01** by [ADR 0001](../decisions/0001-esphome-native-api.md) (ESPHome native API instead of Assist WebSocket), [ADR 0002](../decisions/0002-rust-implementation.md) (Rust), [ADR 0003](../decisions/0003-server-side-wake-word-for-mvp.md) (server-side wake word for the MVP) and [ADR 0004](../decisions/0004-mvp-capture-device-and-lg-handsfree-off.md) (capture from `hw:LGSIC,0`, LG hands-free off). The diagram below is the original sketch: read "authenticated WebSocket" as the ESPHome native API and "LG native?" as not used. The owner also considers this document not fully trustworthy; the [roadmap](../project/roadmap.md) and ADRs take precedence.
 
 ```text
 LG TV (rooted)
