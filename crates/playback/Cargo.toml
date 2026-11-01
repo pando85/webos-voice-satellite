@@ -6,5 +6,16 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
+[dependencies]
+# Pure-Rust HTTP(S) client: rustls (ring) + bundled webpki roots, no system libs.
+ureq = { version = "3.5", default-features = false, features = ["rustls"] }
+# Pure-Rust decoders. MPL-2.0 (file-level copyleft, fine for static linking).
+symphonia = { version = "0.6", default-features = false, features = ["mp3", "flac", "wav", "pcm", "ogg", "vorbis"] }
+tokio = { version = "1", default-features = false, features = ["rt", "process", "io-util", "time", "sync", "macros"] }
+thiserror = "2"
+
+[dev-dependencies]
+tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "time", "process"] }
+
 [lints]
 workspace = true
