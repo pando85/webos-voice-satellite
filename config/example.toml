@@ -1,0 +1,81 @@
+# webos-satellite configuration (TOML). Every key is optional; the values
+# shown are the defaults unless marked "example". Relative paths are resolved
+# against the directory of this file. Command-line options override the file
+# (see `webos-satellite --help`). Check a file with `--check-config`.
+
+# "wake": stream continuously while Home Assistant runs the wake word
+#         (server-side openWakeWord, ADR 0003).
+# "ptt":  push-to-talk; each SIGUSR1 starts one run at speech-to-text.
+mode = "wake"
+
+[device]
+# ESPHome node name: lowercase letters, digits and '-', at most 31 chars.
+# Must be unique among the ESPHome devices in your Home Assistant.
+name = "webos-satellite"
+friendly_name = "TV Voice Satellite"
+# Stable MAC-style id that HA uses as the device's unique id. Either set it
+# (example: "02:00:00:00:00:01", a locally administered address) or leave it
+# unset and set mac_seed; with neither, it is derived from `name`.
+# mac = "02:00:00:00:00:01"
+# mac_seed = "some-random-stable-string"
+model = "LG webOS TV"
+bind = "0.0.0.0"
+port = 6053
+# Noise encryption key: base64 of 32 random bytes, the same value you enter
+# as "encryption key" in HA. Keep it in a private file (mode 0600), e.g.
+#   head -c 32 /dev/urandom | base64 > noise_psk && chmod 600 noise_psk
+# Never commit it. `noise_psk = "..."` inline is accepted but not advised.
+noise_psk_file = "noise_psk"
+# Without a key the device refuses to start unless this is true
+# (plaintext, development only).
+allow_plaintext = false
+# Advertise _esphomelib._tcp over mDNS. HA in a container/pod usually cannot
+# see mDNS; add the device by host and port instead.
+mdns = false
+
+[mic]
+# "alsa": the TV's built-in mic. "file": a raw recording (tests on a PC).
+source = "alsa"
+# ALSA: the card is found by id and the PCM by name (never by index).
+card_id = "LGSIC"
+pcm_name = "WoV PDM Mic"
+# device = 0             # explicit PCM number, overrides pcm_name
+rate = 16000             # must be 16000 (HA's rate; no resampling)
+channels = 2
+period_frames = 256      # the only period/buffer sizes c3-a accepts
+buffer_frames = 8192
+discard_ms = 250         # startup burst dropped after every (re)start
+# File source: raw S24_LE interleaved (what `arecord -f S24_LE -t raw` writes),
+# with `rate` and `channels` as above.
+# path = "recording.raw" # example
+realtime = true          # pace reads like a live mic
+loop = false             # restart at end of file
+skip_ms = 250            # skip the start of the file (startup burst)
+pause_when_idle = true   # advance the file only while streaming to HA
+
+[dsp]
+channel = "left"         # "left" (ch0, ADR 0004), "right" or "mix"
+gain_db = 24.0           # fixed gain; the C3 mic is quiet and has no AGC
+hpf_hz = 120.0           # high-pass cutoff, 0 disables
+
+[sink]
+# "pacat": PulseAudio (the TV). "wav": one WAV file per reply in `dir`.
+# "null": discard.
+type = "pacat"
+# Software gain on every sample written to pacat: 1.0 unity, 0.0 digital
+# silence. On c3-a `pacat --volume` is ignored, so this is the level control;
+# use 0.0 for silent tests.
+gain = 1.0
+binary = "pacat"
+# device = "pcm_output"  # example PulseAudio sink; unset = default sink
+# Streamed TTS (HA's default for this device) is sent to pacat at its native
+# 16 kHz mono. rate/channels apply to decoded URL media (announcements).
+rate = 44100
+channels = 2
+# latency_msec = 200     # pacat --latency-msec for streamed TTS (untested)
+dir = "."                # wav sink output directory
+
+[log]
+# error | warn | info | debug | trace. Audio is never logged; transcripts and
+# reply text appear only at debug.
+level = "info"

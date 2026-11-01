@@ -1,0 +1,829 @@
+//! Configuration file (TOML) and command-line overrides.
+//!
+//! Every section and key is optional; the defaults are the verified values for
+//! the LG C3 (c3-a). Unknown keys are rejected so typos do not silently fall
+//! back to defaults. Relative paths in the file are resolved against the
+//! directory of the file; relative paths given on the command line against the
+//! current directory. See `config/example.toml`.
+
+use std::fmt;
+use std::net::IpAddr;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use serde::Deserialize;
+
+/// Whole configuration.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct Settings {
+    /// Pipeline trigger mode.
+    pub(crate) mode: Mode,
+    /// ESPHome device identity and API server.
+    pub(crate) device: DeviceSection,
+    /// Microphone source.
+    pub(crate) mic: MicSection,
+    /// Microphone front-end.
+    pub(crate) dsp: DspSection,
+    /// Reply audio output.
+    pub(crate) sink: SinkSection,
+    /// Logging.
+    pub(crate) log: LogSection,
+}
+
+/// How pipeline runs start.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum Mode {
+    /// Continuous streaming; Home Assistant runs the wake word (ADR 0003).
+    #[default]
+    Wake,
+    /// One run per trigger (SIGUSR1), starting at speech-to-text.
+    Ptt,
+}
+
+/// `[device]`.
+#[derive(Clone, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct DeviceSection {
+    /// ESPHome node name (`[a-z0-9-]`, at most 31 characters).
+    pub(crate) name: String,
+    /// Name shown in Home Assistant.
+    pub(crate) friendly_name: String,
+    /// Fixed MAC-style id (HA's unique id for the device).
+    pub(crate) mac: Option<String>,
+    /// Seed for a derived, stable MAC-style id when `mac` is not set.
+    pub(crate) mac_seed: Option<String>,
+    /// Model string shown in HA.
+    pub(crate) model: String,
+    /// Listen address.
+    pub(crate) bind: IpAddr,
+    /// TCP port.
+    pub(crate) port: u16,
+    /// Base64 Noise key inline (prefer `noise_psk_file`).
+    pub(crate) noise_psk: Option<String>,
+    /// File holding the base64 Noise key.
+    pub(crate) noise_psk_file: Option<PathBuf>,
+    /// Allow running without encryption (development only).
+    pub(crate) allow_plaintext: bool,
+    /// Advertise `_esphomelib._tcp` over mDNS.
+    pub(crate) mdns: bool,
+}
+
+impl Default for DeviceSection {
+    fn default() -> Self {
+        Self {
+            name: "webos-satellite".to_owned(),
+            friendly_name: "TV Voice Satellite".to_owned(),
+            mac: None,
+            mac_seed: None,
+            model: "LG webOS TV".to_owned(),
+            bind: IpAddr::from([0, 0, 0, 0]),
+            port: webos_esphome_api::DEFAULT_PORT,
+            noise_psk: None,
+            noise_psk_file: None,
+            allow_plaintext: false,
+            mdns: false,
+        }
+    }
+}
+
+impl fmt::Debug for DeviceSection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DeviceSection")
+            .field("name", &self.name)
+            .field("friendly_name", &self.friendly_name)
+            .field("mac", &self.mac)
+            .field("mac_seed", &self.mac_seed.as_ref().map(|_| "<set>"))
+            .field("model", &self.model)
+            .field("bind", &self.bind)
+            .field("port", &self.port)
+            .field("noise_psk", &self.noise_psk.as_ref().map(|_| "<redacted>"))
+            .field("noise_psk_file", &self.noise_psk_file)
+            .field("allow_plaintext", &self.allow_plaintext)
+            .field("mdns", &self.mdns)
+            .finish()
+    }
+}
+
+/// Microphone source kind.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum MicSource {
+    /// ALSA capture PCM (the TV's built-in mic).
+    #[default]
+    Alsa,
+    /// Raw S24_LE interleaved file (tests on a PC).
+    File,
+}
+
+/// `[mic]`. ALSA keys apply to `source = "alsa"`, file keys to `"file"`;
+/// `rate` and `channels` apply to both.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct MicSection {
+    /// Source kind.
+    pub(crate) source: MicSource,
+    /// ALSA card id (`/proc/asound/cards`), not an index.
+    pub(crate) card_id: String,
+    /// Substring of the PCM name or id.
+    pub(crate) pcm_name: Option<String>,
+    /// Explicit PCM device number (overrides `pcm_name`).
+    pub(crate) device: Option<u32>,
+    /// Sample rate in Hz (must be 16000: the front-end does not resample).
+    pub(crate) rate: u32,
+    /// Interleaved channels.
+    pub(crate) channels: u16,
+    /// ALSA period size in frames.
+    pub(crate) period_frames: u32,
+    /// ALSA ring buffer size in frames.
+    pub(crate) buffer_frames: u32,
+    /// Audio dropped after every ALSA start and overrun recovery.
+    pub(crate) discard_ms: u32,
+    /// File path (`source = "file"`).
+    pub(crate) path: Option<PathBuf>,
+    /// Pace file reads at the sample rate, like a live mic.
+    pub(crate) realtime: bool,
+    /// Restart the file at its end.
+    #[serde(rename = "loop")]
+    pub(crate) looping: bool,
+    /// Skip this much audio at the start of the file (startup burst).
+    pub(crate) skip_ms: u32,
+    /// Advance the file only while audio is streamed to HA, so each run sees
+    /// the next part of the recording instead of what passed while idle.
+    pub(crate) pause_when_idle: bool,
+}
+
+impl Default for MicSection {
+    fn default() -> Self {
+        Self {
+            source: MicSource::Alsa,
+            card_id: "LGSIC".to_owned(),
+            pcm_name: Some("WoV PDM Mic".to_owned()),
+            device: None,
+            rate: 16_000,
+            channels: 2,
+            period_frames: 256,
+            buffer_frames: 8192,
+            discard_ms: 250,
+            path: None,
+            realtime: true,
+            looping: false,
+            skip_ms: 250,
+            pause_when_idle: true,
+        }
+    }
+}
+
+/// Channel selection of the front-end.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum Channel {
+    /// Channel 0 (ADR 0004).
+    #[default]
+    Left,
+    /// Channel 1.
+    Right,
+    /// Mean of all channels.
+    Mix,
+}
+
+/// `[dsp]`.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct DspSection {
+    /// Channel selection.
+    pub(crate) channel: Channel,
+    /// Fixed gain in dB.
+    pub(crate) gain_db: f32,
+    /// High-pass cutoff in Hz (0 disables).
+    pub(crate) hpf_hz: f32,
+}
+
+impl Default for DspSection {
+    fn default() -> Self {
+        Self {
+            channel: Channel::Left,
+            gain_db: 24.0,
+            hpf_hz: 120.0,
+        }
+    }
+}
+
+/// Reply sink kind.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum SinkKind {
+    /// PulseAudio through `pacat` (the TV).
+    #[default]
+    Pacat,
+    /// One WAV file per reply in `dir` (PC tests, silent TV tests).
+    Wav,
+    /// Discard.
+    Null,
+}
+
+/// `[sink]`.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct SinkSection {
+    /// Sink kind.
+    #[serde(rename = "type")]
+    pub(crate) kind: SinkKind,
+    /// Software gain applied to every sample written to `pacat` (1.0 unity,
+    /// 0.0 digital silence). The reliable level control on c3-a, where
+    /// `pacat --volume` is ignored.
+    pub(crate) gain: f32,
+    /// `pacat` binary.
+    pub(crate) binary: PathBuf,
+    /// PulseAudio sink name; unset uses the default sink.
+    pub(crate) device: Option<String>,
+    /// Rate for decoded URL/announcement audio sent to `pacat`. Streamed TTS
+    /// is sent at its native 16 kHz mono and PulseAudio converts it.
+    pub(crate) rate: u32,
+    /// Channels for decoded URL/announcement audio sent to `pacat`.
+    pub(crate) channels: u16,
+    /// `pacat --latency-msec` for streamed TTS (unset: PulseAudio default).
+    pub(crate) latency_msec: Option<u32>,
+    /// Output directory of the WAV sink.
+    pub(crate) dir: PathBuf,
+}
+
+impl Default for SinkSection {
+    fn default() -> Self {
+        Self {
+            kind: SinkKind::Pacat,
+            gain: 1.0,
+            binary: PathBuf::from("pacat"),
+            device: None,
+            rate: 44_100,
+            channels: 2,
+            latency_msec: None,
+            dir: PathBuf::from("."),
+        }
+    }
+}
+
+/// `[log]`.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct LogSection {
+    /// `error`, `warn`, `info`, `debug` or `trace`.
+    pub(crate) level: String,
+}
+
+impl Default for LogSection {
+    fn default() -> Self {
+        Self {
+            level: "info".to_owned(),
+        }
+    }
+}
+
+/// Error loading or validating the configuration.
+#[derive(Debug)]
+pub(crate) struct ConfigError(pub(crate) String);
+
+impl fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ConfigError {}
+
+fn err(msg: impl Into<String>) -> ConfigError {
+    ConfigError(msg.into())
+}
+
+fn resolve(base: &Path, p: &mut PathBuf) {
+    if p.is_relative() {
+        *p = base.join(&*p);
+    }
+}
+
+impl Settings {
+    /// Parses TOML text. Relative paths are resolved against `base`.
+    pub(crate) fn from_toml(text: &str, base: &Path) -> Result<Self, ConfigError> {
+        let mut s: Self = toml::from_str(text).map_err(|e| err(format!("config: {e}")))?;
+        if let Some(p) = s.device.noise_psk_file.as_mut() {
+            resolve(base, p);
+        }
+        if let Some(p) = s.mic.path.as_mut() {
+            resolve(base, p);
+        }
+        resolve(base, &mut s.sink.dir);
+        Ok(s)
+    }
+
+    /// Reads and parses a TOML file.
+    pub(crate) fn load(path: &Path) -> Result<Self, ConfigError> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| err(format!("cannot read {}: {e}", path.display())))?;
+        let base = path.parent().unwrap_or_else(|| Path::new("."));
+        Self::from_toml(&text, base)
+    }
+
+    /// Log level filter.
+    pub(crate) fn log_level(&self) -> Result<log::LevelFilter, ConfigError> {
+        self.log
+            .level
+            .parse()
+            .map_err(|_| err(format!("log.level: unknown level {:?}", self.log.level)))
+    }
+
+    /// Checks values that the libraries would only reject later.
+    pub(crate) fn validate(&self) -> Result<(), ConfigError> {
+        self.log_level()?;
+        if self.mic.rate != 16_000 {
+            return Err(err(
+                "mic.rate must be 16000 (Home Assistant expects 16 kHz; the front-end does not resample)",
+            ));
+        }
+        if self.mic.channels == 0 {
+            return Err(err("mic.channels must be at least 1"));
+        }
+        if self.mic.source == MicSource::File && self.mic.path.is_none() {
+            return Err(err("mic.source = \"file\" needs mic.path"));
+        }
+        if !self.dsp.gain_db.is_finite() || !(-20.0..=60.0).contains(&self.dsp.gain_db) {
+            return Err(err("dsp.gain_db must be between -20 and 60"));
+        }
+        if !self.dsp.hpf_hz.is_finite() || self.dsp.hpf_hz < 0.0 {
+            return Err(err("dsp.hpf_hz must be >= 0"));
+        }
+        if !self.sink.gain.is_finite() || !(0.0..=4.0).contains(&self.sink.gain) {
+            return Err(err("sink.gain must be between 0.0 and 4.0"));
+        }
+        if self.sink.rate == 0 || self.sink.channels == 0 {
+            return Err(err("sink.rate and sink.channels must be non-zero"));
+        }
+        if self.device.noise_psk.is_some() && self.device.noise_psk_file.is_some() {
+            return Err(err(
+                "set only one of device.noise_psk and device.noise_psk_file",
+            ));
+        }
+        if self.device.noise_psk.is_none()
+            && self.device.noise_psk_file.is_none()
+            && !self.device.allow_plaintext
+        {
+            return Err(err(
+                "no Noise key: set device.noise_psk_file (or device.allow_plaintext = true for development)",
+            ));
+        }
+        self.esphome_config()?
+            .validate()
+            .map_err(|e| err(format!("device: {e}")))?;
+        Ok(())
+    }
+
+    /// The Noise key, read from the file if configured. Never logged.
+    fn noise_psk(&self) -> Result<Option<String>, ConfigError> {
+        if let Some(k) = &self.device.noise_psk {
+            return Ok(Some(k.trim().to_owned()));
+        }
+        let Some(path) = &self.device.noise_psk_file else {
+            return Ok(None);
+        };
+        let text = std::fs::read_to_string(path).map_err(|e| {
+            err(format!(
+                "cannot read device.noise_psk_file {}: {e}",
+                path.display()
+            ))
+        })?;
+        let key = text.trim();
+        if key.is_empty() {
+            return Err(err(format!("{} is empty", path.display())));
+        }
+        Ok(Some(key.to_owned()))
+    }
+
+    /// Configuration of the ESPHome API server.
+    pub(crate) fn esphome_config(&self) -> Result<webos_esphome_api::Config, ConfigError> {
+        let d = &self.device;
+        Ok(webos_esphome_api::Config {
+            name: d.name.clone(),
+            friendly_name: d.friendly_name.clone(),
+            mac: d.mac.clone(),
+            mac_seed: d.mac_seed.clone(),
+            model: d.model.clone(),
+            bind_addr: d.bind,
+            port: d.port,
+            noise_psk: self.noise_psk()?,
+            mdns: d.mdns,
+            ..webos_esphome_api::Config::default()
+        })
+    }
+
+    /// Front-end configuration.
+    pub(crate) fn frontend_config(&self) -> webos_dsp::FrontendConfig {
+        webos_dsp::FrontendConfig {
+            channel: match self.dsp.channel {
+                Channel::Left => webos_dsp::ChannelMode::Left,
+                Channel::Right => webos_dsp::ChannelMode::Right,
+                Channel::Mix => webos_dsp::ChannelMode::Mix,
+            },
+            gain_db: self.dsp.gain_db,
+            hpf_hz: self.dsp.hpf_hz,
+        }
+    }
+
+    /// ALSA capture configuration.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn capture_config(&self) -> webos_capture::CaptureConfig {
+        let m = &self.mic;
+        webos_capture::CaptureConfig {
+            card_id: m.card_id.clone(),
+            pcm_name: m.pcm_name.clone(),
+            device: m.device,
+            rate: m.rate,
+            channels: m.channels,
+            period_frames: m.period_frames,
+            buffer_frames: m.buffer_frames,
+            discard_ms: m.discard_ms,
+        }
+    }
+
+    /// One-line summary for the startup log (no secrets).
+    pub(crate) fn summary(&self) -> String {
+        let mic = match self.mic.source {
+            MicSource::Alsa => format!(
+                "alsa card={} pcm={}",
+                self.mic.card_id,
+                self.mic
+                    .device
+                    .map_or_else(|| format!("{:?}", self.mic.pcm_name), |d| d.to_string())
+            ),
+            MicSource::File => format!(
+                "file realtime={} loop={} skip_ms={} pause_when_idle={}",
+                self.mic.realtime, self.mic.looping, self.mic.skip_ms, self.mic.pause_when_idle
+            ),
+        };
+        let sink = match self.sink.kind {
+            SinkKind::Pacat => format!(
+                "pacat gain={} device={}",
+                self.sink.gain,
+                self.sink.device.as_deref().unwrap_or("default")
+            ),
+            SinkKind::Wav => format!("wav dir={}", self.sink.dir.display()),
+            SinkKind::Null => "null".to_owned(),
+        };
+        format!(
+            "name={} port={} mode={:?} encryption={} mic=[{mic}] dsp=[{:?} gain_db={} hpf_hz={}] sink=[{sink}]",
+            self.device.name,
+            self.device.port,
+            self.mode,
+            if self.device.noise_psk.is_some() || self.device.noise_psk_file.is_some() {
+                "noise"
+            } else {
+                "PLAINTEXT"
+            },
+            self.dsp.channel,
+            self.dsp.gain_db,
+            self.dsp.hpf_hz,
+        )
+    }
+}
+
+/// Test aids that trigger push-to-talk runs (not for production use).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct TestTriggers {
+    /// Start one push-to-talk run shortly after HA connects.
+    pub(crate) ptt_on_connect: bool,
+    /// Start a push-to-talk run at this interval.
+    pub(crate) ptt_every: Option<Duration>,
+}
+
+/// What the command line asks for.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Command {
+    /// Print the version.
+    Version,
+    /// Print usage.
+    Help,
+    /// Runtime self-test.
+    SelfTest,
+    /// Validate the configuration and print a summary.
+    CheckConfig(Box<Settings>),
+    /// Run the daemon.
+    Run(Box<Settings>, TestTriggers),
+}
+
+pub(crate) const USAGE: &str = "\
+usage: webos-satellite [--config FILE] [options]
+       webos-satellite --version | --help | --self-test
+
+Runs the Home Assistant voice satellite (ESPHome native API on TCP 6053).
+
+options (override the config file):
+  --config FILE          TOML configuration (see config/example.toml)
+  --check-config         validate the configuration, print a summary, exit
+  --mode wake|ptt        wake: continuous server-side wake word; ptt: SIGUSR1 starts a run
+  --name NAME            ESPHome node name
+  --friendly-name NAME   name shown in Home Assistant
+  --port PORT            API port (default 6053)
+  --bind ADDR            listen address (default 0.0.0.0)
+  --noise-psk-file FILE  file with the base64 Noise key
+  --mic alsa|file        microphone source
+  --mic-file FILE        raw S24_LE file as the microphone (implies --mic file)
+  --mic-skip-ms MS       skip the start of the mic file
+  --gain-db DB           front-end gain
+  --sink pacat|wav|null  reply sink
+  --sink-gain G          software gain for pacat (0 = digital silence)
+  --wav-dir DIR          output directory of the wav sink
+  --log-level LEVEL      error|warn|info|debug|trace
+test aids:
+  --ptt-on-connect       start one push-to-talk run after HA connects
+  --ptt-every SECS       start a push-to-talk run every SECS seconds
+
+signals: SIGUSR1 starts a push-to-talk run; SIGTERM/SIGINT stop.";
+
+fn parse_num<T: std::str::FromStr>(flag: &str, v: &str) -> Result<T, ConfigError> {
+    v.parse()
+        .map_err(|_| err(format!("{flag}: invalid value {v:?}")))
+}
+
+fn parse_enum<T: for<'de> Deserialize<'de>>(flag: &str, v: &str) -> Result<T, ConfigError> {
+    use serde::de::value::{Error, StrDeserializer};
+    T::deserialize(StrDeserializer::<Error>::new(v))
+        .map_err(|_| err(format!("{flag}: invalid value {v:?}")))
+}
+
+/// Parses the command line (without the program name).
+pub(crate) fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Command, ConfigError> {
+    let args: Vec<String> = args.into_iter().collect();
+    match args.first().map(String::as_str) {
+        Some("--version" | "-V") => return Ok(Command::Version),
+        Some("--help" | "-h") => return Ok(Command::Help),
+        Some("--self-test") => return Ok(Command::SelfTest),
+        _ => {}
+    }
+
+    // First pass: the config file, so overrides apply on top of it.
+    let mut settings = Settings::default();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a == "--config" {
+            let path = it.next().ok_or_else(|| err("--config needs a value"))?;
+            settings = Settings::load(Path::new(path))?;
+        }
+    }
+
+    let mut check = false;
+    let mut triggers = TestTriggers::default();
+    let mut it = args.iter();
+    while let Some(flag) = it.next() {
+        let flag = flag.as_str();
+        let mut value = || {
+            it.next()
+                .map(String::as_str)
+                .ok_or_else(|| err(format!("{flag} needs a value")))
+        };
+        match flag {
+            "--config" => {
+                value()?;
+            }
+            "--check-config" => check = true,
+            "--mode" => settings.mode = parse_enum(flag, value()?)?,
+            "--name" => value()?.clone_into(&mut settings.device.name),
+            "--friendly-name" => value()?.clone_into(&mut settings.device.friendly_name),
+            "--port" => settings.device.port = parse_num(flag, value()?)?,
+            "--bind" => settings.device.bind = parse_num(flag, value()?)?,
+            "--noise-psk-file" => {
+                settings.device.noise_psk = None;
+                settings.device.noise_psk_file = Some(PathBuf::from(value()?));
+            }
+            "--mic" => settings.mic.source = parse_enum(flag, value()?)?,
+            "--mic-file" => {
+                settings.mic.source = MicSource::File;
+                settings.mic.path = Some(PathBuf::from(value()?));
+            }
+            "--mic-skip-ms" => settings.mic.skip_ms = parse_num(flag, value()?)?,
+            "--gain-db" => settings.dsp.gain_db = parse_num(flag, value()?)?,
+            "--sink" => settings.sink.kind = parse_enum(flag, value()?)?,
+            "--sink-gain" => settings.sink.gain = parse_num(flag, value()?)?,
+            "--wav-dir" => settings.sink.dir = PathBuf::from(value()?),
+            "--log-level" => value()?.clone_into(&mut settings.log.level),
+            "--ptt-on-connect" => triggers.ptt_on_connect = true,
+            "--ptt-every" => {
+                let secs: f64 = parse_num(flag, value()?)?;
+                if !(secs.is_finite() && secs >= 1.0) {
+                    return Err(err("--ptt-every must be at least 1 second"));
+                }
+                triggers.ptt_every = Some(Duration::from_secs_f64(secs));
+            }
+            other => return Err(err(format!("unknown argument: {other}"))),
+        }
+    }
+    settings.validate()?;
+    let settings = Box::new(settings);
+    Ok(if check {
+        Command::CheckConfig(settings)
+    } else {
+        Command::Run(settings, triggers)
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::float_cmp)]
+
+    use super::*;
+
+    fn args(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[test]
+    fn defaults_match_c3_capture() {
+        let s = Settings::default();
+        assert_eq!(s.mode, Mode::Wake);
+        assert_eq!(s.mic.card_id, "LGSIC");
+        assert_eq!(s.mic.period_frames, 256);
+        assert_eq!(s.mic.buffer_frames, 8192);
+        assert_eq!(s.dsp.gain_db, 24.0);
+        assert_eq!(s.sink.kind, SinkKind::Pacat);
+        assert_eq!(s.device.port, 6053);
+    }
+
+    #[test]
+    fn parses_full_file_and_resolves_paths() {
+        let text = r#"
+mode = "ptt"
+[device]
+name = "lg-c3-a"
+friendly_name = "Living room TV"
+mac_seed = "abc"
+port = 6054
+noise_psk_file = "private/psk"
+[mic]
+source = "file"
+path = "rec.raw"
+loop = true
+skip_ms = 500
+[dsp]
+channel = "mix"
+gain_db = 20
+hpf_hz = 100
+[sink]
+type = "wav"
+dir = "out"
+[log]
+level = "debug"
+"#;
+        let s = Settings::from_toml(text, Path::new("/etc/sat")).unwrap();
+        assert_eq!(s.mode, Mode::Ptt);
+        assert_eq!(s.device.name, "lg-c3-a");
+        assert_eq!(s.device.port, 6054);
+        assert_eq!(
+            s.device.noise_psk_file,
+            Some(PathBuf::from("/etc/sat/private/psk"))
+        );
+        assert_eq!(s.mic.source, MicSource::File);
+        assert_eq!(s.mic.path, Some(PathBuf::from("/etc/sat/rec.raw")));
+        assert!(s.mic.looping);
+        assert_eq!(s.mic.skip_ms, 500);
+        assert_eq!(s.dsp.channel, Channel::Mix);
+        assert_eq!(s.sink.kind, SinkKind::Wav);
+        assert_eq!(s.sink.dir, PathBuf::from("/etc/sat/out"));
+        assert_eq!(s.log_level().unwrap(), log::LevelFilter::Debug);
+    }
+
+    #[test]
+    fn example_file_documents_the_defaults() {
+        let base = Path::new("/cfg");
+        let s = Settings::from_toml(include_str!("../../../config/example.toml"), base).unwrap();
+        let mut expected = Settings::default();
+        expected.device.noise_psk_file = Some(base.join("noise_psk"));
+        expected.sink.dir = base.join(".");
+        assert_eq!(s, expected);
+    }
+
+    #[test]
+    fn rejects_unknown_keys() {
+        let e = Settings::from_toml("[mic]\nsorce = \"file\"\n", Path::new(".")).unwrap_err();
+        assert!(e.0.contains("sorce"), "{e}");
+        assert!(Settings::from_toml("modee = \"wake\"\n", Path::new(".")).is_err());
+        assert!(Settings::from_toml("mode = \"always\"\n", Path::new(".")).is_err());
+    }
+
+    #[test]
+    fn validation() {
+        let mut s = Settings::default();
+        // No key and plaintext not allowed.
+        assert!(s.validate().unwrap_err().0.contains("Noise key"));
+        s.device.allow_plaintext = true;
+        s.validate().unwrap();
+
+        let mut bad = s.clone();
+        bad.mic.rate = 48_000;
+        assert!(bad.validate().is_err());
+        let mut bad = s.clone();
+        bad.mic.source = MicSource::File;
+        assert!(bad.validate().is_err());
+        let mut bad = s.clone();
+        bad.sink.gain = -1.0;
+        assert!(bad.validate().is_err());
+        let mut bad = s.clone();
+        bad.device.name = "Bad Name".to_owned();
+        assert!(bad.validate().is_err());
+        let mut bad = s.clone();
+        bad.log.level = "loud".to_owned();
+        assert!(bad.validate().is_err());
+        let mut bad = s;
+        bad.device.noise_psk = Some("AAAA".to_owned());
+        assert!(bad.validate().is_err(), "short key must be rejected");
+    }
+
+    #[test]
+    fn psk_file_is_read_and_trimmed() {
+        let dir = std::env::temp_dir().join(format!("webos-sat-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        std::fs::write(dir.join("psk"), format!("{key}\n")).unwrap();
+        let s = Settings::from_toml("[device]\nnoise_psk_file = \"psk\"\n", &dir).unwrap();
+        s.validate().unwrap();
+        assert_eq!(s.esphome_config().unwrap().noise_psk.as_deref(), Some(key));
+        // The summary and Debug output never contain the key.
+        assert!(!s.summary().contains(key));
+        let mut inline = s.clone();
+        inline.device.noise_psk_file = None;
+        inline.device.noise_psk = Some(key.to_owned());
+        assert!(!format!("{inline:?}").contains(key));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cli_overrides_and_triggers() {
+        let cmd = parse_args(args(&[
+            "--mode",
+            "ptt",
+            "--name",
+            "webos-satellite-dev",
+            "--mic-file",
+            "x.raw",
+            "--sink",
+            "null",
+            "--sink-gain",
+            "0",
+            "--ptt-on-connect",
+            "--ptt-every",
+            "5",
+            "--port",
+            "16053",
+            "--log-level",
+            "debug",
+        ]));
+        // No key: rejected.
+        assert!(cmd.is_err());
+
+        let dir = std::env::temp_dir().join(format!("webos-sat-cli-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("c.toml");
+        std::fs::write(&cfg, "[device]\nallow_plaintext = true\nport = 1\n").unwrap();
+        let cfg = cfg.to_string_lossy().into_owned();
+        let Command::Run(s, t) = parse_args(args(&[
+            "--port",
+            "16053",
+            "--config",
+            &cfg,
+            "--mode",
+            "ptt",
+            "--mic-file",
+            "x.raw",
+            "--sink",
+            "null",
+            "--sink-gain",
+            "0",
+            "--ptt-on-connect",
+            "--ptt-every",
+            "5",
+        ]))
+        .unwrap() else {
+            panic!("expected Run");
+        };
+        // Overrides win over the file regardless of their position.
+        assert_eq!(s.device.port, 16053);
+        assert_eq!(s.mode, Mode::Ptt);
+        assert_eq!(s.mic.source, MicSource::File);
+        assert_eq!(s.sink.kind, SinkKind::Null);
+        assert_eq!(s.sink.gain, 0.0);
+        assert!(t.ptt_on_connect);
+        assert_eq!(t.ptt_every, Some(Duration::from_secs(5)));
+
+        assert!(matches!(
+            parse_args(args(&["--config", &cfg, "--check-config"])).unwrap(),
+            Command::CheckConfig(_)
+        ));
+        assert!(parse_args(args(&["--config", &cfg, "--bogus"])).is_err());
+        assert!(parse_args(args(&["--config", &cfg, "--mode", "loud"])).is_err());
+        assert!(parse_args(args(&["--config", &cfg, "--ptt-every", "0"])).is_err());
+        assert!(parse_args(args(&["--config", &cfg, "--port"])).is_err());
+        assert_eq!(parse_args(args(&["--version"])).unwrap(), Command::Version);
+        assert_eq!(
+            parse_args(args(&["--self-test"])).unwrap(),
+            Command::SelfTest
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

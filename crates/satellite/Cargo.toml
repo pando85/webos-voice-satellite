@@ -12,7 +12,11 @@ name = "webos-satellite"
 path = "src/main.rs"
 
 [dependencies]
+log = "0.4"
 rustix = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1.54", default-features = false, features = ["rt", "macros", "sync", "time", "signal", "process", "io-util"] }
+toml = { version = "0.9", default-features = false, features = ["parse", "serde", "std"] }
 webos-capture = { workspace = true }
 webos-dsp = { workspace = true }
 webos-esphome-api = { workspace = true }
