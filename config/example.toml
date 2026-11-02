@@ -140,3 +140,41 @@ enabled = false
 state_dir = "pairing"
 window_s = 600           # the window closes after this, or once a key is set
 open_on_start = true     # open the window when started without a stored key
+
+[aec]
+# Acoustic echo cancellation: removes what the TV itself plays (programme
+# audio and the satellite's own replies) from the mic before the gain, with
+# WebRTC AEC3 (the pure Rust `sonora` crate). Design and measurements:
+# docs/design/aec-frontend.md. Off until it is evaluated on the TV.
+enabled = false
+# The reference is the TV's output, captured from a PCM on the mic's card
+# (mic.card_id), matched by its id or name (never by index). On the LG C3
+# (c3-a) "SoundEngineCapture" (hw:LGSIC,3) is post-volume and coherent with
+# the speaker signal; "SpeakerFeedback" is not usable as a reference.
+reference_pcm_id = "SoundEngineCapture"
+# The values verified on c3-a: S32_LE, 2 ch, 48 kHz (its only rate), period
+# 256 and buffer 8192 frames. 48000 is decimated to 16 kHz; 16000 is
+# taken as is. reference_format: "s32_le" or "s24_le".
+reference_format = "s32_le"
+reference_channels = 2
+reference_rate = 48000
+reference_period_frames = 256
+reference_buffer_frames = 8192
+# Start mic and reference on one trigger (SNDRV_PCM_IOCTL_LINK). If linking
+# fails they start back to back, reference first. If the reference cannot
+# be opened at all, the mic runs without echo cancellation (logged).
+link = true
+# Mic-behind-reference delay: "auto" (measured at start and every 30 s,
+# passed to AEC3 as a hint; AEC3 also tracks it itself) or a fixed number
+# of ms (0 to 500). It changes on every open on c3-a (12.9 to 19.1 ms).
+delay_ms = "auto"
+# Noise suppression after the echo canceller. Not evaluated for wake word
+# or STT yet.
+ns = false
+# Skip the canceller while the reference has been silent for 2 s (never in
+# the first 5 s of a stream), to save CPU. Not evaluated on the TV.
+bypass_when_silent = false
+reference_gain_db = 0.0  # digital gain on the reference, -20 to 40
+# File reference for mic.source = "file" (PC tests): raw interleaved frames
+# in reference_format/channels/rate, read in lockstep with mic.path.
+# reference_path = "ref.raw"  # example

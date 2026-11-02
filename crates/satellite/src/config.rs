@@ -11,7 +11,7 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 
 /// Default `sink.latency_msec`: P2 session 1 on c3-a measured the reply start
 /// about 0.1 s after the TTS stream started with 200 ms, against about 1.5 s
@@ -42,6 +42,8 @@ pub(crate) struct Settings {
     pub(crate) limits: LimitsSection,
     /// HA-driven key provisioning (pairing without typing a key).
     pub(crate) pairing: PairingSection,
+    /// Acoustic echo cancellation against the TV's own output.
+    pub(crate) aec: AecSection,
 }
 
 /// How pipeline runs start.
@@ -427,6 +429,107 @@ impl PairingSection {
     }
 }
 
+/// `aec.delay_ms`: `"auto"` or a fixed delay in milliseconds.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(crate) enum AecDelay {
+    /// Estimate it (GCC-PHAT) at start and every 30 s.
+    #[default]
+    Auto,
+    /// Mic behind the reference by this many ms (the hint given to AEC3).
+    Fixed(f32),
+}
+
+impl<'de> Deserialize<'de> for AecDelay {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Int(i64),
+            Float(f64),
+            Text(String),
+        }
+        #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+        match Raw::deserialize(d)? {
+            Raw::Int(v) => Ok(Self::Fixed(v as f32)),
+            Raw::Float(v) => Ok(Self::Fixed(v as f32)),
+            Raw::Text(t) if t == "auto" => Ok(Self::Auto),
+            Raw::Text(t) => Err(serde::de::Error::custom(format!(
+                "expected \"auto\" or a number of milliseconds, got {t:?}"
+            ))),
+        }
+    }
+}
+
+/// Sample format of the echo reference.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RefFormat {
+    /// 32-bit samples (SoundEngineCapture on c3-a).
+    #[default]
+    S32Le,
+    /// 24-bit samples in 32-bit containers.
+    S24Le,
+}
+
+/// `[aec]`: echo cancellation with the TV's output as the reference
+/// (docs/design/aec-frontend.md). The ALSA reference is opened on the mic's
+/// card (`mic.card_id`), matched by PCM id or name.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[allow(clippy::struct_excessive_bools)] // one bool per TOML switch
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct AecSection {
+    /// Run the echo canceller (needs a reference).
+    pub(crate) enabled: bool,
+    /// Substring of the reference PCM's id or name on the mic's card.
+    pub(crate) reference_pcm_id: String,
+    /// Reference sample format.
+    pub(crate) reference_format: RefFormat,
+    /// Reference channels (downmixed to mono).
+    pub(crate) reference_channels: u16,
+    /// Reference rate: 48000 (decimated to 16 kHz) or 16000.
+    pub(crate) reference_rate: u32,
+    /// Reference ALSA period size in frames.
+    pub(crate) reference_period_frames: u32,
+    /// Reference ALSA ring buffer size in frames.
+    pub(crate) reference_buffer_frames: u32,
+    /// Link mic and reference so one trigger starts both.
+    pub(crate) link: bool,
+    /// `"auto"` or a fixed mic-behind-reference delay in ms (0 to 500).
+    pub(crate) delay_ms: AecDelay,
+    /// Noise suppression after the echo canceller.
+    pub(crate) ns: bool,
+    /// Skip the canceller while the reference is silent (saves CPU).
+    pub(crate) bypass_when_silent: bool,
+    /// Digital gain on the reference in dB (-20 to 40).
+    pub(crate) reference_gain_db: f32,
+    /// Raw reference file for `mic.source = "file"` (read in lockstep with
+    /// `mic.path`).
+    pub(crate) reference_path: Option<PathBuf>,
+}
+
+impl Default for AecSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            reference_pcm_id: "SoundEngineCapture".to_owned(),
+            reference_format: RefFormat::S32Le,
+            reference_channels: 2,
+            reference_rate: 48_000,
+            reference_period_frames: 256,
+            reference_buffer_frames: 8192,
+            link: true,
+            delay_ms: AecDelay::Auto,
+            ns: false,
+            bypass_when_silent: false,
+            reference_gain_db: 0.0,
+            reference_path: None,
+        }
+    }
+}
+
+/// Largest accepted fixed `aec.delay_ms` (sonora clamps its hint there).
+pub(crate) const MAX_AEC_DELAY_MS: f32 = 500.0;
+
 /// The permission bits of `path` if group or other have any access
 /// (unreadable or non-Unix: `None`).
 #[cfg(unix)]
@@ -478,6 +581,9 @@ impl Settings {
         resolve(base, &mut s.safety.mute_file);
         resolve(base, &mut s.safety.firmware_info);
         resolve(base, &mut s.pairing.state_dir);
+        if let Some(p) = s.aec.reference_path.as_mut() {
+            resolve(base, p);
+        }
         Ok(s)
     }
 
@@ -594,9 +700,51 @@ impl Settings {
                 "--pair and --reset-pairing need pairing.enabled = true and no device.noise_psk or noise_psk_file",
             ));
         }
+        self.validate_aec()?;
         self.esphome_config()?
             .validate()
             .map_err(|e| err(format!("device: {e}")))?;
+        Ok(())
+    }
+
+    fn validate_aec(&self) -> Result<(), ConfigError> {
+        let a = &self.aec;
+        if a.reference_pcm_id.trim().is_empty() {
+            return Err(err("aec.reference_pcm_id must not be empty"));
+        }
+        if a.reference_rate != 16_000 && a.reference_rate != 48_000 {
+            return Err(err(
+                "aec.reference_rate must be 48000 (decimated to 16 kHz) or 16000",
+            ));
+        }
+        if !(1..=8).contains(&a.reference_channels) {
+            return Err(err("aec.reference_channels must be between 1 and 8"));
+        }
+        if a.reference_period_frames == 0 || a.reference_buffer_frames < a.reference_period_frames {
+            return Err(err(
+                "aec.reference_period_frames must be non-zero and aec.reference_buffer_frames at least as large",
+            ));
+        }
+        if let AecDelay::Fixed(ms) = a.delay_ms {
+            if !ms.is_finite() || !(0.0..=MAX_AEC_DELAY_MS).contains(&ms) {
+                return Err(err(format!(
+                    "aec.delay_ms must be \"auto\" or between 0 and {MAX_AEC_DELAY_MS}"
+                )));
+            }
+        }
+        if !a.reference_gain_db.is_finite() || !(-20.0..=40.0).contains(&a.reference_gain_db) {
+            return Err(err("aec.reference_gain_db must be between -20 and 40"));
+        }
+        if !a.enabled && (a.ns || a.bypass_when_silent) {
+            return Err(err(
+                "aec.ns and aec.bypass_when_silent need aec.enabled = true",
+            ));
+        }
+        if a.enabled && self.mic.source == MicSource::File && a.reference_path.is_none() {
+            return Err(err(
+                "aec.enabled with mic.source = \"file\" needs aec.reference_path",
+            ));
+        }
         Ok(())
     }
 
@@ -643,6 +791,22 @@ impl Settings {
             if let Some(p) = self.mic.path.as_ref().filter(|p| !p.exists()) {
                 w.push(format!("mic.path {} does not exist", p.display()));
             }
+        }
+        if let Some(p) = &self.aec.reference_path {
+            if self.mic.source == MicSource::Alsa {
+                w.push(
+                    "aec.reference_path is ignored with mic.source = \"alsa\" (the ALSA reference is used)"
+                        .to_owned(),
+                );
+            } else if self.aec.enabled && !p.exists() {
+                w.push(format!("aec.reference_path {} does not exist", p.display()));
+            }
+        }
+        if self.aec.enabled && self.aec.ns {
+            w.push(
+                "aec.ns is on: noise suppression has not been evaluated for wake word or STT yet"
+                    .to_owned(),
+            );
         }
         w
     }
@@ -735,6 +899,46 @@ impl Settings {
         }
     }
 
+    /// Echo canceller settings (used only when `aec.enabled`).
+    pub(crate) fn aec_config(&self) -> webos_dsp::AecConfig {
+        let a = &self.aec;
+        webos_dsp::AecConfig {
+            reference_rate: a.reference_rate,
+            reference_channels: a.reference_channels,
+            reference_gain_db: a.reference_gain_db,
+            delay: match a.delay_ms {
+                AecDelay::Auto => webos_dsp::DelayMode::Auto,
+                AecDelay::Fixed(ms) => webos_dsp::DelayMode::FixedMs(ms),
+            },
+            apply: webos_dsp::DelayApply::Hint,
+            ns: a.ns,
+            bypass_when_silent: a.bypass_when_silent,
+        }
+    }
+
+    /// Reference sample format for the capture crate.
+    pub(crate) fn reference_format(&self) -> webos_capture::SampleFormat {
+        match self.aec.reference_format {
+            RefFormat::S32Le => webos_capture::SampleFormat::S32Le,
+            RefFormat::S24Le => webos_capture::SampleFormat::S24Le,
+        }
+    }
+
+    /// ALSA echo-reference configuration (on the mic's card).
+    #[cfg(target_os = "linux")]
+    pub(crate) fn reference_config(&self) -> webos_capture::ReferenceConfig {
+        let a = &self.aec;
+        webos_capture::ReferenceConfig {
+            pcm_name: a.reference_pcm_id.clone(),
+            format: self.reference_format(),
+            channels: a.reference_channels,
+            rate: a.reference_rate,
+            period_frames: a.reference_period_frames,
+            buffer_frames: a.reference_buffer_frames,
+            link: a.link,
+        }
+    }
+
     /// ALSA capture configuration.
     #[cfg(target_os = "linux")]
     pub(crate) fn capture_config(&self) -> webos_capture::CaptureConfig {
@@ -800,8 +1004,36 @@ impl Settings {
         } else {
             "PLAINTEXT".to_owned()
         };
+        let a = &self.aec;
+        let aec = if a.enabled {
+            format!(
+                "on ref={} {}/{}ch/{}Hz link={} delay_ms={} ns={} bypass={} ref_gain_db={}{}",
+                a.reference_pcm_id,
+                match a.reference_format {
+                    RefFormat::S32Le => "s32_le",
+                    RefFormat::S24Le => "s24_le",
+                },
+                a.reference_channels,
+                a.reference_rate,
+                a.link,
+                match a.delay_ms {
+                    AecDelay::Auto => "auto".to_owned(),
+                    AecDelay::Fixed(ms) => ms.to_string(),
+                },
+                a.ns,
+                a.bypass_when_silent,
+                a.reference_gain_db,
+                if self.mic.source == MicSource::File {
+                    " (file reference)"
+                } else {
+                    ""
+                }
+            )
+        } else {
+            "off".to_owned()
+        };
         format!(
-            "name={} port={} voice_features={} mode={:?} encryption={encryption} mic=[{mic}] dsp=[{:?} gain_db={} hpf_hz={}] sink=[{sink}] safety=[kill_switch={} mute_file={} firmware={fw}] limits=[nice={} nofile={} rss_mb={} capture_stall_s={} loop_stall_s={}]",
+            "name={} port={} voice_features={} mode={:?} encryption={encryption} mic=[{mic}] dsp=[{:?} gain_db={} hpf_hz={}] aec=[{aec}] sink=[{sink}] safety=[kill_switch={} mute_file={} firmware={fw}] limits=[nice={} nofile={} rss_mb={} capture_stall_s={} loop_stall_s={}]",
             self.device.name,
             self.device.port,
             self.voice_features(),
@@ -1067,6 +1299,107 @@ level = "debug"
         expected.sink.dir = base.join(".");
         expected.pairing.state_dir = base.join("pairing");
         assert_eq!(s, expected);
+    }
+
+    #[test]
+    fn aec_section_defaults_parse_and_validate() {
+        let base = Path::new("/cfg");
+        let s = Settings::default();
+        assert!(!s.aec.enabled);
+        assert_eq!(s.aec.reference_pcm_id, "SoundEngineCapture");
+        assert_eq!(s.aec.delay_ms, AecDelay::Auto);
+        let c = s.aec_config();
+        assert_eq!(c.apply, webos_dsp::DelayApply::Hint);
+        assert_eq!(
+            (
+                c.reference_rate,
+                c.reference_channels,
+                c.ns,
+                c.bypass_when_silent
+            ),
+            (48_000, 2, false, false)
+        );
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            s.reference_config(),
+            webos_capture::ReferenceConfig::default()
+        );
+
+        let s = Settings::from_toml(
+            "[mic]\nsource = \"file\"\npath = \"m.raw\"\n[aec]\nenabled = true\ndelay_ms = 17.5\nreference_path = \"r.raw\"\nreference_format = \"s24_le\"\nreference_rate = 16000\nns = true\n",
+            base,
+        )
+        .unwrap();
+        assert_eq!(s.aec.delay_ms, AecDelay::Fixed(17.5));
+        assert_eq!(s.aec.reference_path, Some(base.join("r.raw")));
+        assert_eq!(s.reference_format(), webos_capture::SampleFormat::S24Le);
+        assert_eq!(s.aec_config().delay, webos_dsp::DelayMode::FixedMs(17.5));
+        assert!(
+            s.summary()
+                .contains("aec=[on ref=SoundEngineCapture s24_le/2ch/16000Hz"),
+            "{}",
+            s.summary()
+        );
+        assert!(s.warnings().iter().any(|w| w.contains("aec.ns")));
+        let s = Settings::from_toml("[aec]\ndelay_ms = 20\n", base).unwrap();
+        assert_eq!(s.aec.delay_ms, AecDelay::Fixed(20.0));
+        assert!(Settings::default().summary().contains("aec=[off]"));
+        // Unknown words and keys are rejected with the key named.
+        let e = Settings::from_toml("[aec]\ndelay_ms = \"soon\"\n", base).unwrap_err();
+        assert!(e.0.contains("auto"), "{e}");
+        let e = Settings::from_toml("[aec]\nenable = true\n", base).unwrap_err();
+        assert!(e.0.contains("enable"), "{e}");
+        let e = Settings::from_toml("[aec]\nreference_format = \"s16_le\"\n", base).unwrap_err();
+        assert!(e.0.contains("s16_le"), "{e}");
+    }
+
+    #[test]
+    fn aec_validation_names_the_key() {
+        let mut s = Settings::default();
+        s.device.allow_plaintext = true;
+        s.validate().unwrap();
+        let cases: Vec<(&str, Mutate)> = vec![
+            ("aec.reference_pcm_id", |s| {
+                s.aec.reference_pcm_id = " ".into();
+            }),
+            ("aec.reference_rate", |s| s.aec.reference_rate = 44_100),
+            ("aec.reference_channels", |s| s.aec.reference_channels = 0),
+            ("aec.reference_channels", |s| s.aec.reference_channels = 9),
+            ("aec.reference_period_frames", |s| {
+                s.aec.reference_buffer_frames = 128;
+            }),
+            ("aec.delay_ms", |s| s.aec.delay_ms = AecDelay::Fixed(600.0)),
+            ("aec.delay_ms", |s| s.aec.delay_ms = AecDelay::Fixed(-1.0)),
+            ("aec.reference_gain_db", |s| s.aec.reference_gain_db = 41.0),
+            ("aec.ns", |s| s.aec.ns = true),
+            ("aec.bypass_when_silent", |s| {
+                s.aec.bypass_when_silent = true;
+            }),
+            ("aec.reference_path", |s| {
+                s.aec.enabled = true;
+                s.mic.source = MicSource::File;
+                s.mic.path = Some(PathBuf::from("m.raw"));
+            }),
+        ];
+        for (key, f) in cases {
+            let mut bad = s.clone();
+            f(&mut bad);
+            let e = bad.validate().unwrap_err();
+            assert!(e.0.contains(key), "{key}: {e}");
+        }
+        let mut ok = s.clone();
+        ok.aec.enabled = true;
+        ok.aec.ns = true;
+        ok.aec.bypass_when_silent = true;
+        ok.aec.delay_ms = AecDelay::Fixed(0.0);
+        ok.validate().unwrap();
+        // A file reference with the ALSA mic is ignored (warned).
+        ok.aec.reference_path = Some(PathBuf::from("r.raw"));
+        assert!(
+            ok.warnings()
+                .iter()
+                .any(|w| w.contains("aec.reference_path is ignored"))
+        );
     }
 
     #[test]

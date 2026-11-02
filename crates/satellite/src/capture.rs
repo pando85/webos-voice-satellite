@@ -1,5 +1,12 @@
 //! Capture thread: AudioSource → Frontend → 32 ms chunks to the API server.
 //!
+//! With `[aec] enabled`, the source also captures the echo reference (ALSA:
+//! [`webos_capture::AlsaDuplex`], the reference PCM on the mic's card; file
+//! mode: [`FilePair`] with `aec.reference_path`), and the front-end runs the
+//! echo canceller between its high-pass filter and its gain. A reference
+//! that cannot be opened or fails is logged and the mic runs without echo
+//! cancellation; it is retried at the next open of the microphone.
+//!
 //! The thread always drains the ALSA source (so the ring buffer does not
 //! overrun) but forwards audio only while [`Shared::streaming`] is set, which
 //! the daemon raises on `StartStreaming` and clears on `StopStreaming`, HA
@@ -25,8 +32,8 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
-use webos_capture::{AudioSource, CaptureError, FileSource};
-use webos_dsp::{Frontend, FrontendConfig};
+use webos_capture::{AudioSource, CaptureError, FilePair, FileSource, ReferenceState};
+use webos_dsp::{AecConfig, AecMetrics, DelayEvent, EchoCanceller, Frontend, FrontendConfig};
 use webos_esphome_api::AppCommand;
 
 use crate::config::{MicSource, Settings};
@@ -86,10 +93,30 @@ pub(crate) struct CaptureSettings {
     pause_when_idle: bool,
     frontend: FrontendConfig,
     kill_switch: Option<PathBuf>,
+    aec: Option<AecSettings>,
+}
+
+/// Echo canceller part of [`CaptureSettings`] (`[aec] enabled`).
+#[derive(Debug, Clone)]
+struct AecSettings {
+    dsp: AecConfig,
+    #[cfg(target_os = "linux")]
+    reference: webos_capture::ReferenceConfig,
+    pcm_id: String,
+    path: Option<PathBuf>,
+    format: webos_capture::SampleFormat,
 }
 
 impl CaptureSettings {
     pub(crate) fn from_settings(s: &Settings) -> Self {
+        let aec = s.aec.enabled.then(|| AecSettings {
+            dsp: s.aec_config(),
+            #[cfg(target_os = "linux")]
+            reference: s.reference_config(),
+            pcm_id: s.aec.reference_pcm_id.clone(),
+            path: s.aec.reference_path.clone(),
+            format: s.reference_format(),
+        });
         Self {
             source: s.mic.source,
             #[cfg(target_os = "linux")]
@@ -103,6 +130,7 @@ impl CaptureSettings {
             pause_when_idle: s.mic.pause_when_idle,
             frontend: s.frontend_config(),
             kill_switch: Some(s.safety.kill_switch.clone()),
+            aec,
         }
     }
 }
@@ -209,7 +237,28 @@ fn open_source(cfg: &CaptureSettings) -> Result<Box<dyn AudioSource>, CaptureErr
                 .ok_or_else(|| CaptureError::DeviceNotFound("mic.path not set".into()))?;
             // Pacing is done here (with a clock that pauses while idle), not by
             // FileSource, so a paused file does not burst to catch up.
-            let mut src = FileSource::open(path, cfg.channels, cfg.rate)?.looping(cfg.looping);
+            let mic = FileSource::open(path, cfg.channels, cfg.rate)?;
+            let mut src: Box<dyn AudioSource> = match cfg
+                .aec
+                .as_ref()
+                .and_then(|a| a.path.as_ref().map(|p| (a, p)))
+            {
+                Some((a, ref_path)) => {
+                    match FileSource::open(ref_path, a.dsp.reference_channels, a.dsp.reference_rate)
+                    {
+                        Ok(reference) => {
+                            Box::new(FilePair::new(mic, reference.format(a.format), cfg.looping))
+                        }
+                        // Like an ALSA reference that cannot be opened: the
+                        // mic runs alone.
+                        Err(e) => {
+                            log::warn!("aec: reference file {}: {e}", ref_path.display());
+                            Box::new(mic.looping(cfg.looping))
+                        }
+                    }
+                }
+                None => Box::new(mic.looping(cfg.looping)),
+            };
             let skip = u64::from(cfg.skip_ms) * u64::from(cfg.rate) / 1000;
             let mut scratch = vec![0_i32; READ_FRAMES * usize::from(cfg.channels)];
             let mut skipped = 0_u64;
@@ -223,15 +272,183 @@ fn open_source(cfg: &CaptureSettings) -> Result<Box<dyn AudioSource>, CaptureErr
                 }
                 skipped += n as u64;
             }
-            Ok(Box::new(src))
+            // The reference skipped along with the mic is dropped too.
+            src.take_reference(&mut Vec::new());
+            Ok(src)
         }
         #[cfg(target_os = "linux")]
-        MicSource::Alsa => Ok(Box::new(webos_capture::AlsaCapture::open(&cfg.alsa)?)),
+        MicSource::Alsa => match &cfg.aec {
+            Some(a) => Ok(Box::new(webos_capture::AlsaDuplex::open(
+                &cfg.alsa,
+                &a.reference,
+            )?)),
+            None => Ok(Box::new(webos_capture::AlsaCapture::open(&cfg.alsa)?)),
+        },
         #[cfg(not(target_os = "linux"))]
         MicSource::Alsa => Err(CaptureError::Unsupported(
             "ALSA capture is only available on Linux".into(),
         )),
     }
+}
+
+/// Builds the front-end for a freshly opened source: with the echo canceller
+/// when `[aec]` is enabled and the source delivers a reference, otherwise
+/// without (and says why).
+fn build_frontend(cfg: &CaptureSettings, src: &dyn AudioSource, rate: u32) -> Frontend {
+    let fe = Frontend::new(cfg.frontend, rate);
+    let Some(a) = &cfg.aec else {
+        return fe;
+    };
+    match src.reference_state() {
+        ReferenceState::Active {
+            linked,
+            unlinked_reason,
+        } => {
+            let Some(fmt) = src.reference_format() else {
+                log::warn!(
+                    "aec: the source reports no reference format; running WITHOUT echo cancellation"
+                );
+                return fe;
+            };
+            let dsp = AecConfig {
+                reference_channels: fmt.channels,
+                reference_rate: fmt.rate,
+                ..a.dsp
+            };
+            let Some(aec) = EchoCanceller::new(dsp) else {
+                log::warn!(
+                    "aec: unsupported reference ({} ch, {} Hz; needs 16000 or 48000 Hz); running WITHOUT echo cancellation",
+                    fmt.channels,
+                    fmt.rate
+                );
+                return fe;
+            };
+            let start = if linked {
+                "linked start".to_owned()
+            } else {
+                format!(
+                    "NOT linked ({}), started reference first",
+                    unlinked_reason.as_deref().unwrap_or("unknown")
+                )
+            };
+            let what = match (&cfg.source, &a.path) {
+                (MicSource::File, Some(p)) => format!("file {}", p.display()),
+                _ => format!("PCM {:?}", a.pcm_id),
+            };
+            log::info!(
+                "aec: echo cancellation on: reference {what} ({} ch, {} Hz, {}), {start}, delay {}, ns={}, bypass_when_silent={}",
+                fmt.channels,
+                fmt.rate,
+                a.format.name(),
+                match a.dsp.delay {
+                    webos_dsp::DelayMode::Auto => "auto".to_owned(),
+                    webos_dsp::DelayMode::FixedMs(ms) => format!("{ms} ms"),
+                },
+                a.dsp.ns,
+                a.dsp.bypass_when_silent
+            );
+            fe.with_echo_canceller(aec)
+        }
+        ReferenceState::Unavailable(why) => {
+            log::warn!(
+                "aec: echo reference {:?} unavailable: {why}; running WITHOUT echo cancellation (retried at the next microphone open)",
+                a.pcm_id
+            );
+            fe
+        }
+        ReferenceState::Off => {
+            log::warn!("aec: no echo reference on this source; running WITHOUT echo cancellation");
+            fe
+        }
+    }
+}
+
+/// Moves the reference frames captured with each mic read into the
+/// front-end, restarts the alignment when the source restarted both
+/// streams, and drops the canceller if the reference is lost.
+#[derive(Debug)]
+struct ReferenceFeed {
+    on: bool,
+    epoch: u64,
+    buf: Vec<i32>,
+}
+
+impl ReferenceFeed {
+    fn new(src: &dyn AudioSource, frontend: &Frontend) -> Self {
+        Self {
+            on: frontend.has_echo_canceller(),
+            epoch: src.reference_epoch(),
+            buf: Vec::new(),
+        }
+    }
+
+    /// Call after each mic read, before processing it.
+    fn feed(
+        &mut self,
+        src: &mut dyn AudioSource,
+        frontend: &mut Frontend,
+        fe_cfg: FrontendConfig,
+        rate: u32,
+    ) {
+        if !self.on {
+            return;
+        }
+        if let ReferenceState::Unavailable(why) = src.reference_state() {
+            log::warn!(
+                "aec: echo reference lost: {why}; continuing WITHOUT echo cancellation until the microphone reopens"
+            );
+            *frontend = Frontend::new(fe_cfg, rate);
+            self.on = false;
+            return;
+        }
+        let e = src.reference_epoch();
+        if e != self.epoch {
+            self.epoch = e;
+            frontend.reset_reference();
+        }
+        src.take_reference(&mut self.buf);
+        frontend.push_reference(&self.buf);
+        self.buf.clear();
+    }
+}
+
+/// Logs a delay lock or change of the canceller at info.
+fn log_aec_event(frontend: &mut Frontend) {
+    match frontend.take_aec_event() {
+        Some(DelayEvent::Locked {
+            delay_ms,
+            confidence,
+        }) => log::info!(
+            "aec: echo delay {delay_ms:.1} ms (mic behind reference, confidence {confidence:.0})"
+        ),
+        Some(DelayEvent::Changed {
+            from_ms,
+            to_ms,
+            confidence,
+        }) => log::info!(
+            "aec: echo delay changed {from_ms:.1} -> {to_ms:.1} ms (confidence {confidence:.0})"
+        ),
+        None => {}
+    }
+}
+
+/// One log line of canceller metrics (levels and timing only, never audio).
+fn log_aec_metrics(m: &AecMetrics, window_s: u64) {
+    let f = |v: Option<f32>| v.map_or_else(|| "n/a".to_owned(), |x| format!("{x:.1}"));
+    log::debug!(
+        "aec: last {window_s} s: delay {} ms (confidence {}), ERLE {} dB (sonora {} dB) over {} active-reference frames, sonora {:.0} us/frame mean {:.0} max ({:.2} % of a core), bypassed {}/{} frames, reference underruns {}",
+        f(m.delay_ms),
+        f(m.delay_confidence),
+        f(m.erle_db),
+        f(m.sonora_erle_db),
+        m.active_frames,
+        m.cpu_us_mean,
+        m.cpu_us_max,
+        m.cpu_pct,
+        m.bypassed,
+        m.frames,
+        m.ref_underruns
+    );
 }
 
 /// Starts the capture thread.
@@ -384,7 +601,8 @@ fn pump(
         cfg.source
     );
     shared.open.store(true, Ordering::Relaxed);
-    let mut frontend = Frontend::new(cfg.frontend, rate);
+    let mut frontend = build_frontend(cfg, src.as_ref(), rate);
+    let mut feed = ReferenceFeed::new(src.as_ref(), &frontend);
     let mut buf = vec![0_i32; READ_FRAMES * ch];
     let mut mono = Vec::with_capacity(READ_FRAMES);
     let mut chunker = Chunker::default();
@@ -427,7 +645,9 @@ fn pump(
                 std::thread::sleep(wait);
             }
         }
+        feed.feed(src.as_mut(), &mut frontend, cfg.frontend, rate);
         frontend.process(&buf[..n * ch], src.channels(), &mut mono);
+        log_aec_event(&mut frontend);
         if streaming {
             for chunk in chunker.push(&mono) {
                 match tx.try_send(AppCommand::Audio(chunk)) {
@@ -458,6 +678,9 @@ fn pump(
                 shared.chunks_sent.load(Ordering::Relaxed),
                 shared.chunks_dropped.load(Ordering::Relaxed),
             );
+            if let Some(m) = frontend.take_aec_metrics() {
+                log_aec_metrics(&m, STATS_EVERY.as_secs());
+            }
         }
     }
     Ok(PumpEnd::Stop)
@@ -591,6 +814,131 @@ mod tests {
         shared.stop.store(true, Ordering::Relaxed);
         h.join().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Deterministic noise in [-a, a].
+    fn noise(n: usize, a: f32, seed: u32) -> Vec<f32> {
+        let mut s = seed.max(1);
+        (0..n)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 17;
+                s ^= s << 5;
+                #[allow(clippy::cast_precision_loss)]
+                let v = (s as f32 / u32::MAX as f32 * 2.0 - 1.0) * a;
+                v
+            })
+            .collect()
+    }
+
+    /// mic.raw: S24 stereo 16 kHz, the echo of `base` (15 ms, -10 dB) plus
+    /// faint near-end noise; ref.raw: S32 stereo 48 kHz, `base` held for
+    /// three samples (what the TV played).
+    #[allow(clippy::cast_possible_truncation)]
+    fn write_echo_pair(dir: &Path, seconds: usize) -> (PathBuf, PathBuf) {
+        let n = 16_000 * seconds;
+        // Band-limited (4-tap average: nulls at 4 and 8 kHz) so the echo has
+        // no energy the decimated 48 kHz reference cannot carry.
+        let white = noise(n + 3, 0.1, 3);
+        let base: Vec<f32> = white
+            .windows(4)
+            .map(|w| w.iter().sum::<f32>() / 4.0)
+            .collect();
+        let near = noise(n, 0.0003, 4);
+        let mut mic = Vec::new();
+        for i in 0..n {
+            let e = if i >= 240 { 0.3 * base[i - 240] } else { 0.0 };
+            let v = ((e + near[i]) * 8_388_607.0) as i32 & 0x00FF_FFFF;
+            for _ in 0..2 {
+                mic.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        let mut reference = Vec::new();
+        for &b in &base {
+            let v = (b * 2_147_483_647.0) as i32;
+            for _ in 0..6 {
+                reference.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        let (m, r) = (dir.join("mic.raw"), dir.join("ref.raw"));
+        std::fs::write(&m, mic).unwrap();
+        std::fs::write(&r, reference).unwrap();
+        (m, r)
+    }
+
+    /// Streams the whole file pair and returns the RMS (dBFS) of the last
+    /// 2 s sent to HA.
+    fn stream_rms_db(s: &Settings) -> f64 {
+        let shared = Arc::new(Shared::default());
+        let (tx, mut rx) = mpsc::channel(4096);
+        shared.streaming.store(true, Ordering::Relaxed);
+        let h = spawn(CaptureSettings::from_settings(s), Arc::clone(&shared), tx).unwrap();
+        let mut samples: Vec<i16> = Vec::new();
+        let t = Instant::now();
+        while t.elapsed() < Duration::from_secs(20) {
+            match rx.try_recv() {
+                Ok(AppCommand::Audio(chunk)) => samples.extend_from_slice(&chunk),
+                Ok(_) => {}
+                Err(_) => {
+                    if samples.len() >= 16_000 * 7 {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+        }
+        shared.stop.store(true, Ordering::Relaxed);
+        h.join().unwrap();
+        assert!(samples.len() >= 16_000 * 7, "{} samples", samples.len());
+        let tail = &samples[samples.len() - 32_000..];
+        #[allow(clippy::cast_precision_loss)]
+        let ms = tail.iter().map(|&v| f64::from(v).powi(2)).sum::<f64>() / tail.len() as f64;
+        10.0 * (ms.sqrt() / 32_768.0).log10()
+    }
+
+    #[test]
+    fn file_pair_with_aec_cancels_the_echo() {
+        let dir = std::env::temp_dir().join(format!("webos-sat-aec-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (m, r) = write_echo_pair(&dir, 8);
+        let mut s = Settings::default();
+        s.mic.source = MicSource::File;
+        s.mic.path = Some(m);
+        s.mic.realtime = false;
+        s.dsp.gain_db = 0.0;
+        let plain = stream_rms_db(&s);
+        s.aec.enabled = true;
+        s.aec.reference_path = Some(r);
+        let cancelled = stream_rms_db(&s);
+        let _ = std::fs::remove_dir_all(&dir);
+        // Echo at about -21 dBFS. This checks the wiring (the canceller is in
+        // the streamed path and sees the reference in step); cancellation
+        // depth on real recordings is measured with chain_eval.py. The
+        // synthetic 48 kHz reference (sample-and-hold) limits it to about
+        // 14 dB here.
+        assert!(plain > -30.0, "plain {plain:.1}");
+        assert!(
+            plain - cancelled > 10.0,
+            "plain {plain:.1} dBFS, AEC {cancelled:.1} dBFS"
+        );
+    }
+
+    #[test]
+    fn missing_reference_file_leaves_the_mic_running() {
+        let dir = std::env::temp_dir().join(format!("webos-sat-aec-miss-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (m, _r) = write_echo_pair(&dir, 8);
+        let mut s = Settings::default();
+        s.mic.source = MicSource::File;
+        s.mic.path = Some(m);
+        s.mic.realtime = false;
+        s.dsp.gain_db = 0.0;
+        s.aec.enabled = true;
+        s.aec.reference_path = Some(dir.join("missing.raw"));
+        // Audio still flows (uncancelled).
+        let db = stream_rms_db(&s);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(db > -30.0, "{db:.1}");
     }
 
     #[test]

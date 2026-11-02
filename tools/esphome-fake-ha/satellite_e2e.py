@@ -5,7 +5,10 @@ Starts the daemon with a synthetic file microphone (S24_LE stereo sine), the
 WAV sink and a fresh Noise key, then plays HA with aioesphomeapi 46.6.0:
 handshake, device info, a wake word run with a streamed TTS reply, a
 push-to-talk run triggered by SIGUSR1, and a SIGTERM shutdown. It also checks
-the log policy (no transcript or reply text at info level, no key).
+the log policy (no transcript or reply text at info level, no key). The AEC
+scenario runs the daemon with `[aec] enabled` on a synthetic mic + reference
+file pair (the mic holds a delayed echo of the reference) and checks the delay
+lock and that the streamed audio has the echo removed.
 
 Usage (from the repository root):
     tools/esphome-fake-ha/run.sh --satellite-only
@@ -381,6 +384,98 @@ async def scenario_pairing_window(binary: str, tmp: str) -> None:
         sat.log.close()
 
 
+def write_echo_pair(mic_path: str, ref_path: str, seconds: float) -> float:
+    """mic: S24_LE stereo 16 kHz, the echo (15 ms, -10 dB) of a band-limited
+    noise; ref: that noise as S32_LE stereo 48 kHz (each sample held three
+    times). Returns the echo RMS in dBFS."""
+    import random
+
+    rnd = random.Random(7)
+    n = int(16000 * seconds)
+    white = [rnd.uniform(-0.1, 0.1) for _ in range(n + 3)]
+    base = [sum(white[i:i + 4]) / 4 for i in range(n)]
+    echo = [0.3 * base[i - 240] if i >= 240 else 0.0 for i in range(n)]
+    with open(mic_path, "wb") as f:
+        for v in echo:
+            s24 = int(v * 0x7FFFFF) & 0xFFFFFF
+            f.write(struct.pack("<ii", s24, s24))
+    with open(ref_path, "wb") as f:
+        for v in base:
+            s32 = int(v * 0x7FFFFFFF)
+            f.write(struct.pack("<ii", s32, s32) * 3)
+    ms = sum(v * v for v in echo[16000:]) / (n - 16000)
+    return 10 * math.log10(ms)
+
+
+async def scenario_aec(binary: str, tmp: str) -> None:
+    print("\n== satellite e2e: [aec] with a file mic + reference pair ==")
+    echo_db = write_echo_pair(os.path.join(tmp, "aec-mic.raw"), os.path.join(tmp, "aec-ref.raw"), 10.0)
+    port = free_port()
+    config = os.path.join(tmp, "sat-aec.toml")
+    with open(config, "w") as f:
+        f.write(f"""
+mode = "wake"
+[device]
+name = "e2e-aec"
+mac = "02:00:00:00:00:ae"
+bind = "127.0.0.1"
+port = {port}
+allow_plaintext = true
+[mic]
+source = "file"
+path = "aec-mic.raw"
+[dsp]
+gain_db = 0.0
+[aec]
+enabled = true
+reference_path = "aec-ref.raw"
+[sink]
+type = "null"
+[log]
+level = "debug"
+""")
+    sat = Satellite(binary, config, os.path.join(tmp, "satellite-aec.log"))
+    await sat.start()
+    ha = FakeHA(port, None)
+    try:
+        cli = await ha.connect()
+        await cli.device_info_and_list_entities()
+        cli.subscribe_states(lambda s: None)
+        ha.subscribe_voice()
+        await ha.next_start()
+        ok = await sat.wait_log("aec: echo cancellation on: reference file")
+        line = next((l for l in sat.text().splitlines() if "echo cancellation on" in l), "missing")
+        check("A1 canceller on with the file reference", ok, line.split("aec: ", 1)[-1].strip())
+        ok = await sat.wait_log("aec: echo delay ", 8)
+        line = next((l for l in sat.text().splitlines() if "aec: echo delay " in l), "")
+        try:
+            delay = float(line.split("aec: echo delay ")[1].split(" ms")[0])
+        except (IndexError, ValueError):
+            delay = float("nan")
+        check("A2 delay locked at the true 15 ms (mic behind reference)",
+              ok and abs(delay - 15.0) < 0.5, line.strip())
+        # Stream for 6 s more (real time), then compare the last 2 s with the echo level.
+        samples: list[int] = []
+        t = time.monotonic()
+        while time.monotonic() - t < 6.0:
+            for c in ha.drain_audio():
+                samples.extend(struct.unpack(f"<{len(c) // 2}h", c))
+            await asyncio.sleep(0.1)
+        tail = samples[-32000:]
+        out_db = 10 * math.log10(sum(v * v for v in tail) / max(len(tail), 1) / 32768.0 ** 2 + 1e-20)
+        check("A3 streamed audio has the echo removed (at least 10 dB below it)",
+              len(tail) == 32000 and echo_db - out_db > 10.0,
+              f"echo {echo_db:.1f} dBFS, streamed {out_db:.1f} dBFS, {len(samples)} samples")
+        sat.proc.send_signal(signal.SIGTERM)
+        rc = await asyncio.wait_for(sat.proc.wait(), 5)
+        check("A4 clean exit", rc == 0, f"rc={rc}")
+    finally:
+        if sat.proc.returncode is None:
+            sat.proc.kill()
+            await sat.proc.wait()
+        sat.log.close()
+
+
 async def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary", required=True, help="path to the webos-satellite binary")
@@ -392,11 +487,12 @@ async def main() -> int:
             await scenario_timers(args.binary, tmp)
             await scenario_pairing(args.binary, tmp)
             await scenario_pairing_window(args.binary, tmp)
+            await scenario_aec(args.binary, tmp)
         except Exception as err:  # noqa: BLE001
             failed = True
             print(f"FAIL  {type(err).__name__}: {err}", flush=True)
             for name in ("satellite.log", "satellite-timers.log", "satellite-pairing.log",
-                         "satellite-pairing.log.2", "satellite-window.log"):
+                         "satellite-pairing.log.2", "satellite-window.log", "satellite-aec.log"):
                 log = os.path.join(tmp, name)
                 if os.path.exists(log):
                     print(f"---- {name} ----")
