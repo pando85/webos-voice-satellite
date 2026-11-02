@@ -21,3 +21,4 @@ All experiments start from a **read-only** baseline. The user must explicitly ap
 | [EXP-006](EXP-006-aec-reference.md) | Echo reference and AEC feasibility | F5 |
 | [EXP-007](EXP-007-assist-pipeline.md) | Wake word and Assist roundtrip | F3 |
 | [EXP-008](EXP-008-airplay-media.md) | Music Assistant and AirPlay | F8 |
+| [P2-corpus](P2-corpus.md) | Phase 2 test corpus and metric definitions | Phase 2 |

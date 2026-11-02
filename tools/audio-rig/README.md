@@ -118,6 +118,63 @@ kubectl --context=<ctx> -n <ns> port-forward svc/<whisper> 11300:10300 &
 Stop the port-forwards afterwards. The signal goes only to the hosts you name; nothing is saved
 unless `--save-wav` is given (keep it local, never commit).
 
+## Phase 2 test corpus, TV-content set and echo stimuli
+
+Three generators prepare everything for the unattended Phase 2 runs (wake-word and STT accuracy,
+false wakes with TV content, echo/AEC measurement). The scripts are committed; their output lives
+under `devices/private/` (gitignored) and is never committed. Metrics and reporting rules:
+[P2 corpus and metrics](../../docs/experiments/P2-corpus.md). Nothing here plays sound; playing
+is a separate, owner-approved step.
+
+```sh
+# one-time: the venv above plus the voices (official rhasspy/piper-voices release on Hugging Face)
+.venv/bin/python -m piper.download_voices --download-dir artifacts/audio-rig/voices \
+    es_ES-sharvard-medium es_ES-davefx-medium es_ES-mls_9972-low es_ES-mls_10246-low \
+    es_MX-ald-medium es_MX-claude-high en_US-lessac-medium en_US-ryan-medium
+
+.venv/bin/python tools/audio-rig/make_corpus.py       # -> devices/private/corpus/p2-v1/   (about 40 s)
+.venv/bin/python tools/audio-rig/make_content.py      # -> devices/private/content/p2-v1/  (about 130 MB of downloads)
+.venv/bin/python tools/audio-rig/make_p2_stimuli.py   # -> devices/private/stimuli/p2-v1/
+```
+
+`ffmpeg` is required for the content set. Add `--force` to `make_corpus.py` to overwrite and
+`--reuse` to `make_content.py` to reuse `_downloads/`.
+
+**Corpus (`make_corpus.py`)**: synthetic Piper voices only (no human voices, no consent needed).
+Spanish speakers: `es_ES-sharvard-medium` speakers M and F (two speakers of one model),
+`es_ES-davefx-medium`, `es_ES-mls_9972-low`, `es_ES-mls_10246-low`, `es_MX-ald-medium`,
+`es_MX-claude-high` (4 apparent female, 3 male; gender is judged from the median f0 and the model's
+speaker names, see `corpus.json`). English voices for the wake word: `en_US-lessac-medium`,
+`en_US-ryan-medium`. Positives: "alexa" alone for all 9 speakers with 3 length/noise variations
+(27 items; the Spanish voices say it with Spanish phonetics, a deliberate accent test), and "alexa" + 0.4 s
++ one of 15 Spanish home-assistant commands for each Spanish speaker (70 items). Negatives: 28 Spanish
+sentences (24 conversation, 4 commands without the wake word) and 14 near-misses ("Alexis", "a la mesa",
+"relaja", "Alexandria", ...), rotated over the Spanish speakers. Every item is scaled to the same active-speech
+RMS (-22 dBFS) under a -6 dBFS peak ceiling, so `play_record.py --gain-db 12` gives -18 dBFS peak for the
+loudest item and about -18 to -22 dBFS for the others. Format: 16-bit PCM, 48 kHz stereo (dual mono) and 16 kHz
+mono variants of every item and of one session file per kind (`pos`, `neg`, `nearmiss`; 4 s gap between items)
+with `session_<kind>_timestamps.csv`. Play a session file with `play_record.py --stimulus <path>`
+(any channel count is handled; the gain rescales the file peak). Piper's noise sampling cannot be seeded, so
+a regeneration is equivalent, not bit-identical: identify a corpus by `corpus.json["manifest_sha256"]` and keep
+the generated directory for comparisons. Voice licenses are in each voice's model card (sharvard CC BY 3.0,
+davefx CC0, MLS voices CC BY 4.0, ald Unlicense, claude Apache-2.0, lessac and ryan have their own
+research/non-commercial terms); this is why the corpus stays private and uncommitted.
+
+**TV-content set (`make_content.py`)**: only Creative Commons (BY, CC0) or public-domain sources, each item's
+license and URL recorded in `manifest.csv`; only HTTPS and `archive.org` hosts are fetched, only media files, into
+a fresh `_downloads/` directory, never executed (ffmpeg decodes with an explicit demuxer and without network
+protocols). Sources: LibriVox Spanish audiobooks (Lazarillo de Tormes, Caperucita Roja), a LibriVox English
+audiobook (Sherlock Holmes), Blender Foundation's *Tears of Steel* (CC BY 3.0: dialogue scenes and the robot
+battle as the action scene), Josh Woodward songs (CC BY 3.0, music with vocals) and Kevin MacLeod tracks
+(CC BY 3.0, music without vocals). Every clip is converted to WAV 48 kHz stereo with two-pass `loudnorm` to
+-23 LUFS (true peak <= -2 dBTP, linear), plus `sampler_10min.wav`, ten 60 s excerpts. Attribution strings are in the
+manifest; add a new source only if its license is clearly CC or public domain, and never a source of
+doubtful provenance (for example uploads with unclear film copyright).
+
+**Stimuli (`make_p2_stimuli.py`)**: 10 s log sweep 50 Hz-8 kHz (plus its inverse filter, float32, analysis only),
+30 s pink noise, 5 s 1 kHz tone at -20 dBFS, and an alignment train of clicks and chirps with irregular spacing
+(event times in `manifest.json`), each as 48 kHz stereo and 16 kHz mono. Fixed seed.
+
 ## Privacy
 
 Recordings can contain people's voices from the room. Keep them short, local and opt-in; tell
