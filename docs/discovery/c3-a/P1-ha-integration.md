@@ -8,6 +8,21 @@
 
 Labels: **verified-on-target** = observed against the owner's HA (and, for audio, using a c3-a recording); **documented** = HA source at tag 2026.10.4; **hypothesis**; **blocked**.
 
+## Permanent entry, direct connection (2026-11-02 morning)
+
+The owner added a router rule so HA's network reaches the TV on TCP 6053. The satellite (build from commit 0bace3e) ran on c3-a from `/tmp`: wake mode, `lg-c3-a`, Noise, sink `pacat` at in-process gain 0, LG hands-free off. HA connected **directly to the TV**, with no relay or bridge. All results **verified-on-target**.
+
+| Check | Result |
+| --- | --- |
+| Config flow (REST: host and port 6053, then the encryption key) | `user` → `encryption_key` (name `lg-c3-a`) → `create_entry`, title "LG C3 (c3-a) Voice Satellite", state `loaded`; the whole flow took 0.5 s. HA connected from its own network, and the satellite logged `Home Assistant 2026.10.4` |
+| Device and entities | device `webos-voice-satellite` / `LG webOS TV` / 2026.10.1; `assist_satellite.*` (idle), `media_player.*` (idle), mute switch (off), two pipeline selects (preferred), finished speaking detection select (default), two wake word selects (unavailable, `no_wake_word`, expected) |
+| Live mic, push-to-talk (SIGUSR1), temporary pipeline with `conversation.home_assistant` | One clean run: STT ended at HA's timeout after 15.9 s (silent room; Whisper hallucinated a phrase), the built-in reply (1811 ms) streamed by HA and played with 0 non-zero samples, wake re-armed |
+| File mic (TV recording "alexa" + "¿qué hora es?"), wake mode | HA detected the wake word; STT `¿Qué va eso?`; built-in reply (3587 ms) streamed by HA and played with 0 non-zero samples; re-armed. From the wake word: STT end 3734 ms, intent end 3750 ms, TTS stream start 3751 ms, `pacat` drained 9183 ms. States idle → listening → processing → responding → idle. HA reconnected 1.5 s after the satellite was restarted |
+| HA log | only the expected encryption probe warnings at setup, and one `APIConnectionError: Not connected` from the deliberate satellite restart during an active wake run (HA-side handling, seen before) |
+| After the test | pipeline select set back to `preferred`, temporary pipeline deleted (HA has its 2 original pipelines). Satellite stopped and the TV's `/tmp` cleaned: no process, file or sink-input left, mic PCM `closed`, kernel taint value unchanged |
+
+**The entry is kept** (HA now has 43 config entries). Its entities show `unavailable` while the satellite is not running. That is expected until autostart on the TV is approved (Phase 3); starting the satellite again from `/tmp` makes HA reconnect by itself.
+
 ## Update: HA's real ESPHome integration against the satellite on the TV (verified)
 
 Later on 2026-11-02 HA's own ESPHome integration was connected to the satellite running on c3-a. The connection went through **a temporary TCP relay on a host the HA network may reach** (one port that demonstrably passes; the service normally on it was stopped for about 4 minutes and restored afterwards). Everything below is **verified-on-target** with HA core 2026.10.4. The satellite ran on the TV from `/tmp`: Noise, sink `pacat` with in-process gain 0, LG hands-free off.

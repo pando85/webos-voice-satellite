@@ -55,7 +55,7 @@ Labels: **verified-on-target**, **hypothesis**, **blocked**.
 ## Rollback and leftovers
 
 - TV: `/tmp/wsat` removed; no `webos-satellite`, sampler, `pactl` loop or `pacat` process left; no sink-inputs; iptables unchanged (ACCEPT); capture PCM `closed`. Nothing outside `/tmp` was written; no service, volume or PulseAudio setting was changed.
-- HA: no `lg-c3-a` ESPHome entry exists, because it could not be created (HA cannot reach the TV). The aborted config flow left no state. Once the owner opens the path, add the entry with the TV's key (stored privately with the owner's files, not in this repository).
+- HA: at the time of this step no `lg-c3-a` ESPHome entry existed, because HA could not reach the TV. The permanent entry was added later the same day, see [P1 HA integration](P1-ha-integration.md#permanent-entry-direct-connection-2026-11-02-morning). The aborted config flow left no state. Once the owner opens the path, add the entry with the TV's key (stored privately with the owner's files, not in this repository).
 
 ## Residual unknowns
 
