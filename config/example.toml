@@ -35,6 +35,18 @@ allow_plaintext = false
 # Advertise _esphomelib._tcp over mDNS. HA in a container/pod usually cannot
 # see mDNS; add the device by host and port instead.
 mdns = false
+# Voice features advertised to HA (default 23 = announce only). Each is a
+# bit of the ESPHome voice feature flags; the satellite behaves the same
+# whether or not a bit is advertised, the bit only decides what HA offers.
+# announce: HA may send announcements (bit 16). Needed for start_conversation.
+announce = true
+# timers: HA forwards its voice timers (bit 8). The satellite logs each
+# change (id, event, seconds only; never the timer name) and "timer finished".
+# There is no chime yet (docs/development/esphome-api.md#timers).
+timers = false
+# start_conversation: lets the assist_satellite.start_conversation service
+# be called for this device (bit 32). Needs announce = true.
+start_conversation = false
 
 [mic]
 # "alsa": the TV's built-in mic. "file": a raw recording (tests on a PC).

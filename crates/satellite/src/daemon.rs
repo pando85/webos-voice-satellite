@@ -18,7 +18,7 @@ use std::time::Duration;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
 use tokio::time::{Instant, MissedTickBehavior};
-use webos_esphome_api::{AppCommand, AppEvent, PipelineMode, Server};
+use webos_esphome_api::{AppCommand, AppEvent, PipelineMode, Server, TimerTable};
 
 use crate::capture::{
     self, CaptureSettings, KILL_SWITCH_POLL, OFF_FIRMWARE, OFF_KILL, OFF_MUTED, OFF_NONE, Shared,
@@ -300,6 +300,8 @@ struct Daemon {
     gate: MicGate,
     kill_switch: PathBuf,
     mute_file: PathBuf,
+    /// Timers HA reported (kept across HA reconnects, which do not replay them).
+    timers: TimerTable,
 }
 
 impl Daemon {
@@ -371,9 +373,32 @@ impl Daemon {
         }
     }
 
+    /// Logs a timer event and keeps the table. The audible chime is not
+    /// implemented (docs/development/esphome-api.md#timers).
+    fn on_timer(&mut self, ev: &AppEvent) {
+        let AppEvent::Timer {
+            event,
+            id,
+            seconds_left,
+            ..
+        } = ev
+        else {
+            return;
+        };
+        // id and seconds only: the timer name is user speech. For FINISHED
+        // this line reads "timer finished id=...".
+        log::info!("timer {event} id={id} seconds_left={seconds_left}");
+        self.timers.apply(ev, std::time::Instant::now());
+        log::debug!("timers known: {}", self.timers.len());
+    }
+
     #[allow(clippy::too_many_lines)] // one arm per event, flat on purpose
     async fn on_event(&mut self, ev: AppEvent) {
         let now = Instant::now();
+        if matches!(ev, AppEvent::Timer { .. }) {
+            self.on_timer(&ev);
+            return;
+        }
         match ev {
             AppEvent::HaConnected { client_info, peer } => {
                 self.connected = true;
@@ -500,12 +525,6 @@ impl Daemon {
                     log::debug!("mute state {muted} confirmed");
                 }
             }
-            AppEvent::Timer {
-                event,
-                id,
-                seconds_left,
-                ..
-            } => log::info!("timer {event} id={id} seconds_left={seconds_left}"),
             other => log::debug!("event {other:?}"),
         }
     }
@@ -638,6 +657,7 @@ pub(crate) async fn run(settings: Settings, triggers: TestTriggers) -> Result<()
         gate,
         kill_switch: settings.safety.kill_switch.clone(),
         mute_file: settings.safety.mute_file.clone(),
+        timers: TimerTable::new(),
     };
     let mut kill_poll = tokio::time::interval(KILL_SWITCH_POLL);
     kill_poll.set_missed_tick_behavior(MissedTickBehavior::Delay);

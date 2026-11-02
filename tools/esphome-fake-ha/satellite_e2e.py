@@ -33,6 +33,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from fake_ha import RESULTS, TIMEOUT, USE_WAKE_WORD, FakeHA, check, until_true  # noqa: E402
 
 from aioesphomeapi import VoiceAssistantEventType as Ev  # noqa: E402
+from aioesphomeapi import VoiceAssistantTimerEventType as TimerEv  # noqa: E402
 
 TRANSCRIPT = "e2e transcript sentinel"
 REPLY = "e2e reply sentinel"
@@ -186,6 +187,61 @@ level = "info"
         sat.log.close()
 
 
+async def scenario_timers(binary: str, tmp: str) -> None:
+    print("\n== satellite e2e: [device] timers + start_conversation, timer events ==")
+    psk = base64.b64encode(os.urandom(32)).decode()
+    with open(os.path.join(tmp, "psk"), "w") as f:
+        f.write(psk + "\n")
+    os.chmod(os.path.join(tmp, "psk"), 0o600)
+    write_mic(os.path.join(tmp, "mic.raw"), 5.0)
+    port = free_port()
+    config = os.path.join(tmp, "sat-timers.toml")
+    with open(config, "w") as f:
+        f.write(f"""
+[device]
+name = "e2e-timers"
+mac = "02:00:00:00:00:e3"
+bind = "127.0.0.1"
+port = {port}
+noise_psk_file = "psk"
+timers = true
+start_conversation = true
+[mic]
+source = "file"
+path = "mic.raw"
+[sink]
+type = "null"
+[log]
+level = "info"
+""")
+    sat = Satellite(binary, config, os.path.join(tmp, "satellite-timers.log"))
+    await sat.start()
+    ha = FakeHA(port, psk)
+    try:
+        cli = await ha.connect()
+        info, _entities, _ = await cli.device_info_and_list_entities()
+        flags = info.voice_assistant_feature_flags_compat(cli.api_version)
+        check("T1 config keys advertise TIMERS and START_CONVERSATION (63)", flags == 63, f"flags={flags}")
+        name = "timer-name-sentinel"
+        cli.send_voice_assistant_timer_event(TimerEv.VOICE_ASSISTANT_TIMER_STARTED, "t-1", name, 300, 300, True)
+        cli.send_voice_assistant_timer_event(TimerEv.VOICE_ASSISTANT_TIMER_UPDATED, "t-1", name, 360, 342, True)
+        cli.send_voice_assistant_timer_event(TimerEv.VOICE_ASSISTANT_TIMER_FINISHED, "t-1", name, 360, 0, False)
+        ok = await sat.wait_log("timer finished id=t-1 seconds_left=0")
+        log = sat.text()
+        check("T2 timer started/updated/finished logged with id and seconds",
+              ok and "timer started id=t-1 seconds_left=300" in log
+              and "timer updated id=t-1 seconds_left=342" in log)
+        check("T3 timer name never logged", name not in log)
+        sat.proc.send_signal(signal.SIGTERM)
+        rc = await asyncio.wait_for(sat.proc.wait(), 5)
+        check("T4 clean exit", rc == 0, f"rc={rc}")
+    finally:
+        if sat.proc.returncode is None:
+            sat.proc.kill()
+            await sat.proc.wait()
+        sat.log.close()
+
+
 async def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary", required=True, help="path to the webos-satellite binary")
@@ -194,13 +250,15 @@ async def main() -> int:
     with tempfile.TemporaryDirectory(prefix="webos-sat-e2e-") as tmp:
         try:
             await scenario(args.binary, tmp)
+            await scenario_timers(args.binary, tmp)
         except Exception as err:  # noqa: BLE001
             failed = True
             print(f"FAIL  {type(err).__name__}: {err}", flush=True)
-            log = os.path.join(tmp, "satellite.log")
-            if os.path.exists(log):
-                print("---- satellite log ----")
-                print(open(log).read())
+            for name in ("satellite.log", "satellite-timers.log"):
+                log = os.path.join(tmp, name)
+                if os.path.exists(log):
+                    print(f"---- {name} ----")
+                    print(open(log).read())
     passed = sum(1 for _, ok, _ in RESULTS if ok)
     print(f"\n{passed} checks passed, {'FAILED' if failed else 'all OK'}")
     return 1 if failed else 0

@@ -42,7 +42,7 @@ Code generation: `build.rs` compiles the proto with `protox` (pure Rust, so no `
 
 ## Timers
 
-Status: **implemented in the API crate (soundless groundwork for Phase 4), off by default, not yet wired into the satellite config.** Verified against aioesphomeapi 46.6.0 acting as HA, not against a real HA.
+Status: **implemented in the API crate and wired into the satellite config (`[device] timers = true`), soundless (the chime is Phase 4), off by default.** Verified against aioesphomeapi 46.6.0 acting as HA, not against a real HA.
 
 How HA behaves (HA 2026.10.4 `esphome/assist_satellite.py`, `intent/timers.py`; source reading):
 
@@ -53,11 +53,11 @@ How HA behaves (HA 2026.10.4 `esphome/assist_satellite.py`, `intent/timers.py`; 
 
 What the crate does:
 
-- Enable it with `Config::voice_features = features::DEFAULT_WITH_TIMERS` (31). The default stays `features::DEFAULT` (23) until the satellite handles timers. `fake_device` takes `--features 31`. The satellite's config file has no key for the voice features yet; adding one is satellite work.
+- Enable it with `Config::voice_features = features::DEFAULT_WITH_TIMERS` (31). The default stays `features::DEFAULT` (23). `fake_device` takes `--features 31`. In the satellite, set `[device] timers = true` (and optionally `start_conversation = true`, which needs `announce = true`); see the configuration reference in [development.md](../development.md#configuration-reference).
 - With TIMERS advertised, each HA timer message becomes `AppEvent::Timer { event: TimerEvent, id, name, total_seconds, seconds_left, is_active }`. Unknown event types are dropped with a debug line. Without TIMERS the messages are ignored.
 - `AppEvent`'s hand-written `Debug` prints event, id and seconds only. The timer name is user speech and stays out of logs (`name_bytes` in `Timer`'s `Debug`). `AppEvent` was already `#[non_exhaustive]`, so adding the variant breaks no match.
 - `TimerTable` is an optional helper for the application: `apply(&AppEvent, Instant)` keeps the timers HA reported (at most 64), `Timer::remaining(now)` counts down locally while the timer is active, and `by_remaining` lists them soonest first. It lives in the application and so survives HA reconnects, which is the only state recovery available given that HA does not replay. The server itself keeps no timer state.
-- The satellite logs each event at info level (`timer <event> id=... seconds_left=...`) and does nothing else.
+- The satellite keeps a `TimerTable` (survives HA reconnects) and logs each event at info level (`timer <event> id=... seconds_left=...`, so a finished timer logs `timer finished id=... seconds_left=0`; never the name). It plays no sound yet: the chime is Phase 4 work (see below). `satellite_e2e.py` checks this with a daemon started with `timers = true` and `start_conversation = true` (flags 63).
 
 What the TV will do (Phase 4, not now): on `FINISHED` the satellite will play a repeating chime through the playback path until the user stops it (voice command to HA, which cancels the timer, or the media player STOP) or a time limit passes. The chime asset, the stop gesture, the volume and the interaction with a running pipeline run (duck or queue) are open Phase 4 and Phase 2 audio decisions. A disconnected HA cannot send `FINISHED`, so the application may sound a known timer from its local `remaining` time. HA's own `FINISHED` after a reconnect must not sound it twice, which `TimerTable` supports by dropping the timer on the first `FINISHED`.
 

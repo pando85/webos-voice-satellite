@@ -48,6 +48,7 @@ pub(crate) enum Mode {
 
 /// `[device]`.
 #[derive(Clone, Deserialize, PartialEq)]
+#[allow(clippy::struct_excessive_bools)] // one bool per TOML switch
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct DeviceSection {
     /// ESPHome node name (`[a-z0-9-]`, at most 31 characters).
@@ -72,6 +73,13 @@ pub(crate) struct DeviceSection {
     pub(crate) allow_plaintext: bool,
     /// Advertise `_esphomelib._tcp` over mDNS.
     pub(crate) mdns: bool,
+    /// Advertise ANNOUNCE (bit 16): HA may send announcements.
+    pub(crate) announce: bool,
+    /// Advertise TIMERS (bit 8): HA forwards its timers to the device.
+    pub(crate) timers: bool,
+    /// Advertise START_CONVERSATION (bit 32): HA may start a conversation
+    /// after an announcement. Needs `announce`.
+    pub(crate) start_conversation: bool,
 }
 
 impl Default for DeviceSection {
@@ -88,6 +96,9 @@ impl Default for DeviceSection {
             noise_psk_file: None,
             allow_plaintext: false,
             mdns: false,
+            announce: true,
+            timers: false,
+            start_conversation: false,
         }
     }
 }
@@ -106,6 +117,9 @@ impl fmt::Debug for DeviceSection {
             .field("noise_psk_file", &self.noise_psk_file)
             .field("allow_plaintext", &self.allow_plaintext)
             .field("mdns", &self.mdns)
+            .field("announce", &self.announce)
+            .field("timers", &self.timers)
+            .field("start_conversation", &self.start_conversation)
             .finish()
     }
 }
@@ -466,6 +480,11 @@ impl Settings {
         if self.safety.kill_switch == self.safety.mute_file {
             return Err(err("safety.kill_switch and safety.mute_file must differ"));
         }
+        if self.device.start_conversation && !self.device.announce {
+            return Err(err(
+                "device.start_conversation needs device.announce = true (HA announces first)",
+            ));
+        }
         if self.device.port == 0 {
             return Err(err("device.port must be between 1 and 65535"));
         }
@@ -552,6 +571,24 @@ impl Settings {
         Ok(Some(key.to_owned()))
     }
 
+    /// Voice feature bits advertised to HA (`[device]` `announce`, `timers`,
+    /// `start_conversation`; the default is 23).
+    pub(crate) fn voice_features(&self) -> u32 {
+        use webos_esphome_api::features as f;
+        let d = &self.device;
+        let mut bits = f::VOICE_ASSISTANT | f::SPEAKER | f::API_AUDIO;
+        if d.announce {
+            bits |= f::ANNOUNCE;
+        }
+        if d.timers {
+            bits |= f::TIMERS;
+        }
+        if d.start_conversation {
+            bits |= f::START_CONVERSATION;
+        }
+        bits
+    }
+
     /// Configuration of the ESPHome API server.
     pub(crate) fn esphome_config(&self) -> Result<webos_esphome_api::Config, ConfigError> {
         let d = &self.device;
@@ -565,6 +602,7 @@ impl Settings {
             port: d.port,
             noise_psk: self.noise_psk()?,
             mdns: d.mdns,
+            voice_features: self.voice_features(),
             ..webos_esphome_api::Config::default()
         })
     }
@@ -630,9 +668,10 @@ impl Settings {
             self.safety.validated_firmware.join(",")
         };
         format!(
-            "name={} port={} mode={:?} encryption={} mic=[{mic}] dsp=[{:?} gain_db={} hpf_hz={}] sink=[{sink}] safety=[kill_switch={} mute_file={} firmware={fw}] limits=[nice={} nofile={} rss_mb={} capture_stall_s={} loop_stall_s={}]",
+            "name={} port={} voice_features={} mode={:?} encryption={} mic=[{mic}] dsp=[{:?} gain_db={} hpf_hz={}] sink=[{sink}] safety=[kill_switch={} mute_file={} firmware={fw}] limits=[nice={} nofile={} rss_mb={} capture_stall_s={} loop_stall_s={}]",
             self.device.name,
             self.device.port,
+            self.voice_features(),
             self.mode,
             if self.device.noise_psk.is_some() || self.device.noise_psk_file.is_some() {
                 "noise"
@@ -893,6 +932,47 @@ level = "debug"
         expected.device.noise_psk_file = Some(base.join("noise_psk"));
         expected.sink.dir = base.join(".");
         assert_eq!(s, expected);
+    }
+
+    #[test]
+    fn voice_feature_keys_map_onto_the_flags() {
+        use webos_esphome_api::features as f;
+        assert_eq!(Settings::default().voice_features(), 23);
+        assert_eq!(Settings::default().voice_features(), f::DEFAULT);
+        let s = Settings::from_toml("[device]\ntimers = true\n", Path::new(".")).unwrap();
+        assert_eq!(s.voice_features(), 31);
+        let s = Settings::from_toml(
+            "[device]\ntimers = true\nstart_conversation = true\n",
+            Path::new("."),
+        )
+        .unwrap();
+        assert_eq!(s.voice_features(), 63);
+        let s =
+            Settings::from_toml("[device]\nstart_conversation = true\n", Path::new(".")).unwrap();
+        assert_eq!(s.voice_features(), 55);
+        let s = Settings::from_toml("[device]\nannounce = false\n", Path::new(".")).unwrap();
+        assert_eq!(s.voice_features(), 7);
+        // The flags reach the API config, which accepts every combination.
+        let mut s = s;
+        s.device.allow_plaintext = true;
+        s.device.timers = true;
+        assert_eq!(s.esphome_config().unwrap().voice_features, 15);
+        assert!(s.summary().contains("voice_features=15"));
+    }
+
+    #[test]
+    fn start_conversation_requires_announce() {
+        let mut s = Settings::default();
+        s.device.allow_plaintext = true;
+        s.device.start_conversation = true;
+        s.device.announce = false;
+        let e = s.validate().unwrap_err();
+        assert!(e.0.contains("device.start_conversation"), "{e}");
+        s.device.announce = true;
+        s.validate().unwrap();
+        // Typos in the new keys are still rejected.
+        assert!(Settings::from_toml("[device]\ntimer = true\n", Path::new(".")).is_err());
+        assert!(Settings::from_toml("[device]\ntimers = \"yes\"\n", Path::new(".")).is_err());
     }
 
     #[test]
