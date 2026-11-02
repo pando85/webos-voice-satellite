@@ -84,7 +84,36 @@ Chosen limits versus c3-a: the daemon needs about 1 MB resident and 1.5 % of a c
 | Watchdog, supervisor | No trip, no restart, no `ERROR` line; 0 xruns during the soak | verified-on-target |
 | Capture statistics at shutdown (whole process life, about 57 minutes) | 84 184 chunks sent, 248 dropped (most likely during the T5 partition, when writes were blocked for 10 s), 0 xruns | verified-on-target |
 | RSS | 1.7 MB for the first 4 cycles, then a **single rise to 9.5 MB** during the 5th bridge session (a steady 64 kB per second for 2 minutes, ending exactly when that session ended), then flat at 9.46 to 9.65 MB for the remaining 8 cycles (22 minutes). At the end: VmRSS 9648 kB, RssAnon 8600 kB, almost all in one anonymous mapping (the heap). Nothing unusual in the satellite log or the bridge log for that session | verified-on-target (observation) |
-| Cause of the RSS rise | Unknown. Not a steady leak at this rate (it did not repeat in 8 identical sessions). Hypothesis: a backlog buffered in user space during a slow stretch of the connection, freed afterwards but kept by the allocator. Needs a reproduction with heap instrumentation and the drop counter logged per session | hypothesis |
+| Cause of the RSS rise | Not reproduced exactly (see the PC investigation below), but a mechanism with the same signature was found and fixed: musl's `malloc` keeps growing under repeated TTS replies while the Rust heap stays flat. The TV step itself happened during a wake-mode session with no logged reply, so it stays **unproven for that event**; re-soak with the fixed build | hypothesis (mechanism verified-on-host) |
+
+### RSS investigation on the PC (2026-11-02, host only, no TV, no HA)
+
+Method: the real daemon with a synthetic file microphone and a fake HA (aioesphomeapi 46.6.0, Noise), VmRSS, VmHWM and RssAnon from `/proc/<pid>/status` every 3 to 30 s. Two builds of the same commit: host glibc, and static `x86_64-unknown-linux-musl` (zigbuild), which has the same malloc (musl mallocng) as the armv7 TV build. A scratch-only counting global allocator (not committed) gave the Rust-visible live bytes. Labels below are `verified-on-host`; none is a TV measurement.
+
+| Scenario | glibc | musl malloc (the TV's allocator) |
+| --- | --- | --- |
+| 160 s wake session, mic streamed, HA draining | RssAnon 400 kB, flat | 620 kB, flat after the first 10 s |
+| Peer stalled 60 s (the satellite's event loop never saw backpressure; kernel buffers absorbed 2 MB), then released | flat | flat (620 kB), 0 chunks dropped |
+| 150 reconnects | not run | +570 kB over the first 75, then flat (1020 kB) |
+| A 300 kB (9.6 s) TTS reply every 10 s for 420 s, null sink | RssAnon 404 kB, flat | **0.4 MB to 21.6 MB, linear, about 52 kB/s, about 1.7 bytes of RSS per reply byte, no plateau** (RSS 2.8 to 24.0 MB) |
+| Same, Rust live bytes (counting allocator, musl) | n/a | 87 to 94 kB peak, flat |
+| Same, build with `dlmalloc` (the fix) | n/a | RssAnon 192 kB, flat for 36 replies and 300 s |
+
+Findings:
+
+- **No unbounded Rust-side queue in the microphone path.** Capture sends with `try_send` into a 64-chunk channel and drops (and counts) when full; a 60 s stall of the peer neither grew RSS nor dropped chunks on loopback. The server's write buffer is reused per frame.
+- **The growth is the musl allocator, not a Rust leak.** With TTS replies the Rust live heap stays under 100 kB while RssAnon grows without bound; a single anonymous mapping (the heap) holds it, as on the TV (RssAnon 8600 kB in one mapping). glibc and `dlmalloc` on the same code stay flat. The suspect traffic is each reply's burst of 1 KiB chunks (events, queue blocks, decode buffers); the exact mallocng behaviour was not dissected.
+- **Why it matters beyond the soak**: at that rate a 5 s reply costs about 270 kB, so the 64 MiB RSS ceiling (exit 72, supervisor restart) would be reached after a few hundred replies.
+- **Does this explain the TV step (a steady 64 kB/s for 2 minutes, then flat)?** It has the same signature (a linear rise in one heap mapping that stops when the audio stops, never returned to the OS), but on the PC the rise follows TTS audio, while the soak's session is described as wake-mode streaming with nothing unusual in the logs. A reply during that session is possible but not recorded, so this is not proven. On the PC a mic-only session on musl does not grow.
+
+Changes made (host-verified; not yet run on the TV):
+
+- `dlmalloc` (pure Rust, `global` feature) is the global allocator on musl targets only (`crates/satellite/Cargo.toml`); host builds keep the system allocator. armv7 binary +7 kB; the armv7 build under `qemu-arm-static` passes the daemon end-to-end harness (17 checks).
+- The player's TTS queue is byte-bounded (2 MiB, about 65 s of 16 kHz mono audio): beyond that audio is dropped with a warning and a count instead of queueing without limit if the sink stalls (a pacat that never reads). Tested with a fake pacat.
+- The microphone chunk buffer is allocated at its final size (the old `flat_map` collect regrew it eight times per chunk).
+- The watchdog thread now logs `memory: resident size N KiB (last reported M KiB)` at info each time RSS grows 2 MiB beyond the last report, and the size at debug every 10 s, so a rise shows in the log with a timestamp.
+
+To close this on the target (owner-authorized TV session): run the soak again with this build, with `memory:` lines in the log, and include at least one spoken reply in the first sessions. Expected: RSS stays near 1 to 2 MB.
 
 The rise stays far below the 64 MiB ceiling, which would turn a real leak into a restart by the supervisor (exit 72) rather than memory pressure on the TV.
 
@@ -99,5 +128,5 @@ The rise stays far below the 64 MiB ceiling, which would turn a real leak into a
 - Behaviour in screen-off, standby and Always Ready, and on resume: [D5 plan](D5-plan.md) (owner).
 - The capture stall reopen on a real stall (expected in standby).
 - HA's own integration against the TV (network block), including HA restarts and its reconnect backoff.
-- Multi-day memory and descriptor behaviour (Phase 3 exit criterion); this run covered about 1 hour. The single 8 MB RSS rise in the soak is unexplained.
+- Multi-day memory and descriptor behaviour (Phase 3 exit criterion); this run covered about 1 hour. The single 8 MB RSS rise in the soak is not reproduced on the target; the musl allocator mechanism is fixed on the host and needs a TV re-soak.
 - Autostart after a real reboot (needs the owner's approval: [autostart design](../../design/autostart.md)).

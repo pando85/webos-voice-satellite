@@ -25,6 +25,11 @@ mod watchdog;
 
 use std::process::ExitCode;
 
+/// See the musl note in this crate's Cargo.toml.
+#[cfg(target_env = "musl")]
+#[global_allocator]
+static ALLOC: dlmalloc::GlobalDlmalloc = dlmalloc::GlobalDlmalloc;
+
 use config::{Command, USAGE};
 
 pub(crate) const VERSION: &str = env!("CARGO_PKG_VERSION");

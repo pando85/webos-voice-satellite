@@ -25,6 +25,15 @@ const TICK: Duration = Duration::from_secs(1);
 const SUSPEND_GAP: Duration = Duration::from_secs(5);
 /// Resident size is checked this often.
 const RSS_EVERY: Duration = Duration::from_secs(10);
+/// The resident size is logged at info each time it grows this much beyond
+/// the last logged value (and at debug at every check), so a slow rise shows
+/// up in the log without a profiler (see docs/discovery/c3-a/P3-robustness.md).
+const RSS_REPORT_STEP: u64 = 2 << 20;
+
+/// Whether `rss` is far enough above the last reported size to log.
+fn rss_report_due(last_reported: u64, rss: u64) -> bool {
+    rss >= last_reported.saturating_add(RSS_REPORT_STEP)
+}
 
 /// Exit code: the event loop stalled.
 pub(crate) const EXIT_LOOP_STALL: i32 = 70;
@@ -117,6 +126,7 @@ fn run(loop_stall: Duration, max_rss: u64, beats: &Beats, capture_beat: &dyn Fn(
     let start = Instant::now();
     let mut mon = Monitor::new(loop_stall, start);
     let mut rss_at = start;
+    let mut rss_reported = 0_u64;
     loop {
         std::thread::sleep(TICK);
         if beats.disarmed.load(Ordering::Relaxed) {
@@ -154,13 +164,24 @@ fn run(loop_stall: Duration, max_rss: u64, beats: &Beats, capture_beat: &dyn Fn(
         }
         if max_rss > 0 && now.saturating_duration_since(rss_at) >= RSS_EVERY {
             rss_at = now;
-            if let Some(rss) = crate::limits::rss_bytes().filter(|r| *r > max_rss) {
-                log::error!(
-                    "watchdog: resident memory {} KiB is above the ceiling of {} KiB; exiting with {EXIT_RSS} for a restart",
-                    rss / 1024,
-                    max_rss / 1024
-                );
-                std::process::exit(EXIT_RSS);
+            if let Some(rss) = crate::limits::rss_bytes() {
+                if rss > max_rss {
+                    log::error!(
+                        "watchdog: resident memory {} KiB is above the ceiling of {} KiB; exiting with {EXIT_RSS} for a restart",
+                        rss / 1024,
+                        max_rss / 1024
+                    );
+                    std::process::exit(EXIT_RSS);
+                }
+                log::debug!("memory: resident {} KiB", rss / 1024);
+                if rss_report_due(rss_reported, rss) {
+                    log::info!(
+                        "memory: resident size {} KiB (last reported {} KiB)",
+                        rss / 1024,
+                        rss_reported / 1024
+                    );
+                    rss_reported = rss;
+                }
             }
         }
     }
@@ -169,6 +190,14 @@ fn run(loop_stall: Duration, max_rss: u64, beats: &Beats, capture_beat: &dyn Fn(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rss_is_reported_in_steps() {
+        assert!(rss_report_due(0, 3 << 20));
+        assert!(!rss_report_due(0, 1 << 20));
+        assert!(!rss_report_due(3 << 20, 4 << 20));
+        assert!(rss_report_due(3 << 20, 5 << 20));
+    }
 
     #[test]
     fn progress_keeps_it_quiet_and_a_stall_trips() {

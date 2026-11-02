@@ -12,6 +12,8 @@
 
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::io::AsyncWriteExt as _;
@@ -51,13 +53,88 @@ pub(crate) struct Done {
     pub(crate) result: Result<PlayStats, String>,
 }
 
+/// Most streamed TTS audio that may wait for the sink (about 65 s of 16 kHz
+/// mono s16le). HA streams a reply only slightly ahead of real time, so the
+/// queue stays near empty unless the sink stalls (pacat blocked); then audio
+/// beyond this is dropped (and counted) instead of growing without bound.
+pub(crate) const MAX_QUEUED_BYTES: usize = 2 << 20;
+
+/// Sender half of a byte-bounded chunk queue.
+struct ChunkTx {
+    tx: mpsc::UnboundedSender<Vec<u8>>,
+    queued: Arc<AtomicUsize>,
+    max: usize,
+    dropped_chunks: u64,
+}
+
+/// Receiver half of a byte-bounded chunk queue.
+pub(crate) struct ChunkRx {
+    rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    queued: Arc<AtomicUsize>,
+}
+
+fn chunk_queue(max: usize) -> (ChunkTx, ChunkRx) {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let queued = Arc::new(AtomicUsize::new(0));
+    (
+        ChunkTx {
+            tx,
+            queued: Arc::clone(&queued),
+            max,
+            dropped_chunks: 0,
+        },
+        ChunkRx { rx, queued },
+    )
+}
+
+impl ChunkTx {
+    /// Queues a chunk; returns false (and drops it) when the queue is full.
+    fn push(&mut self, data: Vec<u8>) -> bool {
+        let len = data.len();
+        if self.queued.load(Ordering::Relaxed).saturating_add(len) > self.max {
+            self.dropped_chunks += 1;
+            if self.dropped_chunks == 1 {
+                log::warn!(
+                    "player: the sink is {} KiB behind; dropping TTS audio until it catches up",
+                    self.max / 1024
+                );
+            }
+            return false;
+        }
+        self.queued.fetch_add(len, Ordering::Relaxed);
+        if self.tx.send(data).is_err() {
+            self.queued.fetch_sub(len, Ordering::Relaxed);
+        }
+        true
+    }
+}
+
+impl Drop for ChunkTx {
+    fn drop(&mut self) {
+        if self.dropped_chunks > 0 {
+            log::warn!(
+                "player: {} TTS chunks dropped because the sink fell behind",
+                self.dropped_chunks
+            );
+        }
+    }
+}
+
+impl ChunkRx {
+    async fn recv(&mut self) -> Option<Vec<u8>> {
+        let data = self.rx.recv().await?;
+        self.queued.fetch_sub(data.len(), Ordering::Relaxed);
+        Some(data)
+    }
+}
+
 struct Active {
     id: u64,
     kind: Kind,
     /// Dropping or firing it cancels the task.
     cancel: Option<oneshot::Sender<()>>,
     /// Streamed TTS chunks; `None` after `TTS_STREAM_END`.
-    chunks: Option<mpsc::UnboundedSender<Vec<u8>>>,
+    chunks: Option<ChunkTx>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -141,7 +218,7 @@ impl Player {
     pub(crate) fn start_stream(&mut self, rate: u32, channels: u16) -> Option<Kind> {
         let stopped = self.stop();
         let (id, cancel_rx, cancel_tx) = self.begin();
-        let (chunk_tx, chunk_rx) = mpsc::unbounded_channel();
+        let (chunk_tx, chunk_rx) = chunk_queue(MAX_QUEUED_BYTES);
         let cfg = self.cfg.clone();
         let done_tx = self.done_tx.clone();
         let task = tokio::spawn(async move {
@@ -171,9 +248,9 @@ impl Player {
 
     /// SPEAKER mode: one PCM chunk of the current stream.
     pub(crate) fn push(&mut self, data: Vec<u8>) {
-        match self.current.as_ref().and_then(|a| a.chunks.as_ref()) {
+        match self.current.as_mut().and_then(|a| a.chunks.as_mut()) {
             Some(tx) => {
-                let _ = tx.send(data);
+                tx.push(data);
             }
             None => log::debug!("player: TTS audio without an open stream; dropped"),
         }
@@ -267,7 +344,7 @@ async fn stream_pacat(
     cfg: &SinkSection,
     rate: u32,
     channels: u16,
-    mut rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    mut rx: ChunkRx,
     mut cancel: oneshot::Receiver<()>,
 ) -> Result<PlayStats, String> {
     let mut child = Command::new(&cfg.binary)
@@ -326,7 +403,7 @@ async fn stream_pacat(
 }
 
 async fn collect(
-    mut rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    mut rx: ChunkRx,
     mut cancel: oneshot::Receiver<()>,
     keep: bool,
 ) -> Result<(Vec<u8>, usize), String> {
@@ -352,7 +429,7 @@ async fn stream_wav(
     path: PathBuf,
     rate: u32,
     channels: u16,
-    rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    rx: ChunkRx,
     cancel: oneshot::Receiver<()>,
 ) -> Result<PlayStats, String> {
     let (buf, total) = collect(rx, cancel, true).await?;
@@ -382,7 +459,7 @@ async fn stream_wav(
 async fn stream_null(
     rate: u32,
     channels: u16,
-    rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    rx: ChunkRx,
     cancel: oneshot::Receiver<()>,
 ) -> Result<PlayStats, String> {
     let (_, total) = collect(rx, cancel, false).await?;
@@ -526,6 +603,57 @@ mod tests {
         let a = pacat_stream_args(&cfg, 16_000, 1);
         assert!(a.contains(&"--latency-msec=200".to_owned()));
         assert!(a.contains(&"--device=pcm_output".to_owned()));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn chunk_queue_is_bounded_by_bytes_and_frees_on_receive() {
+        let (mut tx, mut rx) = chunk_queue(3000);
+        assert!(tx.push(vec![0; 1024]));
+        assert!(tx.push(vec![0; 1024]));
+        assert!(!tx.push(vec![0; 1024]), "third chunk exceeds 3000 bytes");
+        assert_eq!(tx.dropped_chunks, 1);
+        assert_eq!(rx.queued.load(Ordering::Relaxed), 2048);
+        assert_eq!(rx.recv().await.unwrap().len(), 1024);
+        assert_eq!(rx.queued.load(Ordering::Relaxed), 1024);
+        assert!(tx.push(vec![0; 1024]), "room again after the sink took one");
+        drop(tx);
+        assert_eq!(rx.recv().await.unwrap().len(), 1024);
+        assert_eq!(rx.recv().await.unwrap().len(), 1024);
+        assert!(rx.recv().await.is_none());
+        assert_eq!(rx.queued.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stalled_sink_drops_instead_of_growing() {
+        // A pacat that never reads its input: the player's queue must stop at
+        // the byte limit while HA keeps sending.
+        let dir = std::env::temp_dir().join(format!("webos-sat-stall-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("fake-pacat");
+        std::fs::write(&script, "#!/bin/sh\nsleep 30\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let mut cfg = SinkSection::default();
+        cfg.binary.clone_from(&script);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut p = Player::new(cfg, tx);
+        p.start_stream(16_000, 1);
+        // 16 MiB offered; the pipe (64 KiB) plus the queue limit can hold far less.
+        for _ in 0..16 {
+            for _ in 0..1024 {
+                p.push(vec![1; 1024]);
+                tokio::task::yield_now().await;
+            }
+        }
+        let tx = p.current.as_ref().and_then(|a| a.chunks.as_ref()).unwrap();
+        let queued = tx.queued.load(Ordering::Relaxed);
+        assert!(queued <= MAX_QUEUED_BYTES, "queued {queued}");
+        assert!(tx.dropped_chunks > 0);
+        p.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn chunk(v: i16, n: usize) -> Vec<u8> {

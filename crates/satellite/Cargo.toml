@@ -22,5 +22,12 @@ webos-dsp = { workspace = true }
 webos-esphome-api = { workspace = true }
 webos-playback = { workspace = true }
 
+# musl's malloc does not give memory back after TTS replies (RSS grew about 1.7
+# bytes per reply byte on a PC musl build while Rust's live bytes stayed flat),
+# so the static TV builds use this pure-Rust allocator. Host (glibc) builds keep
+# the system allocator. docs/discovery/c3-a/P3-robustness.md.
+[target.'cfg(target_env = "musl")'.dependencies]
+dlmalloc = { version = "0.2", features = ["global"] }
+
 [lints]
 workspace = true

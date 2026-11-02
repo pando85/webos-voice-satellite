@@ -721,7 +721,10 @@ impl Ctx {
                 let Some(s) = self.session.as_mut() else {
                     return;
                 };
-                let data: Vec<u8> = samples.iter().flat_map(|v| v.to_le_bytes()).collect();
+                // Exact capacity: `flat_map().collect()` has no size hint and
+                // would regrow the buffer about eight times per chunk.
+                let mut data = Vec::with_capacity(samples.len() * 2);
+                data.extend(samples.iter().flat_map(|v| v.to_le_bytes()));
                 let msg = pb::VoiceAssistantAudio {
                     data,
                     ..Default::default()
