@@ -1,6 +1,6 @@
 # Install and configuration UX: Homebrew Channel package, first run and pairing
 
-- **Status:** **proposal, not accepted.** No code was written for this document and nothing was run on a TV or on Home Assistant (HA). Accepting it needs an owner decision and, for the TV-side parts, the verification list at the end.
+- **Status:** **proposal, not accepted as a whole.** Milestone 3b, the daemon side of HA-driven pairing (section 5), was implemented on 2026-11-02 at the owner's request and tested on a PC, including one run against a real HA 2026.10.4 in a local venv; see [section 8](#8-implementation-status-milestone-3b). Nothing was run on a TV or against the owner's HA. The rest (HBC package, TV app, autostart wiring, config entities) is still a proposal. Accepting it needs an owner decision and, for the TV-side parts, the verification list in section 7.
 - **Date:** 2026-11-02. Research date for every external source below: 2026-11-02 (GitHub trees and files read at the tags or heads named in the [Sources](#sources) list).
 - **Scope:** backlog [#3 Install and configuration UX](../project/backlog.md) (owner priority 2: public project, interleaved into [roadmap](../project/roadmap.md) Phases 3 and 5). Device in scope for TV facts: c3-a (LG C3, webOS TV 8.3.0, firmware 03.30.74, Homebrew Channel 0.6.3). Other models and firmware are **not** covered.
 - **Related:** [autostart design](autostart.md), [ADR 0001](../decisions/0001-esphome-native-api.md), [D0-D1 root method](../discovery/c3-a/D0-D1-runtime.md#root-method-details), [rooted-TV improvements](../discovery/c3-a/rooted-tv-improvements.md), [ESPHome research](../research/esphome-rust-satellite.md), [ESPHome API crate](../development/esphome-api.md), [P1 runtime smoke (UDP 5353)](../discovery/c3-a/P1-runtime-smoke.md#udp-5353-mdns).
@@ -76,14 +76,16 @@ Sources for this section: HA 2026.10.4 `esphome/config_flow.py` and `manager.py`
 
 ### 2.3 What our daemon does today (code)
 
+Written against commit 89a658d, before milestone 3b. Rows marked **3b** changed with the pairing work (section 8).
+
 | Topic | Status | Where |
 | --- | --- | --- |
 | Noise with a pre-shared key | implemented; verified-on-target against HA 2026.10.4 with a key typed in the config flow | [`server.rs`](../../crates/esphome-api/src/server.rs), [P1 HA integration](../discovery/c3-a/P1-ha-integration.md) |
-| No key configured | serves **plaintext only** and logs a development warning; a Noise client gets `Bad indicator byte`. The daemon refuses to start without a key unless `allow_plaintext = true` | `server.rs` (`Server::bind`, `handshake_inner`), [config](../../config/example.toml) |
-| `DeviceInfoResponse.api_encryption_supported` | `true` only when a key is configured, so HA never tries to provision | `server.rs` (`device_info`) |
-| `api_encryption_provisionable` | never set | `server.rs` |
-| `NoiseEncryptionSetKeyRequest` | answered with `success = false` and a warning | `server.rs` (dispatch) |
-| Key storage | read once from `device.noise_psk_file`; held in an immutable `Arc<Resolved>`; nothing writes it | [`config.rs`](../../crates/esphome-api/src/config.rs) |
+| No key configured | serves **plaintext only** and logs a development warning; a Noise client gets `Bad indicator byte`. The daemon refuses to start without a key unless `allow_plaintext = true`. **3b:** or `[pairing] enabled = true`, which starts unpaired instead | `server.rs` (`Server::bind`, `handshake_inner`), [config](../../config/example.toml) |
+| `DeviceInfoResponse.api_encryption_supported` | `true` only when a key is configured, so HA never tries to provision. **3b:** also `true` on keyless pairing sessions | `server.rs` (`device_info`, `keyless_device_info`) |
+| `api_encryption_provisionable` | never set. **3b:** `true` on keyless pairing sessions (only possible while the window is open) | `server.rs` |
+| `NoiseEncryptionSetKeyRequest` | answered with `success = false` and a warning. **3b:** accepted over zero-PSK Noise while unpaired and the window is open; rotation by the key holder | `server.rs`, [`pairing.rs`](../../crates/esphome-api/src/pairing.rs) |
+| Key storage | read once from `device.noise_psk_file`; held in an immutable `Arc<Resolved>`; nothing writes it. **3b:** a provisioned key lives in `<pairing.state_dir>/noise_psk`, written atomically; the runtime key state is owned by the server loop | [`config.rs`](../../crates/esphome-api/src/config.rs), `pairing.rs` |
 | mDNS `_esphomelib._tcp` | implemented with `mdns-sd` 0.21 (cargo feature `mdns`, on by default); **off by default in the config** (`device.mdns = false`). TXT: `mac`, `friendly_name`, `version`, `platform`, `board`, `network`, and `api_encryption` only when a key is set. Host name `<name>.local.`. Fails soft | [`mdns.rs`](../../crates/esphome-api/src/mdns.rs) |
 | mDNS evidence | the TXT builder has a unit test and `fake_device --mdns` exists; **no run on the TV, no recorded discovery by a real HA**. On c3-a UDP 5353 is already bound by `mdnsd`, `avahi-daemon` and `iconnectivity` (v4) and `mdnsd` and `chip-service` (v6); the reuse flags were not read and whether LG's `mdnsd` coexists or answers for foreign services is unknown ([P1 runtime smoke](../discovery/c3-a/P1-runtime-smoke.md#udp-5353-mdns), verified-on-target for the binders). `mdns-sd` sets `SO_REUSEADDR` and `SO_REUSEPORT` (documented, [research](../research/esphome-rust-satellite.md)) | |
 | HA discovery in the owner's homelab | not used: HA runs in a pod without multicast reach, the entry was added by host and port | [P1 HA integration](../discovery/c3-a/P1-ha-integration.md) |
@@ -179,9 +181,10 @@ Milestone 3a, package and autostart (no pairing change):
 
 Milestone 3b, HA-driven pairing (PC work first):
 
-- Daemon changes from 2.3 (keyless unprovisioned mode, SetKey, mutable key state, window).
-- Tests with `aioesphomeapi` and the fake-HA harness on a PC: provisionable flag, zero-PSK `SetKey` (accepted, all-zero rejected, bad length rejected, closed window refused), activation drops older sessions, plaintext and zero-PSK refused afterwards, no microphone data on an unprovisioned session, key file mode 0600, nothing secret in logs. Then one run against the owner's HA (the `lg-c3-a` entry's key flow can be exercised by deleting and re-adding a throwaway device; owner decision).
-- `ctl pair` and `ctl reset-pairing` subcommands used by the app; a `--status --json` output with no secrets.
+- **Done (2026-11-02):** daemon changes from 2.3 (keyless unprovisioned mode, SetKey, mutable key state, window). See section 8.
+- **Done:** tests with `aioesphomeapi` and the fake-HA harness on a PC: provisionable flag, zero-PSK `SetKey` (accepted, all-zero rejected, bad length rejected, closed window refused), activation drops older sessions, plaintext and zero-PSK refused afterwards, no microphone data on an unprovisioned session, key file mode 0600, nothing secret in logs. Also one run against a real HA 2026.10.4 on the PC (not the owner's HA).
+- **Pending:** one run against the owner's HA, on a TV, with a **new** test device name (never the permanent `lg-c3-a` entry); owner decision and authorization.
+- **Partly done:** the app's `ctl pair` and `ctl reset-pairing` map onto the trigger files `<state_dir>/pair` and `<state_dir>/reset-pairing` (and the `--pair`, `--reset-pairing` flags); a `ctl` wrapper and a `--status --json` output with no secrets are not written.
 
 ### 4.2 Phase 5 slice
 
@@ -204,12 +207,12 @@ Milestone 3b, HA-driven pairing (PC work first):
 
 ### 5.2 Rules
 
-1. Microphone data never flows on a keyless session; `SubscribeVoiceAssistant` is ignored until a real key is active. HA's manager runs the key step right after `DeviceInfo`, before entity setup, so no audio is needed to pair.
-2. The window opens only on an explicit local action (TV app button, `ctl pair`, or the first launch of the app after install), **not** on every boot. Default length 10 minutes, visible countdown in the app. After the first successful `SetKey` the window closes.
+1. Microphone data never flows on a keyless session; `SubscribeVoiceAssistant` is ignored until a real key is active. HA's manager runs the key step right after `DeviceInfo`, before entity setup, so no audio is needed to pair. **Implemented:** keyless sessions never become the main session; the daemon also keeps the PCM closed ("not paired") until the key is active. One addition was needed: HA lists entities before the key step, so keyless sessions answer `ListEntitiesRequest` with an empty list.
+2. The window opens only on an explicit local action (TV app button, `ctl pair`, or the first launch of the app after install), **not** on every boot. Default length 10 minutes, visible countdown in the app. After the first successful `SetKey` the window closes. **Implemented differently:** with `pairing.open_on_start = true` (default) the window opens at every start **while no key is stored** (as ESPHome's `provisioning:`); once paired a restart does not open it. `open_on_start = false` gives this rule's behaviour (explicit action only). No countdown UI exists yet.
 3. `SetKey`: base64, exactly 32 bytes, not all-zero; write to a temporary file in the same directory, `fsync`, `rename` to the key file (mode 0600), then activate. Never log the key or its length beyond "key set". One `SetKey` attempt per second.
 4. After activation: close all sessions, refuse plaintext and zero-PSK, set TXT `api_encryption`.
 5. The pairing result is shown on the TV: peer address and the HA `client_info` string the daemon already logs ("Home Assistant 2026.10.4"), so the owner can see that it is their HA and press "reset pairing" otherwise.
-6. `reset-pairing` is local only (TV app, `ctl`, or deleting the key file with the daemon stopped); a remote empty-key `SetKey` is refused. HA keeps its stored key per MAC, so re-pairing a TV whose key was reset needs the device removed in HA first; the stable `mac_seed` must survive an IPK update and a reinstall (stored in the prefix, not regenerated).
+6. `reset-pairing` is local only (TV app, `ctl`, or deleting the key file with the daemon stopped); a remote empty-key `SetKey` is refused. HA keeps its stored key per MAC, so re-pairing a TV whose key was reset needs the device removed in HA first; the stable `mac_seed` must survive an IPK update and a reinstall (stored in the prefix, not regenerated). **Correction (PC run with HA 2026.10.4, section 8):** removal is not needed. After a reset HA's old key fails, HA opens a re-authentication flow (`reauth_encryption_removed_confirm`); once the user confirms it, HA sets the key from its own storage (the same key as before) and reconnects. A reset therefore does not change the key when the same HA re-pairs.
 7. Optional hardening (open question 3): hold the `SetKey` reply until the owner presses OK on the TV. Not assumed possible; HA's reply timeout is unknown.
 
 ### 5.3 Threat model for the pairing window
@@ -229,7 +232,7 @@ Milestone 3b, HA-driven pairing (PC work first):
 1. **mDNS on the TV.** Does `mdns-sd` coexist with `mdnsd`, `avahi-daemon` and `iconnectivity` on UDP 5353 on c3-a, does a real HA on the same L2 see the card, and does it survive interface changes and standby? If not, is an avahi service file or a call to LG's `mdnsd` a better route (a write outside `/tmp`, needs approval)?
 2. **HBC package mechanics.** Does the installer keep the exec bit and an ELF payload in an app or service directory on 0.6.3 and 0.7.x? Which directory is writable and persistent for `etc/` and the key (is the app directory replaced on update)? Is `/media/developer` guaranteed?
 3. **Confirm-on-TV.** Can the `SetKey` reply be held until the owner confirms, and what is HA's timeout for `noise_encryption_set_key`?
-4. **HA version support.** Accept only HA 2026.9.0 or newer for the no-typing flow, or also offer the old plaintext push (deprecated, to be removed in 2027.2.0 on the ESPHome side)? Recommendation: support only the zero-PSK path and document the manual key for older HA.
+4. **HA version support.** Accept only HA 2026.9.0 or newer for the no-typing flow, or also offer the old plaintext push (deprecated, to be removed in 2027.2.0 on the ESPHome side)? Recommendation: support only the zero-PSK path and document the manual key for older HA. **Implemented as recommended** (plaintext `SetKey` refused); still open for the owner to confirm.
 5. **Other firmware.** What does the installer do on an unvalidated firmware? Recommendation: install, keep the mic closed, show why, and require an explicit "I understand" override before capture, because the capture ioctls and the DAPM oops hazard are validated only on c3-a ([improvements 4](../discovery/c3-a/rooted-tv-improvements.md)).
 6. **Architecture selection.** Which binaries to ship (armv7 musl only, or also aarch64) and how the installer picks them on a TV whose userland differs from c3-a.
 7. **Central repo and AI policy.** Whether to submit to `webosbrew/apps-repo` given its AI-use rule (H5), or self-host first. Also the repository license, which the [roadmap](../project/roadmap.md#phase-5-second-tv-and-packaging) already lists as an owner decision.
@@ -245,12 +248,45 @@ Each item is a bounded experiment with its own plan, run only with the owner's a
 2. **`exec` as root:** the app's `exec` call runs as root with HBC elevated on c3-a (0.6.3); a clear failure when it is not.
 3. **init.d symlink hook** from the package directory: returns at once, no failsafe, survives an IPK update, disappears on uninstall; test reboot approved by the owner ([autostart design](autostart.md#proposed-install-needs-the-owners-approval-not-done)).
 4. **mDNS advertisement** from the daemon: `_esphomelib._tcp` visible from another host on the LAN, HA discovery card appears, no disturbance of LG's responders (check that `mdnsd` and `avahi-daemon` still answer), behaviour across screen-off and standby (D5).
-5. **Unprovisioned mode, PC first:** the daemon passes the section 4.1 test list against `aioesphomeapi`; then against the owner's HA with a throwaway entry: discovery or host and port, no key typed, the key stored in HA, reconnect after an HA restart and after a daemon restart.
-6. **Pairing window:** closes on timeout; refuses connections afterwards; reopens only on the local action; no audio in any keyless session; no key in logs or `ps` output; the key file mode is 0600 and survives a reboot.
+5. **Unprovisioned mode, PC first:** the daemon passes the section 4.1 test list against `aioesphomeapi`; then against the owner's HA with a throwaway entry: discovery or host and port, no key typed, the key stored in HA, reconnect after an HA restart and after a daemon restart. **PC part done** (section 8), including a real HA 2026.10.4 on the PC; the owner's HA and the TV are pending. HA restart was not exercised.
+6. **Pairing window:** closes on timeout; refuses connections afterwards; reopens only on the local action; no audio in any keyless session; no key in logs or `ps` output; the key file mode is 0600 and survives a reboot. **PC part done** except `ps` output (the key is never an argument) and the reboot (TV).
 7. **Reset and reinstall:** `reset-pairing`, IPK update and reinstall keep the stable MAC and either re-pair cleanly or tell the user what to do in HA.
 8. **Firmware guard through the installer:** an unvalidated firmware keeps the mic closed and the app explains it.
 9. **No secret leakage:** the app screens, `ctl status`, `--check-config`, logs and mDNS TXT contain no key, token or other secret (grep test on a PC run, then on the TV).
 10. **HBC variance:** repeat 1 to 3 on HBC 0.7.x (second C3 or another rooted TV) before the compatibility record claims anything beyond c3-a.
+
+## 8. Implementation status (milestone 3b)
+
+Implemented on 2026-11-02 in commits 84de706 (API crate) and 849a1dd (daemon). Everything below is PC-only; nothing ran on a TV or against the owner's HA.
+
+**What exists**
+
+- `webos-esphome-api`: `Config::provisioning` ([`pairing.rs`](../../crates/esphome-api/src/pairing.rs), [`server.rs`](../../crates/esphome-api/src/server.rs)). Behaviour, divergences from ESPHome and test lists: [ESPHome API crate, Pairing](../development/esphome-api.md#pairing-ha-driven-key-provisioning).
+- Daemon: `[pairing]` (`enabled`, default false; `state_dir`, `window_s`, `open_on_start`), `--pair`, `--reset-pairing`, trigger files `pair` and `reset-pairing`, the "not paired" microphone gate. User guide: [development, Pairing](../development.md#pairing-without-typing-a-key). Security notes: [SECURITY.md](../../SECURITY.md#pairing).
+- `[pairing] enabled` defaults to false: a config without a key still fails to start as before, so nobody gets an open pairing window by accident. The first-run script of milestone 3a would set it.
+- mDNS follows the key state (section 5.1) but stays off by default (`device.mdns = false`) because the advertiser is unverified on c3-a, where UDP 5353 is shared with `mdnsd`, `avahi-daemon` and others (2.3). Discovery would let HA offer the device with one click during the window; without it the user adds host and port, which the PC run showed works without typing a key.
+
+**Decisions taken while implementing**
+
+| Question | Decision | Basis |
+| --- | --- | --- |
+| Rotation by a session that proved the key | allowed (new valid key; same key is a no-op) | ESPHome 2026.10.1 `api_connection.cpp` accepts `SetKey` on any authenticated session; HA 2026.10.4 never rotates |
+| Empty key (clear) | refused | rule 6 (reset is local) |
+| `SetKey` over plaintext | refused | open question 4; ESPHome deprecates it |
+| Key fixed in the config | never changed (`success = false`) | ESPHome with a YAML key |
+| Corrupt stored key at start | the daemon refuses to start | fail safe: no silent reopening of pairing |
+| Rate limit | one `SetKey` attempt per second (any session) | rule 3 |
+
+**Test results (2026-11-02, host x86_64):** API crate 54 unit tests, 4 loopback tests and 7 pairing loopback tests; satellite 51 unit tests; `fake_ha.py` 58 checks (16 new: scenarios D and E); `satellite_e2e.py` 29 checks (12 new: scenarios P and W); `cargo fmt`, `clippy -D warnings`, the armv7 and aarch64 musl release builds and `tools/check_docs.py` pass. Real HA 2026.10.4 on the PC: the flow worked end to end without typing a key ([development](../development.md#testing-without-ha-reaching-the-device) has the observations and how to repeat it).
+
+**Pending verification on a TV with real HA** (owner authorization; use a **new** test device name and MAC seed, never the permanent `lg-c3-a` entry, and remove the test entry afterwards):
+
+1. HA in the owner's cluster adds the TV by host and port with `[pairing] enabled = true`, no key typed; the key appears in the new entry and in `<state_dir>/noise_psk` (0600) on the TV.
+2. HA's reconnect after pairing, after an HA restart and after a daemon restart on the TV.
+3. `reset-pairing` on the TV, then HA's re-authentication confirm.
+4. Window timeout and HA's "closed its setup window" message in the real UI.
+5. Logs on the TV contain no key; the microphone PCM stays closed (`/proc/asound/.../status`) until the key is set.
+6. Optional, separate experiment: mDNS discovery on the same L2 as HA (verification item 4), which the owner's pod setup cannot see.
 
 ## Sources
 

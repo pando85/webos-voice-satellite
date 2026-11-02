@@ -43,7 +43,7 @@ Items not in the ranked list stay in the backlog without a priority or a phase: 
 
 ## 3. Install and configuration UX
 
-- **Status:** owner priority 2 (2026-11-02): Homebrew Channel package and first-run configuration in Phase 3 and Phase 5; QR and phone configuration needs a security design first.
+- **Status:** owner priority 2 (2026-11-02): Homebrew Channel package and first-run configuration in Phase 3 and Phase 5; QR and phone configuration needs a security design first. Proposal: [install and configuration UX](../design/install-and-config-ux.md). Pairing without typing the key (milestone 3b, daemon side) implemented and PC-tested on 2026-11-02; TV and owner-HA verification pending ([status](../design/install-and-config-ux.md#8-implementation-status-milestone-3b)).
 - **Why:** a rooted-TV install via SSH is acceptable for the owner but not for others.
 - **Approach options:**
   - Homebrew Channel package with a simple webOS app UI for basic settings (enable, mic gain, wake word, HA connection status).

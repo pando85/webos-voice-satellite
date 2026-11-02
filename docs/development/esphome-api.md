@@ -30,15 +30,40 @@ Code generation: `build.rs` compiles the proto with `protox` (pure Rust, so no `
 - **Wake words:** `VoiceAssistantConfigurationResponse` reports no available or active wake words and `max_active_wake_words = 0`. The wake word is whatever the selected HA pipeline configures.
 - **Encryption:**
   - With `noise_psk` set, the device accepts only Noise. Plaintext clients get the Noise-framed rejection, which HA reports as "requires encryption" and answers by asking for the key.
-  - Without `noise_psk`, the device serves plaintext only (development).
-  - `api_encryption_supported` is true only when a key is configured, so HA never tries to provision a key. Key storage is not implemented.
-- **One HA client at a time.** A new connection that completes its handshake replaces the old one.
+  - With `provisioning` set (and no `noise_psk`), HA sets the key itself: see [Pairing](#pairing-ha-driven-key-provisioning).
+  - With neither, the device serves plaintext only (development). `api_encryption_supported` is then false, so HA never tries to provision a key.
+- **One HA client at a time.** A new connection that completes its handshake replaces the old one. Keyless pairing sessions are the exception: they never replace it (below).
 - **Retry policy:**
   - A run that ends with `ERROR`, or without progress (no `WAKE_WORD_END` or `STT_END`), delays the next wake word start by 250 ms × 2ⁿ.
   - Configuration errors (`*-missing`, `*not-found*`) use 2 s × 2ⁿ instead.
   - The delay is capped at 60 s.
   - HA's start reply must arrive within 10 s.
 - **mDNS:** optional (`Config::mdns`, cargo feature `mdns`, on by default). It advertises `_esphomelib._tcp` with TXT records `friendly_name`, `version`, `mac`, `platform`, `board`, `network` and `api_encryption`, using `mdns-sd`. If the advertisement fails, the server logs a warning and keeps running.
+
+## Pairing (HA-driven key provisioning)
+
+Status: **implemented (2026-11-02), tested on a PC against aioesphomeapi 46.6.0 acting as HA; not run against a real HA or on a TV.** Design and threat model: [install and configuration UX](../design/install-and-config-ux.md#5-pairing-mode-design-option-c-detail). Code: [`pairing.rs`](../../crates/esphome-api/src/pairing.rs) (pure state machine and key file), [`server.rs`](../../crates/esphome-api/src/server.rs).
+
+`Config::provisioning = Some(Provisioning { key_file, window, open_at_start })` with `noise_psk = None`:
+
+- **Start.** The server reads `key_file`. A valid key means paired (Noise with that key, as a fixed key). No file means unpaired. A corrupt file (not base64 of 32 non-zero bytes) stops `Server::bind` with an error instead of silently reopening pairing. `Server::needs_pairing()` tells the application to keep the microphone closed.
+- **Window.** Opened at `run()` when unpaired and `open_at_start`, or by `AppCommand::OpenPairingWindow`. Closes after `window` (in memory only, so a restart reopens it if `open_at_start`) or when a key is accepted. `AppCommand::ResetPairing` deletes the key file, closes every session and reopens it. Changes arrive as `AppEvent::Pairing(PairingEvent::…)`: `WindowOpened`, `WindowClosed`, `Paired { client_info, peer }`, `KeyRotated`, `Reset`.
+- **Keyless sessions** (unpaired only). The first byte selects plaintext or Noise with the all-zero PSK, as ESPHome does. Each keyless session runs in its own task (at most four) and never becomes the main session, so the voice state machine, the entities and microphone audio are unreachable without a key. It answers `HelloRequest`, `DeviceInfoRequest` (with `api_encryption_supported` and `api_encryption_provisionable` set and `voice_assistant_feature_flags = 0`), `ListEntitiesRequest` with only `ListEntitiesDoneResponse` (HA lists entities before it provisions), ping, disconnect and `NoiseEncryptionSetKeyRequest`. Voice, switch and media player messages are logged and ignored. While the window is closed, a new connection gets its `HelloResponse` and then `DisconnectRequest(reason = PROVISIONING_CLOSED)`, which HA's config flow reports as "closed its setup window"; existing keyless sessions are closed when the window closes.
+- **`SetKey`.** The key field holds base64 text, as HA and ESPHome use it. Accepted only from a zero-PSK Noise session while the window is open, at most one attempt per second (any session): base64 of exactly 32 bytes, not all zero, not empty. The key is written to `key_file` atomically (exclusive temporary file with mode 0600 in the same directory, `fsync`, `rename`, directory `fsync`, base64 plus a newline, the `noise_psk_file` format). Then the reply `success = true` is sent, the key is activated, and every session opened before it (the keyless sessions, a main session) gets a `DisconnectRequest` and is closed, as ESPHome does 100 ms after its reply. HA then reconnects with the key. A storage failure answers `success = false` and keeps the device unpaired.
+- **After pairing.** Plaintext and zero-PSK clients are refused as with a fixed key ("requires encryption", "Handshake MAC failure", which HA reads as "already has an encryption key"). A session that proved the key may **rotate** it with a new valid key (ESPHome behaviour; HA 2026.10.4 does not do this). Setting the current key again answers success and changes nothing. An empty key (ESPHome: clear the key) is refused: a reset is a local action only. A key fixed in the configuration is never changed (ESPHome: "Key set in YAML").
+- **Logging.** The key is never logged or put in `Debug` output: `KeyState`, `Transport` and `Refusal` redact or omit it, and refusals name the reason only. Logs contain the peer address, the client info and the key file path.
+- **mDNS** (when enabled) follows the runtime state: TXT without `api_encryption` while the window is open, with it once a key is active, and no advertisement while unpaired with the window closed. Unverified on a TV.
+
+Divergences from ESPHome 2026.10.1 (all deliberate):
+
+| ESPHome | This crate | Why |
+| --- | --- | --- |
+| A keyless device is a full plaintext device (entities, voice) | Keyless sessions get identity, an empty entity list and `SetKey` only | No microphone access or control without a key ([design rule 1](../design/install-and-config-ux.md#52-rules)) |
+| `SetKey` accepted over plaintext (deprecated, "will be removed in 2027.2.0") | Refused over plaintext | The key would cross the LAN in clear; HA 2026.9+ uses the zero-PSK path when `api_encryption_provisionable` is set |
+| Empty key clears the key remotely | Refused | Reset is local only (design rule 6) |
+| `provisioning:` window is optional; without it a keyless device accepts a key forever | The window is mandatory (1 s to 1 day) | Bounded exposure |
+| Multiple concurrent API clients | One main session plus up to four keyless sessions | Existing single-client design; HA needs two keyless sessions at once (main and zero-PSK) |
+| `voice_assistant_feature_flags` as configured | 0 on keyless sessions | HA creates no satellite before a key exists |
 
 ## Timers
 
@@ -117,8 +142,12 @@ The harness plays HA:
   - a push-to-talk run through stdin;
   - `TtsUrl` followed by `AnnounceFinished`;
   - replacement of the first client by a second one.
+- **Scenario D** (pairing) replays HA 2026.10.4's provisioning with aioesphomeapi: the keyless main session (provisionable, no voice features, no entities, no start or audio after subscribing, the app is not told HA connected), `SetKey` over plaintext refused, `_async_provision_key_over_noise` (zero-PSK client, `noise_encryption_set_key`) accepted, the keyless session closed, the key file (mode 0600, same key), a reconnect with the key that gives the full device and streams audio, refusal of no key, a wrong key and the zero PSK as HA's config flow classifies them, provisioning refused once paired, `reset-pairing`, and no key in the device log at trace level.
+- **Scenario E** (pairing window) checks HA's config flow logic (`_fetch_device_info`) before and after a 1.5 s window: `provisioning_closed` on both transports, no key accepted, and the `pair` command reopening it.
 
-`fake_device` takes the options `--port`, `--mode wake|ptt|none`, `--features N`, `--mac`, `--name` and `--mdns`. It reads the key from `WEBOS_ESPHOME_PSK` and accepts the stdin commands `ptt`, `wake`, `stop`, `mute`, `unmute` and `quit`. Each app event is printed as an `EVENT …` line. The harness generates its keys at runtime.
+`fake_device` takes the options `--port`, `--mode wake|ptt|none`, `--features N`, `--mac`, `--name`, `--mdns` and, for pairing, `--pair-key-file FILE`, `--pair-window SECS` and `--pair-closed`. It reads the key from `WEBOS_ESPHOME_PSK` and accepts the stdin commands `ptt`, `wake`, `stop`, `mute`, `unmute`, `pair`, `reset-pairing` and `quit`. Each app event is printed as an `EVENT …` line. The harness generates its keys at runtime.
+
+`tests/pairing_io.rs` drives the same flows with a minimal Rust client over loopback (restricted keyless session, zero-PSK pairing with bad keys first, window timeout and reopen, a window closed at start, reset, rotation, a fixed key, a corrupt key file) and checks with a capturing logger at trace level that no key reaches the log.
 
 Results on 2026-11-02 (host x86_64, Python 3.14, aioesphomeapi 46.6.0):
 
@@ -126,6 +155,8 @@ Results on 2026-11-02 (host x86_64, Python 3.14, aioesphomeapi 46.6.0):
 - All 33 harness checks passed, against the host build and against the static armv7 build under `qemu-arm-static`.
 
 Results on 2026-11-02 after the timers work (host x86_64 only): 42 unit tests and 4 loopback tests in the crate (the timer ones are new), 42 `fake_ha.py` checks and 13 satellite end-to-end checks passed. The armv7 and qemu run was not repeated.
+
+Results on 2026-11-02 after the pairing work (host x86_64 only): 54 unit tests, 4 loopback tests and 7 pairing loopback tests in the crate, 58 `fake_ha.py` checks and 29 satellite end-to-end checks passed.
 
 Cross-build: the armv7 binary is static EABI5 with VFPv3, about 0.9 MB.
 

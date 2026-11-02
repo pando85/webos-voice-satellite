@@ -113,16 +113,36 @@ Behaviour:
 
 On the TV, use the scripts in [Install on a TV](#install-on-a-tv-non-persistent) rather than copying files by hand.
 
+### Pairing without typing a key
+
+Status: implemented and tested on a PC (aioesphomeapi harnesses, and one run against a real Home Assistant 2026.10.4 in a local venv, below). **Not run on a TV and not against the owner's HA.** Design and threat model: [install and configuration UX](design/install-and-config-ux.md#5-pairing-mode-design-option-c-detail); protocol details: [ESPHome API crate](development/esphome-api.md#pairing-ha-driven-key-provisioning).
+
+Instead of creating a key, set `[pairing] enabled = true` and leave `device.noise_psk` and `device.noise_psk_file` unset. Home Assistant 2026.9 or newer then generates the key and sets it on the device (HA calls this a dynamic encryption key):
+
+1. Start the daemon. With no stored key it logs `NOT PAIRED` and `PAIRING WINDOW OPEN for 600 s`, and the microphone stays closed (`capture: microphone off (not paired)`).
+2. In HA add the ESPHome integration with the TV's address and port 6053 (or accept the discovered device if mDNS works). HA reads the device info without a key, sees that the device is provisionable, sends a random key over a short Noise session with the all-zero key, stores the key and reconnects with it. No key is shown or typed.
+3. The daemon logs `PAIRED by "Home Assistant 2026.10.4" from <address>` and opens the microphone. Check that this is your HA.
+
+Rules and controls:
+
+- **Precedence.** An explicit `device.noise_psk` or `noise_psk_file` disables pairing and works as before (`--check-config` warns that `pairing.enabled` is ignored). `pairing.enabled` together with `device.allow_plaintext` is rejected.
+- **State directory.** `pairing.state_dir` (default `pairing`, relative to the config file, created with mode 0700) holds the stored key `noise_psk` (mode 0600, written atomically: temporary file, `fsync`, `rename`). It is the same format as `noise_psk_file`. Keep it on persistent storage if the pairing must survive a reboot.
+- **Window.** It opens at start when no key is stored (`pairing.open_on_start`, default true), with `--pair`, or when the file `<state_dir>/pair` appears. It closes after `pairing.window_s` (default 600 s, 1 to 86400) or as soon as a key is set. Closed means: a new keyless connection gets the hello and then a disconnect with the reason HA shows as "closed its setup window". The closed state is not stored; a restart reopens the window if `open_on_start` is true.
+- **While unpaired** a keyless connection gets the device identity, an empty entity list and the key exchange only. No voice pipeline, no audio, no entities, and the microphone PCM stays closed.
+- **Reset.** `--reset-pairing` (at startup) or the file `<state_dir>/reset-pairing` (while running) deletes the stored key, closes every connection, closes the microphone and reopens the window. The daemon deletes trigger files when it acts on them (checked every second). HA cannot clear the key remotely. An HA that knew the old key starts a re-authentication: in HA, confirm "encryption removed" for the device and HA sets the key it stored before (seen with a local HA 2026.10.4; it does not need the device to be removed).
+- **Older HA** (before 2026.9) cannot pair this way; set `device.noise_psk_file` and type the key in HA instead.
+- **Security.** The key exchange stops passive sniffing but authenticates nobody: whoever on the LAN connects first while the window is open can set the key and later receive microphone audio. Open the window only when you are about to add the device, keep it short, and check the `PAIRED by` line. See [SECURITY.md](../SECURITY.md#pairing).
+
 ### Configuration reference
 
 [config/example.toml](../config/example.toml) is the reference: every key with its default and a comment, and a unit test fails if the file and the code's defaults drift apart. Rules:
 
 - Every key is optional. Unknown sections and keys are **rejected** with the key name and line (`deny_unknown_fields`), so a typo cannot silently fall back to a default.
 - Relative paths in the file resolve against the file's directory; on the command line against the current directory. Command-line options override the file whatever their position.
-- `validate()` (also run by `--check-config`) rejects, naming the key: an unknown `log.level`, `mic.rate` other than 16000, zero `mic.channels`, `period_frames` or `port`, `buffer_frames` smaller than `period_frames`, `mic.source = "file"` without `mic.path`, `dsp.channel = "right"` on a mono mic, out-of-range `dsp.gain_db` (-20 to 60) or `sink.gain` (0 to 4), zero `sink.rate` or `sink.channels`, `sink.latency_msec` above 10000 (0 means PulseAudio's default buffering), both `noise_psk` and `noise_psk_file`, no key without `allow_plaintext`, and a node name or key the ESPHome layer rejects.
+- `validate()` (also run by `--check-config`) rejects, naming the key: an unknown `log.level`, `mic.rate` other than 16000, zero `mic.channels`, `period_frames` or `port`, `buffer_frames` smaller than `period_frames`, `mic.source = "file"` without `mic.path`, `dsp.channel = "right"` on a mono mic, out-of-range `dsp.gain_db` (-20 to 60) or `sink.gain` (0 to 4), zero `sink.rate` or `sink.channels`, `sink.latency_msec` above 10000 (0 means PulseAudio's default buffering), both `noise_psk` and `noise_psk_file`, no key without `pairing.enabled` or `allow_plaintext`, `pairing.enabled` together with `allow_plaintext`, `pairing.window_s` outside 1 to 86400, an empty `pairing.state_dir`, `--pair` or `--reset-pairing` without active pairing, and a node name or key the ESPHome layer rejects.
 - `[device]` `announce` (default true), `timers` (false) and `start_conversation` (false) choose the advertised voice feature flags: 16, 8 and 32 on top of the fixed 7 (voice assistant, speaker, API audio), so the default is 23, `timers = true` gives 31 and `start_conversation = true` gives 55 (63 with both). `start_conversation = true` with `announce = false` is rejected. The satellite behaves the same whichever bits are advertised; they decide what HA offers. With `timers = true` HA forwards its voice timers: the daemon keeps a `TimerTable` and logs each change as `timer <started|updated|cancelled|finished> id=… seconds_left=…` at info (never the timer name). There is no chime yet; see [Timers](development/esphome-api.md#timers). The startup summary and `--check-config` print `voice_features=N`.
 - It also rejects `limits.nice` outside -20 to 19, `limits.max_open_files` below 32 (0 = inherit), `limits.max_rss_mb` below 8 (0 = off), `limits.loop_stall_s` below 5 (0 = off), and an empty or identical `safety.kill_switch` and `safety.mute_file`.
-- Non-fatal **warnings** (printed by `--check-config`, logged at `warn` at startup, never containing a secret): `noise_psk_file` readable by group or other (with the actual mode and `chmod 600`), `noise_psk` set inline, plaintext allowed, `mic.path` missing, an empty `safety.validated_firmware` (guard off).
+- Non-fatal **warnings** (printed by `--check-config`, logged at `warn` at startup, never containing a secret): `noise_psk_file` or the stored pairing key readable by group or other (with the actual mode and `chmod 600`), `noise_psk` set inline, `pairing.enabled` ignored because a key is set, plaintext allowed, `mic.path` missing, an empty `safety.validated_firmware` (guard off).
 
 ### Logging policy
 
@@ -139,7 +159,7 @@ Logs go to **stderr**. The ops scripts redirect it to `<prefix>/log/webos-satell
 Never logged at any level:
 
 - audio (the capture path logs counts only; `AppEvent` and `AppCommand` have a hand-written `Debug` that prints sizes, so `{ev:?}` cannot dump PCM);
-- the Noise key (`Config` and `DeviceSection` redact it in `Debug`; the summary prints only `encryption=noise`);
+- the Noise key, configured or provisioned by HA (`Config` and `DeviceSection` redact it in `Debug`, the pairing state machine never prints it, `SetKey` refusals name the reason only; the summary prints only `encryption=noise` or `encryption=pairing(paired)`);
 - Home Assistant tokens and TTS or announcement URLs, which may carry `authSig` or token parameters: only `scheme://host/first-segment/…` is logged (`redact_url`), and the HTTP client's malformed-URL message is replaced because it can echo the URL;
 - the conversation id (`<set>` only).
 
@@ -186,7 +206,18 @@ Home Assistant's ESPHome integration opens the connection: HA must be able to re
 
 ### Testing without HA reaching the device
 
-`tools/esphome-fake-ha/run.sh` runs the protocol harness and an end-to-end check of the real binary (file mic, WAV sink, wake and push-to-talk runs, SIGTERM, log policy). Everything stays on 127.0.0.1.
+`tools/esphome-fake-ha/run.sh` runs the protocol harness and an end-to-end check of the real binary (file mic, WAV sink, wake and push-to-talk runs, SIGTERM, log policy, and pairing: HA's provisioning flow, restart, reset file, window timeout and pair file). Everything stays on 127.0.0.1.
+
+**Pairing against a real HA on the PC (2026-11-02).** HA 2026.10.4 from PyPI in a scratch venv (Python 3.14.7), onboarded through its REST API, with only `config`, `onboarding` and `http` in its configuration; the satellite (debug build of commit 849a1dd) with a file mic and `[pairing] enabled = true` on 127.0.0.1. Observed (label: `observed-on-other-device`, a PC, not a TV):
+
+- The ESPHome config flow by host and port created the entry without asking for a key.
+- HA's manager logged `Generating new encryption key`, set it over the zero-PSK session, and logged `Generated and stored encryption key`. The daemon stored the same key (mode 0600) that HA put in the config entry and in its `esphome.encryption_keys` storage.
+- HA's next reconnect without a key got "requires encryption", HA's re-authentication found the stored key by itself, and about 5 s after the key was set HA was connected with Noise: entry loaded, assist satellite, media player, mute switch and the pipeline and wake word selects present, voice subscription active. No flow waited for the user.
+- After a daemon restart HA reconnected with the key.
+- After `reset-pairing` HA's old key failed and HA opened a re-authentication flow at `reauth_encryption_removed_confirm`. Confirming it made HA set the key from its storage (the same key) and reconnect.
+- The key appeared in neither log (satellite at debug, HA's ESPHome logger at debug).
+
+To repeat: `pip install homeassistant==2026.10.4` in a venv, start `hass -c <dir>` with that minimal configuration, create the first user with `POST /api/onboarding/users` and `/auth/token`, then `POST /api/config/config_entries/flow` with `{"handler": "esphome"}` and the host and port. Never point such a test at a production HA.
 
 When HA cannot open a connection to the satellite (the situation on the owner's network as of 2026-11-02), `tools/esphome-fake-ha/ha_bridge.py` plays HA's ESPHome integration from the PC. It connects to the satellite and runs HA's real pipeline over the WebSocket API with an access token read from a file. `--synthetic-reply-every SECS` (with `--reply-on-intent-failure TEXT`) is a soak aid that answers every device run with a real TTS-only reply instead of running a wake word or STT. See its docstring and [P1 HA integration](discovery/c3-a/P1-ha-integration.md#bridge-stands-in-for-has-esphome-integration) for what it does and does not cover.
 
