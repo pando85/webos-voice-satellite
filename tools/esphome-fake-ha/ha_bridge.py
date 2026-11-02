@@ -40,7 +40,7 @@ import sys
 import time
 
 import aiohttp
-from aioesphomeapi import APIClient, VoiceAssistantEventType as Ev
+from aioesphomeapi import APIClient, MediaPlayerEntityState, MediaPlayerState, VoiceAssistantEventType as Ev
 from aioesphomeapi.model import VoiceAssistantCommandFlag
 
 USE_WAKE_WORD = int(VoiceAssistantCommandFlag.USE_WAKE_WORD)
@@ -143,6 +143,8 @@ class Bridge:
         self.pipeline_id: str | None = None
         self.finished = asyncio.Event()
         self.tts_task: asyncio.Task | None = None
+        self.media_state = None
+        self.media_changed = asyncio.Event()
 
     # ---- device side ----
 
@@ -163,6 +165,8 @@ class Bridge:
             # HA's default wake word timeout for WS runs is 3 s; the device
             # streams continuously, like an ESPHome satellite.
             payload["input"]["timeout"] = 3600
+            # The whole run is capped too (HA default 300 s).
+            payload["timeout"] = 3600
         if self.pipeline_id:
             payload["pipeline"] = self.pipeline_id
         log(f"device start request: {'wake word' if wake else 'push-to-talk (stt)'}"
@@ -294,15 +298,17 @@ class Bridge:
         elif etype in PLAIN:
             send(PLAIN[etype], {})
         elif etype == "run-end":
-            await self.end_audio(run)
+            # HA has unregistered the binary handler; send nothing more.
+            run.audio_open = False
             if run.substitute is not None:
                 await run.substitute
             send(Ev.VOICE_ASSISTANT_RUN_END, {})
             if self.tts_task is not None:
                 await self.tts_task
                 self.tts_task = None
-                # Let the device drain and report playback before a possible exit.
-                await asyncio.sleep(1.0)
+                # Wait until the device reports its media player idle again
+                # (it plays out its buffer first), at most 15 s.
+                await self.wait_media_idle(15.0)
             self.finish(run)
             return True
         return False
@@ -362,6 +368,27 @@ class Bridge:
         run.mark("tts-stream-end")
         log(f"TTS streamed: {run.info['tts_audio_ms']} ms of audio ({len(pcm)} bytes)")
 
+    def on_state(self, state) -> None:
+        if isinstance(state, MediaPlayerEntityState):
+            self.media_state = state.state
+            self.media_changed.set()
+
+    async def wait_media_idle(self, timeout: float) -> None:
+        t = time.monotonic()
+        deadline = t + timeout
+        # The ANNOUNCING state may still be on its way; give it a moment.
+        await asyncio.sleep(0.2)
+        while self.media_state != MediaPlayerState.IDLE and time.monotonic() < deadline:
+            self.media_changed.clear()
+            try:
+                await asyncio.wait_for(self.media_changed.wait(), deadline - time.monotonic())
+            except TimeoutError:
+                break
+        if self.run is not None:
+            self.run.mark("device-media-idle")
+        log(f"device media player {self.media_state.name if self.media_state is not None else '?'} "
+            f"{round((time.monotonic() - t) * 1000)} ms after the TTS stream ended")
+
     def finish(self, run: Run) -> None:
         run.info["marks_ms"] = run.marks
         run.info["mic_audio_bytes"] = run.audio_bytes
@@ -401,7 +428,7 @@ class Bridge:
             flags = info.voice_assistant_feature_flags_compat(self.cli.api_version)
             log(f"device: name={info.name} api={self.cli.api_version} voice_flags={flags} "
                 f"esphome_version={info.esphome_version}")
-            self.cli.subscribe_states(lambda s: None)
+            self.cli.subscribe_states(self.on_state)
             self.cli.subscribe_voice_assistant(
                 handle_start=self.handle_start, handle_stop=self.handle_stop,
                 handle_audio=self.handle_audio)

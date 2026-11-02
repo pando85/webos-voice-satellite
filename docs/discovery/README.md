@@ -15,6 +15,7 @@ Device discovery results, one directory per TV. Each log states the date, firmwa
 | [P1-capture-validation.md](c3-a/P1-capture-validation.md) | Roadmap 1.2: pure-Rust ALSA capture of `hw:LGSIC,0` and the DSP front-end validated on target (levels vs arecord, MicBusy, xrun recovery, startup discard) |
 | [P1-playback-silent-validation.md](c3-a/P1-playback-silent-validation.md) | Roadmap 1.6: TTS fetch (rustls, no system CA store), decode, resample and `pacat` streaming validated silently on target; `pacat --volume` is ignored, so gain is applied in-process |
 | [P1-ha-integration.md](c3-a/P1-ha-integration.md) | Roadmap 1.4: satellite on the PC with TV-mic audio against the owner's HA. HA cannot reach the LAN (no entity yet); wake word id `alexa_v0.1` never fires, `alexa` does (pipeline fixed); wake, STT and streamed TTS verified through a bridge; the conversation agents are broken on HA's side |
+| [P1-tv-live.md](c3-a/P1-tv-live.md) | Roadmap 1.5: `webos-satellite` on c3-a from `/tmp`, silent: the live mic to HA's pipeline (push-to-talk), the full wake → STT → reply chain from TV-mic audio with the reply in PulseAudio at gain 0, an 11-minute stability run, CPU/RSS/bandwidth |
 | [rooted-tv-improvements.md](c3-a/rooted-tv-improvements.md) | Hardening and hygiene backlog for the rooted TV (documented only, not applied) |
 
 Not yet done: D4 (behaviour while the TV plays sound, echo, SpeakerFeedback as reference) and D5 (power states). They are scheduled in [roadmap](../project/roadmap.md) Phases 2 and 3.

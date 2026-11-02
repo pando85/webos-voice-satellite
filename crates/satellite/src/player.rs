@@ -126,7 +126,6 @@ impl Player {
     }
 
     /// Whether something is playing (or streaming in).
-    #[cfg(test)]
     pub(crate) fn is_active(&self) -> bool {
         self.current.is_some()
     }

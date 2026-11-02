@@ -304,7 +304,12 @@ impl Voice {
 
     pub(crate) fn on_disconnect(&mut self) {
         self.stop_streaming(false);
-        if self.run.playback_pending
+        // SPEAKER mode: a reply whose stream already ended is complete on the
+        // device and finishes playing; HA needs no report for it. A reply
+        // still streaming (or a URL/announcement that may need HA) stops.
+        let received_reply =
+            self.speaker && self.run.playback_pending && self.run.tts_stream == TtsStream::None;
+        if (self.run.playback_pending && !received_reply)
             || self.run.tts_stream != TtsStream::None
             || matches!(self.phase, Phase::Announcing { .. })
         {
@@ -990,6 +995,24 @@ mod tests {
         // Audio outside a stream is dropped.
         v.on_tts_audio(vec![9]);
         assert!(v.take().is_empty());
+    }
+
+    #[test]
+    fn speaker_mode_disconnect_keeps_a_received_reply_but_stops_a_partial_one() {
+        let t0 = Instant::now();
+        // Stream complete, then HA disconnects: no StopPlayback.
+        let mut v = speaker_streaming(t0);
+        ev(&mut v, t0, Ev::VoiceAssistantTtsStreamStart, &[]);
+        ev(&mut v, t0, Ev::VoiceAssistantTtsStreamEnd, &[]);
+        v.take();
+        v.on_disconnect();
+        assert!(!v.take().contains(&Out::App(AppEvent::StopPlayback)));
+        // Stream still arriving: StopPlayback.
+        let mut v = speaker_streaming(t0);
+        ev(&mut v, t0, Ev::VoiceAssistantTtsStreamStart, &[]);
+        v.take();
+        v.on_disconnect();
+        assert!(v.take().contains(&Out::App(AppEvent::StopPlayback)));
     }
 
     #[test]

@@ -2,7 +2,7 @@
 
 Roadmap step 1.3. The crate [`crates/esphome-api`](../../crates/esphome-api) implements the device side of the ESPHome native API. Home Assistant's ESPHome integration connects to it and creates an Assist satellite ([ADR 0001](../decisions/0001-esphome-native-api.md)). Wake word, STT, conversation and TTS run in HA ([ADR 0003](../decisions/0003-server-side-wake-word-for-mvp.md)). The state machine and the public API are documented in the crate docs (`src/lib.rs`, `cargo doc -p webos-esphome-api`).
 
-**Status:** tested only against aioesphomeapi 46.6.0 acting as HA, on the host and under qemu-arm. It has **not** been tested against a real HA instance or on the TV. That is roadmap step 1.4.
+**Status (2026-11-02):** tested against aioesphomeapi 46.6.0 acting as HA (on the host, under qemu-arm, and on c3-a inside `webos-satellite`). It also carried full pipeline runs with the owner's real HA pipeline through the HA bridge. HA's own ESPHome integration has **not** connected to it yet, because HA cannot reach the TV's network ([P1 HA integration](../discovery/c3-a/P1-ha-integration.md), [P1 TV live](../discovery/c3-a/P1-tv-live.md)).
 
 ## Pinned protocol sources
 
@@ -99,6 +99,16 @@ CARGO_TARGET_DIR=target/w-esphome cargo zigbuild --release --target armv7-unknow
 ```
 
 ## Open points for step 1.4 (live HA)
+
+Results so far, from the bridge runs in [P1 HA integration](../discovery/c3-a/P1-ha-integration.md):
+
+- The pipeline asked for `alexa_v0.1`, which never fired. Kiwi was changed to `alexa`.
+- The Piper reply reaches the device in SPEAKER mode.
+- The real order of events is `RUN_END` before `TTS_STREAM_START`.
+- aioesphomeapi sends the API-audio subscribe flag as `1 << 2`, not as api.proto's `1`; both are accepted.
+- On disconnect, a reply that has fully arrived keeps playing.
+
+The original list follows.
 
 - **Adding the device:** Settings → Devices & services → Add integration → ESPHome, then enter the TV's IP and port 6053. HA tries plaintext first. When the device requires Noise, HA asks for the encryption key, which is the same base64 key as `noise_psk`. With mDNS working, HA may offer the device as discovered instead.
 - **Things that need a real HA instance:**

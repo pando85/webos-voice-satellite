@@ -248,8 +248,11 @@ impl Daemon {
                 self.connected = false;
                 self.set_streaming(false);
                 log::warn!("HA disconnected");
-                self.player.stop();
-                Self::log_line(self.runs.flush());
+                // Playback was already stopped through StopPlayback if it
+                // needed HA; a fully received reply keeps playing.
+                if !self.player.is_active() {
+                    Self::log_line(self.runs.flush());
+                }
             }
             AppEvent::StartStreaming { wake_word, .. } => {
                 self.set_streaming(true);

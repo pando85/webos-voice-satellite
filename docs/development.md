@@ -1,6 +1,6 @@
 # Development
 
-How to build, test and run the Rust workspace. Status: Phase 1.1 (workspace, cross-build, CI, TV smoke test). The binary does nothing useful yet; see the [roadmap](project/roadmap.md) for what comes next and [P1 runtime smoke](discovery/c3-a/P1-runtime-smoke.md) for what was verified on the TV.
+How to build, test and run the Rust workspace. Status: Phase 1.4/1.5. `webos-satellite` is the working daemon (capture → front-end → ESPHome API → reply playback). For what was verified, see [P1 HA integration](discovery/c3-a/P1-ha-integration.md) and [P1 TV live](discovery/c3-a/P1-tv-live.md); for what comes next, see the [roadmap](project/roadmap.md).
 
 ## Layout
 
@@ -10,8 +10,13 @@ How to build, test and run the Rust workspace. Status: Phase 1.1 (workspace, cro
 | `rust-toolchain.toml` | Pinned toolchain (`1.99.1`), `rustfmt`, `clippy`, the two TV cross targets |
 | `.cargo/config.toml` | Softfp codegen flags for `armv7-unknown-linux-musleabi` |
 | `Makefile` | Entry points listed below |
-| `crates/satellite` | Binary `webos-satellite` (`--version`, `--self-test`) |
-| `crates/capture`, `dsp`, `esphome-api`, `playback` | Stub libraries; each is implemented in its own directory by a later roadmap item (1.2, 1.2, 1.3, 1.6) |
+| `crates/satellite` | Binary `webos-satellite`: the daemon (config, capture thread, player, latency log), plus `--self-test` |
+| `crates/capture` | ALSA capture through raw ioctls (no alsa-lib), file source for tests |
+| `crates/dsp` | Mic front-end: channel select, high-pass, gain, S24 to S16 |
+| `crates/esphome-api` | ESPHome native API device server and voice state machine ([details](development/esphome-api.md)) |
+| `crates/playback` | TTS fetch, decode, resample, `pacat`/WAV/null sinks |
+| `config/example.toml` | Commented configuration with all defaults |
+| `tools/esphome-fake-ha/` | Fake-HA harnesses (`run.sh`) and the HA bridge (`ha_bridge.py`) |
 
 Keep the root files minimal and stable; add per-crate dependencies in the crate's own `Cargo.toml`, with versions declared once in `[workspace.dependencies]`. Workspace lints forbid `unsafe` code; a crate that genuinely needs it (for example tinyalsa ioctls in `capture`) must opt out locally and say why.
 
@@ -61,6 +66,50 @@ Variables: `TV` (default `root@webos-tv`; set your TV's address with `TV=root@<h
 - Binaries go to `/tmp` (tmpfs, lost at reboot) only, and are deleted afterwards (`make clean-tv`). Inspect and checksum before copying (`file`, `readelf -h`, `sha256sum`). Never commit binaries.
 - Each TV session needs owner authorization ([roadmap](project/roadmap.md#phase-1-silent-build-and-integration-no-sound-played)). Follow the [discovery safety rules](discovery/README.md#safety-rules-learned): no ASoC/DAPM sysfs nodes, no `/sys/kernel/debug`, no writes outside `/tmp`, no service changes.
 - The `--self-test` is read-only: it reads `/proc/self/status`, calls `uname`, `getrlimit` and the page size, and opens no audio device and no socket.
+
+## Running the satellite
+
+Configuration is a TOML file; every key is optional and [config/example.toml](../config/example.toml) lists all of them with their defaults. Command-line options override the file (`webos-satellite --help`). `--check-config` validates and prints a summary without starting.
+
+1. Create a Noise key and keep it private (it is also the "encryption key" HA asks for):
+
+   ```sh
+   umask 077; head -c 32 /dev/urandom | base64 > devices/private/<device>/noise_psk
+   ```
+
+2. Write a config next to it (in `devices/private/`, which is gitignored). Example for a PC test with a recorded TV-mic file and WAV output:
+
+   ```toml
+   mode = "wake"                       # or "ptt"
+   [device]
+   name = "webos-satellite-dev"        # unique among HA's ESPHome devices
+   mac_seed = "<random stable string>"
+   noise_psk_file = "noise_psk"
+   [mic]
+   source = "file"
+   path = "<recording>.raw"            # S24_LE, 2 ch, 16 kHz
+   [sink]
+   type = "wav"
+   dir = "<output dir>"
+   ```
+
+3. Run it: `target/release/webos-satellite --config devices/private/<device>/<file>.toml`.
+
+Behaviour:
+
+- `mode = "wake"`: as soon as HA subscribes, the satellite streams the mic continuously and HA's pipeline runs the wake word. `mode = "ptt"`: `kill -USR1 <pid>` starts one run at speech-to-text. A SIGUSR1 also works in wake mode, where it aborts the wake word run. `--ptt-on-connect` and `--ptt-every SECS` are test aids.
+- Audio is sent only while HA asks for it. If the mic is busy (LG hands-free holds the PCM), the satellite logs `MIC BUSY` and retries with a backoff of up to 30 s.
+- Replies: HA streams the TTS as 16 kHz mono PCM. The `pacat` sink writes it to PulseAudio as it arrives, multiplied by `sink.gain` (use `0.0` for silent tests; `pacat --volume` is ignored on c3-a). The `wav` sink writes one file per reply. Each playback logs its count of non-zero samples.
+- Logs go to stderr: one latency line per run. Transcripts and reply text appear only at `debug`. Keys and token URLs are never logged.
+- SIGTERM/SIGINT stop playback (killing `pacat`), release the PCM and disconnect HA.
+
+On the TV (rules in "Running on a TV" above): copy the static armv7 binary, the config and the key to `/tmp`, set `[mic] source = "alsa"` (defaults are the c3-a values), and start it in the background with its log in `/tmp`. Delete everything afterwards. Nothing is installed or persisted.
+
+### Testing without HA reaching the device
+
+`tools/esphome-fake-ha/run.sh` runs the protocol harness and an end-to-end check of the real binary (file mic, WAV sink, wake and push-to-talk runs, SIGTERM, log policy). Everything stays on 127.0.0.1.
+
+When HA cannot open a connection to the satellite (the situation on the owner's network as of 2026-11-02), `tools/esphome-fake-ha/ha_bridge.py` plays HA's ESPHome integration from the PC. It connects to the satellite and runs HA's real pipeline over the WebSocket API with an access token read from a file. See its docstring and [P1 HA integration](discovery/c3-a/P1-ha-integration.md#bridge-stands-in-for-has-esphome-integration) for what it does and does not cover.
 
 ## CI
 

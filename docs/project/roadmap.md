@@ -23,7 +23,7 @@ Research tasks and implementation work are tracked in GitHub Issues. This roadma
 - **Remaining, folded into later phases:**
   - **D4**, behaviour while the TV plays sound (echo in the mic, whether `hw:LGSIC,1` SpeakerFeedback is a usable AEC reference): Phase 2.
   - **D5**, power states (screen off, standby, Always Ready; capture and network behaviour): Phase 3.
-  - Wake word model name that the HA pipeline requests (still unchecked, see [D3](../discovery/c3-a/D3-mic-identification.md#offline-ha-pipeline-check-wyoming-2026-11-01)): Phase 1.4.
+  - Wake word model name that the HA pipeline requests: checked in Phase 1.4 ([P1 HA integration](../discovery/c3-a/P1-ha-integration.md)). `alexa_v0.1` never fired; Kiwi now uses `alexa`.
 - **Exit criteria:** met for D0 to D3. Residual unknowns are listed in the discovery logs and carried as Phase 2/3 work.
 - **Needs-owner:** none open for Phase 0 itself.
 
@@ -43,13 +43,26 @@ Research tasks and implementation work are tracked in GitHub Issues. This roadma
 | 1.6 | Playback module | TTS download, decode and resample to the sink format, write to PulseAudio (candidate route: system PulseAudio default sink, `card0 pcm6p`, S16_LE 2 ch 44.1 kHz, [hypothesis](../discovery/c3-a/D3-mic-identification.md#conclusions-from-step-5a)) | Verified with the TV muted or the sink volume at zero and with PulseAudio stream statistics (`pactl` stream and sink-input counters): the stream is consumed, underruns are counted, nothing audible |
 | 1.7 | Ops basics | Config file format and loader, logs that never contain audio or secrets, start, stop and uninstall scripts that leave no residue | Uninstall returns the TV to the pre-install state (checked against a before/after file listing); logs reviewed for leaks |
 
+- **Status (2026-11-02):**
+
+| ID | Status | Evidence / what remains |
+| --- | --- | --- |
+| 1.1 | done | [P1 runtime smoke](../discovery/c3-a/P1-runtime-smoke.md) |
+| 1.2 | done | [P1 capture validation](../discovery/c3-a/P1-capture-validation.md) |
+| 1.3 | done | [ESPHome API crate](../development/esphome-api.md) |
+| 1.4 | partially done | The satellite binary works with TV-mic audio against the owner's real HA pipeline: wake word, STT and a streamed TTS reply. The wake word id is recorded and Kiwi was fixed (`alexa_v0.1` → `alexa`). These runs went through a bridge, because **HA cannot open connections into the LAN** where the TV and the PC are. **Remaining (needs owner):** a router rule (or network move) so HA reaches TCP 6053 on the TV, then the config flow and the `assist_satellite` entity; and a working conversation agent for Kiwi (the Ollama model is missing). See [P1 HA integration](../discovery/c3-a/P1-ha-integration.md) |
+| 1.5 | partially done | The same binary ran on c3-a from `/tmp`, silent: the live mic streamed to HA's pipeline via push-to-talk; the full wake → STT → reply chain ran on the TV from TV-mic audio, with the reply in PulseAudio at gain 0; a 10+ minute stability run; CPU, memory and bandwidth sampled. **Remaining:** HA's own connection to the TV (same network block as 1.4), and "a spoken phrase from a live human" (Phase 2, since no sound may be played and nobody spoke). See [P1 TV live](../discovery/c3-a/P1-tv-live.md) |
+| 1.6 | done | [P1 playback silent validation](../discovery/c3-a/P1-playback-silent-validation.md); streamed TTS to `pacat` at gain 0 verified in [P1 TV live](../discovery/c3-a/P1-tv-live.md) |
+| 1.7 | partially done | Config file format and loader, and logs without audio or secrets, exist in `webos-satellite`. Start, stop and uninstall scripts are not written yet |
+
 - **Phase exit criteria:** an HA satellite entity exists for c3-a; wake word, STT and intent work end to end from **TV-mic** audio (not only PC audio); reply audio reaches PulseAudio silently; no persistent change on the TV.
 - **Needs-owner:**
   - Authorize running a copied binary from `/tmp` on c3-a (1.1, 1.5), and each TV session.
-  - Add the ESPHome device in the HA UI and supply the encryption key via a private channel (1.4).
+  - Add the ESPHome device in the HA UI and supply the encryption key via a private channel (1.4). **First, allow HA to reach the TV on TCP 6053**: HA's cluster network currently gets a TCP reset for every host on the LAN ([P1 HA integration](../discovery/c3-a/P1-ha-integration.md)).
+  - Restore a working conversation agent for the Kiwi pipeline (Ollama model `qwen2.5:3b` missing; Kiwi Test's `conversation.chatgpt` does not exist).
   - Keep LG hands-free off; confirm TV state before each live test.
   - Approve the TV-muted playback test (1.6) and how mute is achieved.
-  - Provide or approve access for checking the pipeline's wake word model name (not done yet; reading HA storage needs owner approval).
+  - ~~Check the pipeline's wake word model name~~: done in 1.4. Kiwi used `alexa_v0.1`, which never fires; it is now `alexa`. Kiwi Test still has `alexa_v0.1`.
 
 ## Phase 2: Sound tests
 
