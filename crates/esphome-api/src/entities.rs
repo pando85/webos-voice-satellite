@@ -73,7 +73,10 @@ pub(crate) fn media_player_state(state: MediaState) -> MediaPlayerStateResponse 
         key: media_player_key(),
         state: match state {
             MediaState::Idle => MediaPlayerState::Idle,
-            MediaState::Announcing => MediaPlayerState::Announcing,
+            // HA 2026.10.4 maps only IDLE/PLAYING/PAUSED/OFF/ON
+            // (`esphome/media_player.py` `_STATES`); ANNOUNCING raised a
+            // KeyError in HA on every TTS reply (seen on c3-a).
+            MediaState::Announcing => MediaPlayerState::Playing,
         } as i32,
         volume: 1.0,
         muted: false,

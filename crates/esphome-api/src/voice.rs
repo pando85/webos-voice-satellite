@@ -27,6 +27,9 @@ pub(crate) const TTS_STREAM_START_TIMEOUT: Duration = Duration::from_secs(2);
 /// Format of TTS audio streamed by HA in SPEAKER mode (HA 2026.10.4 forces
 /// WAV 16 kHz mono 16-bit and sends the PCM frames without the WAV header).
 pub(crate) const TTS_STREAM_RATE: u32 = 16_000;
+/// After aborting a run, wait this long at most for HA's `RUN_END` of the
+/// aborted run before sending the next start request.
+pub(crate) const ABORT_DRAIN_TIMEOUT: Duration = Duration::from_millis(1500);
 
 /// Media player state reported to HA.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,6 +77,12 @@ enum Phase {
     Running,
     /// Announcement handed to the app; waiting for `AnnounceFinished`.
     Announcing { start_conversation: bool },
+    /// A run was aborted and HA has not sent its `RUN_END` yet. The next
+    /// start waits for it: HA 2026.10.4 ends the aborted run asynchronously,
+    /// and its trailing events (`ERROR`, `RUN_END`) would otherwise be taken
+    /// for the new run's, ending it at once (seen on c3-a with the real
+    /// integration: an endless abort/restart cascade).
+    Draining { since: Instant, wake_word: bool },
 }
 
 /// SPEAKER-mode TTS stream of the current run.
@@ -116,6 +125,8 @@ pub(crate) struct Voice {
     speaker: bool,
     failures: u32,
     conversation: Option<(String, Instant)>,
+    /// An abort was sent and the aborted run's `RUN_END` has not arrived.
+    stale_run: bool,
     out: Vec<Out>,
 }
 
@@ -145,6 +156,7 @@ impl Voice {
             speaker,
             failures: 0,
             conversation: None,
+            stale_run: false,
             out: Vec::new(),
         }
     }
@@ -179,6 +191,7 @@ impl Voice {
         match self.phase {
             Phase::Waiting { until } => Some(until),
             Phase::Starting { since } => Some(since + START_TIMEOUT),
+            Phase::Draining { since, .. } => Some(since + ABORT_DRAIN_TIMEOUT),
             Phase::Running => match self.run.tts_stream {
                 TtsStream::Expected { since } => Some(since + TTS_STREAM_START_TIMEOUT),
                 _ => None,
@@ -205,6 +218,13 @@ impl Voice {
     fn start(&mut self, now: Instant, wake_word: bool) {
         if !self.subscribed || self.muted {
             self.phase = Phase::Idle;
+            return;
+        }
+        if self.stale_run {
+            self.phase = Phase::Draining {
+                since: now,
+                wake_word,
+            };
             return;
         }
         let conversation_id = self.conversation_id(now).unwrap_or_default();
@@ -241,10 +261,14 @@ impl Voice {
     /// Aborts a run that is starting or in progress (HA is told to abort).
     fn abort_run(&mut self) {
         match self.phase {
-            Phase::Starting { .. } => self.ha(ToHa::Abort),
+            Phase::Starting { .. } => {
+                self.ha(ToHa::Abort);
+                self.stale_run = true;
+            }
             Phase::Running => {
                 if !self.run.ended {
                     self.ha(ToHa::Abort);
+                    self.stale_run = true;
                 }
                 self.stop_streaming(false);
                 if self.run.playback_pending || self.run.tts_stream != TtsStream::None {
@@ -317,6 +341,7 @@ impl Voice {
         }
         self.run = Run::default();
         self.subscribed = false;
+        self.stale_run = false;
         self.phase = Phase::Idle;
         self.out.retain(|o| matches!(o, Out::App(_)));
     }
@@ -354,6 +379,18 @@ impl Voice {
             log::debug!("voice: unknown event type {event_type}");
             return;
         };
+        if self.stale_run {
+            // No start was sent since the abort, so this is the old run.
+            if ev == Ev::VoiceAssistantRunEnd {
+                self.stale_run = false;
+                if let Phase::Draining { wake_word, .. } = self.phase {
+                    self.start(now, wake_word);
+                }
+            } else {
+                log::debug!("voice: ignoring {} of the aborted run", ev.as_str_name());
+            }
+            return;
+        }
         match self.phase {
             Phase::Running => {}
             // Events can overtake the response; treat them as an implicit start.
@@ -573,7 +610,10 @@ impl Voice {
                     // Let the response finish playing; the run ends without re-arming.
                     self.stop_streaming(false);
                 }
-                Phase::Starting { .. } | Phase::Waiting { .. } | Phase::Running => {
+                Phase::Starting { .. }
+                | Phase::Waiting { .. }
+                | Phase::Running
+                | Phase::Draining { .. } => {
                     self.abort_run();
                     self.phase = Phase::Idle;
                 }
@@ -587,6 +627,11 @@ impl Voice {
     pub(crate) fn on_tick(&mut self, now: Instant) {
         match self.phase {
             Phase::Waiting { until } if now >= until => self.rearm(now),
+            Phase::Draining { since, wake_word } if now >= since + ABORT_DRAIN_TIMEOUT => {
+                log::debug!("voice: no RUN_END for the aborted run; starting anyway");
+                self.stale_run = false;
+                self.start(now, wake_word);
+            }
             Phase::Starting { since } if now >= since + START_TIMEOUT => {
                 log::warn!("voice: no VoiceAssistantResponse within {START_TIMEOUT:?}");
                 self.ha(ToHa::Abort);
@@ -880,6 +925,9 @@ mod tests {
         );
         v.on_start_pipeline(t0, PipelineMode::PushToTalk);
         assert!(v.take().is_empty());
+        // HA ends the aborted run while the mic is muted.
+        ev(&mut v, t0, Ev::VoiceAssistantRunEnd, &[]);
+        assert!(v.take().is_empty());
         v.on_mute(t0, false);
         let out = v.take();
         assert!(matches!(
@@ -996,6 +1044,68 @@ mod tests {
         // Audio outside a stream is dropped.
         v.on_tts_audio(vec![9]);
         assert!(v.take().is_empty());
+    }
+
+    #[test]
+    fn push_to_talk_waits_for_the_aborted_runs_end() {
+        let t0 = Instant::now();
+        let mut v = armed_and_streaming(t0);
+        ev(&mut v, t0, Ev::VoiceAssistantRunStart, &[]);
+        ev(&mut v, t0, Ev::VoiceAssistantWakeWordStart, &[]);
+        v.take();
+        v.on_start_pipeline(t0, PipelineMode::PushToTalk);
+        // Abort now, start only after HA ended the aborted run.
+        assert_eq!(
+            v.take(),
+            [Out::Ha(ToHa::Abort), Out::App(AppEvent::StopStreaming)]
+        );
+        assert_eq!(v.next_deadline(), Some(t0 + ABORT_DRAIN_TIMEOUT));
+        // Trailing events of the aborted run, as HA 2026.10.4 sends them.
+        ev(
+            &mut v,
+            t0,
+            Ev::VoiceAssistantError,
+            &[("code", "no_wake_word")],
+        );
+        assert!(v.take().is_empty(), "old run's error must be ignored");
+        ev(&mut v, t0, Ev::VoiceAssistantRunEnd, &[]);
+        assert_eq!(
+            v.take(),
+            [Out::Ha(ToHa::Start {
+                wake_word: false,
+                conversation_id: String::new()
+            })]
+        );
+        // The new run proceeds normally.
+        v.on_response(t0, 0, false);
+        ev(&mut v, t0, Ev::VoiceAssistantRunStart, &[]);
+        ev(&mut v, t0, Ev::VoiceAssistantSttStart, &[]);
+        assert_eq!(
+            v.take(),
+            [Out::App(AppEvent::StartStreaming {
+                wake_word: false,
+                conversation_id: None
+            })]
+        );
+        assert!(v.is_streaming());
+    }
+
+    #[test]
+    fn aborted_run_without_run_end_starts_after_the_drain_timeout() {
+        let t0 = Instant::now();
+        let mut v = armed_and_streaming(t0);
+        v.on_start_pipeline(t0, PipelineMode::PushToTalk);
+        v.take();
+        v.on_tick(t0 + ABORT_DRAIN_TIMEOUT - Duration::from_millis(1));
+        assert!(v.take().is_empty());
+        v.on_tick(t0 + ABORT_DRAIN_TIMEOUT);
+        assert_eq!(
+            v.take(),
+            [Out::Ha(ToHa::Start {
+                wake_word: false,
+                conversation_id: String::new()
+            })]
+        );
     }
 
     #[test]

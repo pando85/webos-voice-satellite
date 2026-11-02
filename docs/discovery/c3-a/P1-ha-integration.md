@@ -8,7 +8,28 @@
 
 Labels: **verified-on-target** = observed against the owner's HA (and, for audio, using a c3-a recording); **documented** = HA source at tag 2026.10.4; **hypothesis**; **blocked**.
 
-## Summary
+## Update: HA's real ESPHome integration against the satellite on the TV (verified)
+
+Later on 2026-11-02 HA's own ESPHome integration was connected to the satellite running on c3-a. The connection went through **a temporary TCP relay on a host the HA network may reach** (one port that demonstrably passes; the service normally on it was stopped for about 4 minutes and restored afterwards). Everything below is **verified-on-target** with HA core 2026.10.4. The satellite ran on the TV from `/tmp`: Noise, sink `pacat` with in-process gain 0, LG hands-free off.
+
+| Check | Result |
+| --- | --- |
+| Config flow (REST) | `user` → `encryption_key` (HA asks for the key, `name: lg-c3-a`) → `create_entry`; the entry is `loaded`. HA's log showed the expected "requires encryption" and the zero-key probe ("Invalid encryption key: received_name=lg-c3-a") before the key was given |
+| Device | name "LG C3 (c3-a) Voice Satellite", manufacturer `webos-voice-satellite`, model `LG webOS TV`, sw_version `2026.10.1` |
+| Entities | `assist_satellite.*` (state `idle`, supported_features 1); `media_player.*` (`idle`); `switch.*mute_microphone` (`off`); two pipeline selects ("Assistant" and "Assistant 2", options preferred/Kiwi/Kiwi Test/test pipeline); "finished speaking detection" select; two wake word selects, `unavailable` with option `no_wake_word` (expected: the device reports no on-device wake words) |
+| Live mic | right after the entry was created, HA subscribed and the satellite streamed the live mic into HA's wake word stage (silent room, no detection) |
+| Temporary pipeline | "webos-satellite-test": es, faster-whisper, Piper `es_ES-sharvard-medium`, `conversation.home_assistant`, openWakeWord `alexa`; selected on the satellite's pipeline select |
+| End to end through the real integration (file mic: TV recording "alexa" + "¿qué hora es?") | HA detected the wake word at 6.98 s of audio; STT `¿Qué va eso?`; the built-in intent answered (response type `error`: "Lo siento, no conozco ningún dispositivo llamado va eso"); **HA streamed the TTS over the API in SPEAKER mode** (WAV 16 kHz) with its own pacing. The satellite played 3587 ms through `pacat` with **0 non-zero samples** (stream `s16le 1ch 16000Hz` seen in `pactl` 32 times) and re-armed |
+| Latency (satellite's line, from the wake word) | STT end 3775 ms, intent end 3894 ms, TTS stream start 3894 ms, `pacat` drained 9275 ms; HA reconnected 3.5 s after a satellite restart |
+| `assist_satellite` states | `idle` → `listening` (wake word) → `processing` (STT end) → `responding` (TTS) → `idle` (when HA finished streaming), then the next wake run |
+| Push-to-talk (SIGUSR1) with the live mic | **failed: abort cascade (bug, fixed afterwards).** After the satellite aborted the wake run, HA's `RUN_END` for the aborted run arrived after the new start request. The satellite took it for the end of the new run and restarted; each restart aborted HA's newest run again. The pipeline debug shows runs ending 250 to 550 ms after they started, retried with a growing backoff (no hot loop). Fix in `webos-esphome-api`: after an abort, the next start waits for the aborted run's `RUN_END` (at most 1.5 s), and events of the aborted run are ignored. Unit tests reproduce the sequence. **Not yet re-verified against HA** |
+| HA error on every reply | `KeyError: <MediaPlayerState.ANNOUNCING: 4>` in `esphome/entry_data.py`: HA 2026.10.4 maps only IDLE/PLAYING/PAUSED/OFF/ON for ESPHome media players. Fix: the satellite reports PLAYING while a reply plays. **Not yet re-verified against HA** |
+| `assist_satellite.announce` (message, no pre-announce) | **no result:** the service call did not return within 60 s, and the satellite received no announce request. Probably related to the abort cascade or the media player error above (**hypothesis**). Retest after the fixes. The pod-IP media URL question therefore remains open |
+| HA log | besides the `KeyError` above: one `APIConnectionError: Not connected` traceback from a wake word run cancelled when the satellite was restarted on purpose |
+
+Cleanup: the temporary pipeline and the ESPHome entry were deleted, the relay was stopped, and the service on the relay port was restarted and listened on all its original ports again. The TV's `/tmp` was cleaned, with no process or sink-input left. HA is back to its original 42 config entries and 2 pipelines (Kiwi keeps `wake_word_id` `alexa`). The permanent TV entry still needs the owner's network rule (HA → TV TCP 6053).
+
+## Summary (first session, before the relay)
 
 | Question | Result | Label |
 | --- | --- | --- |
