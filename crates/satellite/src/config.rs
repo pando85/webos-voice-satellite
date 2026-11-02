@@ -29,6 +29,10 @@ pub(crate) struct Settings {
     pub(crate) sink: SinkSection,
     /// Logging.
     pub(crate) log: LogSection,
+    /// Kill switch, mute persistence and firmware guard.
+    pub(crate) safety: SafetySection,
+    /// Resource limits and watchdog.
+    pub(crate) limits: LimitsSection,
 }
 
 /// How pipeline runs start.
@@ -280,6 +284,68 @@ impl Default for LogSection {
     }
 }
 
+/// `[safety]`: privacy and firmware gates.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct SafetySection {
+    /// While this file exists the microphone PCM is closed, nothing is
+    /// streamed and HA sees the mute switch on; HA cannot unmute. Checked at
+    /// startup and every 250 ms.
+    pub(crate) kill_switch: PathBuf,
+    /// Remembers HA's mute switch across daemon restarts: created on mute,
+    /// removed on unmute, read at startup.
+    pub(crate) mute_file: PathBuf,
+    /// Firmware versions (`webos_manufacturing_version`) the ALSA capture has
+    /// been validated on. On any other version, or if `firmware_info` cannot
+    /// be read, the satellite starts with the microphone disabled. An empty
+    /// list turns the guard off (with a warning).
+    pub(crate) validated_firmware: Vec<String>,
+    /// Read-only JSON file with the TV's OS information (nyx).
+    pub(crate) firmware_info: PathBuf,
+}
+
+impl Default for SafetySection {
+    fn default() -> Self {
+        Self {
+            kill_switch: PathBuf::from("/tmp/webos-satellite.disable"),
+            mute_file: PathBuf::from("/tmp/webos-satellite.muted"),
+            validated_firmware: vec!["03.30.74".to_owned()],
+            firmware_info: PathBuf::from("/var/run/nyx/os_info.json"),
+        }
+    }
+}
+
+/// `[limits]`: resource limits and watchdog thresholds.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct LimitsSection {
+    /// Scheduling niceness of the daemon (and its `pacat` child), -20 to 19.
+    pub(crate) nice: i32,
+    /// Soft `RLIMIT_NOFILE` (0 keeps the inherited limit).
+    pub(crate) max_open_files: u32,
+    /// Resident memory ceiling in MiB; above it the daemon exits so a
+    /// supervisor restarts it (0 disables).
+    pub(crate) max_rss_mb: u32,
+    /// An ALSA read that sees no audio for this long closes and reopens the
+    /// device (0 disables).
+    pub(crate) capture_stall_s: u32,
+    /// The daemon exits (code 70/71) when its event loop or capture thread
+    /// shows no progress for this long (0 disables).
+    pub(crate) loop_stall_s: u32,
+}
+
+impl Default for LimitsSection {
+    fn default() -> Self {
+        Self {
+            nice: 10,
+            max_open_files: 256,
+            max_rss_mb: 64,
+            capture_stall_s: 5,
+            loop_stall_s: 30,
+        }
+    }
+}
+
 /// The permission bits of `path` if group or other have any access
 /// (unreadable or non-Unix: `None`).
 #[cfg(unix)]
@@ -327,6 +393,9 @@ impl Settings {
             resolve(base, p);
         }
         resolve(base, &mut s.sink.dir);
+        resolve(base, &mut s.safety.kill_switch);
+        resolve(base, &mut s.safety.mute_file);
+        resolve(base, &mut s.safety.firmware_info);
         Ok(s)
     }
 
@@ -374,6 +443,28 @@ impl Settings {
         }
         if self.sink.latency_msec == Some(0) {
             return Err(err("sink.latency_msec must be at least 1 (or unset)"));
+        }
+        if !(-20..=19).contains(&self.limits.nice) {
+            return Err(err("limits.nice must be between -20 and 19"));
+        }
+        if self.limits.max_open_files != 0 && self.limits.max_open_files < 32 {
+            return Err(err(
+                "limits.max_open_files must be 0 (inherit) or at least 32",
+            ));
+        }
+        if self.limits.max_rss_mb != 0 && self.limits.max_rss_mb < 8 {
+            return Err(err("limits.max_rss_mb must be 0 (off) or at least 8"));
+        }
+        if self.limits.loop_stall_s != 0 && self.limits.loop_stall_s < 5 {
+            return Err(err("limits.loop_stall_s must be 0 (off) or at least 5"));
+        }
+        if self.safety.kill_switch.as_os_str().is_empty()
+            || self.safety.mute_file.as_os_str().is_empty()
+        {
+            return Err(err("safety.kill_switch and safety.mute_file must be set"));
+        }
+        if self.safety.kill_switch == self.safety.mute_file {
+            return Err(err("safety.kill_switch and safety.mute_file must differ"));
         }
         if self.device.port == 0 {
             return Err(err("device.port must be between 1 and 65535"));
@@ -428,6 +519,9 @@ impl Settings {
                     path.display()
                 ));
             }
+        }
+        if self.safety.validated_firmware.is_empty() {
+            w.push("safety.validated_firmware is empty: the firmware guard is off".to_owned());
         }
         if self.mic.source == MicSource::File {
             if let Some(p) = self.mic.path.as_ref().filter(|p| !p.exists()) {
@@ -501,6 +595,7 @@ impl Settings {
             period_frames: m.period_frames,
             buffer_frames: m.buffer_frames,
             discard_ms: m.discard_ms,
+            read_timeout_ms: self.limits.capture_stall_s.saturating_mul(1000),
         }
     }
 
@@ -528,8 +623,14 @@ impl Settings {
             SinkKind::Wav => format!("wav dir={}", self.sink.dir.display()),
             SinkKind::Null => "null".to_owned(),
         };
+        let l = &self.limits;
+        let fw = if self.safety.validated_firmware.is_empty() {
+            "off".to_owned()
+        } else {
+            self.safety.validated_firmware.join(",")
+        };
         format!(
-            "name={} port={} mode={:?} encryption={} mic=[{mic}] dsp=[{:?} gain_db={} hpf_hz={}] sink=[{sink}]",
+            "name={} port={} mode={:?} encryption={} mic=[{mic}] dsp=[{:?} gain_db={} hpf_hz={}] sink=[{sink}] safety=[kill_switch={} mute_file={} firmware={fw}] limits=[nice={} nofile={} rss_mb={} capture_stall_s={} loop_stall_s={}]",
             self.device.name,
             self.device.port,
             self.mode,
@@ -541,17 +642,36 @@ impl Settings {
             self.dsp.channel,
             self.dsp.gain_db,
             self.dsp.hpf_hz,
+            self.safety.kill_switch.display(),
+            self.safety.mute_file.display(),
+            l.nice,
+            l.max_open_files,
+            l.max_rss_mb,
+            l.capture_stall_s,
+            l.loop_stall_s,
         )
     }
 }
 
-/// Test aids that trigger push-to-talk runs (not for production use).
+/// Which thread `--test-hang` freezes.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum Hang {
+    /// The tokio event loop.
+    Loop,
+    /// The capture thread.
+    Capture,
+}
+
+/// Test aids (not for production use).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct TestTriggers {
     /// Start one push-to-talk run shortly after HA connects.
     pub(crate) ptt_on_connect: bool,
     /// Start a push-to-talk run at this interval.
     pub(crate) ptt_every: Option<Duration>,
+    /// Freeze a thread 5 s after startup, to exercise the watchdog.
+    pub(crate) hang: Option<Hang>,
 }
 
 /// What the command line asks for.
@@ -565,6 +685,8 @@ pub(crate) enum Command {
     SelfTest,
     /// Validate the configuration and print a summary.
     CheckConfig(Box<Settings>),
+    /// Read the firmware version and compare it with the allow-list.
+    CheckFirmware(Box<Settings>),
     /// Run the daemon.
     Run(Box<Settings>, TestTriggers),
 }
@@ -578,6 +700,8 @@ Runs the Home Assistant voice satellite (ESPHome native API on TCP 6053).
 options (override the config file):
   --config FILE          TOML configuration (see config/example.toml)
   --check-config         validate the configuration, print a summary, exit
+  --check-firmware       compare the TV firmware with safety.validated_firmware, exit
+                         (0 validated, 1 not validated or unreadable, 3 guard off)
   --mode wake|ptt        wake: continuous server-side wake word; ptt: SIGUSR1 starts a run
   --name NAME            ESPHome node name
   --friendly-name NAME   name shown in Home Assistant
@@ -592,11 +716,15 @@ options (override the config file):
   --sink-gain G          software gain for pacat (0 = digital silence)
   --wav-dir DIR          output directory of the wav sink
   --log-level LEVEL      error|warn|info|debug|trace
+  --kill-switch FILE     while FILE exists the mic is closed and reported muted
 test aids:
   --ptt-on-connect       start one push-to-talk run after HA connects
   --ptt-every SECS       start a push-to-talk run every SECS seconds
+  --test-hang loop|capture  freeze that thread 5 s after start (watchdog test)
 
-signals: SIGUSR1 starts a push-to-talk run; SIGTERM/SIGINT stop.";
+signals: SIGUSR1 starts a push-to-talk run; SIGTERM/SIGINT stop.
+exit codes: 0 stopped by a signal, 1 error, 2 bad arguments or config,
+  70 event loop stalled, 71 capture thread stalled, 72 memory ceiling exceeded.";
 
 fn parse_num<T: std::str::FromStr>(flag: &str, v: &str) -> Result<T, ConfigError> {
     v.parse()
@@ -630,6 +758,7 @@ pub(crate) fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Comm
     }
 
     let mut check = false;
+    let mut check_fw = false;
     let mut triggers = TestTriggers::default();
     let mut it = args.iter();
     while let Some(flag) = it.next() {
@@ -644,6 +773,8 @@ pub(crate) fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Comm
                 value()?;
             }
             "--check-config" => check = true,
+            "--check-firmware" => check_fw = true,
+            "--kill-switch" => settings.safety.kill_switch = PathBuf::from(value()?),
             "--mode" => settings.mode = parse_enum(flag, value()?)?,
             "--name" => value()?.clone_into(&mut settings.device.name),
             "--friendly-name" => value()?.clone_into(&mut settings.device.friendly_name),
@@ -665,6 +796,7 @@ pub(crate) fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Comm
             "--wav-dir" => settings.sink.dir = PathBuf::from(value()?),
             "--log-level" => value()?.clone_into(&mut settings.log.level),
             "--ptt-on-connect" => triggers.ptt_on_connect = true,
+            "--test-hang" => triggers.hang = Some(parse_enum(flag, value()?)?),
             "--ptt-every" => {
                 let secs: f64 = parse_num(flag, value()?)?;
                 if !(secs.is_finite() && secs >= 1.0) {
@@ -677,7 +809,9 @@ pub(crate) fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Comm
     }
     settings.validate()?;
     let settings = Box::new(settings);
-    Ok(if check {
+    Ok(if check_fw {
+        Command::CheckFirmware(settings)
+    } else if check {
         Command::CheckConfig(settings)
     } else {
         Command::Run(settings, triggers)
@@ -801,7 +935,7 @@ level = "debug"
     fn validation_messages_name_the_key() {
         let mut s = Settings::default();
         s.device.allow_plaintext = true;
-        let cases: [(Mutate, &str); 6] = [
+        let cases: [(Mutate, &str); 11] = [
             (|s| s.mic.rate = 44_100, "mic.rate"),
             (|s| s.sink.latency_msec = Some(0), "sink.latency_msec"),
             (|s| s.device.port = 0, "device.port"),
@@ -814,6 +948,14 @@ level = "debug"
                 "dsp.channel",
             ),
             (|s| s.dsp.hpf_hz = -1.0, "dsp.hpf_hz"),
+            (|s| s.limits.nice = 20, "limits.nice"),
+            (|s| s.limits.max_open_files = 8, "limits.max_open_files"),
+            (|s| s.limits.max_rss_mb = 1, "limits.max_rss_mb"),
+            (|s| s.limits.loop_stall_s = 1, "limits.loop_stall_s"),
+            (
+                |s| s.safety.mute_file = s.safety.kill_switch.clone(),
+                "safety.mute_file",
+            ),
         ];
         for (mutate, key) in cases {
             let mut bad = s.clone();
@@ -861,6 +1003,12 @@ level = "debug"
         s.mic.source = MicSource::File;
         s.mic.path = Some(PathBuf::from("/nonexistent/webos-sat.raw"));
         assert!(s.warnings().iter().any(|m| m.contains("does not exist")));
+        s.safety.validated_firmware.clear();
+        assert!(
+            s.warnings()
+                .iter()
+                .any(|m| m.contains("firmware guard is off"))
+        );
     }
 
     #[test]
@@ -943,6 +1091,17 @@ level = "debug"
             parse_args(args(&["--config", &cfg, "--check-config"])).unwrap(),
             Command::CheckConfig(_)
         ));
+        let Command::CheckFirmware(s) = parse_args(args(&[
+            "--config",
+            &cfg,
+            "--check-firmware",
+            "--kill-switch",
+            "/run/x.disable",
+        ]))
+        .unwrap() else {
+            panic!("expected CheckFirmware");
+        };
+        assert_eq!(s.safety.kill_switch, PathBuf::from("/run/x.disable"));
         assert!(parse_args(args(&["--config", &cfg, "--bogus"])).is_err());
         assert!(parse_args(args(&["--config", &cfg, "--mode", "loud"])).is_err());
         assert!(parse_args(args(&["--config", &cfg, "--ptt-every", "0"])).is_err());

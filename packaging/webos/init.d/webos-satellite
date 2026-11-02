@@ -1,0 +1,25 @@
+#!/bin/sh
+# DRAFT boot hook for /var/lib/webosbrew/init.d/ (run by `run-parts` from the
+# Homebrew Channel's startup.sh at early boot, while its failsafe flag is set).
+#
+# NOT INSTALLED. Copying this file to the TV is a persistent change that needs
+# the owner's explicit approval; see docs/design/autostart.md for the review,
+# the install step and the rollback (delete this one file).
+#
+# Contract with run-parts: returns at once with status 0, prints nothing,
+# reads nothing from stdin, never fails. Everything else happens in a
+# detached session after a delay (autostart.sh), so a slow, hanging or
+# crashing satellite can neither block the hook chain nor trip failsafe mode.
+#
+# Edit PREFIX to the persistent install directory chosen at install time.
+PREFIX=/media/developer/webos-satellite
+
+if [ -f "$PREFIX/.webos-satellite-install" ] && [ -f "$PREFIX/bin/autostart.sh" ] &&
+    [ ! -e "$PREFIX/disable" ]; then
+    if command -v setsid >/dev/null 2>&1; then
+        setsid sh "$PREFIX/bin/autostart.sh" </dev/null >/dev/null 2>&1 &
+    else
+        sh "$PREFIX/bin/autostart.sh" </dev/null >/dev/null 2>&1 &
+    fi
+fi
+exit 0

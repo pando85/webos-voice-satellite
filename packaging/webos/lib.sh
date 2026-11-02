@@ -55,8 +55,18 @@ set_paths() {
     CFG=$PREFIX/etc/config.toml
     PIDFILE=$PREFIX/run/webos-satellite.pid
     ROTPID=$PREFIX/run/rotate.pid
+    SUPPID=$PREFIX/run/supervise.pid
     LOG=$PREFIX/log/webos-satellite.log
+    # Markers at the top of the prefix (persistent with a persistent prefix):
+    # DISABLE: do not start (autostart and supervisor honour it);
+    # CRASHLOOP: written by supervise.sh when it gave up.
+    DISABLE=$PREFIX/disable
+    CRASHLOOP=$PREFIX/crashloop
 }
+
+# Default kill-switch file of the daemon (safety.kill_switch in the config).
+# shellcheck disable=SC2034
+KILL_SWITCH_DEFAULT=/tmp/webos-satellite.disable
 
 # Picks the prefix: --prefix DIR, or the parent of the directory holding the
 # installed script. Call as: resolve_prefix "$0" "$prefix_arg"
@@ -106,11 +116,24 @@ rotator_alive() {
     tr '\0' ' ' <"/proc/$rp/cmdline" 2>/dev/null | grep -q "rotate.sh"
 }
 
-# Stops the daemon (TERM, wait, then KILL) and the log rotator, and removes
-# the pidfiles. Argument: seconds to wait (default 10).
+# True if the supervisor in $SUPPID is alive (a `sh` running supervise.sh).
+supervisor_alive() {
+    sp=$(read_pid "$SUPPID")
+    [ -n "$sp" ] || return 1
+    kill -0 "$sp" 2>/dev/null || return 1
+    tr '\0' ' ' <"/proc/$sp/cmdline" 2>/dev/null | grep -q "supervise.sh"
+}
+
+# Stops the supervisor (if any), the daemon (TERM, wait, then KILL) and the
+# log rotator, and removes the pidfiles. Argument: seconds to wait (default 10).
 stop_daemon() {
     wait_s=${1:-10}
     pid=$(read_pid "$PIDFILE")
+    if supervisor_alive; then
+        # The supervisor forwards TERM to the daemon and will not restart it.
+        note "stopping supervisor pid $(read_pid "$SUPPID")"
+        kill -TERM "$(read_pid "$SUPPID")" 2>/dev/null
+    fi
     if is_ours "$pid"; then
         note "stopping pid $pid"
         kill -TERM "$pid" 2>/dev/null
@@ -127,10 +150,19 @@ stop_daemon() {
         fi
         is_ours "$pid" && die "pid $pid is still running"
     else
-        note "not running"
+        note "daemon not running"
+    fi
+    i=0
+    while supervisor_alive && [ "$i" -lt 5 ]; do
+        sleep 1
+        i=$((i + 1))
+    done
+    if supervisor_alive; then
+        note "supervisor still running; sending SIGKILL"
+        kill -KILL "$(read_pid "$SUPPID")" 2>/dev/null
     fi
     if rotator_alive; then
         kill -TERM "$(read_pid "$ROTPID")" 2>/dev/null
     fi
-    rm -f "$PIDFILE" "$ROTPID"
+    rm -f "$PIDFILE" "$ROTPID" "$SUPPID"
 }

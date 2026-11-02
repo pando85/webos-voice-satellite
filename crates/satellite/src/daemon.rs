@@ -1,8 +1,16 @@
 //! The daemon: wires capture → ESPHome API server and server events → player.
 //!
-//! Runs on a single-threaded tokio runtime; capture has its own OS thread.
+//! Runs on a single-threaded tokio runtime; capture and the watchdog have
+//! their own OS threads.
+//!
+//! Microphone gate ([`MicGate`]): the PCM is open only while HA's mute switch
+//! is off, the kill-switch file is absent and the firmware guard passed. The
+//! kill switch and the guard force the mute switch on in HA; an unmute from HA
+//! is then refused. The API connection stays up while the mic is off, so HA
+//! shows the device and its mute state.
 
 use std::fmt::Write as _;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -12,9 +20,16 @@ use tokio::sync::mpsc;
 use tokio::time::{Instant, MissedTickBehavior};
 use webos_esphome_api::{AppCommand, AppEvent, PipelineMode, Server};
 
-use crate::capture::{self, CaptureSettings, Shared};
-use crate::config::{Mode, Settings, TestTriggers};
+use crate::capture::{
+    self, CaptureSettings, KILL_SWITCH_POLL, OFF_FIRMWARE, OFF_KILL, OFF_MUTED, OFF_NONE, Shared,
+};
+use crate::config::{Hang, MicSource, Mode, Settings, TestTriggers};
+use crate::firmware::{self, Verdict};
 use crate::player::{Done, Kind, Player, redact_url};
+use crate::watchdog::{self, Beats};
+
+/// Delay before `--test-hang` freezes a thread.
+const TEST_HANG_AFTER: Duration = Duration::from_secs(5);
 
 /// Delay between HA connecting and a `--ptt-on-connect` run (HA subscribes to
 /// voice events right after the hello exchange).
@@ -190,12 +205,101 @@ async fn tick_opt(iv: Option<&mut tokio::time::Interval>) {
     }
 }
 
+/// Decides whether the microphone may be open and what HA's mute switch must
+/// show. Pure logic; the daemon applies the commands it returns.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct MicGate {
+    /// HA's mute switch as the user set it.
+    ha_muted: bool,
+    /// The kill-switch file exists.
+    kill: bool,
+    /// The firmware guard refused this firmware.
+    firmware_block: bool,
+}
+
+impl MicGate {
+    /// The reason the mute switch is forced on, if any.
+    pub(crate) fn forced(&self) -> Option<&'static str> {
+        if self.kill {
+            Some("kill switch")
+        } else if self.firmware_block {
+            Some("firmware guard")
+        } else {
+            None
+        }
+    }
+
+    /// The microphone must be closed.
+    pub(crate) fn mic_off(&self) -> bool {
+        self.ha_muted || self.forced().is_some()
+    }
+
+    /// Value for [`Shared::mic_off`].
+    pub(crate) fn off_code(&self) -> u8 {
+        if self.kill {
+            OFF_KILL
+        } else if self.firmware_block {
+            OFF_FIRMWARE
+        } else if self.ha_muted {
+            OFF_MUTED
+        } else {
+            OFF_NONE
+        }
+    }
+
+    /// The kill-switch file appeared or went away. Returns the command for
+    /// the API server, if one is needed.
+    pub(crate) fn set_kill(&mut self, on: bool) -> Option<AppCommand> {
+        if self.kill == on {
+            return None;
+        }
+        self.kill = on;
+        if on {
+            Some(AppCommand::SetMuted(true))
+        } else if self.mic_off() {
+            None
+        } else {
+            Some(AppCommand::SetMuted(false))
+        }
+    }
+
+    /// HA's switch changed (or the echo of our own `SetMuted`). Returns the
+    /// command to send back (re-mute when an unmute is refused) and whether
+    /// the user's mute state changed.
+    pub(crate) fn on_mute_changed(&mut self, muted: bool) -> (Option<AppCommand>, bool) {
+        if self.forced().is_some() {
+            return ((!muted).then_some(AppCommand::SetMuted(true)), false);
+        }
+        let changed = self.ha_muted != muted;
+        self.ha_muted = muted;
+        (None, changed)
+    }
+}
+
+/// Remembers HA's mute switch in `path` (exists = muted). Best effort.
+fn store_mute(path: &Path, muted: bool) {
+    let res = if muted {
+        std::fs::write(path, b"")
+    } else {
+        match std::fs::remove_file(path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            other => other,
+        }
+    };
+    if let Err(e) = res {
+        log::warn!("cannot update the mute file {}: {e}", path.display());
+    }
+}
+
 struct Daemon {
     cmd_tx: mpsc::Sender<AppCommand>,
     shared: Arc<Shared>,
     player: Player,
     runs: RunTracker,
     connected: bool,
+    gate: MicGate,
+    kill_switch: PathBuf,
+    mute_file: PathBuf,
 }
 
 impl Daemon {
@@ -207,6 +311,37 @@ impl Daemon {
 
     fn set_streaming(&self, on: bool) {
         self.shared.streaming.store(on, Ordering::Relaxed);
+    }
+
+    fn apply_gate(&self) {
+        self.shared
+            .mic_off
+            .store(self.gate.off_code(), Ordering::Relaxed);
+    }
+
+    /// Polls the kill-switch file.
+    async fn poll_kill_switch(&mut self) {
+        let on = self.kill_switch.exists();
+        if on == self.gate.kill {
+            return;
+        }
+        let cmd = self.gate.set_kill(on);
+        self.apply_gate();
+        if on {
+            log::warn!(
+                "KILL SWITCH {} present: microphone closed, reported muted to HA",
+                self.kill_switch.display()
+            );
+        } else if let Some(why) = self.gate.forced() {
+            log::info!("kill switch removed; the microphone stays off ({why})");
+        } else if self.gate.mic_off() {
+            log::info!("kill switch removed; the microphone stays muted (HA's switch)");
+        } else {
+            log::info!("kill switch removed: microphone enabled");
+        }
+        if let Some(cmd) = cmd {
+            self.send(cmd).await;
+        }
     }
 
     async fn ptt(&self, source: &str) {
@@ -347,7 +482,23 @@ impl Daemon {
                 if muted {
                     self.set_streaming(false);
                 }
-                log::info!("microphone {}", if muted { "MUTED" } else { "unmuted" });
+                let (cmd, changed) = self.gate.on_mute_changed(muted);
+                self.apply_gate();
+                if let Some(cmd) = cmd {
+                    log::warn!(
+                        "unmute refused: {} is active; the microphone stays off",
+                        self.gate.forced().unwrap_or("a safety gate")
+                    );
+                    self.send(cmd).await;
+                } else if changed {
+                    store_mute(&self.mute_file, muted);
+                    log::info!(
+                        "microphone {} by Home Assistant",
+                        if muted { "MUTED" } else { "unmuted" }
+                    );
+                } else {
+                    log::debug!("mute state {muted} confirmed");
+                }
             }
             AppEvent::Timer {
                 event,
@@ -394,6 +545,7 @@ impl Daemon {
 }
 
 /// Runs the daemon until SIGTERM/SIGINT.
+#[allow(clippy::too_many_lines)] // linear setup, loop and shutdown
 pub(crate) async fn run(settings: Settings, triggers: TestTriggers) -> Result<(), String> {
     let esp = settings.esphome_config().map_err(|e| e.to_string())?;
     let server = Server::bind(esp).await.map_err(|e| e.to_string())?;
@@ -404,7 +556,7 @@ pub(crate) async fn run(settings: Settings, triggers: TestTriggers) -> Result<()
         server.local_addr().map_err(|e| e.to_string())?
     );
     log::info!("config: {}", settings.summary());
-    if triggers.ptt_on_connect || triggers.ptt_every.is_some() {
+    if triggers.ptt_on_connect || triggers.ptt_every.is_some() || triggers.hang.is_some() {
         log::warn!("test triggers enabled: {triggers:?}");
     }
 
@@ -412,21 +564,67 @@ pub(crate) async fn run(settings: Settings, triggers: TestTriggers) -> Result<()
     let mut sigint = signal(SignalKind::interrupt()).map_err(|e| e.to_string())?;
     let mut sigusr1 = signal(SignalKind::user_defined1()).map_err(|e| e.to_string())?;
 
+    // Microphone gate: firmware guard, kill switch and the remembered mute.
+    let verdict = firmware::check(&settings);
+    let gated = settings.mic.source == MicSource::Alsa;
+    match &verdict {
+        Verdict::Validated(_) => log::info!("firmware guard: {verdict}"),
+        Verdict::Off => log::warn!("{verdict}"),
+        _ if !gated => log::info!("firmware guard (not applied to a file mic): {verdict}"),
+        _ => log::error!("FIRMWARE GUARD: {verdict}"),
+    }
+    let gate = MicGate {
+        ha_muted: settings.safety.mute_file.exists(),
+        kill: settings.safety.kill_switch.exists(),
+        firmware_block: gated && !verdict.allows_capture(),
+    };
+    if gate.kill {
+        log::warn!(
+            "KILL SWITCH {} present at startup: the microphone stays closed until it is removed",
+            settings.safety.kill_switch.display()
+        );
+    }
+    if gate.ha_muted {
+        log::info!(
+            "microphone muted (remembered in {})",
+            settings.safety.mute_file.display()
+        );
+    }
+    // The echo of this SetMuted(true) is not a user change (see MicGate).
+    let start_muted = gate.mic_off();
+
     let (ev_tx, mut ev_rx) = mpsc::unbounded_channel();
     let (cmd_tx, cmd_rx) = mpsc::channel(64);
     let shared = Arc::new(Shared::default());
+    shared.mic_off.store(gate.off_code(), Ordering::Relaxed);
     let cap = capture::spawn(
         CaptureSettings::from_settings(&settings),
         Arc::clone(&shared),
         cmd_tx.clone(),
     )
     .map_err(|e| format!("cannot start the capture thread: {e}"))?;
+    let beats = Arc::new(Beats::default());
+    {
+        let shared = Arc::clone(&shared);
+        watchdog::spawn(
+            Duration::from_secs(u64::from(settings.limits.loop_stall_s)),
+            u64::from(settings.limits.max_rss_mb) << 20,
+            Arc::clone(&beats),
+            move || shared.beat.load(Ordering::Relaxed),
+        )
+        .map_err(|e| format!("cannot start the watchdog thread: {e}"))?;
+    }
     if settings.mode == Mode::Wake {
         let _ = cmd_tx
             .send(AppCommand::StartPipeline {
                 mode: PipelineMode::WakeWord,
             })
             .await;
+    }
+    // After the wake word start: a start while muted is ignored by the voice
+    // layer, but an armed wake word re-arms on unmute.
+    if start_muted {
+        let _ = cmd_tx.send(AppCommand::SetMuted(true)).await;
     }
     let server_task = tokio::spawn(server.run(ev_tx, cmd_rx));
 
@@ -437,12 +635,18 @@ pub(crate) async fn run(settings: Settings, triggers: TestTriggers) -> Result<()
         player: Player::new(settings.sink.clone(), done_tx),
         runs: RunTracker::default(),
         connected: false,
+        gate,
+        kill_switch: settings.safety.kill_switch.clone(),
+        mute_file: settings.safety.mute_file.clone(),
     };
+    let mut kill_poll = tokio::time::interval(KILL_SWITCH_POLL);
+    kill_poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut ptt_timer = triggers.ptt_every.map(|p| {
         let mut iv = tokio::time::interval_at(Instant::now() + p, p);
         iv.set_missed_tick_behavior(MissedTickBehavior::Delay);
         iv
     });
+    let mut hang_at = triggers.hang.map(|_| Instant::now() + TEST_HANG_AFTER);
     let mut ptt_on_connect_at: Option<Instant> = None;
     let mut ptt_on_connect_done = false;
 
@@ -469,7 +673,27 @@ pub(crate) async fn run(settings: Settings, triggers: TestTriggers) -> Result<()
                 break;
             }
             _ = sigusr1.recv() => d.ptt("SIGUSR1").await,
+            _ = kill_poll.tick() => {
+                beats.event_loop.fetch_add(1, Ordering::Relaxed);
+                d.poll_kill_switch().await;
+            }
             () = tick_opt(ptt_timer.as_mut()) => d.ptt("--ptt-every").await,
+            () = sleep_opt(hang_at) => {
+                hang_at = None;
+                match triggers.hang {
+                    Some(Hang::Capture) => {
+                        log::warn!("--test-hang: freezing the capture thread");
+                        shared.test_hang.store(true, Ordering::Relaxed);
+                    }
+                    Some(Hang::Loop) => {
+                        log::warn!("--test-hang: freezing the event loop");
+                        loop {
+                            std::thread::sleep(Duration::from_secs(1));
+                        }
+                    }
+                    None => {}
+                }
+            }
             () = sleep_opt(ptt_on_connect_at) => {
                 ptt_on_connect_at = None;
                 ptt_on_connect_done = true;
@@ -480,6 +704,7 @@ pub(crate) async fn run(settings: Settings, triggers: TestTriggers) -> Result<()
 
     // Shutdown: stop streaming and playback (kills pacat), release the mic,
     // then close the command channel so the server says goodbye to HA.
+    beats.disarmed.store(true, Ordering::Relaxed);
     d.set_streaming(false);
     d.player.shutdown().await;
     Daemon::log_line(d.runs.flush());
@@ -553,6 +778,68 @@ mod tests {
         assert!(prev.starts_with("run 1 "));
         r.intent(t0, false);
         assert!(r.run_end().unwrap().starts_with("run 2 "));
+    }
+
+    #[test]
+    fn kill_switch_forces_mute_and_restores_the_users_state() {
+        let mut g = MicGate::default();
+        assert!(!g.mic_off());
+        assert_eq!(g.set_kill(true), Some(AppCommand::SetMuted(true)));
+        assert!(g.mic_off());
+        // The echo of our own SetMuted(true) is not a user change.
+        assert_eq!(g.on_mute_changed(true), (None, false));
+        // HA tries to unmute: refused, re-muted.
+        assert_eq!(
+            g.on_mute_changed(false),
+            (Some(AppCommand::SetMuted(true)), false)
+        );
+        assert_eq!(g.set_kill(true), None);
+        // Removed: back to unmuted.
+        assert_eq!(g.set_kill(false), Some(AppCommand::SetMuted(false)));
+        assert_eq!(g.on_mute_changed(false), (None, false));
+        assert!(!g.mic_off());
+    }
+
+    #[test]
+    fn a_user_mute_survives_the_kill_switch() {
+        let mut g = MicGate::default();
+        assert_eq!(g.on_mute_changed(true), (None, true));
+        assert!(g.mic_off());
+        assert_eq!(g.set_kill(true), Some(AppCommand::SetMuted(true)));
+        assert_eq!(g.set_kill(false), None);
+        assert!(g.mic_off());
+        assert_eq!(g.on_mute_changed(false), (None, true));
+        assert!(!g.mic_off());
+    }
+
+    #[test]
+    fn firmware_block_cannot_be_unmuted_or_cleared_by_the_kill_switch() {
+        let mut g = MicGate {
+            firmware_block: true,
+            ..MicGate::default()
+        };
+        assert!(g.mic_off());
+        assert_eq!(g.forced(), Some("firmware guard"));
+        assert_eq!(
+            g.on_mute_changed(false),
+            (Some(AppCommand::SetMuted(true)), false)
+        );
+        assert_eq!(g.set_kill(true), Some(AppCommand::SetMuted(true)));
+        assert_eq!(g.set_kill(false), None);
+        assert!(g.mic_off());
+    }
+
+    #[test]
+    fn mute_file_round_trip() {
+        let dir = std::env::temp_dir().join(format!("webos-sat-mute-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("muted");
+        store_mute(&f, true);
+        assert!(f.exists());
+        store_mute(&f, false);
+        assert!(!f.exists());
+        store_mute(&f, false);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

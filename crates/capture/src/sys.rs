@@ -319,6 +319,32 @@ impl Pcm {
         self.ioctl_none(IOCTL_DROP)
     }
 
+    /// Waits until the PCM is readable (or in an error state that a read will
+    /// report, such as an overrun) for at most `timeout_ms` milliseconds.
+    /// Returns `false` on timeout. `EINTR` counts as readable so the caller's
+    /// read reports or retries it.
+    pub(crate) fn wait_readable(&self, timeout_ms: u32) -> io::Result<bool> {
+        let mut pfd = libc::pollfd {
+            fd: self.file.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let timeout = c_int::try_from(timeout_ms).unwrap_or(c_int::MAX);
+        // SAFETY: `pfd` is one valid, exclusively borrowed `pollfd` and the
+        // count passed is 1. The fd is valid for the lifetime of `self`.
+        let ret = unsafe { libc::poll(&raw mut pfd, 1, timeout) };
+        if ret < 0 {
+            let e = io::Error::last_os_error();
+            return if e.raw_os_error() == Some(libc::EINTR) {
+                Ok(true)
+            } else {
+                Err(e)
+            };
+        }
+        // Any revents (POLLIN, POLLERR on xrun, POLLHUP) means a read returns.
+        Ok(ret > 0)
+    }
+
     /// Reads up to `frames` interleaved frames into `buf`
     /// (`SNDRV_PCM_IOCTL_READI_FRAMES`); returns the frame count read.
     ///

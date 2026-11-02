@@ -1,6 +1,6 @@
 # Development
 
-How to build, test and run the Rust workspace. Status: Phase 1.4/1.5/1.7. `webos-satellite` is the working daemon (capture → front-end → ESPHome API → reply playback). For what was verified, see [P1 HA integration](discovery/c3-a/P1-ha-integration.md) and [P1 TV live](discovery/c3-a/P1-tv-live.md); for what comes next, see the [roadmap](project/roadmap.md).
+How to build, test and run the Rust workspace. Status: Phase 1 plus the non-persistent Phase 3 work (kill switch, watchdog, supervisor, firmware guard, resource limits; [P3 robustness](discovery/c3-a/P3-robustness.md)). `webos-satellite` is the working daemon (capture → front-end → ESPHome API → reply playback). For what was verified, see [P1 HA integration](discovery/c3-a/P1-ha-integration.md) and [P1 TV live](discovery/c3-a/P1-tv-live.md); for what comes next, see the [roadmap](project/roadmap.md).
 
 ## Layout
 
@@ -10,14 +10,15 @@ How to build, test and run the Rust workspace. Status: Phase 1.4/1.5/1.7. `webos
 | `rust-toolchain.toml` | Pinned toolchain (`1.99.1`), `rustfmt`, `clippy`, the two TV cross targets |
 | `.cargo/config.toml` | Softfp codegen flags for `armv7-unknown-linux-musleabi` |
 | `Makefile` | Entry points listed below |
-| `crates/satellite` | Binary `webos-satellite`: the daemon (config, capture thread, player, latency log), plus `--self-test` |
+| `crates/satellite` | Binary `webos-satellite`: the daemon (config, capture thread, player, latency log, microphone gate, firmware guard, watchdog, resource limits), plus `--self-test` and `--check-firmware` |
 | `crates/capture` | ALSA capture through raw ioctls (no alsa-lib), file source for tests |
 | `crates/dsp` | Mic front-end: channel select, high-pass, gain, S24 to S16 |
 | `crates/esphome-api` | ESPHome native API device server and voice state machine ([details](development/esphome-api.md)) |
 | `crates/playback` | TTS fetch, decode, resample, `pacat`/WAV/null sinks |
 | `config/example.toml` | Commented configuration with all defaults |
-| `packaging/webos/` | POSIX sh install, start, stop, status and uninstall scripts for a TV ([below](#install-on-a-tv-non-persistent)) |
+| `packaging/webos/` | POSIX sh install, start, stop, status, uninstall and supervisor scripts for a TV ([below](#install-on-a-tv-non-persistent)); `init.d/` holds the **draft** boot hook ([autostart design](design/autostart.md)); `tests/run.sh` tests the scripts on the host |
 | `tools/esphome-fake-ha/` | Fake-HA harnesses (`run.sh`) and the HA bridge (`ha_bridge.py`) |
+| `tools/lifecycle/` | Microphone-gate check of the real binary (`local_check.py`), an HA-side client for mute cycles, state watching and reconnect loops against a TV (`lifecycle_client.py`), `run.sh` for both host checks |
 
 Keep the root files minimal and stable; add per-crate dependencies in the crate's own `Cargo.toml`, with versions declared once in `[workspace.dependencies]`. Workspace lints forbid `unsafe` code; a crate that genuinely needs it (for example tinyalsa ioctls in `capture`) must opt out locally and say why.
 
@@ -102,6 +103,10 @@ Behaviour:
 
 - `mode = "wake"`: as soon as HA subscribes, the satellite streams the mic continuously and HA's pipeline runs the wake word. `mode = "ptt"`: `kill -USR1 <pid>` starts one run at speech-to-text. A SIGUSR1 also works in wake mode, where it aborts the wake word run. `--ptt-on-connect` and `--ptt-every SECS` are test aids.
 - Audio is sent only while HA asks for it. If the mic is busy (LG hands-free holds the PCM), the satellite logs `MIC BUSY` and retries with a backoff of up to 30 s.
+- **Microphone gate.** The capture PCM is open only while the microphone is wanted. It is closed (the hardware mic is released, `/proc/asound/.../status` shows `closed`) when HA's "Mute microphone" switch is on, while the **kill-switch** file exists (`safety.kill_switch`, default `/tmp/webos-satellite.disable`), or when the **firmware guard** refused the firmware. The kill switch and the guard force the switch on in HA, and an unmute from HA is refused until they clear; the API connection stays up so HA still shows the device. HA's mute is remembered in `safety.mute_file` (default `/tmp/webos-satellite.muted`) so a restarted daemon comes back muted. Measured on c3-a: PCM closed 3 to 18 ms after the mute reached the satellite, 30 to 70 ms after the kill-switch file appeared ([P3 robustness](discovery/c3-a/P3-robustness.md)).
+  - Stop listening now: `touch /tmp/webos-satellite.disable`; resume: `rm /tmp/webos-satellite.disable`. The capture thread checks the file itself every 250 ms, so this works even if the event loop hangs.
+- **Firmware guard.** At startup the daemon reads `webos_manufacturing_version` from `/var/run/nyx/os_info.json` (read-only; `03.30.74` on c3-a) and compares it with `safety.validated_firmware`. On another version, or if the file cannot be read, the ALSA microphone stays disabled (reported muted) and an `ERROR FIRMWARE GUARD` line is logged. `--check-firmware` prints the verdict and exits 0 (validated), 1 (not validated or unreadable) or 3 (guard off: empty list). File-mic runs are not gated.
+- **Watchdog and limits.** An ALSA read that sees no audio for `limits.capture_stall_s` (5 s) closes and reopens the device with backoff. A watchdog thread exits the process with code 70 (event loop stalled), 71 (capture thread stalled) after `limits.loop_stall_s` (30 s), or 72 when the resident size exceeds `limits.max_rss_mb` (64 MiB), so a supervisor restarts it; a SIGSTOP/SIGCONT or system suspend is detected and not counted. At startup the daemon sets its niceness (`limits.nice`, 10) and the soft open-file limit (`limits.max_open_files`, 256), inherited by `pacat`. `RLIMIT_AS` is not set because `pacat` would inherit it (PulseAudio clients map large shared-memory pools). `--test-hang loop|capture` freezes a thread to test the watchdog.
 - Replies: HA streams the TTS as 16 kHz mono PCM. The `pacat` sink writes it to PulseAudio as it arrives, multiplied by `sink.gain` (use `0.0` for silent tests; `pacat --volume` is ignored on c3-a). The `wav` sink writes one file per reply. Each playback logs its count of non-zero samples.
 - Logs go to stderr: one latency line per run. Transcripts and reply text appear only at `debug`. Keys and token URLs are never logged ([policy](#logging-policy)).
 - SIGTERM/SIGINT stop playback (killing `pacat`), release the PCM and disconnect HA.
@@ -115,7 +120,8 @@ On the TV, use the scripts in [Install on a TV](#install-on-a-tv-non-persistent)
 - Every key is optional. Unknown sections and keys are **rejected** with the key name and line (`deny_unknown_fields`), so a typo cannot silently fall back to a default.
 - Relative paths in the file resolve against the file's directory; on the command line against the current directory. Command-line options override the file whatever their position.
 - `validate()` (also run by `--check-config`) rejects, naming the key: an unknown `log.level`, `mic.rate` other than 16000, zero `mic.channels`, `period_frames` or `port`, `buffer_frames` smaller than `period_frames`, `mic.source = "file"` without `mic.path`, `dsp.channel = "right"` on a mono mic, out-of-range `dsp.gain_db` (-20 to 60) or `sink.gain` (0 to 4), zero `sink.rate`, `sink.channels` or `sink.latency_msec`, both `noise_psk` and `noise_psk_file`, no key without `allow_plaintext`, and a node name or key the ESPHome layer rejects.
-- Non-fatal **warnings** (printed by `--check-config`, logged at `warn` at startup, never containing a secret): `noise_psk_file` readable by group or other (with the actual mode and `chmod 600`), `noise_psk` set inline, plaintext allowed, `mic.path` missing.
+- It also rejects `limits.nice` outside -20 to 19, `limits.max_open_files` below 32 (0 = inherit), `limits.max_rss_mb` below 8 (0 = off), `limits.loop_stall_s` below 5 (0 = off), and an empty or identical `safety.kill_switch` and `safety.mute_file`.
+- Non-fatal **warnings** (printed by `--check-config`, logged at `warn` at startup, never containing a secret): `noise_psk_file` readable by group or other (with the actual mode and `chmod 600`), `noise_psk` set inline, plaintext allowed, `mic.path` missing, an empty `safety.validated_firmware` (guard off).
 
 ### Logging policy
 
@@ -145,9 +151,11 @@ The scripts in [`packaging/webos/`](../packaging/webos) are POSIX sh (checked wi
 | Script | Purpose |
 | --- | --- |
 | `install.sh --prefix DIR --config FILE [--binary FILE] [--psk-file FILE]` | Copies binary, scripts, config and key (0700 dirs, 0600 files), validates the config with `--check-config`. Refuses a non-empty directory that is not a previous install. Refuses prefixes outside `/tmp`, `/run` and `/dev/shm` unless `--persistent` (owner authorization required). The config has no default on purpose: the example config plays audio |
-| `start.sh` | Starts the daemon in the background (`nohup`, stdin from `/dev/null`), pidfile in `run/`, log in `log/`; checks after 1 s that it is still alive and prints the log tail if not |
-| `stop.sh` | SIGTERM, waits up to 10 s, then SIGKILL; removes the pidfiles. The pid is only trusted if `/proc/<pid>/exe` is the installed binary |
-| `status.sh` | Running or not (exit 0 or 3), RSS, log size, last log lines |
+| `start.sh [--supervise]` | Starts the daemon in the background (`nohup`, stdin from `/dev/null`), pidfile in `run/`, log in `log/`; checks after 1 s that it is still alive and prints the log tail if not. `--supervise` runs it under `supervise.sh`. Refuses while `DIR/disable` exists, and with `--supervise` while `DIR/crashloop` exists |
+| `supervise.sh` | Restart loop (started by `start.sh --supervise`): a daemon exit other than 0 restarts it after 1, 2, 4, ... s (at most `WEBOS_SAT_BACKOFF_MAX`, 300 s); `WEBOS_SAT_MAX_CRASHES` (5) exits within `WEBOS_SAT_CRASH_WINDOW` (600 s) write `DIR/crashloop` and stop it for good. Exit 0 (the daemon stopped on SIGTERM) ends it. Logs `SUPER` lines into the daemon log |
+| `autostart.sh` | Boot-time start for the draft `init.d` hook: waits (`--delay`, 60 s), then starts `start.sh --supervise` unless `DIR/disable`, `DIR/crashloop` or the kill switch exists or `--check-firmware` fails; logs to `log/autostart.log`. Not wired into boot ([autostart design](design/autostart.md)) |
+| `stop.sh` | Stops the supervisor first (so nothing restarts), then SIGTERM to the daemon, waits up to 10 s, then SIGKILL; removes the pidfiles. The pid is only trusted if `/proc/<pid>/exe` is the installed binary |
+| `status.sh` | Running or not (exit 0 or 3), supervisor, markers and kill switch, RSS, fd and thread counts, log size, last log lines |
 | `uninstall.sh` | Stops, then `rm -rf` of the prefix. Refuses `/`, empty or relative paths, `..` components, symbolic links, system directories (`/tmp` itself, `/var`, `/media/developer`, ...) and any directory without the marker file |
 
 The installed scripts find their prefix from their own location (`DIR/bin/..`); from the repository they take `--prefix DIR`.
@@ -165,7 +173,9 @@ make tv-uninstall-tmp TV=root@<host>
 
 The config's `noise_psk_file = "noise_psk"` resolves to `etc/noise_psk`. For silent tests use `[sink] type = "null"` or `"wav"` with `dir = "../out"`, or `"pacat"` with `gain = 0.0`. `pacat --volume` is ignored on c3-a.
 
-**No autostart.** These scripts do not hook into boot. Autostart is Phase 3 and needs the owner's approval; the place it would go is a script in `/var/lib/webosbrew/init.d` (run by `run-parts` at early boot, with failsafe-mode risk, see [D0-D1](discovery/c3-a/D0-D1-runtime.md)) that calls `start.sh` with a persistent prefix. Nothing is added there today, and `--persistent` has not been used.
+**No autostart.** These scripts do not hook into boot. The reviewed design, the draft hook `packaging/webos/init.d/webos-satellite` and the owner-approval step are in [autostart design](design/autostart.md). Nothing is installed in `/var/lib/webosbrew/init.d`, and `--persistent` has not been used on a TV.
+
+**Markers** (files at the top of the prefix): `disable` (do not start; honoured by `start.sh`, `supervise.sh` and `autostart.sh`), `crashloop` (written by the supervisor when it gives up; remove it by hand after fixing the cause). The kill switch is separate: it keeps a running daemon's microphone closed.
 
 The before/after result on c3-a is in [P1 ops](discovery/c3-a/P1-ops.md).
 
@@ -181,8 +191,8 @@ When HA cannot open a connection to the satellite (the situation on the owner's 
 
 ## CI
 
-- [`.github/workflows/validate.yml`](../.github/workflows/validate.yml): documentation checks (`sh -n tools/probe/probe.sh`, `sh -n` of `packaging/webos/*.sh`, `python3 tools/check_docs.py`).
-- [`.github/workflows/rust.yml`](../.github/workflows/rust.yml): `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test` on the host; then the armv7 and aarch64 cross-builds, ELF checks, a run of the armv7 binary under `qemu-user-static`, and the armv7 binary uploaded as a short-lived workflow artifact.
+- [`.github/workflows/validate.yml`](../.github/workflows/validate.yml): documentation checks (`sh -n tools/probe/probe.sh`, `sh -n` of the packaging and lifecycle scripts, `python3 tools/check_docs.py`).
+- [`.github/workflows/rust.yml`](../.github/workflows/rust.yml): `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test` and `packaging/webos/tests/run.sh` on the host; then the armv7 and aarch64 cross-builds, ELF checks, a run of the armv7 binary under `qemu-user-static`, and the armv7 binary uploaded as a short-lived workflow artifact.
 
 Actions are pinned to commit SHAs with the version in a comment. Update them deliberately.
 
@@ -192,6 +202,8 @@ Actions are pinned to commit SHAs with the version in a comment. Update them del
 make lint test
 python3 tools/check_docs.py
 sh -n tools/probe/probe.sh
-for f in packaging/webos/*.sh; do sh -n "$f"; done
-shellcheck -x -P SCRIPTDIR -s sh packaging/webos/*.sh   # if installed
+for f in packaging/webos/*.sh packaging/webos/init.d/* packaging/webos/tests/*.sh tools/lifecycle/*.sh; do sh -n "$f"; done
+shellcheck -x -P SCRIPTDIR -s sh packaging/webos/*.sh packaging/webos/init.d/* packaging/webos/tests/*.sh   # if installed
+tools/esphome-fake-ha/run.sh     # protocol and daemon e2e harness
+tools/lifecycle/run.sh           # microphone gate and ops scripts on the host
 ```

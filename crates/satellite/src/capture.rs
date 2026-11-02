@@ -6,12 +6,21 @@
 //! disconnect and mute. Chunks go out with `try_send`: when the server is
 //! backed up a chunk is dropped and counted rather than stalling capture.
 //!
+//! The PCM is open only while the microphone is wanted: [`Shared::mic_off`]
+//! (HA's mute switch, the kill switch or the firmware guard, set by the
+//! daemon) or the kill-switch file itself (checked here every 250 ms, so the
+//! hardware is released even if the daemon's event loop is stuck) closes it
+//! within one read (16 ms at the c3-a settings), and it is reopened when the
+//! microphone is wanted again.
+//!
 //! Open failures (mic busy because LG hands-free holds the PCM, device not
-//! found, I/O errors) are logged and retried with a capped backoff.
+//! found, I/O errors) are logged and retried with a capped backoff. A device
+//! that stops delivering audio for `limits.capture_stall_s` is closed and
+//! reopened.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -30,6 +39,10 @@ const READ_FRAMES: usize = 256;
 const RETRY_BASE: Duration = Duration::from_secs(1);
 /// Retry delay cap.
 const RETRY_MAX: Duration = Duration::from_secs(30);
+/// The kill-switch file is checked this often.
+pub(crate) const KILL_SWITCH_POLL: Duration = Duration::from_millis(250);
+/// A stream that ran this long resets the stream-error backoff.
+const STREAM_OK_AFTER: Duration = Duration::from_secs(60);
 /// Level statistics are logged at debug this often.
 const STATS_EVERY: Duration = Duration::from_secs(60);
 
@@ -48,6 +61,14 @@ pub(crate) struct Shared {
     pub(crate) chunks_dropped: AtomicU64,
     /// Source overruns recovered (ALSA).
     pub(crate) xruns: AtomicU64,
+    /// Keep the microphone closed: one of the `OFF_*` reasons, or 0.
+    pub(crate) mic_off: AtomicU8,
+    /// Bumped on every turn of the capture loop (watchdog heartbeat).
+    pub(crate) beat: AtomicU64,
+    /// Times the PCM was closed because the microphone was not wanted.
+    pub(crate) releases: AtomicU64,
+    /// Test aid (`--test-hang capture`): freeze the thread.
+    pub(crate) test_hang: AtomicBool,
 }
 
 /// What the capture thread needs from the configuration.
@@ -64,6 +85,7 @@ pub(crate) struct CaptureSettings {
     skip_ms: u32,
     pause_when_idle: bool,
     frontend: FrontendConfig,
+    kill_switch: Option<PathBuf>,
 }
 
 impl CaptureSettings {
@@ -80,6 +102,7 @@ impl CaptureSettings {
             skip_ms: s.mic.skip_ms,
             pause_when_idle: s.mic.pause_when_idle,
             frontend: s.frontend_config(),
+            kill_switch: Some(s.safety.kill_switch.clone()),
         }
     }
 }
@@ -108,10 +131,63 @@ impl Chunker {
     }
 }
 
+/// [`Shared::mic_off`]: the microphone may be open.
+pub(crate) const OFF_NONE: u8 = 0;
+/// [`Shared::mic_off`]: muted by HA's switch.
+pub(crate) const OFF_MUTED: u8 = 1;
+/// [`Shared::mic_off`]: the kill switch.
+pub(crate) const OFF_KILL: u8 = 2;
+/// [`Shared::mic_off`]: the firmware guard.
+pub(crate) const OFF_FIRMWARE: u8 = 3;
+
+/// Cached check of the kill-switch file (one `stat` per 250 ms at most).
+#[derive(Debug)]
+struct KillSwitch<'a> {
+    path: Option<&'a Path>,
+    checked: Option<Instant>,
+    active: bool,
+}
+
+impl<'a> KillSwitch<'a> {
+    fn new(path: Option<&'a Path>) -> Self {
+        Self {
+            path,
+            checked: None,
+            active: false,
+        }
+    }
+
+    fn active(&mut self) -> bool {
+        let Some(path) = self.path else {
+            return false;
+        };
+        if self.checked.is_none_or(|t| t.elapsed() >= KILL_SWITCH_POLL) {
+            self.checked = Some(Instant::now());
+            self.active = path.exists();
+        }
+        self.active
+    }
+}
+
+/// Why the microphone is not wanted, or `None` if it is.
+fn unwanted(shared: &Shared, kill: &mut KillSwitch<'_>) -> Option<&'static str> {
+    if kill.active() {
+        return Some("kill switch");
+    }
+    match shared.mic_off.load(Ordering::Relaxed) {
+        OFF_NONE => None,
+        OFF_MUTED => Some("muted"),
+        OFF_KILL => Some("kill switch"),
+        OFF_FIRMWARE => Some("firmware guard"),
+        _ => Some("disabled"),
+    }
+}
+
 /// Sleeps up to `d`, waking early when `stop` is set. Returns false if stopped.
 fn sleep_unless_stopped(shared: &Shared, d: Duration) -> bool {
     let end = Instant::now() + d;
     while !shared.stop.load(Ordering::Relaxed) {
+        shared.beat.fetch_add(1, Ordering::Relaxed);
         let left = end.saturating_duration_since(Instant::now());
         if left.is_zero() {
             return true;
@@ -166,17 +242,44 @@ pub(crate) fn spawn(
         .spawn(move || run(&cfg, &shared, &tx))
 }
 
+/// How [`pump`] ended without an error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PumpEnd {
+    /// The thread is stopping.
+    Stop,
+    /// The microphone is not wanted any more (the reason).
+    Released(&'static str),
+}
+
+fn backoff(n: u32) -> Duration {
+    RETRY_BASE
+        .saturating_mul(1 << n.saturating_sub(1).min(5))
+        .min(RETRY_MAX)
+}
+
 fn run(cfg: &CaptureSettings, shared: &Shared, tx: &mpsc::Sender<AppCommand>) {
     let mut failures = 0_u32;
+    let mut stream_errors = 0_u32;
     let mut busy_logged = false;
+    let mut kill = KillSwitch::new(cfg.kill_switch.as_deref());
+    let mut idle_reason: Option<&'static str> = None;
     while !shared.stop.load(Ordering::Relaxed) {
+        if let Some(why) = unwanted(shared, &mut kill) {
+            if idle_reason != Some(why) {
+                log::info!("capture: microphone off ({why})");
+                idle_reason = Some(why);
+            }
+            if !sleep_unless_stopped(shared, Duration::from_millis(20)) {
+                break;
+            }
+            continue;
+        }
+        idle_reason = None;
         let src = match open_source(cfg) {
             Ok(src) => src,
             Err(e) => {
                 failures = failures.saturating_add(1);
-                let delay = RETRY_BASE
-                    .saturating_mul(1 << failures.saturating_sub(1).min(5))
-                    .min(RETRY_MAX);
+                let delay = backoff(failures);
                 match e {
                     CaptureError::MicBusy if busy_logged => {
                         log::debug!("capture: mic still busy; retry in {} s", delay.as_secs());
@@ -193,7 +296,7 @@ fn run(cfg: &CaptureSettings, shared: &Shared, tx: &mpsc::Sender<AppCommand>) {
                         delay.as_secs()
                     ),
                 }
-                if !sleep_unless_stopped(shared, delay) {
+                if !sleep_unless_wanted_or_stopped(shared, &mut kill, delay) {
                     break;
                 }
                 continue;
@@ -204,11 +307,34 @@ fn run(cfg: &CaptureSettings, shared: &Shared, tx: &mpsc::Sender<AppCommand>) {
         }
         failures = 0;
         busy_logged = false;
-        match pump(cfg, src, shared, tx) {
-            Ok(()) => break,
+        let opened = Instant::now();
+        let end = pump(cfg, src, shared, tx, &mut kill);
+        // `pump` consumed and dropped the source: the PCM is closed now.
+        shared.open.store(false, Ordering::Relaxed);
+        if opened.elapsed() >= STREAM_OK_AFTER {
+            stream_errors = 0;
+        }
+        match end {
+            Ok(PumpEnd::Stop) => break,
+            Ok(PumpEnd::Released(why)) => {
+                shared.releases.fetch_add(1, Ordering::Relaxed);
+                log::info!("capture: microphone closed, PCM released ({why})");
+                idle_reason = Some(why);
+            }
             Err(e) => {
-                log::error!("capture: stream failed: {e}; reopening");
-                if !sleep_unless_stopped(shared, RETRY_BASE) {
+                stream_errors = stream_errors.saturating_add(1);
+                let delay = backoff(stream_errors);
+                match e {
+                    CaptureError::Stalled(ms) => log::warn!(
+                        "capture: no audio from the device for {ms} ms; closed it, reopening in {} s",
+                        delay.as_secs()
+                    ),
+                    other => log::error!(
+                        "capture: stream failed: {other}; reopening in {} s",
+                        delay.as_secs()
+                    ),
+                }
+                if !sleep_unless_wanted_or_stopped(shared, &mut kill, delay) {
                     break;
                 }
             }
@@ -218,13 +344,34 @@ fn run(cfg: &CaptureSettings, shared: &Shared, tx: &mpsc::Sender<AppCommand>) {
     log::debug!("capture: thread stopped");
 }
 
-/// Reads until stop (`Ok`) or a stream error (`Err`, caller reopens).
+/// Sleeps up to `d` (a retry delay); returns early (true) when the
+/// microphone stops being wanted, so a mute during a retry wait is logged at
+/// once. Returns false if stopped.
+fn sleep_unless_wanted_or_stopped(shared: &Shared, kill: &mut KillSwitch<'_>, d: Duration) -> bool {
+    let end = Instant::now() + d;
+    loop {
+        if unwanted(shared, kill).is_some() {
+            return !shared.stop.load(Ordering::Relaxed);
+        }
+        let left = end.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return !shared.stop.load(Ordering::Relaxed);
+        }
+        if !sleep_unless_stopped(shared, left.min(Duration::from_millis(100))) {
+            return false;
+        }
+    }
+}
+
+/// Reads until stop or release (`Ok`) or a stream error (`Err`, caller
+/// reopens). The source is dropped (PCM closed) when this returns.
 fn pump(
     cfg: &CaptureSettings,
     mut src: Box<dyn AudioSource>,
     shared: &Shared,
     tx: &mpsc::Sender<AppCommand>,
-) -> Result<(), CaptureError> {
+    kill: &mut KillSwitch<'_>,
+) -> Result<PumpEnd, CaptureError> {
     let ch = usize::from(src.channels());
     let rate = src.rate();
     let is_file = cfg.source == MicSource::File;
@@ -246,6 +393,13 @@ fn pump(
     let mut eof = false;
 
     while !shared.stop.load(Ordering::Relaxed) {
+        shared.beat.fetch_add(1, Ordering::Relaxed);
+        while shared.test_hang.load(Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_secs(1));
+        }
+        if let Some(why) = unwanted(shared, kill) {
+            return Ok(PumpEnd::Released(why));
+        }
         let streaming = shared.streaming.load(Ordering::Relaxed);
         if streaming != was_streaming {
             chunker.clear();
@@ -280,7 +434,7 @@ fn pump(
                     Err(mpsc::error::TrySendError::Full(_)) => {
                         shared.chunks_dropped.fetch_add(1, Ordering::Relaxed);
                     }
-                    Err(mpsc::error::TrySendError::Closed(_)) => return Ok(()),
+                    Err(mpsc::error::TrySendError::Closed(_)) => return Ok(PumpEnd::Stop),
                 }
             }
         }
@@ -303,7 +457,7 @@ fn pump(
             );
         }
     }
-    Ok(())
+    Ok(PumpEnd::Stop)
 }
 
 #[cfg(test)]
@@ -369,6 +523,70 @@ mod tests {
         // 8000 frames - 4000 skipped = 4000 samples = 7 whole chunks.
         assert_eq!(samples, 7 * CHUNK_SAMPLES);
         assert_eq!(shared.chunks_sent.load(Ordering::Relaxed), 7);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn wait_for(f: impl Fn() -> bool) -> bool {
+        let t = Instant::now();
+        while t.elapsed() < Duration::from_secs(3) {
+            if f() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        false
+    }
+
+    #[test]
+    fn mute_and_kill_switch_close_and_reopen_the_source() {
+        let dir = std::env::temp_dir().join(format!("webos-sat-gate-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mic.raw");
+        write_raw(&path, 16_000, 1000);
+        let kill = dir.join("disable");
+        let mut s = Settings::default();
+        s.mic.source = MicSource::File;
+        s.mic.path = Some(path);
+        s.mic.looping = true;
+        s.safety.kill_switch.clone_from(&kill);
+        let shared = Arc::new(Shared::default());
+        let (tx, _rx) = mpsc::channel(1024);
+        let h = spawn(CaptureSettings::from_settings(&s), Arc::clone(&shared), tx).unwrap();
+        assert!(wait_for(|| shared.open.load(Ordering::Relaxed)));
+
+        // Mute (daemon flag): closed within a read or two.
+        let t = Instant::now();
+        shared.mic_off.store(OFF_MUTED, Ordering::Relaxed);
+        assert!(wait_for(|| !shared.open.load(Ordering::Relaxed)));
+        assert!(
+            t.elapsed() < Duration::from_millis(500),
+            "{:?}",
+            t.elapsed()
+        );
+        assert_eq!(shared.releases.load(Ordering::Relaxed), 1);
+        shared.mic_off.store(OFF_NONE, Ordering::Relaxed);
+        assert!(wait_for(|| shared.open.load(Ordering::Relaxed)));
+
+        // Kill-switch file (checked by the thread itself): closed within one
+        // poll interval plus a read.
+        let t = Instant::now();
+        std::fs::write(&kill, b"").unwrap();
+        assert!(wait_for(|| !shared.open.load(Ordering::Relaxed)));
+        assert!(
+            t.elapsed() < KILL_SWITCH_POLL + Duration::from_millis(250),
+            "{:?}",
+            t.elapsed()
+        );
+        assert_eq!(shared.releases.load(Ordering::Relaxed), 2);
+        // Stays closed while the file exists.
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(!shared.open.load(Ordering::Relaxed));
+        std::fs::remove_file(&kill).unwrap();
+        assert!(wait_for(|| shared.open.load(Ordering::Relaxed)));
+        assert!(shared.beat.load(Ordering::Relaxed) > 0);
+
+        shared.stop.store(true, Ordering::Relaxed);
+        h.join().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 

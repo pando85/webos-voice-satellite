@@ -37,6 +37,10 @@ pub struct CaptureConfig {
     /// overrun recovery): the stream begins with a full-scale burst of about
     /// 5 ms.
     pub discard_ms: u32,
+    /// A read that sees no audio for this long fails with
+    /// [`CaptureError::Stalled`] instead of blocking forever (0 disables the
+    /// timeout). A period is 16 ms at the c3-a settings.
+    pub read_timeout_ms: u32,
 }
 
 impl Default for CaptureConfig {
@@ -50,6 +54,7 @@ impl Default for CaptureConfig {
             period_frames: 256,
             buffer_frames: 8192,
             discard_ms: 250,
+            read_timeout_ms: 5000,
         }
     }
 }
@@ -65,6 +70,7 @@ pub struct AlsaCapture {
     discard_frames: u64,
     discard_left: u64,
     xruns: u64,
+    read_timeout_ms: u32,
 }
 
 fn select_pcm(cfg: &CaptureConfig, pcms: &[PcmInfo]) -> Result<PcmInfo, CaptureError> {
@@ -156,6 +162,7 @@ impl AlsaCapture {
             discard_frames,
             discard_left: discard_frames,
             xruns: 0,
+            read_timeout_ms: cfg.read_timeout_ms,
         })
     }
 
@@ -208,6 +215,9 @@ impl AlsaCapture {
         consecutive: &mut u32,
     ) -> Result<Option<usize>, CaptureError> {
         loop {
+            if self.read_timeout_ms > 0 && !self.pcm.wait_readable(self.read_timeout_ms)? {
+                return Err(CaptureError::Stalled(self.read_timeout_ms));
+            }
             match self.pcm.readi(buf, usize::from(self.channels), frames) {
                 Ok(n) => {
                     *consecutive = 0;
@@ -389,9 +399,10 @@ mod tests {
                 c.channels,
                 c.period_frames,
                 c.buffer_frames,
-                c.discard_ms
+                c.discard_ms,
+                c.read_timeout_ms
             ),
-            (16_000, 2, 256, 8192, 250)
+            (16_000, 2, 256, 8192, 250, 5000)
         );
     }
 }

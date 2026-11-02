@@ -22,6 +22,8 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: cargo test (host)
         run: cargo test --workspace
+      - name: Ops scripts (supervisor, crash-loop guard, autostart gating)
+        run: sh packaging/webos/tests/run.sh
   build-tv:
     runs-on: ubuntu-latest
     needs: lint-test

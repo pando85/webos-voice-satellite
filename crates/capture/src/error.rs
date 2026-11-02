@@ -28,6 +28,11 @@ pub enum CaptureError {
         /// The last error.
         source: io::Error,
     },
+    /// No audio arrived within the configured read timeout
+    /// ([`crate::CaptureConfig::read_timeout_ms`]): the driver stopped
+    /// delivering periods. The caller should close and reopen the device.
+    #[error("no audio from the capture device for {0} ms (stalled)")]
+    Stalled(u32),
     /// Any other I/O error.
     #[error("i/o error: {0}")]
     Io(#[from] io::Error),

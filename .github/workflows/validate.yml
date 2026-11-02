@@ -13,6 +13,6 @@ jobs:
       - name: Check POSIX shell syntax
         run: |
           sh -n tools/probe/probe.sh
-          for f in packaging/webos/*.sh; do sh -n "$f"; done
+          for f in packaging/webos/*.sh packaging/webos/init.d/* packaging/webos/tests/*.sh tools/lifecycle/*.sh; do sh -n "$f"; done
       - name: Check research files and Markdown links
         run: python3 tools/check_docs.py

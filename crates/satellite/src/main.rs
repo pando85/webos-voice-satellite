@@ -16,9 +16,12 @@
 mod capture;
 mod config;
 mod daemon;
+mod firmware;
+mod limits;
 mod logger;
 mod player;
 mod selftest;
+mod watchdog;
 
 use std::process::ExitCode;
 
@@ -52,12 +55,20 @@ fn main() -> ExitCode {
             println!("config ok: {}", s.summary());
             ExitCode::SUCCESS
         }
+        Command::CheckFirmware(s) => {
+            let v = firmware::check(&s);
+            println!("{v}");
+            ExitCode::from(v.exit_code())
+        }
         Command::Run(s, triggers) => {
             // validate() already checked the level.
             logger::init(s.log_level().unwrap_or(log::LevelFilter::Info));
+            // Before any thread exists: niceness is per thread on Linux.
+            let limits = limits::apply(&s.limits);
             for w in s.warnings() {
                 log::warn!("config: {w}");
             }
+            log::info!("{limits}");
             let rt = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()

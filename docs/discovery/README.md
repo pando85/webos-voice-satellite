@@ -17,6 +17,8 @@ Device discovery results, one directory per TV. Each log states the date, firmwa
 | [P1-ha-integration.md](c3-a/P1-ha-integration.md) | Roadmap 1.4: satellite on the PC with TV-mic audio against the owner's HA. HA cannot reach the LAN (no entity yet); wake word id `alexa_v0.1` never fires, `alexa` does (pipeline fixed); wake, STT and streamed TTS verified through a bridge; the conversation agents are broken on HA's side |
 | [P1-tv-live.md](c3-a/P1-tv-live.md) | Roadmap 1.5: `webos-satellite` on c3-a from `/tmp`, silent: the live mic to HA's pipeline (push-to-talk), the full wake → STT → reply chain from TV-mic audio with the reply in PulseAudio at gain 0, an 11-minute stability run, CPU/RSS/bandwidth |
 | [P1-ops.md](c3-a/P1-ops.md) | Roadmap 1.7: install, start, stop, status and uninstall scripts run on c3-a under `/tmp/webos-satellite`; before/after listing of `/tmp`, processes, sink-inputs and sockets shows no residue; log leak review with canary strings |
+| [P3-robustness.md](c3-a/P3-robustness.md) | Phase 3 without sound or persistence: kill switch and mute release the PCM in tens of milliseconds, firmware guard, watchdog and supervisor, resource limits, reconnection tests and a soak through the HA bridge |
+| [D5-plan.md](c3-a/D5-plan.md) | Owner procedure for screen-off, standby and Always Ready observations (not run) |
 | [rooted-tv-improvements.md](c3-a/rooted-tv-improvements.md) | Hardening and hygiene backlog for the rooted TV (documented only, not applied) |
 
 Not yet done: D4 (behaviour while the TV plays sound, echo, SpeakerFeedback as reference) and D5 (power states). They are scheduled in [roadmap](../project/roadmap.md) Phases 2 and 3.

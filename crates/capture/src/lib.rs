@@ -17,7 +17,10 @@
 //! returns `EBUSY` while LG hands-free voice holds it ([`CaptureError::MicBusy`]);
 //! it accepts only period 256 / buffer 8192 at S24_LE, 2 ch, 16 kHz; the first
 //! ~5 ms are a full-scale burst, so [`CaptureConfig::discard_ms`] frames are
-//! dropped after every start and every overrun recovery.
+//! dropped after every start and every overrun recovery. A read waits at most
+//! [`CaptureConfig::read_timeout_ms`] for audio and then fails with
+//! [`CaptureError::Stalled`], so a driver that stops delivering periods is
+//! detected and the caller can reopen the device.
 //!
 //! `unsafe` is confined to the private `sys` module (ioctl struct layouts and
 //! calls); the rest of the crate is safe code.

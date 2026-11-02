@@ -65,7 +65,7 @@ chmod 700 "$PREFIX" "$PREFIX/bin" "$PREFIX/etc" "$PREFIX/run" "$PREFIX/log" "$PR
 
 cp "$binary" "$PREFIX/bin/webos-satellite"
 chmod 700 "$PREFIX/bin/webos-satellite"
-for f in lib.sh start.sh stop.sh status.sh uninstall.sh rotate.sh; do
+for f in lib.sh start.sh stop.sh status.sh uninstall.sh rotate.sh supervise.sh autostart.sh; do
     cp "$here/$f" "$PREFIX/bin/$f"
     chmod 700 "$PREFIX/bin/$f"
 done

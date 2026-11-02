@@ -82,3 +82,28 @@ dir = "."                # wav sink output directory
 # error | warn | info | debug | trace. Audio is never logged; transcripts and
 # reply text appear only at debug.
 level = "info"
+
+[safety]
+# Kill switch: while this file exists the microphone PCM is closed (the
+# hardware mic is released), nothing is streamed, and Home Assistant sees
+# the "Mute microphone" switch on and cannot turn it off. Checked at startup
+# and every 250 ms. `touch` it to stop listening, `rm` it to resume.
+kill_switch = "/tmp/webos-satellite.disable"
+# Remembers HA's mute switch across daemon restarts (created on mute, removed
+# on unmute). Under /tmp it is lost at reboot; put it in a persistent
+# directory if a mute must survive reboots.
+mute_file = "/tmp/webos-satellite.muted"
+# Firmware guard: the LG firmware versions (webos_manufacturing_version) the
+# ALSA capture was validated on. On another version, or if firmware_info
+# cannot be read, the satellite starts with the microphone disabled (shown
+# as muted in HA). Check with `webos-satellite --check-firmware`. An empty
+# list turns the guard off. File-mic tests are not gated.
+validated_firmware = ["03.30.74"]
+firmware_info = "/var/run/nyx/os_info.json"
+
+[limits]
+nice = 10                # scheduling niceness (also applies to pacat)
+max_open_files = 256     # soft RLIMIT_NOFILE; 0 keeps the inherited limit
+max_rss_mb = 64          # exit (code 72) above this resident size; 0 = off
+capture_stall_s = 5      # reopen the ALSA device after this long without audio
+loop_stall_s = 30        # exit (code 70/71) if the event loop or capture thread hangs
