@@ -122,3 +122,21 @@ max_open_files = 256     # soft RLIMIT_NOFILE; 0 keeps the inherited limit
 max_rss_mb = 64          # exit (code 72) above this resident size; 0 = off
 capture_stall_s = 5      # reopen the ALSA device after this long without audio
 loop_stall_s = 30        # exit (code 70/71) if the event loop or capture thread hangs
+
+[pairing]
+# Pairing without typing a key: Home Assistant 2026.9 or newer generates the
+# Noise key and sets it on the device (ESPHome "dynamic encryption key"). Only
+# used when [device] has no noise_psk / noise_psk_file: an explicit key always
+# wins and disables pairing. Mutually exclusive with allow_plaintext.
+# While unpaired the microphone stays closed and a keyless connection gets
+# only hello, device info, an empty entity list and the key exchange, and
+# only while the pairing window is open. Whoever on the LAN connects first
+# during the window can claim the device (HA's zero-PSK key exchange stops
+# sniffing but authenticates nobody), so keep the window short.
+enabled = false
+# Holds the stored key (noise_psk, mode 0600) and the trigger files: create
+# `pair` to open the window, `reset-pairing` to delete the stored key and
+# reopen it (the daemon deletes the trigger file; CLI: --pair, --reset-pairing).
+state_dir = "pairing"
+window_s = 600           # the window closes after this, or once a key is set
+open_on_start = true     # open the window when started without a stored key

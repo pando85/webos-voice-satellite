@@ -4,10 +4,15 @@
 //! their own OS threads.
 //!
 //! Microphone gate ([`MicGate`]): the PCM is open only while HA's mute switch
-//! is off, the kill-switch file is absent and the firmware guard passed. The
-//! kill switch and the guard force the mute switch on in HA; an unmute from HA
-//! is then refused. The API connection stays up while the mic is off, so HA
-//! shows the device and its mute state.
+//! is off, the kill-switch file is absent, the firmware guard passed and, with
+//! `[pairing]`, a key is active. The kill switch and the guard force the mute
+//! switch on in HA; an unmute from HA is then refused. The API connection
+//! stays up while the mic is off, so HA shows the device and its mute state.
+//!
+//! Pairing (`[pairing]`): the API server owns the key state; the daemon
+//! prepares the state directory, applies `--reset-pairing`, polls the `pair`
+//! and `reset-pairing` trigger files and keeps the microphone closed until
+//! the server reports [`PairingEvent::Paired`].
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -18,15 +23,19 @@ use std::time::Duration;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
 use tokio::time::{Instant, MissedTickBehavior};
-use webos_esphome_api::{AppCommand, AppEvent, PipelineMode, Server, TimerTable};
+use webos_esphome_api::{AppCommand, AppEvent, PairingEvent, PipelineMode, Server, TimerTable};
 
 use crate::capture::{
-    self, CaptureSettings, KILL_SWITCH_POLL, OFF_FIRMWARE, OFF_KILL, OFF_MUTED, OFF_NONE, Shared,
+    self, CaptureSettings, KILL_SWITCH_POLL, OFF_FIRMWARE, OFF_KILL, OFF_MUTED, OFF_NONE,
+    OFF_UNPAIRED, Shared,
 };
 use crate::config::{Hang, MicSource, Mode, Settings, TestTriggers};
 use crate::firmware::{self, Verdict};
 use crate::player::{Done, Kind, Player, redact_url};
 use crate::watchdog::{self, Beats};
+
+/// The pairing trigger files are checked this often.
+const PAIRING_POLL: Duration = Duration::from_secs(1);
 
 /// Delay before `--test-hang` freezes a thread.
 const TEST_HANG_AFTER: Duration = Duration::from_secs(5);
@@ -208,6 +217,7 @@ async fn tick_opt(iv: Option<&mut tokio::time::Interval>) {
 /// Decides whether the microphone may be open and what HA's mute switch must
 /// show. Pure logic; the daemon applies the commands it returns.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // one bool per independent gate
 pub(crate) struct MicGate {
     /// HA's mute switch as the user set it.
     ha_muted: bool,
@@ -215,6 +225,8 @@ pub(crate) struct MicGate {
     kill: bool,
     /// The firmware guard refused this firmware.
     firmware_block: bool,
+    /// Pairing is enabled and no key is active: nobody may listen yet.
+    unpaired: bool,
 }
 
 impl MicGate {
@@ -224,6 +236,8 @@ impl MicGate {
             Some("kill switch")
         } else if self.firmware_block {
             Some("firmware guard")
+        } else if self.unpaired {
+            Some("not paired")
         } else {
             None
         }
@@ -240,6 +254,8 @@ impl MicGate {
             OFF_KILL
         } else if self.firmware_block {
             OFF_FIRMWARE
+        } else if self.unpaired {
+            OFF_UNPAIRED
         } else if self.ha_muted {
             OFF_MUTED
         } else {
@@ -263,6 +279,22 @@ impl MicGate {
         }
     }
 
+    /// Pairing state changed (`true`: no key active). Returns the command for
+    /// the API server, if one is needed (as [`MicGate::set_kill`]).
+    pub(crate) fn set_unpaired(&mut self, on: bool) -> Option<AppCommand> {
+        if self.unpaired == on {
+            return None;
+        }
+        self.unpaired = on;
+        if on {
+            Some(AppCommand::SetMuted(true))
+        } else if self.mic_off() {
+            None
+        } else {
+            Some(AppCommand::SetMuted(false))
+        }
+    }
+
     /// HA's switch changed (or the echo of our own `SetMuted`). Returns the
     /// command to send back (re-mute when an unmute is refused) and whether
     /// the user's mute state changed.
@@ -274,6 +306,63 @@ impl MicGate {
         self.ha_muted = muted;
         (None, changed)
     }
+}
+
+/// Deletes a trigger file. True if it existed and is gone (act on it once).
+fn consume_trigger(path: &Path, warned: &mut bool) -> bool {
+    match std::fs::remove_file(path) {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => {
+            if !*warned {
+                *warned = true;
+                log::warn!(
+                    "pairing trigger {} cannot be removed ({e}); ignored",
+                    path.display()
+                );
+            }
+            false
+        }
+    }
+}
+
+/// Creates the pairing state directory (mode 0700) and applies the startup
+/// actions: `--reset-pairing` or a `reset-pairing` file deletes the stored
+/// key; a `pair` file opens the window (as `--pair`).
+fn prepare_pairing(settings: &mut Settings) -> Result<(), String> {
+    let p = &settings.pairing;
+    if !p.state_dir.is_dir() {
+        let mut b = std::fs::DirBuilder::new();
+        b.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt as _;
+            b.mode(0o700);
+        }
+        b.create(&p.state_dir).map_err(|e| {
+            format!(
+                "cannot create pairing.state_dir {}: {e}",
+                p.state_dir.display()
+            )
+        })?;
+    }
+    let mut warned = false;
+    let reset = consume_trigger(&p.reset_trigger(), &mut warned) || p.reset_now;
+    let pair = consume_trigger(&p.pair_trigger(), &mut warned);
+    if reset {
+        let key = p.key_file();
+        match webos_esphome_api::pairing::remove_key(&key) {
+            Ok(true) => log::warn!("PAIRING RESET: stored key {} deleted", key.display()),
+            Ok(false) => log::info!("pairing reset: no stored key"),
+            Err(e) => return Err(format!("cannot delete {}: {e}", key.display())),
+        }
+        // A reset always reopens the window.
+        settings.pairing.open_now = true;
+    }
+    if pair {
+        settings.pairing.open_now = true;
+    }
+    Ok(())
 }
 
 /// Remembers HA's mute switch in `path` (exists = muted). Best effort.
@@ -302,6 +391,9 @@ struct Daemon {
     mute_file: PathBuf,
     /// Timers HA reported (kept across HA reconnects, which do not replay them).
     timers: TimerTable,
+    /// `pair` and `reset-pairing` trigger files, with pairing enabled.
+    pairing_triggers: Option<(PathBuf, PathBuf)>,
+    trigger_warned: bool,
 }
 
 impl Daemon {
@@ -343,6 +435,57 @@ impl Daemon {
         }
         if let Some(cmd) = cmd {
             self.send(cmd).await;
+        }
+    }
+
+    /// Acts on the `reset-pairing` and `pair` trigger files.
+    async fn poll_pairing(&mut self) {
+        let Some((pair, reset)) = self.pairing_triggers.clone() else {
+            return;
+        };
+        if consume_trigger(&reset, &mut self.trigger_warned) {
+            log::warn!("{} found: resetting the pairing", reset.display());
+            self.send(AppCommand::ResetPairing).await;
+        } else if consume_trigger(&pair, &mut self.trigger_warned) {
+            log::info!("{} found: opening the pairing window", pair.display());
+            self.send(AppCommand::OpenPairingWindow).await;
+        }
+    }
+
+    async fn set_unpaired(&mut self, on: bool) {
+        let cmd = self.gate.set_unpaired(on);
+        self.apply_gate();
+        if let Some(cmd) = cmd {
+            self.send(cmd).await;
+        }
+    }
+
+    async fn on_pairing(&mut self, ev: PairingEvent) {
+        match ev {
+            PairingEvent::Paired { client_info, peer } => {
+                log::warn!(
+                    "PAIRED by {client_info:?} from {}; if that is not your Home Assistant, reset the pairing",
+                    peer.ip()
+                );
+                self.set_unpaired(false).await;
+                if self.gate.mic_off() {
+                    log::info!(
+                        "the microphone stays off ({})",
+                        self.gate.forced().unwrap_or("muted")
+                    );
+                }
+            }
+            PairingEvent::KeyRotated => log::info!("pairing key replaced by the key holder"),
+            PairingEvent::Reset => {
+                self.set_streaming(false);
+                log::warn!("pairing reset: microphone closed until paired again");
+                self.set_unpaired(true).await;
+            }
+            PairingEvent::WindowOpened { seconds } => {
+                log::info!("pairing window open for {seconds} s");
+            }
+            PairingEvent::WindowClosed => log::info!("pairing window closed"),
+            other => log::debug!("pairing event {other:?}"),
         }
     }
 
@@ -503,6 +646,7 @@ impl Daemon {
                 log::debug!("HA pipeline error message: {message:?}");
                 self.runs.error(&code);
             }
+            AppEvent::Pairing(ev) => self.on_pairing(ev).await,
             AppEvent::MuteChanged(muted) => {
                 if muted {
                     self.set_streaming(false);
@@ -568,9 +712,18 @@ impl Daemon {
 
 /// Runs the daemon until SIGTERM/SIGINT.
 #[allow(clippy::too_many_lines)] // linear setup, loop and shutdown
-pub(crate) async fn run(settings: Settings, triggers: TestTriggers) -> Result<(), String> {
+pub(crate) async fn run(mut settings: Settings, triggers: TestTriggers) -> Result<(), String> {
+    if settings.pairing_active() {
+        prepare_pairing(&mut settings)?;
+    }
     let esp = settings.esphome_config().map_err(|e| e.to_string())?;
     let server = Server::bind(esp).await.map_err(|e| e.to_string())?;
+    let unpaired = server.needs_pairing();
+    if unpaired {
+        log::warn!("NOT PAIRED: the microphone stays closed until Home Assistant sets the key");
+    } else if settings.pairing_active() && settings.pairing.open_now {
+        log::warn!("pairing window not opened: already paired (use --reset-pairing to pair again)");
+    }
     log::info!(
         "webos-satellite {} ({}) ESPHome API on {}",
         crate::VERSION,
@@ -599,6 +752,7 @@ pub(crate) async fn run(settings: Settings, triggers: TestTriggers) -> Result<()
         ha_muted: settings.safety.mute_file.exists(),
         kill: settings.safety.kill_switch.exists(),
         firmware_block: gated && !verdict.allows_capture(),
+        unpaired,
     };
     if gate.kill {
         log::warn!(
@@ -661,7 +815,19 @@ pub(crate) async fn run(settings: Settings, triggers: TestTriggers) -> Result<()
         kill_switch: settings.safety.kill_switch.clone(),
         mute_file: settings.safety.mute_file.clone(),
         timers: TimerTable::new(),
+        pairing_triggers: settings.pairing_active().then(|| {
+            (
+                settings.pairing.pair_trigger(),
+                settings.pairing.reset_trigger(),
+            )
+        }),
+        trigger_warned: false,
     };
+    let mut pairing_poll = settings.pairing_active().then(|| {
+        let mut iv = tokio::time::interval_at(Instant::now() + PAIRING_POLL, PAIRING_POLL);
+        iv.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        iv
+    });
     let mut kill_poll = tokio::time::interval(KILL_SWITCH_POLL);
     kill_poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut ptt_timer = triggers.ptt_every.map(|p| {
@@ -701,6 +867,7 @@ pub(crate) async fn run(settings: Settings, triggers: TestTriggers) -> Result<()
                 d.poll_kill_switch().await;
             }
             () = tick_opt(ptt_timer.as_mut()) => d.ptt("--ptt-every").await,
+            () = tick_opt(pairing_poll.as_mut()) => d.poll_pairing().await,
             () = sleep_opt(hang_at) => {
                 hang_at = None;
                 match triggers.hang {
@@ -850,6 +1017,81 @@ mod tests {
         assert_eq!(g.set_kill(true), Some(AppCommand::SetMuted(true)));
         assert_eq!(g.set_kill(false), None);
         assert!(g.mic_off());
+    }
+
+    #[test]
+    fn unpaired_keeps_the_mic_closed_until_paired() {
+        let mut g = MicGate {
+            unpaired: true,
+            ..MicGate::default()
+        };
+        assert!(g.mic_off());
+        assert_eq!(g.forced(), Some("not paired"));
+        assert_eq!(g.off_code(), OFF_UNPAIRED);
+        // No HA can unmute while unpaired.
+        assert_eq!(
+            g.on_mute_changed(false),
+            (Some(AppCommand::SetMuted(true)), false)
+        );
+        // Paired: unmuted unless something else holds the mic.
+        assert_eq!(g.set_unpaired(false), Some(AppCommand::SetMuted(false)));
+        assert!(!g.mic_off());
+        assert_eq!(g.set_unpaired(false), None);
+        // Reset: closed again; the kill switch outranks it.
+        assert_eq!(g.set_unpaired(true), Some(AppCommand::SetMuted(true)));
+        assert_eq!(g.set_kill(true), Some(AppCommand::SetMuted(true)));
+        assert_eq!(g.off_code(), OFF_KILL);
+        assert_eq!(g.set_unpaired(false), None, "still killed");
+        assert!(g.mic_off());
+        // A user mute from before pairing survives it.
+        let mut g = MicGate {
+            unpaired: true,
+            ha_muted: true,
+            ..MicGate::default()
+        };
+        assert_eq!(g.set_unpaired(false), None);
+        assert!(g.mic_off());
+    }
+
+    #[test]
+    fn pairing_startup_actions_and_triggers() {
+        let dir = std::env::temp_dir().join(format!("webos-sat-pairing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut s = Settings::default();
+        s.pairing.enabled = true;
+        s.pairing.state_dir = dir.join("state");
+        // Creates the directory with mode 0700; nothing else happens.
+        prepare_pairing(&mut s).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&s.pairing.state_dir)
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o700);
+        }
+        assert!(!s.pairing.open_now);
+        // A pair file opens the window and is consumed.
+        std::fs::write(s.pairing.pair_trigger(), b"").unwrap();
+        prepare_pairing(&mut s).unwrap();
+        assert!(s.pairing.open_now && !s.pairing.pair_trigger().exists());
+        // A reset file deletes the stored key and reopens the window.
+        s.pairing.open_now = false;
+        webos_esphome_api::pairing::store_key(&s.pairing.key_file(), &[3; 32]).unwrap();
+        std::fs::write(s.pairing.reset_trigger(), b"").unwrap();
+        prepare_pairing(&mut s).unwrap();
+        assert!(!s.pairing.key_file().exists() && !s.pairing.reset_trigger().exists());
+        assert!(s.pairing.open_now);
+        // --reset-pairing does the same without a file.
+        s.pairing.open_now = false;
+        webos_esphome_api::pairing::store_key(&s.pairing.key_file(), &[3; 32]).unwrap();
+        s.pairing.reset_now = true;
+        prepare_pairing(&mut s).unwrap();
+        assert!(!s.pairing.key_file().exists() && s.pairing.open_now);
+        let mut warned = false;
+        assert!(!consume_trigger(&dir.join("absent"), &mut warned) && !warned);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

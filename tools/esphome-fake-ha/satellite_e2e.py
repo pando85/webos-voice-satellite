@@ -30,7 +30,16 @@ import tempfile
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from fake_ha import RESULTS, TIMEOUT, USE_WAKE_WORD, FakeHA, check, until_true  # noqa: E402
+from fake_ha import (  # noqa: E402
+    RESULTS,
+    TIMEOUT,
+    USE_WAKE_WORD,
+    FakeHA,
+    check,
+    fetch_device_info_like_ha,
+    provision_over_zero_psk,
+    until_true,
+)
 
 from aioesphomeapi import VoiceAssistantEventType as Ev  # noqa: E402
 from aioesphomeapi import VoiceAssistantTimerEventType as TimerEv  # noqa: E402
@@ -242,6 +251,136 @@ level = "info"
         sat.log.close()
 
 
+def pairing_config(tmp: str, name: str, port: int, mac: str, window_s: int) -> str:
+    config = os.path.join(tmp, f"{name}.toml")
+    with open(config, "w") as f:
+        f.write(f"""
+mode = "wake"
+[device]
+name = "{name}"
+mac = "{mac}"
+bind = "127.0.0.1"
+port = {port}
+[mic]
+source = "file"
+path = "mic.raw"
+loop = true
+[sink]
+type = "null"
+[log]
+level = "debug"
+[pairing]
+enabled = true
+state_dir = "{name}-state"
+window_s = {window_s}
+""")
+    return config
+
+
+async def scenario_pairing(binary: str, tmp: str) -> None:
+    print("\n== satellite e2e: [pairing] HA-driven key provisioning ==")
+    write_mic(os.path.join(tmp, "mic.raw"), 5.0)
+    port = free_port()
+    config = pairing_config(tmp, "e2e-pairing", port, "02:00:00:00:00:e4", 600)
+    state = os.path.join(tmp, "e2e-pairing-state")
+    key_file = os.path.join(state, "noise_psk")
+    log_path = os.path.join(tmp, "satellite-pairing.log")
+    sat = Satellite(binary, config, log_path)
+    await sat.start()
+    new_key = base64.b64encode(os.urandom(32))
+    try:
+        ok = await sat.wait_log("PAIRING WINDOW OPEN for 600 s") and await sat.wait_log(
+            "capture: microphone off (not paired)")
+        check("P1 unpaired start: window open, microphone closed (not paired)",
+              ok and "capture: microphone open" not in sat.text()
+              and (os.stat(state).st_mode & 0o777) == 0o700)
+        ha = FakeHA(port)
+        cli = await ha.connect()
+        info, entities, _ = await cli.device_info_and_list_entities()
+        flags = info.voice_assistant_feature_flags_compat(cli.api_version)
+        ha.subscribe_voice()
+        no_start = await ha.expect_no_start(1.0)
+        check("P2 keyless HA session: provisionable, no voice, no pipeline, no audio",
+              info.api_encryption_provisionable and flags == 0 and entities == [] and no_start
+              and ha.audio.empty() and "HA connected" not in sat.text(), f"flags={flags}")
+        ok = await provision_over_zero_psk(port, new_key)
+        check("P3 HA's zero-PSK provisioning accepted", ok is True)
+        ok = await sat.wait_log("PAIRED by") and await sat.wait_log("capture: microphone open")
+        mode = os.stat(key_file).st_mode & 0o777
+        check("P4 key stored (0600), keyless session closed, microphone opens",
+              ok and mode == 0o600 and await until_true(lambda: ha.stopped.is_set()), f"mode={mode:o}")
+
+        ha2 = FakeHA(port, new_key.decode())
+        cli2 = await ha2.connect()
+        info2 = await cli2.device_info()
+        ha2.subscribe_voice()
+        _conv, vflags, _ = await ha2.next_start()
+        ok = await until_true(lambda: ha2.audio.qsize() >= 5, TIMEOUT)
+        check("P5 reconnect with the provisioned key: wake word run streams the file mic",
+              ok and bool(vflags & USE_WAKE_WORD) and not info2.api_encryption_provisionable
+              and info2.voice_assistant_feature_flags_compat(cli2.api_version) == 23)
+        await cli2.disconnect()
+        res = [await fetch_device_info_like_ha(port, k) for k in (None, base64.b64encode(os.urandom(32)).decode())]
+        check("P6 no key / wrong key refused", res == ["requires_encryption_key", "invalid_psk"], str(res))
+
+        sat.proc.send_signal(signal.SIGTERM)
+        await asyncio.wait_for(sat.proc.wait(), 5)
+        sat.log.close()
+        sat = Satellite(binary, config, log_path + ".2")
+        await sat.start()
+        ok = await sat.wait_log("esphome-api: paired (stored key)")
+        check("P7 restart: paired from the stored key, no window",
+              ok and "PAIRING WINDOW OPEN" not in sat.text()
+              and await fetch_device_info_like_ha(port, new_key.decode()) == "ok")
+
+        ha3 = FakeHA(port, new_key.decode())
+        await ha3.connect()
+        with open(os.path.join(state, "reset-pairing"), "w"):
+            pass
+        ok = await sat.wait_log("PAIRING RESET") and await sat.wait_log("PAIRING WINDOW OPEN")
+        ok = ok and await sat.wait_log("PCM released (not paired)")
+        check("P8 reset-pairing file: key deleted, session dropped, window open, microphone closed",
+              ok and not os.path.exists(key_file) and not os.path.exists(os.path.join(state, "reset-pairing"))
+              and await until_true(lambda: ha3.stopped.is_set())
+              and await fetch_device_info_like_ha(port, new_key.decode()) == "invalid_psk")
+        sat.proc.send_signal(signal.SIGTERM)
+        rc = await asyncio.wait_for(sat.proc.wait(), 5)
+        logs = open(log_path).read() + sat.text()
+        check("P9 clean exit; the key is never logged (debug level)",
+              rc == 0 and new_key.decode() not in logs, f"rc={rc}")
+    finally:
+        if sat.proc.returncode is None:
+            sat.proc.kill()
+            await sat.proc.wait()
+        sat.log.close()
+
+
+async def scenario_pairing_window(binary: str, tmp: str) -> None:
+    print("\n== satellite e2e: [pairing] window timeout and pair trigger file ==")
+    port = free_port()
+    config = pairing_config(tmp, "e2e-window", port, "02:00:00:00:00:e5", 2)
+    state = os.path.join(tmp, "e2e-window-state")
+    sat = Satellite(binary, config, os.path.join(tmp, "satellite-window.log"))
+    await sat.start()
+    try:
+        ok = await sat.wait_log("pairing window closed without a key", timeout=6)
+        res = await fetch_device_info_like_ha(port, None)
+        check("W1 window timeout: HA's config flow gets provisioning_closed", ok and res == "provisioning_closed", res)
+        with open(os.path.join(state, "pair"), "w"):
+            pass
+        ok = await sat.wait_log("found: opening the pairing window")
+        res = await fetch_device_info_like_ha(port, None)
+        check("W2 pair trigger file reopens the window", ok and res == "ok", res)
+        sat.proc.send_signal(signal.SIGTERM)
+        rc = await asyncio.wait_for(sat.proc.wait(), 5)
+        check("W3 clean exit", rc == 0, f"rc={rc}")
+    finally:
+        if sat.proc.returncode is None:
+            sat.proc.kill()
+            await sat.proc.wait()
+        sat.log.close()
+
+
 async def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary", required=True, help="path to the webos-satellite binary")
@@ -251,10 +390,13 @@ async def main() -> int:
         try:
             await scenario(args.binary, tmp)
             await scenario_timers(args.binary, tmp)
+            await scenario_pairing(args.binary, tmp)
+            await scenario_pairing_window(args.binary, tmp)
         except Exception as err:  # noqa: BLE001
             failed = True
             print(f"FAIL  {type(err).__name__}: {err}", flush=True)
-            for name in ("satellite.log", "satellite-timers.log"):
+            for name in ("satellite.log", "satellite-timers.log", "satellite-pairing.log",
+                         "satellite-pairing.log.2", "satellite-window.log"):
                 log = os.path.join(tmp, name)
                 if os.path.exists(log):
                     print(f"---- {name} ----")

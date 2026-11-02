@@ -40,6 +40,8 @@ pub(crate) struct Settings {
     pub(crate) safety: SafetySection,
     /// Resource limits and watchdog.
     pub(crate) limits: LimitsSection,
+    /// HA-driven key provisioning (pairing without typing a key).
+    pub(crate) pairing: PairingSection,
 }
 
 /// How pipeline runs start.
@@ -369,6 +371,62 @@ impl Default for LimitsSection {
     }
 }
 
+/// `[pairing]`: Home Assistant sets the Noise key itself (HA 2026.9 or newer).
+/// Only used when `device.noise_psk` and `device.noise_psk_file` are unset.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[allow(clippy::struct_excessive_bools)] // TOML switches and two CLI actions
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct PairingSection {
+    /// Start without a key and let HA provision one while the window is open.
+    pub(crate) enabled: bool,
+    /// Directory (created with mode 0700) for the stored key `noise_psk` and
+    /// the trigger files `pair` and `reset-pairing`.
+    pub(crate) state_dir: PathBuf,
+    /// How long the pairing window stays open, in seconds.
+    pub(crate) window_s: u32,
+    /// Open the window when the daemon starts without a stored key.
+    pub(crate) open_on_start: bool,
+    /// `--pair`: open the window at startup whatever `open_on_start` says.
+    #[serde(skip)]
+    pub(crate) open_now: bool,
+    /// `--reset-pairing`: delete the stored key before starting.
+    #[serde(skip)]
+    pub(crate) reset_now: bool,
+}
+
+/// Longest accepted `pairing.window_s` (one day).
+pub(crate) const MAX_PAIRING_WINDOW_S: u32 = 86_400;
+
+impl Default for PairingSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            state_dir: PathBuf::from("pairing"),
+            window_s: 600,
+            open_on_start: true,
+            open_now: false,
+            reset_now: false,
+        }
+    }
+}
+
+impl PairingSection {
+    /// The stored key (written by the daemon when HA sets it).
+    pub(crate) fn key_file(&self) -> PathBuf {
+        self.state_dir.join("noise_psk")
+    }
+
+    /// Creating this file opens the pairing window (the daemon deletes it).
+    pub(crate) fn pair_trigger(&self) -> PathBuf {
+        self.state_dir.join("pair")
+    }
+
+    /// Creating this file deletes the stored key and opens the window.
+    pub(crate) fn reset_trigger(&self) -> PathBuf {
+        self.state_dir.join("reset-pairing")
+    }
+}
+
 /// The permission bits of `path` if group or other have any access
 /// (unreadable or non-Unix: `None`).
 #[cfg(unix)]
@@ -419,6 +477,7 @@ impl Settings {
         resolve(base, &mut s.safety.kill_switch);
         resolve(base, &mut s.safety.mute_file);
         resolve(base, &mut s.safety.firmware_info);
+        resolve(base, &mut s.pairing.state_dir);
         Ok(s)
     }
 
@@ -512,12 +571,27 @@ impl Settings {
                 "set only one of device.noise_psk and device.noise_psk_file",
             ));
         }
-        if self.device.noise_psk.is_none()
-            && self.device.noise_psk_file.is_none()
-            && !self.device.allow_plaintext
-        {
+        if !self.has_fixed_key() && !self.pairing_active() && !self.device.allow_plaintext {
             return Err(err(
-                "no Noise key: set device.noise_psk_file (or device.allow_plaintext = true for development)",
+                "no Noise key: set device.noise_psk_file, or pairing.enabled = true to let Home Assistant set one (or device.allow_plaintext = true for development)",
+            ));
+        }
+        if self.pairing_active() && self.device.allow_plaintext {
+            return Err(err(
+                "pairing.enabled and device.allow_plaintext exclude each other",
+            ));
+        }
+        if !(1..=MAX_PAIRING_WINDOW_S).contains(&self.pairing.window_s) {
+            return Err(err(format!(
+                "pairing.window_s must be between 1 and {MAX_PAIRING_WINDOW_S}"
+            )));
+        }
+        if self.pairing.state_dir.as_os_str().is_empty() {
+            return Err(err("pairing.state_dir must be set"));
+        }
+        if (self.pairing.open_now || self.pairing.reset_now) && !self.pairing_active() {
+            return Err(err(
+                "--pair and --reset-pairing need pairing.enabled = true and no device.noise_psk or noise_psk_file",
             ));
         }
         self.esphome_config()?
@@ -530,10 +604,7 @@ impl Settings {
     /// `--check-config`. Never includes secret values.
     pub(crate) fn warnings(&self) -> Vec<String> {
         let mut w = Vec::new();
-        if self.device.allow_plaintext
-            && self.device.noise_psk.is_none()
-            && self.device.noise_psk_file.is_none()
-        {
+        if self.device.allow_plaintext && !self.has_fixed_key() && !self.pairing_active() {
             w.push("device.allow_plaintext: the API is unencrypted (development only)".to_owned());
         }
         if self.device.noise_psk.is_some() {
@@ -550,6 +621,21 @@ impl Settings {
                 ));
             }
         }
+        if self.pairing.enabled && self.has_fixed_key() {
+            w.push(
+                "pairing.enabled is ignored: a key is set in [device] (an explicit key disables pairing)"
+                    .to_owned(),
+            );
+        }
+        if self.pairing_active() {
+            let key = self.pairing.key_file();
+            if let Some(mode) = loose_mode(&key) {
+                w.push(format!(
+                    "the stored pairing key {} has mode {mode:04o}: group/other can read it; run chmod 600",
+                    key.display()
+                ));
+            }
+        }
         if self.safety.validated_firmware.is_empty() {
             w.push("safety.validated_firmware is empty: the firmware guard is off".to_owned());
         }
@@ -559,6 +645,17 @@ impl Settings {
             }
         }
         w
+    }
+
+    /// `device.noise_psk` or `device.noise_psk_file` is set: that key is used
+    /// and pairing is off.
+    pub(crate) fn has_fixed_key(&self) -> bool {
+        self.device.noise_psk.is_some() || self.device.noise_psk_file.is_some()
+    }
+
+    /// Pairing is enabled and not overridden by an explicit key.
+    pub(crate) fn pairing_active(&self) -> bool {
+        self.pairing.enabled && !self.has_fixed_key()
     }
 
     /// The Noise key, read from the file if configured. Never logged.
@@ -612,6 +709,13 @@ impl Settings {
             bind_addr: d.bind,
             port: d.port,
             noise_psk: self.noise_psk()?,
+            provisioning: self
+                .pairing_active()
+                .then(|| webos_esphome_api::Provisioning {
+                    key_file: self.pairing.key_file(),
+                    window: Duration::from_secs(u64::from(self.pairing.window_s)),
+                    open_at_start: self.pairing.open_on_start || self.pairing.open_now,
+                }),
             mdns: d.mdns,
             voice_features: self.voice_features(),
             ..webos_esphome_api::Config::default()
@@ -679,17 +783,29 @@ impl Settings {
         } else {
             self.safety.validated_firmware.join(",")
         };
+        let encryption = if self.has_fixed_key() {
+            "noise".to_owned()
+        } else if self.pairing_active() {
+            format!(
+                "pairing({}) pairing=[state_dir={} window_s={} open_on_start={}]",
+                if self.pairing.key_file().exists() {
+                    "paired"
+                } else {
+                    "not paired"
+                },
+                self.pairing.state_dir.display(),
+                self.pairing.window_s,
+                self.pairing.open_on_start
+            )
+        } else {
+            "PLAINTEXT".to_owned()
+        };
         format!(
-            "name={} port={} voice_features={} mode={:?} encryption={} mic=[{mic}] dsp=[{:?} gain_db={} hpf_hz={}] sink=[{sink}] safety=[kill_switch={} mute_file={} firmware={fw}] limits=[nice={} nofile={} rss_mb={} capture_stall_s={} loop_stall_s={}]",
+            "name={} port={} voice_features={} mode={:?} encryption={encryption} mic=[{mic}] dsp=[{:?} gain_db={} hpf_hz={}] sink=[{sink}] safety=[kill_switch={} mute_file={} firmware={fw}] limits=[nice={} nofile={} rss_mb={} capture_stall_s={} loop_stall_s={}]",
             self.device.name,
             self.device.port,
             self.voice_features(),
             self.mode,
-            if self.device.noise_psk.is_some() || self.device.noise_psk_file.is_some() {
-                "noise"
-            } else {
-                "PLAINTEXT"
-            },
             self.dsp.channel,
             self.dsp.gain_db,
             self.dsp.hpf_hz,
@@ -768,12 +884,16 @@ options (override the config file):
   --wav-dir DIR          output directory of the wav sink
   --log-level LEVEL      error|warn|info|debug|trace
   --kill-switch FILE     while FILE exists the mic is closed and reported muted
+  --pair                 open the pairing window at startup (needs pairing.enabled)
+  --reset-pairing        delete the stored pairing key, then open the window
 test aids:
   --ptt-on-connect       start one push-to-talk run after HA connects
   --ptt-every SECS       start a push-to-talk run every SECS seconds
   --test-hang loop|capture  freeze that thread 5 s after start (watchdog test)
 
 signals: SIGUSR1 starts a push-to-talk run; SIGTERM/SIGINT stop.
+pairing files (in pairing.state_dir, checked every second, deleted when acted on):
+  pair opens the pairing window; reset-pairing deletes the stored key and opens it.
 exit codes: 0 stopped by a signal, 1 error, 2 bad arguments or config,
   70 event loop stalled, 71 capture thread stalled, 72 memory ceiling exceeded.";
 
@@ -826,6 +946,8 @@ pub(crate) fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Comm
             "--check-config" => check = true,
             "--check-firmware" => check_fw = true,
             "--kill-switch" => settings.safety.kill_switch = PathBuf::from(value()?),
+            "--pair" => settings.pairing.open_now = true,
+            "--reset-pairing" => settings.pairing.reset_now = true,
             "--mode" => settings.mode = parse_enum(flag, value()?)?,
             "--name" => value()?.clone_into(&mut settings.device.name),
             "--friendly-name" => value()?.clone_into(&mut settings.device.friendly_name),
@@ -943,6 +1065,7 @@ level = "debug"
         let mut expected = Settings::default();
         expected.device.noise_psk_file = Some(base.join("noise_psk"));
         expected.sink.dir = base.join(".");
+        expected.pairing.state_dir = base.join("pairing");
         assert_eq!(s, expected);
     }
 
@@ -1081,6 +1204,117 @@ level = "debug"
         // TOML syntax and type errors carry the position and key.
         let e = Settings::from_toml("[mic]\nrate = \"fast\"\n", Path::new(".")).unwrap_err();
         assert!(e.0.contains("rate") && e.0.contains("line 2"), "{e}");
+    }
+
+    #[test]
+    fn pairing_section_and_key_precedence() {
+        let base = Path::new("/etc/sat");
+        let s = Settings::from_toml(
+            "[pairing]\nenabled = true\nstate_dir = \"state\"\nwindow_s = 120\nopen_on_start = false\n",
+            base,
+        )
+        .unwrap();
+        s.validate().unwrap();
+        assert!(s.pairing_active() && !s.has_fixed_key());
+        assert_eq!(
+            s.pairing.key_file(),
+            PathBuf::from("/etc/sat/state/noise_psk")
+        );
+        assert_eq!(
+            s.pairing.pair_trigger(),
+            PathBuf::from("/etc/sat/state/pair")
+        );
+        assert_eq!(
+            s.pairing.reset_trigger(),
+            PathBuf::from("/etc/sat/state/reset-pairing")
+        );
+        let esp = s.esphome_config().unwrap();
+        assert!(esp.noise_psk.is_none());
+        let prov = esp.provisioning.unwrap();
+        assert_eq!(prov.key_file, PathBuf::from("/etc/sat/state/noise_psk"));
+        assert_eq!(prov.window, Duration::from_secs(120));
+        assert!(!prov.open_at_start);
+        assert!(
+            s.summary().contains("encryption=pairing(not paired)"),
+            "{}",
+            s.summary()
+        );
+        assert!(s.warnings().is_empty(), "{:?}", s.warnings());
+        // --pair opens the window at startup even with open_on_start = false.
+        let mut pair_now = s.clone();
+        pair_now.pairing.open_now = true;
+        assert!(
+            pair_now
+                .esphome_config()
+                .unwrap()
+                .provisioning
+                .unwrap()
+                .open_at_start
+        );
+
+        // An explicit key wins: pairing off, with a warning; nothing secret.
+        let key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        let mut keyed = s.clone();
+        keyed.device.noise_psk = Some(key.to_owned());
+        keyed.validate().unwrap();
+        assert!(!keyed.pairing_active());
+        assert!(keyed.esphome_config().unwrap().provisioning.is_none());
+        assert!(keyed.summary().contains("encryption=noise"));
+        let w = keyed.warnings();
+        assert!(
+            w.iter().any(|m| m.contains("pairing.enabled is ignored")),
+            "{w:?}"
+        );
+        assert!(!w.iter().any(|m| m.contains(key)));
+        // --pair/--reset-pairing need active pairing.
+        keyed.pairing.open_now = true;
+        assert!(keyed.validate().unwrap_err().0.contains("--pair"));
+
+        // Plaintext and pairing exclude each other; window bounds.
+        let cases: [(Mutate, &str); 4] = [
+            (|s| s.device.allow_plaintext = true, "allow_plaintext"),
+            (|s| s.pairing.window_s = 0, "pairing.window_s"),
+            (
+                |s| s.pairing.window_s = MAX_PAIRING_WINDOW_S + 1,
+                "pairing.window_s",
+            ),
+            (
+                |s| s.pairing.state_dir = PathBuf::new(),
+                "pairing.state_dir",
+            ),
+        ];
+        for (mutate, key) in cases {
+            let mut bad = s.clone();
+            mutate(&mut bad);
+            let e = bad.validate().unwrap_err();
+            assert!(e.0.contains(key), "{key}: {e}");
+        }
+        // Without a key, pairing or plaintext the message names pairing.
+        let e = Settings::default().validate().unwrap_err();
+        assert!(e.0.contains("pairing.enabled"), "{e}");
+        assert!(Settings::from_toml("[pairing]\nenabeld = true\n", base).is_err());
+    }
+
+    #[test]
+    fn pairing_cli_flags() {
+        let dir = std::env::temp_dir().join(format!("webos-sat-pair-cli-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("c.toml");
+        std::fs::write(&cfg, "[pairing]\nenabled = true\n").unwrap();
+        let cfg = cfg.to_string_lossy().into_owned();
+        let Command::Run(s, _) =
+            parse_args(args(&["--config", &cfg, "--pair", "--reset-pairing"])).unwrap()
+        else {
+            panic!("expected Run");
+        };
+        assert!(s.pairing.open_now && s.pairing.reset_now);
+        assert_eq!(s.pairing.state_dir, dir.join("pairing"));
+        // Without pairing enabled the flags are an error.
+        let plain = dir.join("p.toml");
+        std::fs::write(&plain, "[device]\nallow_plaintext = true\n").unwrap();
+        let plain = plain.to_string_lossy().into_owned();
+        assert!(parse_args(args(&["--config", &plain, "--pair"])).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]

@@ -7,8 +7,8 @@
 //! backed up a chunk is dropped and counted rather than stalling capture.
 //!
 //! The PCM is open only while the microphone is wanted: [`Shared::mic_off`]
-//! (HA's mute switch, the kill switch or the firmware guard, set by the
-//! daemon) or the kill-switch file itself (checked here every 250 ms, so the
+//! (HA's mute switch, the kill switch, the firmware guard or "not paired",
+//! set by the daemon) or the kill-switch file itself (checked here every 250 ms, so the
 //! hardware is released even if the daemon's event loop is stuck) closes it
 //! within one read (16 ms at the c3-a settings), and it is reopened when the
 //! microphone is wanted again.
@@ -139,6 +139,8 @@ pub(crate) const OFF_MUTED: u8 = 1;
 pub(crate) const OFF_KILL: u8 = 2;
 /// [`Shared::mic_off`]: the firmware guard.
 pub(crate) const OFF_FIRMWARE: u8 = 3;
+/// [`Shared::mic_off`]: pairing enabled and no key yet (no HA may listen).
+pub(crate) const OFF_UNPAIRED: u8 = 4;
 
 /// Cached check of the kill-switch file (one `stat` per 250 ms at most).
 #[derive(Debug)]
@@ -179,6 +181,7 @@ fn unwanted(shared: &Shared, kill: &mut KillSwitch<'_>) -> Option<&'static str> 
         OFF_MUTED => Some("muted"),
         OFF_KILL => Some("kill switch"),
         OFF_FIRMWARE => Some("firmware guard"),
+        OFF_UNPAIRED => Some("not paired"),
         _ => Some("disabled"),
     }
 }
