@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import logging
 import os
 import re
 import sys
@@ -526,6 +527,99 @@ async def fetch_device_info_like_ha(port: int, psk: str | None) -> str:
         await cli.disconnect(force=True)
 
 
+async def clear_key_like_ha(port: int, psk: str) -> bool:
+    """HA 2026.10.4 esphome/__init__.py _async_clear_dynamic_encryption_key
+    (run when the config entry is deleted): connect with the entry's key,
+    send an empty key, then disconnect() (DisconnectRequest, wait for the
+    response)."""
+    cli = APIClient("127.0.0.1", port, "", client_info="fake-ha-remove", noise_psk=psk)
+    try:
+        await asyncio.wait_for(cli.connect(), TIMEOUT)
+        return await asyncio.wait_for(cli.noise_encryption_set_key(b""), TIMEOUT)
+    finally:
+        await cli.disconnect()
+
+
+class ErrorLog(logging.Handler):
+    """Collects aioesphomeapi log records at ERROR and above (HA logs
+    "disconnect request failed" with a traceback when its disconnect races
+    one from the device)."""
+
+    def __init__(self) -> None:
+        super().__init__(logging.ERROR)
+        self.records: list[str] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records.append(record.getMessage())
+
+    def __enter__(self) -> "ErrorLog":
+        logging.getLogger("aioesphomeapi").addHandler(self)
+        return self
+
+    def __exit__(self, *exc) -> None:
+        logging.getLogger("aioesphomeapi").removeHandler(self)
+
+
+class CoalescingProxy:
+    """TCP proxy that hands the device's bytes to the client in batches:
+    everything the device sends within `hold` seconds after a first byte is
+    written in one go, so the client reads it in one `data_received`. That is
+    what HA 2026.10.4 in its Kubernetes pod saw behind a router (P3 on c3-a):
+    a HelloResponse and a DisconnectRequest sent back to back arrived
+    together, and aioesphomeapi 46.6.0 then dropped the disconnect reason.
+    Client-to-device bytes pass at once."""
+
+    def __init__(self, target_port: int, hold: float = 0.05) -> None:
+        self.target_port = target_port
+        self.hold = hold
+        self.port = 0
+        self.batches = 0
+
+    async def __aenter__(self) -> "CoalescingProxy":
+        self.server = await asyncio.start_server(self._handle, "127.0.0.1", 0)
+        self.port = self.server.sockets[0].getsockname()[1]
+        return self
+
+    async def __aexit__(self, *exc) -> None:
+        self.server.close()
+        await self.server.wait_closed()
+
+    async def _handle(self, cr: asyncio.StreamReader, cw: asyncio.StreamWriter) -> None:
+        dr, dw = await asyncio.open_connection("127.0.0.1", self.target_port)
+        loop = asyncio.get_running_loop()
+
+        async def up() -> None:
+            try:
+                while data := await cr.read(65536):
+                    dw.write(data)
+                    await dw.drain()
+            finally:
+                dw.close()
+
+        async def down() -> None:
+            try:
+                eof = False
+                while not eof and (data := await dr.read(65536)):
+                    buf = bytearray(data)
+                    deadline = loop.time() + self.hold
+                    while (left := deadline - loop.time()) > 0:
+                        try:
+                            more = await asyncio.wait_for(dr.read(65536), left)
+                        except TimeoutError:
+                            break
+                        if not more:
+                            eof = True
+                            break
+                        buf += more
+                    self.batches += 1
+                    cw.write(bytes(buf))
+                    await cw.drain()
+            finally:
+                cw.close()
+
+        await asyncio.gather(up(), down(), return_exceptions=True)
+
+
 async def scenario_pairing(binary: str) -> None:
     """Unpaired device; HA's provisioning flow sets a key over zero-PSK Noise."""
     print("\n== scenario D: pairing (HA-driven key provisioning) ==")
@@ -635,13 +729,94 @@ async def scenario_pairing_window(binary: str) -> None:
         await dev.stop()
 
 
+async def scenario_window_behind_router(binary: str) -> None:
+    """HA's config flow against a closed window with HA's network timing: the
+    device's frames are delivered in batches (CoalescingProxy). With the
+    DisconnectRequest right behind the HelloResponse, this returned
+    connection_error (as the owner's HA did 4 of 4 on c3-a); the device now
+    sends it after the client's next message."""
+    print("\n== scenario F: closed window, HA's timing behind a router ==")
+    key_file = os.path.join(LOG_DIR, "pairing-f", "noise_psk")
+    os.makedirs(os.path.dirname(key_file), exist_ok=True)
+    dev = Device(binary, ["--mode", "wake", "--mac", "02:00:00:00:00:0f", "--pair-key-file", key_file,
+                          "--pair-closed"], None)
+    await dev.start()
+    try:
+        async with CoalescingProxy(dev.port) as proxy:
+            res = [await fetch_device_info_like_ha(proxy.port, k) for k in (None, ZERO_NOISE_PSK) * 3]
+            check("F1 closed window through the batching proxy: provisioning_closed 6 of 6 (plaintext, zero-PSK)",
+                  res == ["provisioning_closed"] * 6 and proxy.batches > 0, str(res))
+        res = [await fetch_device_info_like_ha(dev.port, k) for k in (None, ZERO_NOISE_PSK)]
+        check("F2 closed window, direct: provisioning_closed", res == ["provisioning_closed"] * 2, str(res))
+    finally:
+        await dev.stop()
+
+
+async def scenario_key_clear(binary: str) -> None:
+    """HA deletes the entry and clears the key it provisioned: accepted from
+    the key holder only; unpaired with the window closed, also after a
+    restart, until a local open."""
+    print("\n== scenario G: key clear on entry deletion ==")
+    key_file = os.path.join(LOG_DIR, "pairing-g", "noise_psk")
+    os.makedirs(os.path.dirname(key_file), exist_ok=True)
+    args = ["--mode", "wake", "--mac", "02:00:00:00:00:10", "--pair-key-file", key_file]
+    dev = Device(binary, args, None)
+    await dev.start()
+    try:
+        await dev.wait_event("Pairing(WindowOpened")
+        key = base64.b64encode(os.urandom(32))
+        check("G1 provisioned over zero-PSK", await provision_over_zero_psk(dev.port, key) is True)
+        await dev.wait_event("Pairing(Paired")
+        ha = FakeHA(dev.port, key.decode())
+        await ha.connect()
+        await ha.cli.disconnect()  # the entry is unloaded before it is removed
+        await asyncio.sleep(1.1)  # one SetKey attempt per second
+        with ErrorLog() as errors:
+            ok = await clear_key_like_ha(dev.port, key.decode())
+        check("G2 HA's clear on entry removal accepted (HA then drops its stored key)", ok is True)
+        await dev.wait_event('Pairing(Cleared { client_info: "fake-ha-remove"')
+        check("G3 key file deleted, marker written",
+              not os.path.exists(key_file) and os.path.exists(key_file + ".cleared"))
+        check("G4 HA's disconnect() after the reply answered cleanly (no error logged)",
+              errors.records == [], str(errors.records))
+        res = [await fetch_device_info_like_ha(dev.port, k) for k in (None, ZERO_NOISE_PSK, key.decode())]
+        check("G5 unpaired, window closed: keyless refused, old key refused",
+              res == ["provisioning_closed", "provisioning_closed", "invalid_psk"], str(res))
+        await dev.stop()
+
+        dev = Device(binary, args, None)
+        await dev.start()
+        await asyncio.sleep(0.3)
+        res = await fetch_device_info_like_ha(dev.port, None)
+        check("G6 restart (window opens at start otherwise): still closed",
+              res == "provisioning_closed" and dev.count_since("Pairing(WindowOpened", 0) == 0, res)
+        await dev.command("pair")
+        await dev.wait_event("Pairing(WindowOpened")
+        ok = await provision_over_zero_psk(dev.port, key)
+        await dev.wait_event("Pairing(Paired")
+        check("G7 local pair command: HA re-pairs with its stored key, marker removed",
+              ok is True and not os.path.exists(key_file + ".cleared"))
+        await dev.stop()
+
+        fixed = base64.b64encode(os.urandom(32)).decode()
+        dev = Device(binary, ["--mode", "wake", "--mac", "02:00:00:00:00:11"], fixed)
+        await dev.start()
+        ok = await clear_key_like_ha(dev.port, fixed)
+        await asyncio.sleep(0.2)
+        check("G8 a key fixed in the configuration is not cleared",
+              ok is False and await fetch_device_info_like_ha(dev.port, fixed) == "ok")
+    finally:
+        await dev.stop()
+
+
 async def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--device", required=True, help="path to the fake_device binary")
     args = parser.parse_args()
     failed = False
     for scenario in (scenario_plaintext_speaker, scenario_noise_url, scenario_timers,
-                     scenario_pairing, scenario_pairing_window):
+                     scenario_pairing, scenario_pairing_window, scenario_window_behind_router,
+                     scenario_key_clear):
         try:
             await scenario(args.device)
         except Exception as err:  # noqa: BLE001

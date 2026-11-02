@@ -32,10 +32,15 @@
 //!   removed in 2027.2.0); HA never uses that path when the device says
 //!   `api_encryption_provisionable`.
 //! - Paired through this flow: a session that proved the key may rotate it
-//!   (ESPHome behaviour). An empty key ("clear") is refused: resetting the
-//!   pairing is a local action only. The all-zero key is always refused.
+//!   (ESPHome behaviour), or **clear** it with an empty key (HA 2026.10.4 does
+//!   this when its entry is deleted, ESPHome accepts it). A clear deletes the
+//!   stored key and returns to unpaired with the window **closed**, and
+//!   writes a marker ([`cleared_marker`]) so a restart does not reopen it
+//!   either: only a local action (open the window, reset) does. An empty key
+//!   from any other session is refused. The all-zero key is always refused.
 //! - The window closes on timeout or when a key is accepted. The closed state
-//!   is in memory only (a restart reopens it if configured), as in ESPHome.
+//!   is in memory only (a restart reopens it if configured), as in ESPHome,
+//!   except after a clear (above).
 
 use std::fmt;
 use std::io::{self, Write as _};
@@ -97,7 +102,7 @@ pub(crate) enum Refusal {
     WindowClosed,
     /// Already paired and the session did not prove the key.
     AlreadyPaired,
-    /// Empty key ("clear"): resetting the pairing is local only.
+    /// Empty key ("clear") from a session that did not prove the stored key.
     EmptyKey,
     /// Not base64 of exactly 32 bytes.
     Invalid,
@@ -115,7 +120,9 @@ impl fmt::Display for Refusal {
             Self::OverPlaintext => "a key is only accepted over a (zero-PSK) Noise session",
             Self::WindowClosed => "the pairing window is closed",
             Self::AlreadyPaired => "already paired",
-            Self::EmptyKey => "an empty key (clear) is refused; reset pairing locally",
+            Self::EmptyKey => {
+                "an empty key (clear) is accepted only over a session keyed with the stored key"
+            }
             Self::Invalid => "the key is not base64 of 32 bytes",
             Self::AllZero => "the all-zero key is reserved",
             Self::RateLimited => "too many attempts",
@@ -176,6 +183,29 @@ impl fmt::Debug for Transport {
             Self::Plaintext => f.write_str("Plaintext"),
             Self::Keyless { open } => f.debug_struct("Keyless").field("open", open).finish(),
         }
+    }
+}
+
+/// What an accepted `SetKey` asks for. `Debug` never shows the key.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KeyChange {
+    /// The key is already active: success, nothing to do (ESPHome's "New PSK
+    /// matches old").
+    Unchanged,
+    /// Store this key, then [`Pairing::activate`].
+    Set([u8; 32]),
+    /// Delete the stored key, then [`Pairing::clear`] (empty key from the key
+    /// holder).
+    Clear,
+}
+
+impl fmt::Debug for KeyChange {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Unchanged => "Unchanged",
+            Self::Set(_) => "Set(<redacted>)",
+            Self::Clear => "Clear",
+        })
     }
 }
 
@@ -290,15 +320,13 @@ impl Pairing {
         }
     }
 
-    /// Checks a `SetKey` request. `Ok(Some(key))`: store, then
-    /// [`Pairing::activate`]; `Ok(None)`: the key is already active (success,
-    /// nothing to do, as ESPHome's "New PSK matches old").
+    /// Checks a `SetKey` request (see [`KeyChange`]).
     pub(crate) fn check_set_key(
         &mut self,
         key_b64: &[u8],
         origin: Origin,
         now: Instant,
-    ) -> Result<Option<[u8; 32]>, Refusal> {
+    ) -> Result<KeyChange, Refusal> {
         match (&self.state, origin) {
             (KeyState::Fixed(_), _) => return Err(Refusal::FixedKey),
             (KeyState::Plaintext, _) | (_, Origin::DevPlaintext) => {
@@ -324,17 +352,38 @@ impl Pairing {
             return Err(Refusal::RateLimited);
         }
         self.last_attempt = Some(now);
+        if key_b64.is_empty() {
+            // Only the two combinations above get here; of those, only the
+            // key holder (a session that proved the stored key) may clear it.
+            return match (&self.state, origin) {
+                (KeyState::Paired(_), Origin::Authenticated) => Ok(KeyChange::Clear),
+                _ => Err(Refusal::EmptyKey),
+            };
+        }
         let key = parse_key(key_b64)?;
         if matches!(self.state, KeyState::Paired(k) if k == key) {
-            return Ok(None);
+            return Ok(KeyChange::Unchanged);
         }
-        Ok(Some(key))
+        Ok(KeyChange::Set(key))
     }
 
     /// Activates a stored key: closes the window, invalidates older sessions.
     pub(crate) fn activate(&mut self, key: [u8; 32]) {
         self.state = KeyState::Paired(key);
         self.epoch += 1;
+    }
+
+    /// Forgets a provisioned key after a remote clear (the caller deleted the
+    /// file and wrote the marker): unpaired with the window **closed**, older
+    /// sessions invalidated. Returns false (and changes nothing) unless the
+    /// state is `Paired`.
+    pub(crate) fn clear(&mut self) -> bool {
+        if !self.enabled || !matches!(self.state, KeyState::Paired(_)) {
+            return false;
+        }
+        self.state = KeyState::Unpaired { window_until: None };
+        self.epoch += 1;
+        true
     }
 
     /// Forgets the key (the caller deleted the file) and opens the window.
@@ -432,6 +481,54 @@ pub fn remove_key(path: &Path) -> io::Result<bool> {
     }
 }
 
+/// The marker written when the key holder cleared the key remotely:
+/// `<key_file>.cleared` in the same directory. While it exists and no key is
+/// stored, the server does not open the pairing window at start; an explicit
+/// local open, a reset or a new key removes it.
+#[must_use]
+pub fn cleared_marker(key_file: &Path) -> PathBuf {
+    let mut name = key_file.file_name().unwrap_or_default().to_os_string();
+    name.push(".cleared");
+    key_file.with_file_name(name)
+}
+
+/// True if [`cleared_marker`] exists. Any error other than "not found" counts
+/// as present (fail closed: the window then needs a local action).
+#[must_use]
+pub fn was_cleared(key_file: &Path) -> bool {
+    match std::fs::symlink_metadata(cleared_marker(key_file)) {
+        Ok(_) => true,
+        Err(e) => e.kind() != io::ErrorKind::NotFound,
+    }
+}
+
+/// Writes [`cleared_marker`] (mode 0600, synced).
+///
+/// # Errors
+///
+/// Any I/O error.
+pub fn mark_cleared(key_file: &Path) -> io::Result<()> {
+    let marker = cleared_marker(key_file);
+    forget_cleared(key_file)?;
+    write_new_private(
+        &marker,
+        b"the key holder cleared the pairing key; open the pairing window locally to pair again\n",
+    )?;
+    sync_dir(parent_dir(&marker))
+}
+
+/// Removes [`cleared_marker`]; a missing marker is not an error.
+///
+/// # Errors
+///
+/// Any I/O error other than "not found".
+pub fn forget_cleared(key_file: &Path) -> io::Result<()> {
+    match std::fs::remove_file(cleared_marker(key_file)) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    }
+}
+
 fn parent_dir(path: &Path) -> &Path {
     match path.parent() {
         Some(p) if !p.as_os_str().is_empty() => p,
@@ -523,7 +620,7 @@ mod tests {
         let got = p
             .check_set_key(KEY_B64.as_bytes(), Origin::ZeroPsk, t0)
             .unwrap();
-        assert_eq!(got, Some(key()));
+        assert_eq!(got, KeyChange::Set(key()));
         let e = p.epoch();
         p.activate(key());
         assert_eq!(p.epoch(), e + 1);
@@ -615,27 +712,111 @@ mod tests {
     }
 
     #[test]
-    fn authenticated_session_may_rotate_but_not_clear() {
+    fn authenticated_session_may_rotate() {
         let t0 = Instant::now();
         let mut p = Pairing::new(KeyState::Paired(key()), Duration::from_secs(600), true);
         // Same key: success, nothing to do.
         assert_eq!(
             p.check_set_key(KEY_B64.as_bytes(), Origin::Authenticated, t0),
-            Ok(None)
-        );
-        let t1 = t0 + Duration::from_secs(2);
-        assert_eq!(
-            p.check_set_key(b"", Origin::Authenticated, t1),
-            Err(Refusal::EmptyKey)
+            Ok(KeyChange::Unchanged)
         );
         let new = encode_key(&[9; 32]);
         let t2 = t0 + Duration::from_secs(4);
         assert_eq!(
             p.check_set_key(new.as_bytes(), Origin::Authenticated, t2),
-            Ok(Some([9; 32]))
+            Ok(KeyChange::Set([9; 32]))
         );
         p.activate([9; 32]);
         assert_eq!(p.transport(), Transport::Noise([9; 32]));
+    }
+
+    #[test]
+    fn only_the_key_holder_may_clear_and_the_window_stays_closed() {
+        let t0 = Instant::now();
+        let at = |n: u64| t0 + Duration::from_secs(n * 2);
+        // Unpaired, window open: an empty key over zero-PSK (or plaintext)
+        // is no clear, there is nothing to clear.
+        let mut unp = unpaired(true, t0);
+        assert_eq!(
+            unp.check_set_key(b"", Origin::ZeroPsk, at(0)),
+            Err(Refusal::EmptyKey)
+        );
+        assert_eq!(
+            unp.check_set_key(b"", Origin::KeylessPlaintext, at(1)),
+            Err(Refusal::OverPlaintext)
+        );
+        assert!(!unp.clear(), "nothing to clear while unpaired");
+        // Paired: keyless sessions cannot clear.
+        let mut p = Pairing::new(KeyState::Paired(key()), Duration::from_secs(600), true);
+        assert_eq!(
+            p.check_set_key(b"", Origin::ZeroPsk, at(0)),
+            Err(Refusal::AlreadyPaired)
+        );
+        assert_eq!(
+            p.check_set_key(b"", Origin::KeylessPlaintext, at(1)),
+            Err(Refusal::AlreadyPaired)
+        );
+        // Fixed key and development mode: never.
+        let mut fixed = Pairing::new(KeyState::Fixed(key()), Duration::from_secs(1), false);
+        assert_eq!(
+            fixed.check_set_key(b"", Origin::Authenticated, at(0)),
+            Err(Refusal::FixedKey)
+        );
+        assert!(!fixed.clear());
+        let mut dev = Pairing::new(KeyState::Plaintext, Duration::from_secs(1), false);
+        assert_eq!(
+            dev.check_set_key(b"", Origin::DevPlaintext, at(0)),
+            Err(Refusal::DevPlaintext)
+        );
+        assert!(!dev.clear());
+        // The key holder: clear, then unpaired with the window closed. The
+        // rate limit applies to clears too.
+        assert_eq!(
+            p.check_set_key(b"", Origin::Authenticated, at(3)),
+            Ok(KeyChange::Clear)
+        );
+        assert_eq!(
+            p.check_set_key(
+                b"",
+                Origin::Authenticated,
+                at(3) + Duration::from_millis(500)
+            ),
+            Err(Refusal::RateLimited)
+        );
+        let e = p.epoch();
+        assert!(p.clear());
+        assert!(p.epoch() == e + 1, "the keyed sessions are dropped");
+        assert!(p.needs_pairing() && !p.has_key() && !p.window_open());
+        assert_eq!(p.transport(), Transport::Keyless { open: false });
+        assert_eq!(p.deadline(), None, "no timer reopens it");
+        assert!(!p.on_tick(at(100)));
+        assert!(!p.window_open());
+        // A local action reopens it.
+        assert!(matches!(p.open_window(at(100)), OpenResult::Opened(_)));
+    }
+
+    #[test]
+    fn cleared_marker_round_trip() {
+        let dir = tmpdir("marker");
+        let key_file = dir.join("noise_psk");
+        assert_eq!(cleared_marker(&key_file), dir.join("noise_psk.cleared"));
+        assert!(!was_cleared(&key_file));
+        forget_cleared(&key_file).unwrap();
+        mark_cleared(&key_file).unwrap();
+        mark_cleared(&key_file).unwrap();
+        assert!(was_cleared(&key_file));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(cleared_marker(&key_file))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        forget_cleared(&key_file).unwrap();
+        assert!(!was_cleared(&key_file));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -663,6 +844,11 @@ mod tests {
         for r in [Refusal::Invalid, Refusal::AllZero, Refusal::EmptyKey] {
             assert!(!r.to_string().contains("AQID"));
         }
+        let set = format!("{:?}", KeyChange::Set(key()));
+        assert!(
+            set.contains("redacted") && !set.contains("1, 2, 3"),
+            "{set}"
+        );
     }
 
     #[cfg(unix)]

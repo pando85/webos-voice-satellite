@@ -140,6 +140,7 @@ enabled = false
 state_dir = "pairing"
 window_s = 600           # the window closes after this, or once a key is set
 open_on_start = true     # open the window when started without a stored key
+                         # (not after HA cleared it on removal: then `pair`)
 
 [aec]
 # Acoustic echo cancellation: removes what the TV itself plays (programme

@@ -39,6 +39,7 @@ from fake_ha import (  # noqa: E402
     USE_WAKE_WORD,
     FakeHA,
     check,
+    clear_key_like_ha,
     fetch_device_info_like_ha,
     provision_over_zero_psk,
     until_true,
@@ -359,12 +360,16 @@ async def scenario_pairing(binary: str, tmp: str) -> None:
 
 
 async def scenario_pairing_window(binary: str, tmp: str) -> None:
-    print("\n== satellite e2e: [pairing] window timeout and pair trigger file ==")
+    print("\n== satellite e2e: [pairing] window timeout, pair trigger file, key clear ==")
+    write_mic(os.path.join(tmp, "mic.raw"), 5.0)
     port = free_port()
     config = pairing_config(tmp, "e2e-window", port, "02:00:00:00:00:e5", 2)
     state = os.path.join(tmp, "e2e-window-state")
-    sat = Satellite(binary, config, os.path.join(tmp, "satellite-window.log"))
+    key_file = os.path.join(state, "noise_psk")
+    log_path = os.path.join(tmp, "satellite-window.log")
+    sat = Satellite(binary, config, log_path)
     await sat.start()
+    key = base64.b64encode(os.urandom(32))
     try:
         ok = await sat.wait_log("pairing window closed without a key", timeout=6)
         res = await fetch_device_info_like_ha(port, None)
@@ -374,9 +379,33 @@ async def scenario_pairing_window(binary: str, tmp: str) -> None:
         ok = await sat.wait_log("found: opening the pairing window")
         res = await fetch_device_info_like_ha(port, None)
         check("W2 pair trigger file reopens the window", ok and res == "ok", res)
+        ok = await provision_over_zero_psk(port, key)
+        ok = ok and await sat.wait_log("PAIRED by") and await sat.wait_log("capture: microphone open")
+        check("W3 paired in the reopened window, microphone open", ok)
+        await asyncio.sleep(1.1)  # one SetKey attempt per second
+        ok = await clear_key_like_ha(port, key.decode())
+        ok = ok and await sat.wait_log("pairing CLEARED by") and await sat.wait_log("PCM released (not paired)")
+        res = await fetch_device_info_like_ha(port, None)
+        check("W4 HA's clear on entry removal: key deleted, microphone closed, window stays closed",
+              ok and not os.path.exists(key_file) and res == "provisioning_closed", res)
         sat.proc.send_signal(signal.SIGTERM)
         rc = await asyncio.wait_for(sat.proc.wait(), 5)
-        check("W3 clean exit", rc == 0, f"rc={rc}")
+        sat.log.close()
+        sat = Satellite(binary, config, log_path + ".2")
+        await sat.start()
+        ok = await sat.wait_log("the key holder cleared the pairing key")
+        res = await fetch_device_info_like_ha(port, None)
+        check("W5 restart after the clear: window still closed", rc == 0 and ok and res == "provisioning_closed"
+              and "PAIRING WINDOW OPEN" not in sat.text(), res)
+        with open(os.path.join(state, "pair"), "w"):
+            pass
+        ok = await sat.wait_log("found: opening the pairing window")
+        res = await fetch_device_info_like_ha(port, None)
+        check("W6 pair trigger file reopens it", ok and res == "ok", res)
+        sat.proc.send_signal(signal.SIGTERM)
+        rc = await asyncio.wait_for(sat.proc.wait(), 5)
+        check("W7 clean exit; the key is never logged",
+              rc == 0 and key.decode() not in open(log_path).read() + sat.text(), f"rc={rc}")
     finally:
         if sat.proc.returncode is None:
             sat.proc.kill()

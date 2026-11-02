@@ -362,6 +362,17 @@ fn prepare_pairing(settings: &mut Settings) -> Result<(), String> {
     if pair {
         settings.pairing.open_now = true;
     }
+    if settings.pairing.open_now {
+        // A local open (flag, file or reset) ends the closed state that a
+        // remote clear by the key holder leaves behind.
+        let key = settings.pairing.key_file();
+        webos_esphome_api::pairing::forget_cleared(&key).map_err(|e| {
+            format!(
+                "cannot remove {}: {e}",
+                webos_esphome_api::pairing::cleared_marker(&key).display()
+            )
+        })?;
+    }
     Ok(())
 }
 
@@ -479,6 +490,14 @@ impl Daemon {
             PairingEvent::Reset => {
                 self.set_streaming(false);
                 log::warn!("pairing reset: microphone closed until paired again");
+                self.set_unpaired(true).await;
+            }
+            PairingEvent::Cleared { client_info, peer } => {
+                self.set_streaming(false);
+                log::warn!(
+                    "pairing CLEARED by {client_info:?} from {} (the device was removed in Home Assistant): microphone closed; to pair again, open the pairing window locally (--pair or the pair file)",
+                    peer.ip()
+                );
                 self.set_unpaired(true).await;
             }
             PairingEvent::WindowOpened { seconds } => {
@@ -1072,10 +1091,16 @@ mod tests {
             assert_eq!(mode & 0o777, 0o700);
         }
         assert!(!s.pairing.open_now);
-        // A pair file opens the window and is consumed.
+        // Without a local action the marker of a remote clear stays.
+        let key = s.pairing.key_file();
+        webos_esphome_api::pairing::mark_cleared(&key).unwrap();
+        prepare_pairing(&mut s).unwrap();
+        assert!(webos_esphome_api::pairing::was_cleared(&key));
+        // A pair file opens the window, is consumed and ends the cleared state.
         std::fs::write(s.pairing.pair_trigger(), b"").unwrap();
         prepare_pairing(&mut s).unwrap();
         assert!(s.pairing.open_now && !s.pairing.pair_trigger().exists());
+        assert!(!webos_esphome_api::pairing::was_cleared(&key));
         // A reset file deletes the stored key and reopens the window.
         s.pairing.open_now = false;
         webos_esphome_api::pairing::store_key(&s.pairing.key_file(), &[3; 32]).unwrap();

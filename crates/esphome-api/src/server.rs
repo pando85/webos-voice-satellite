@@ -20,7 +20,7 @@ use crate::frame::{
     self, Codec, FrameError, HANDSHAKE_MAC_FAILURE, NoiseResponder, RawMessage, decode_noise_frame,
     encode_noise_frame,
 };
-use crate::pairing::{self, KeyState, OpenResult, Origin, Pairing, Transport, ZERO_PSK};
+use crate::pairing::{self, KeyChange, KeyState, OpenResult, Origin, Pairing, Transport, ZERO_PSK};
 use crate::proto::{self as pb, ApiMessage};
 use crate::timers;
 use crate::voice::{FLAG_USE_WAKE_WORD, Out, ToHa, Voice};
@@ -40,6 +40,17 @@ const MAX_PENDING: usize = 4;
 /// connection and the short zero-PSK session that sets the key.
 const MAX_KEYLESS: usize = 4;
 const READ_CHUNK: usize = 8192;
+/// Closed pairing window: how long to wait after the `HelloResponse` for the
+/// client's next message before the `DisconnectRequest(PROVISIONING_CLOSED)`
+/// is sent anyway. HA's config flow sends `DeviceInfoRequest` at once.
+const CLOSED_WINDOW_WAIT: Duration = Duration::from_secs(2);
+/// After our own `DisconnectRequest`: how long to wait for the client's
+/// `DisconnectResponse` (or its close) before the socket is dropped.
+const DISCONNECT_LINGER: Duration = Duration::from_secs(1);
+/// After a key change or clear on the main session: how long its client may
+/// still disconnect by itself (HA does right after the `SetKey` reply) before
+/// the server sends `DisconnectRequest`. ESPHome waits 100 ms.
+const KEY_CHANGE_GRACE: Duration = Duration::from_millis(500);
 
 /// Error starting the server.
 #[derive(Debug)]
@@ -80,6 +91,9 @@ pub struct Server {
     listener: TcpListener,
     cfg: Arc<Resolved>,
     pairing: Pairing,
+    /// Unpaired because the key holder cleared the key
+    /// ([`pairing::cleared_marker`]): the window is not opened at start.
+    cleared: bool,
 }
 
 impl Server {
@@ -117,11 +131,17 @@ impl Server {
             ),
             KeyState::Fixed(_) => {}
         }
+        let cleared = matches!(state, KeyState::Unpaired { .. })
+            && cfg
+                .provisioning
+                .as_ref()
+                .is_some_and(|p| pairing::was_cleared(&p.key_file));
         let pairing = Pairing::new(state, window, cfg.provisioning.is_some());
         Ok(Self {
             listener,
             cfg: Arc::new(cfg),
             pairing,
+            cleared,
         })
     }
 
@@ -170,19 +190,7 @@ impl Server {
         let mut pending: JoinSet<Result<Session, (SocketAddr, FrameError)>> = JoinSet::new();
         let mut keyless: JoinSet<()> = JoinSet::new();
         log::info!("esphome-api: listening on {bind}");
-        if ctx.pairing.needs_pairing()
-            && ctx
-                .cfg
-                .provisioning
-                .as_ref()
-                .is_some_and(|p| p.open_at_start)
-        {
-            ctx.open_window(Instant::now());
-        } else if ctx.pairing.needs_pairing() {
-            log::warn!(
-                "esphome-api: pairing window closed; open it to pair (keyless connections are refused)"
-            );
-        }
+        ctx.window_at_start(self.cleared);
         ctx.refresh_mdns();
 
         loop {
@@ -469,17 +477,62 @@ async fn handshake_inner(
     .await?;
     s.client_info = hello.client_info;
     if transport == (Transport::Keyless { open: false }) {
-        // As ESPHome's `provisioning:` after its window: acknowledge the hello
-        // (the client learns the name), then disconnect with the reason HA
-        // shows as "closed its setup window".
         log::warn!("esphome-api: {peer} refused: the pairing window is closed");
-        s.send(&pb::DisconnectRequest {
-            reason: pb::DisconnectReason::ProvisioningClosed as i32,
-        })
-        .await?;
+        refuse_closed_window(&mut s).await?;
         return Err(FrameError::Protocol("pairing window closed"));
     }
     Ok(s)
+}
+
+/// As ESPHome's `provisioning:` after its window: the hello was acknowledged
+/// (the client learns the name); now disconnect with the reason HA shows as
+/// "closed its setup window".
+///
+/// ESPHome sends `DisconnectRequest` right behind the `HelloResponse`. That
+/// races in aioesphomeapi 46.6.0 (HA 2026.10.4): it reports the reason
+/// (`ConnectionClosedEvent`, which HA's config flow checks) only if the
+/// connection is already `CONNECTED`, which happens when `connect()` resumes
+/// after the `HelloResponse`. When both frames arrive in one read (HA in a
+/// container behind a router, c3-a P3), the disconnect is handled first and
+/// HA shows `connection_error`. So the request waits for the client's next
+/// message (HA's flow sends `DeviceInfoRequest` once `connect()` returned) or
+/// [`CLOSED_WINDOW_WAIT`] for a client that sends nothing.
+async fn refuse_closed_window(s: &mut Session) -> Result<(), FrameError> {
+    match timeout(CLOSED_WINDOW_WAIT, s.read_message()).await {
+        Ok(Ok(msg)) if msg.type_id == pb::DisconnectRequest::ID => {
+            let _ = s.send(&pb::DisconnectResponse::default()).await;
+            return Ok(());
+        }
+        Ok(Ok(msg)) => log::debug!(
+            "esphome-api: {} sent {} on a closed window; disconnecting",
+            s.peer,
+            pb::message_name(msg.type_id).unwrap_or("unknown")
+        ),
+        Ok(Err(err)) => return Err(err),
+        Err(_) => log::debug!("esphome-api: {} sent nothing after hello", s.peer),
+    }
+    s.send(&pb::DisconnectRequest {
+        reason: pb::DisconnectReason::ProvisioningClosed as i32,
+    })
+    .await?;
+    linger(s).await;
+    Ok(())
+}
+
+/// After our `DisconnectRequest`: waits up to [`DISCONNECT_LINGER`] for the
+/// client's `DisconnectResponse` or close, so the socket is not closed with
+/// unread data (which would reset the connection).
+async fn linger(s: &mut Session) {
+    let _ = timeout(DISCONNECT_LINGER, async {
+        loop {
+            match s.read_message().await {
+                Ok(msg) if msg.type_id == pb::DisconnectResponse::ID => return,
+                Ok(_) => {}
+                Err(_) => return,
+            }
+        }
+    })
+    .await;
 }
 
 async fn noise_handshake(
@@ -542,8 +595,9 @@ struct Ctx {
 enum Flow {
     Continue,
     Close,
-    /// A key was activated on this session: reply sent, now close everything.
-    KeyChanged,
+    /// The key was replaced or cleared on this session: reply sent; retire
+    /// this session ([`retire`]), close the others and report the event.
+    KeyChanged(PairingEvent),
 }
 
 /// A `SetKey` from a keyless session, decided by the server loop (which owns
@@ -575,7 +629,7 @@ async fn serve_keyless(
                 Err(err) => break 'session err.to_string(),
             };
             match keyless_message(&mut s, &msg, &info, &keys).await {
-                Ok(Flow::Continue | Flow::KeyChanged) => {}
+                Ok(Flow::Continue | Flow::KeyChanged(_)) => {}
                 Ok(Flow::Close) => break 'session "disconnect requested".to_owned(),
                 Err(err) => break 'session err.to_string(),
             }
@@ -596,6 +650,54 @@ async fn serve_keyless(
         }
     };
     log::info!("esphome-api: keyless session {} closed: {reason}", s.peer);
+}
+
+/// Ends the main session after its client changed or cleared the key. HA
+/// disconnects by itself right after the `SetKey` reply (`cli.disconnect()`
+/// sends `DisconnectRequest` and waits for the response); answering that,
+/// instead of racing it with our own request, keeps HA's log free of
+/// "disconnect request failed". Only disconnect and ping are answered; after
+/// [`KEY_CHANGE_GRACE`] the server sends `DisconnectRequest` itself. Nothing
+/// else is served: the session is no longer the main session.
+async fn retire(mut s: Session) {
+    let until = Instant::now() + KEY_CHANGE_GRACE;
+    let reason: String = loop {
+        match s.codec.decode(&mut s.rbuf) {
+            Ok(Some(msg)) => {
+                match msg.type_id {
+                    pb::DisconnectRequest::ID => {
+                        let _ = s.send(&pb::DisconnectResponse::default()).await;
+                        break "client disconnected".to_owned();
+                    }
+                    pb::DisconnectResponse::ID => break "client disconnected".to_owned(),
+                    pb::PingRequest::ID => {
+                        if let Err(err) = s.send(&pb::PingResponse::default()).await {
+                            break err.to_string();
+                        }
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+            Ok(None) => {}
+            Err(err) => break err.to_string(),
+        }
+        tokio::select! {
+            read = s.fill() => if let Err(err) = read {
+                break err.to_string();
+            },
+            () = sleep_until(until) => {
+                if s.send(&pb::DisconnectRequest::default()).await.is_ok() {
+                    linger(&mut s).await;
+                }
+                break "disconnected after the key change".to_owned();
+            }
+        }
+    };
+    log::info!(
+        "esphome-api: HA connection {} ended after the key change: {reason}",
+        s.peer
+    );
 }
 
 async fn keyless_message(
@@ -758,8 +860,13 @@ impl Ctx {
                     self.close("disconnect requested");
                     return;
                 }
-                Ok(Flow::KeyChanged) => {
-                    self.after_key_change(PairingEvent::KeyRotated).await;
+                Ok(Flow::KeyChanged(ev)) => {
+                    if let Some(s) = self.session.take() {
+                        self.voice.on_disconnect();
+                        self.emit(AppEvent::HaDisconnected);
+                        tokio::spawn(retire(s));
+                    }
+                    self.after_key_change(ev).await;
                     return;
                 }
                 Err(err) => {
@@ -999,14 +1106,22 @@ impl Ctx {
                     .map(|r| r.key)
                     .unwrap_or_default();
                 let (origin, peer) = (s.kind.origin(), s.peer);
-                let (success, activated) = self.apply_set_key(&key, origin, peer, now);
+                let client_info = s.client_info.clone();
+                let (success, applied) = self.apply_set_key(&key, origin, peer, now);
                 let Some(s) = self.session.as_mut() else {
                     return Ok(Flow::Close);
                 };
-                s.send(&pb::NoiseEncryptionSetKeyResponse { success })
-                    .await?;
-                if activated {
-                    return Ok(Flow::KeyChanged);
+                let sent = s.send(&pb::NoiseEncryptionSetKeyResponse { success }).await;
+                // The change is done even if the reply could not be sent.
+                match applied {
+                    Some(Applied::Set) => return Ok(Flow::KeyChanged(PairingEvent::KeyRotated)),
+                    Some(Applied::Cleared) => {
+                        return Ok(Flow::KeyChanged(PairingEvent::Cleared {
+                            client_info,
+                            peer,
+                        }));
+                    }
+                    None => sent?,
                 }
             }
             pb::HelloRequest::ID
@@ -1074,15 +1189,49 @@ impl Ctx {
     }
 }
 
+/// What an accepted `SetKey` changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Applied {
+    /// A new key was stored and activated.
+    Set,
+    /// The key was deleted (unpaired, window closed).
+    Cleared,
+}
+
 /// Pairing: window, `SetKey`, activation and reset.
 impl Ctx {
     fn key_file(&self) -> Option<&std::path::Path> {
         self.cfg.provisioning.as_ref().map(|p| p.key_file.as_path())
     }
 
+    /// At start: opens the window if unpaired and configured, unless the key
+    /// holder cleared the key (then only a local action opens it).
+    fn window_at_start(&mut self, cleared: bool) {
+        if !self.pairing.needs_pairing() {
+            return;
+        }
+        if cleared {
+            log::warn!(
+                "esphome-api: the key holder cleared the pairing key; the pairing window stays closed until it is opened locally (keyless connections are refused)"
+            );
+        } else if self
+            .cfg
+            .provisioning
+            .as_ref()
+            .is_some_and(|p| p.open_at_start)
+        {
+            self.open_window(Instant::now());
+        } else {
+            log::warn!(
+                "esphome-api: pairing window closed; open it to pair (keyless connections are refused)"
+            );
+        }
+    }
+
     fn open_window(&mut self, now: Instant) {
         match self.pairing.open_window(now) {
             OpenResult::Opened(d) => {
+                self.forget_cleared();
                 log::warn!(
                     "esphome-api: PAIRING WINDOW OPEN for {} s: add this device in Home Assistant (2026.9 or newer sets the key)",
                     d.as_secs()
@@ -1101,50 +1250,93 @@ impl Ctx {
         }
     }
 
-    /// Checks and stores a key. Returns (reply success, key activated). Never
-    /// logs the key.
+    /// Removes the marker of a remote clear (a local open, a reset or a new
+    /// key ends that state). Best effort, logged.
+    fn forget_cleared(&self) {
+        if let Some(path) = self.key_file() {
+            if let Err(err) = pairing::forget_cleared(path) {
+                log::error!(
+                    "esphome-api: cannot remove {}: {err}",
+                    pairing::cleared_marker(path).display()
+                );
+            }
+        }
+    }
+
+    /// Checks a `SetKey` and stores or deletes the key. Returns the reply's
+    /// `success` and what changed. Never logs the key.
     fn apply_set_key(
         &mut self,
         key: &[u8],
         origin: Origin,
         peer: SocketAddr,
         now: Instant,
-    ) -> (bool, bool) {
-        let key = match self.pairing.check_set_key(key, origin, now) {
+    ) -> (bool, Option<Applied>) {
+        let change = match self.pairing.check_set_key(key, origin, now) {
             Err(why) => {
                 log::warn!("esphome-api: SetKey from {peer} refused: {why}");
-                return (false, false);
+                return (false, None);
             }
-            Ok(None) => {
+            Ok(KeyChange::Unchanged) => {
                 log::info!("esphome-api: SetKey from {peer}: that key is already active");
-                return (true, false);
+                return (true, None);
             }
-            Ok(Some(key)) => key,
+            Ok(change) => change,
         };
-        let Some(path) = self.key_file() else {
-            return (false, false);
+        let Some(path) = self.key_file().map(std::path::Path::to_path_buf) else {
+            return (false, None);
         };
-        if let Err(err) = pairing::store_key(path, &key) {
-            log::error!(
-                "esphome-api: SetKey from {peer}: cannot store the key in {}: {err}",
-                path.display()
-            );
-            return (false, false);
+        match change {
+            KeyChange::Set(key) => {
+                if let Err(err) = pairing::store_key(&path, &key) {
+                    log::error!(
+                        "esphome-api: SetKey from {peer}: cannot store the key in {}: {err}",
+                        path.display()
+                    );
+                    return (false, None);
+                }
+                log::warn!(
+                    "esphome-api: key set by {peer} and stored in {} (mode 0600); closing sessions opened before it",
+                    path.display()
+                );
+                self.forget_cleared();
+                self.pairing.activate(key);
+                (true, Some(Applied::Set))
+            }
+            KeyChange::Clear => {
+                // The marker first: if it cannot be written, the key stays.
+                if let Err(err) = pairing::mark_cleared(&path) {
+                    log::error!(
+                        "esphome-api: key clear from {peer} refused: cannot write {}: {err}",
+                        pairing::cleared_marker(&path).display()
+                    );
+                    return (false, None);
+                }
+                if let Err(err) = pairing::remove_key(&path) {
+                    log::error!(
+                        "esphome-api: key clear from {peer} failed: cannot delete {}: {err}; the key stays active",
+                        path.display()
+                    );
+                    self.forget_cleared();
+                    return (false, None);
+                }
+                self.pairing.clear();
+                log::warn!(
+                    "esphome-api: PAIRING CLEARED by the key holder {peer}: stored key deleted ({}); unpaired, and the pairing window stays closed until it is opened locally",
+                    path.display()
+                );
+                (true, Some(Applied::Cleared))
+            }
+            KeyChange::Unchanged => (true, None),
         }
-        log::warn!(
-            "esphome-api: key set by {peer} and stored in {} (mode 0600); closing sessions opened before it",
-            path.display()
-        );
-        self.pairing.activate(key);
-        (true, true)
     }
 
     async fn on_key_request(&mut self, req: KeyRequest) {
-        let (success, activated) =
-            self.apply_set_key(&req.key, req.origin, req.peer, Instant::now());
+        let (success, applied) = self.apply_set_key(&req.key, req.origin, req.peer, Instant::now());
         // The keyless task sends the reply before it sees the new epoch.
         let _ = req.reply.send(success);
-        if activated {
+        // Keyless sessions can only set a first key (never clear one).
+        if applied == Some(Applied::Set) {
             self.after_key_change(PairingEvent::Paired {
                 client_info: req.client_info,
                 peer: req.peer,
@@ -1170,6 +1362,7 @@ impl Ctx {
             log::warn!("esphome-api: reset-pairing ignored: pairing is not enabled");
             return;
         };
+        self.forget_cleared();
         match pairing::remove_key(&path) {
             Ok(existed) => log::warn!(
                 "esphome-api: PAIRING RESET: stored key {} ({})",

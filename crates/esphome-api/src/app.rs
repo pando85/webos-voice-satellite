@@ -42,6 +42,17 @@ pub enum PairingEvent {
     /// The stored key was deleted ([`AppCommand::ResetPairing`]); the device
     /// is unpaired again.
     Reset,
+    /// The key holder cleared the key remotely (an empty `SetKey` over a
+    /// session keyed with the stored key; HA sends it when its entry is
+    /// deleted). The key file is deleted, the device is unpaired, and the
+    /// pairing window stays **closed** (also across restarts) until it is
+    /// opened locally ([`AppCommand::OpenPairingWindow`] or a reset).
+    Cleared {
+        /// `client_info` of the session that cleared the key.
+        client_info: String,
+        /// Its address.
+        peer: SocketAddr,
+    },
 }
 
 /// Event from the server to the application.
@@ -177,10 +188,12 @@ pub enum AppCommand {
     /// Mute or unmute the microphone (reported to HA via the switch entity).
     SetMuted(bool),
     /// Open (or restart) the pairing window. Ignored, with a log line, when a
-    /// key is active or pairing is not enabled.
+    /// key is active or pairing is not enabled. A local action: it also
+    /// removes the marker of a remote clear ([`PairingEvent::Cleared`]).
     OpenPairingWindow,
     /// Delete the stored key, close every session and open the pairing
-    /// window. A local action only: HA cannot clear the key.
+    /// window. A local action. (The key holder can also clear the key
+    /// remotely, but that leaves the window closed: [`PairingEvent::Cleared`].)
     ResetPairing,
 }
 

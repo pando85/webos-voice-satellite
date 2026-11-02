@@ -218,6 +218,33 @@ impl Client {
         r.reason
     }
 
+    /// Nothing arrives within `wait` (the connection stays open).
+    async fn expect_silence(&mut self, wait: Duration) {
+        let got = timeout(wait, async {
+            loop {
+                if let Some(m) = self.codec.decode(&mut self.buf).unwrap() {
+                    return Some(m.type_id);
+                }
+                let mut tmp = [0_u8; 4096];
+                match self.stream.read(&mut tmp).await {
+                    Ok(0) | Err(_) => return None,
+                    Ok(n) => self.buf.extend_from_slice(&tmp[..n]),
+                }
+            }
+        })
+        .await;
+        assert!(got.is_err(), "expected silence, got {got:?}");
+    }
+
+    /// What HA's config flow does after `connect()`: `DeviceInfoRequest`. On
+    /// a closed window the answer is `DisconnectRequest`; returns its reason.
+    async fn device_info_refused(&mut self) -> i32 {
+        self.send(&pb::DeviceInfoRequest {}).await;
+        let reason = self.expect_disconnect().await;
+        self.send(&pb::DisconnectResponse {}).await;
+        reason
+    }
+
     async fn expect_closed(&mut self) {
         loop {
             if self.try_recv().await.is_none() {
@@ -443,9 +470,8 @@ async fn zero_psk_set_key_pairs_and_then_requires_the_key() {
     let info = c.device_info().await;
     assert!(info.api_encryption_supported && !info.api_encryption_provisionable);
     assert_eq!(info.voice_assistant_feature_flags, features::DEFAULT);
-    // A keyless SetKey is impossible now, and so is a remote clear.
-    sleep(Duration::from_millis(1050)).await;
-    assert!(!c.set_key(b"").await);
+    // (A clear by this key holder is tested in
+    // key_holder_clear_unpairs_with_the_window_closed.)
     drop(c);
 
     // A restarted server is paired from the file.
@@ -473,11 +499,12 @@ async fn closed_window_refuses_and_reopens_on_request() {
     let closed = pb::DisconnectReason::ProvisioningClosed as i32;
     let mut c = connect_plain(dev.port).await;
     assert_eq!(c.hello().await.name, "pair-tv");
-    assert_eq!(c.expect_disconnect().await, closed);
+    assert_eq!(c.device_info_refused().await, closed);
     c.expect_closed().await;
     let mut z = connect_noise(dev.port, &ZERO).await.unwrap();
     z.hello().await;
-    assert_eq!(z.expect_disconnect().await, closed);
+    assert_eq!(z.device_info_refused().await, closed);
+    z.expect_closed().await;
 
     dev.cmds.send(AppCommand::OpenPairingWindow).await.unwrap();
     dev.event(|e| matches!(e, AppEvent::Pairing(PairingEvent::WindowOpened { .. })))
@@ -485,6 +512,58 @@ async fn closed_window_refuses_and_reopens_on_request() {
     let mut c = connect_plain(dev.port).await;
     c.hello().await;
     assert!(c.device_info().await.api_encryption_provisionable);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Closed window, timing: the `DisconnectRequest` is not sent right behind
+/// the `HelloResponse` (aioesphomeapi 46.6.0 drops the reason when both
+/// arrive in one read, P3 on c3-a), but after the client's next message; a
+/// client that sends nothing gets it after a timeout; a client that
+/// disconnects itself gets `DisconnectResponse`.
+#[tokio::test]
+async fn closed_window_disconnects_after_the_clients_next_message() {
+    let dir = tmpdir("window-timing");
+    let (dev, needs) = start(config(
+        &dir.join("noise_psk"),
+        Duration::from_secs(600),
+        false,
+    ))
+    .await;
+    assert!(needs);
+    let closed = pb::DisconnectReason::ProvisioningClosed as i32;
+    for zero_psk in [false, true] {
+        let mut c = if zero_psk {
+            connect_noise(dev.port, &ZERO).await.unwrap()
+        } else {
+            connect_plain(dev.port).await
+        };
+        assert_eq!(c.hello().await.name, "pair-tv");
+        c.expect_silence(Duration::from_millis(400)).await;
+        let t = std::time::Instant::now();
+        assert_eq!(c.device_info_refused().await, closed);
+        assert!(
+            t.elapsed() < Duration::from_millis(300),
+            "{:?}",
+            t.elapsed()
+        );
+        c.expect_closed().await;
+    }
+    // A quiet client: the request comes after the timeout (2 s).
+    let mut q = connect_plain(dev.port).await;
+    q.hello().await;
+    let t = std::time::Instant::now();
+    assert_eq!(q.expect_disconnect().await, closed);
+    assert!(
+        t.elapsed() >= Duration::from_millis(1500),
+        "{:?}",
+        t.elapsed()
+    );
+    // A client that disconnects first.
+    let mut d = connect_plain(dev.port).await;
+    d.hello().await;
+    d.send(&pb::DisconnectRequest::default()).await;
+    let _: pb::DisconnectResponse = d.recv_as().await;
+    d.expect_closed().await;
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -502,7 +581,7 @@ async fn window_can_start_closed() {
     let mut c = connect_plain(dev.port).await;
     c.hello().await;
     assert_eq!(
-        c.expect_disconnect().await,
+        c.device_info_refused().await,
         pb::DisconnectReason::ProvisioningClosed as i32
     );
     dev.cmds.send(AppCommand::OpenPairingWindow).await.unwrap();
@@ -551,6 +630,81 @@ async fn reset_pairing_deletes_the_key_and_reopens_the_window() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// HA's `_async_clear_dynamic_encryption_key` (entry deleted): connect with
+/// the key, empty `SetKey`, then `disconnect()`. The key is deleted, the
+/// device is unpaired with the window closed, also after a restart, until a
+/// local open. Keyless sessions cannot clear.
+#[tokio::test]
+async fn key_holder_clear_unpairs_with_the_window_closed() {
+    let dir = tmpdir("clear");
+    let key_file = dir.join("noise_psk");
+    let marker = webos_esphome_api::pairing::cleared_marker(&key_file);
+    let key = random_key();
+    webos_esphome_api::pairing::store_key(&key_file, &key).unwrap();
+    let (mut dev, needs) = start(config(&key_file, Duration::from_secs(60), true)).await;
+    assert!(!needs);
+    let mut c = connect_noise(dev.port, &key).await.unwrap();
+    c.hello().await;
+    dev.event(|e| matches!(e, AppEvent::HaConnected { .. }))
+        .await;
+    assert!(c.set_key(b"").await, "the key holder may clear");
+    match dev.event(|e| matches!(e, AppEvent::Pairing(_))).await {
+        AppEvent::Pairing(PairingEvent::Cleared { client_info, .. }) => {
+            assert_eq!(client_info, "rust-test");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(!key_file.exists() && marker.exists());
+    #[cfg(unix)]
+    assert_eq!(mode(&marker), 0o600);
+    // HA's cli.disconnect() right after the reply is answered (no race with
+    // a DisconnectRequest from the server).
+    c.send(&pb::DisconnectRequest::default()).await;
+    let _: pb::DisconnectResponse = c.recv_as().await;
+    c.expect_closed().await;
+    assert!(
+        dev.pending_events()
+            .iter()
+            .all(|e| !matches!(e, AppEvent::Pairing(PairingEvent::WindowOpened { .. }))),
+        "the window must stay closed"
+    );
+    // Unpaired, window closed: keyless sessions are refused, the old key fails.
+    let closed = pb::DisconnectReason::ProvisioningClosed as i32;
+    let mut p = connect_plain(dev.port).await;
+    p.hello().await;
+    assert_eq!(p.device_info_refused().await, closed);
+    assert!(is_mac_failure(
+        &connect_noise(dev.port, &key).await.err().unwrap()
+    ));
+    // A restart with open_at_start keeps it closed (marker).
+    let (dev2, needs2) = start(config(&key_file, Duration::from_secs(60), true)).await;
+    assert!(needs2);
+    let mut p = connect_plain(dev2.port).await;
+    p.hello().await;
+    assert_eq!(p.device_info_refused().await, closed);
+    // A local open ends that state.
+    dev.cmds.send(AppCommand::OpenPairingWindow).await.unwrap();
+    dev.event(|e| matches!(e, AppEvent::Pairing(PairingEvent::WindowOpened { .. })))
+        .await;
+    assert!(!marker.exists());
+    // Unpaired: an empty key over zero-PSK is no clear.
+    sleep(Duration::from_millis(1100)).await; // one SetKey attempt per second
+    let mut z = connect_noise(dev.port, &ZERO).await.unwrap();
+    z.hello().await;
+    assert!(!z.set_key(b"").await);
+    assert!(
+        logs()
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.contains("accepted only over a session keyed with the stored key")),
+        "refused as an empty key, not by the rate limit"
+    );
+    assert_not_logged(&b64(&key));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A session that proved the paired key may rotate it (ESPHome behaviour);
 /// a key fixed in the configuration cannot change.
 #[tokio::test]
@@ -593,6 +747,7 @@ async fn authenticated_rotation_and_fixed_key() {
     let mut c = connect_noise(fixed_dev.port, &old).await.unwrap();
     c.hello().await;
     assert!(!c.set_key(b64(&new).as_bytes()).await);
+    assert!(!c.set_key(b"").await, "a fixed key cannot be cleared");
     assert!(!fixed_file.exists());
     assert_not_logged(&b64(&old));
     assert_not_logged(&b64(&new));
