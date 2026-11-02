@@ -1,6 +1,6 @@
 # AEC front-end: echo cancellation in the satellite
 
-- **Status:** implemented in the daemon, **off by default** (`[aec] enabled = false`). Verified on the PC only: unit tests with synthetic echo, the fake-HA end-to-end harness with a file mic and file reference, and real c3-a recordings processed offline through the daemon's exact front-end. **Nothing in this document has been run on a TV.** The on-TV plan is in [section 9](#9-on-tv-verification-plan-pending) and is pending owner authorization.
+- **Status:** implemented in the daemon, **off by default** (`[aec] enabled = false`). Verified on the PC only: unit tests with synthetic echo, the fake-HA end-to-end harness with a file mic and file reference, and real c3-a recordings processed offline through the daemon's exact front-end. On c3-a (2026-11-02, [P3 TV verification](../discovery/c3-a/P3-tv-verify-aec-pairing.md)): the CPU benchmark (section 9 step 1) and a silent 10-minute daemon smoke (step 2, without a reference signal) are done; the live A/B (step 3) is pending. The rest of this document is PC evidence unless labelled **verified-on-target**.
 - **Date:** 2026-11-02.
 - **Scope:** [backlog item 1](../project/backlog.md#1-professional-audio-front-end), the audio front-end (owner priority 1). Device facts are from c3-a (LG C3, webOS TV 8.3.0, firmware 03.30.74, TV speaker, power state "Screen Saver"). Other models, firmware, outputs and power states are **not** covered.
 - **Related:** [AEC candidates research](../research/aec-candidates.md) (why `sonora`), [P2 session 1](../discovery/c3-a/P2-session1-audible-and-echo.md) (the reference taps), [EXP-006](../experiments/EXP-006-aec-reference.md), [D3 mic identification](../discovery/c3-a/D3-mic-identification.md), [ADR 0002](../decisions/0002-rust-implementation.md), [ADR 0004](../decisions/0004-mvp-capture-device-and-lg-handsfree-off.md), [development](../development.md).
@@ -13,7 +13,7 @@ Labels follow [AGENTS.md](../../AGENTS.md): **verified-on-target** (measured on 
 - The reference is the TV's own output from `SoundEngineCapture` (`hw:LGSIC,3` on c3-a), matched by PCM id on the mic's card, captured as S32_LE 2 ch 48 kHz (the parameters that worked in P2 session 1), linked with the mic so one trigger starts both, and decimated to 16 kHz.
 - On five real mic + reference recordings from P2 session 1, the integrated chain reaches **14.9 to 21.8 dB ERLE in 200 to 4000 Hz** with the defaults (18.0 dB on the pink-noise recording where the research measured 17.9 dB for standalone `sonora`). **verified-on-host, device recordings**
 - Measured design choices: the gain stays after the canceller (the canceller on the saturated +24 dB signal leaves 12 to 18 dB more residual echo), the GCC-PHAT delay goes to AEC3 as a hint (no measurable difference from AEC3 alone; pre-delaying the reference was harmful), NS and the silent-reference bypass stay off by default.
-- Host cost: 61 µs per 10 ms frame for the whole stage (0.6 % of one Ryzen 9 5950X core), +0.8 MB peak RSS; the static armv7 binary grows by 400 KiB (+15.4 %). The TV CPU cost is **unknown**.
+- Host cost: 61 µs per 10 ms frame for the whole stage (0.6 % of one Ryzen 9 5950X core), +0.8 MB peak RSS; the static armv7 binary grows by 400 KiB (+15.4 %). **On the TV (armv7) the stage costs about 1.0 ms per frame, 11 % of one core (13 % for the whole daemon in wake mode, 2.8 % with `bypass_when_silent`); the aarch64 build 0.21 ms per frame** (section 3.10, **verified-on-target**).
 
 ## 2. Signal flow
 
@@ -150,7 +150,8 @@ Host: AMD Ryzen 9 5950X, one thread, release build (opt-level 3 for `webos-dsp` 
 | `aec_offline` example, armv7 | 751,812 bytes |
 
 - The armv7 binary of `aec_offline`, run under `qemu-arm-static` on tap3-v10 and tap2-v10, gave exactly the same ERLE, delay and lock time as the host build, with and without NS (emulated time is meaningless). The armv7 daemon's `--self-test` passes under qemu.
-- **The TV cost is unknown.** sonora has SIMD for x86 and aarch64 but scalar code on armv7 (**documented**, research), so the host figures flatter the armv7 build (**hypothesis**). Section 9 step 1 measures it.
+- **TV cost (measured, [P3 TV verification](../discovery/c3-a/P3-tv-verify-aec-pairing.md#1-aec-cpu-benchmark-section-9-step-1)):** on c3-a (Cortex-A76 at 1.4 GHz, armv7 build) sonora takes 1.0 ms per frame (23 times the host), the whole stage runs at a real-time factor of 0.11 (NS 0.16, `--no-aec` 0.003), single frames up to 8 ms, peak RSS of `aec_offline` 6.9 MB. The aarch64 build of the same code on the same TV: 0.21 ms per frame, real-time factor 0.028. The daemon with the canceller in wake mode: 13.0 % of one core and 1.86 MB RSS over 10 minutes, 0 xruns; 2.8 % with `bypass_when_silent`. **verified-on-target**. sonora has SIMD for x86 and aarch64 but scalar code on armv7 (**documented**, research), which fits the gap.
+- On the TV the armv7 binary gives exactly the ERLE and delay it gives under `qemu-arm`; against x86_64 the broadband ERLE differs by up to 0.9 dB (float codegen), so "the same ERLE as the host" holds only for the recordings named above.
 
 ## 4. Real-pair results with the integrated chain
 
@@ -180,7 +181,7 @@ ERLE in 200 to 4000 Hz over frames where the reference is active, the output lag
 | Delay not found (reference silent, unrelated) | No lock; AEC3 still estimates on its own | no `echo delay` line | **verified-on-host** |
 | Delay jumps (reopen, unknown causes) | Re-estimated every 30 s; AEC3 tracks it itself | `info aec: echo delay changed A -> B ms` | jump behaviour on the TV **unknown** |
 | Unsupported reference rate | Rejected by `--check-config`; at runtime, no canceller | config error / `warn` | **verified-on-host** |
-| Mute, kill switch, firmware guard, unpaired | Both PCMs closed with the mic (the duplex is one source) | existing `microphone closed` lines | **hypothesis** for the reference PCM's status on the TV |
+| Mute, kill switch, firmware guard, unpaired | Both PCMs closed with the mic (the duplex is one source) | existing `microphone closed` lines | **verified-on-target** for HA mute, the kill switch and `stop.sh` (both `closed` in the same 10 ms poll, reopened linked; [P3 TV verification](../discovery/c3-a/P3-tv-verify-aec-pairing.md#2-daemon-smoke-with-aec-section-9-step-2)); firmware guard and unpaired not exercised with AEC on |
 
 ## 6. Configuration
 
@@ -208,7 +209,7 @@ python3 tools/audio-rig/aec_eval/chain_eval.py --tool target/release/examples/ae
 
 ## 9. On-TV verification plan (pending)
 
-**Status: pending.** Each step needs the owner's authorization for that TV session ([AGENTS.md](../../AGENTS.md)). Order: after Phase 2 session 2 has finished with the TV. Nothing is installed persistently; binaries go to `/tmp` and are removed. Opening `hw:LGSIC,3` was done in P2 session 1 without side effects; LG hands-free must stay off ([ADR 0004](../decisions/0004-mvp-capture-device-and-lg-handsfree-off.md)). Do not read ASoC/DAPM sysfs or debugfs nodes.
+**Status (2026-11-02):** step 1 done; step 2 done except the delay lock and ERLE, which need a reference signal (the TV played nothing); step 3 pending. Results: [P3 TV verification](../discovery/c3-a/P3-tv-verify-aec-pairing.md). Each step needs the owner's authorization for that TV session ([AGENTS.md](../../AGENTS.md)). Order: after Phase 2 session 2 has finished with the TV. Nothing is installed persistently; binaries go to `/tmp` and are removed. Opening `hw:LGSIC,3` was done in P2 session 1 without side effects; LG hands-free must stay off ([ADR 0004](../decisions/0004-mvp-capture-device-and-lg-handsfree-off.md)). Do not read ASoC/DAPM sysfs or debugfs nodes.
 
 ### Step 1: CPU benchmark (no audio device opened)
 
@@ -232,6 +233,7 @@ python3 tools/audio-rig/aec_eval/chain_eval.py --tool target/release/examples/ae
   ```
 
 - **Signals:** `wall_s` against 183.75 s of audio, `cpu_us_mean` and `cpu_us_max` per frame, and the ERLE and lock lines, which must equal the host's (14.9 dB, 16.52 ms). The recording holds no speech.
+- **Result (2026-11-02):** 1.0 ms per frame, 11 % of one core (armv7), 0.21 ms with the aarch64 build; ERLE and delay identical to the armv7 build under `qemu-arm` (the host's 14.9 dB in-band figure was not recomputed on the TV). That is the 10 to 30 % band below.
 - **Interpretation:** below 10 % of one core with the canceller: keep the defaults. 10 to 30 %: turn on `bypass_when_silent`, check thermal behaviour and the daemon's watchdog. Above 30 %, or `cpu_us_max` close to 10 000 µs: the scalar armv7 path is too slow; try the aarch64 build, then the C++ WebRTC fallback with NEON ([research](../research/aec-candidates.md#recommendation)). Different ERLE from the host means a float or codegen difference on the TV: stop and investigate.
 
 ### Step 2: daemon smoke with the reference (silent, no speech)
@@ -241,6 +243,7 @@ python3 tools/audio-rig/aec_eval/chain_eval.py --tool target/release/examples/ae
 - **Expected:** `aec: echo cancellation on: reference PCM "SoundEngineCapture" (2 ch, 48000 Hz, s32_le), linked start`; an `aec: echo delay` line between 11 and 19 ms (200 to 4000 Hz, about 0.5 ms below the session 1 figures); debug lines with ERLE above 10 dB during the stimulus and no reference underruns; `/proc/asound/card*/pcm3c/sub0/status` `RUNNING` while open; both `pcm0c` and `pcm3c` `closed` within 250 ms of `touch /tmp/webos-satellite.disable` and of HA's mute, and reopened after.
 - **Failure interpretation:** `unavailable: busy` means another process holds the tap (stop and record it); `NOT linked` means the raw `LINK` differs from alsa-lib's (the fallback still runs; record the reason); underruns mean the reference period differs from the request (record `hw_params`); a missing lock with a playing stimulus means a format or scaling error.
 - **Rollback:** stop the daemon with the ops scripts, check that every LGSIC capture PCM is `closed`, remove `/tmp/webos-satellite`.
+- **Result (2026-11-02, wake mode, silent TV, no stimulus):** reference opened and linked (trigger timestamps within 2 µs), 0 xruns and 0 reference underruns in 10 minutes, 13.0 % of one core, RSS 1.86 MB flat; mute, kill switch and stop closed both PCMs, unmute reopened both linked. Delay and ERLE stayed `n/a` (0 active-reference frames): still to verify with a stimulus.
 
 ### Step 3: live A/B with the AEC set during content
 
@@ -252,7 +255,7 @@ python3 tools/audio-rig/aec_eval/chain_eval.py --tool target/release/examples/ae
 
 ## 10. Open questions
 
-- TV CPU and memory (step 1); whether armv7 or aarch64 is the better build for it.
+- Whether to ship the aarch64 build (four times cheaper canceller on c3-a) or to enable `bypass_when_silent` by default on armv7; the daemon has not run as aarch64 with capture and `pacat` on the TV yet.
 - Double talk: near-end loss on real speech over content (only synthetic double talk exists, from the research).
 - The defaults for NS and reference gain, from the session 2 AEC set (step 3).
 - Residual saturation of the +24 dB stream during loud replies (tap3-v20b): a lower gain while the satellite plays, a limiter, or an automatic gain stage.

@@ -239,17 +239,18 @@ Milestone 3b, HA-driven pairing (PC work first):
 8. **Where does the first-run script run?** Through HBC `exec` from the app (needs root HBC) or from the init.d hook. Failure modes with a non-elevated HBC (0.7.1 and 0.7.2 fixes) are unknown.
 9. **Entities.** Are `number` and `select` config entities worth the extra code in the daemon's ESPHome layer versus a TV app setting for mic gain? HA handles authentication, so the recommendation is entities.
 10. **Window trigger on first run.** Auto-open on the first app launch only, or always require the button? Needs UX testing with non-technical users.
+11. **Key clear on entry removal.** Accept HA's empty-key `SetKey` on an authenticated session (back to unpaired, as ESPHome) or keep reset local only and leave HA's stored key behind (measured 2026-11-02, section 8).
 
 ## 7. What must be verified on a TV before acceptance
 
-Each item is a bounded experiment with its own plan, run only with the owner's authorization, read-only first, and recorded as `verified-on-target`, negative or inconclusive with firmware, HBC version and power state. None has been run.
+Each item is a bounded experiment with its own plan, run only with the owner's authorization, read-only first, and recorded as `verified-on-target`, negative or inconclusive with firmware, HBC version and power state. Items 1 to 3 and 7 to 10 have not been run; 4 to 6 were partly run on c3-a on 2026-11-02 (section 8).
 
 1. **Test IPK** (an empty app plus a payload with a `chmod +x` script): installs through `luna-send` or HBC from a hashed manifest, exec bit and directory layout survive, uninstall leaves nothing behind.
 2. **`exec` as root:** the app's `exec` call runs as root with HBC elevated on c3-a (0.6.3); a clear failure when it is not.
 3. **init.d symlink hook** from the package directory: returns at once, no failsafe, survives an IPK update, disappears on uninstall; test reboot approved by the owner ([autostart design](autostart.md#proposed-install-needs-the-owners-approval-not-done)).
-4. **mDNS advertisement** from the daemon: `_esphomelib._tcp` visible from another host on the LAN, HA discovery card appears, no disturbance of LG's responders (check that `mdnsd` and `avahi-daemon` still answer), behaviour across screen-off and standby (D5).
-5. **Unprovisioned mode, PC first:** the daemon passes the section 4.1 test list against `aioesphomeapi`; then against the owner's HA with a throwaway entry: discovery or host and port, no key typed, the key stored in HA, reconnect after an HA restart and after a daemon restart. **PC part done** (section 8), including a real HA 2026.10.4 on the PC; the owner's HA and the TV are pending. HA restart was not exercised.
-6. **Pairing window:** closes on timeout; refuses connections afterwards; reopens only on the local action; no audio in any keyless session; no key in logs or `ps` output; the key file mode is 0600 and survives a reboot. **PC part done** except `ps` output (the key is never an argument) and the reboot (TV).
+4. **mDNS advertisement** from the daemon: `_esphomelib._tcp` visible from another host on the LAN, HA discovery card appears, no disturbance of LG's responders (check that `mdnsd` and `avahi-daemon` still answer), behaviour across screen-off and standby (D5). **2026-11-02:** seen from a PC on the TV's L2 with LG's responders unaffected; HA discovery and standby still open ([P3 TV verification](../discovery/c3-a/P3-tv-verify-aec-pairing.md)).
+5. **Unprovisioned mode, PC first:** the daemon passes the section 4.1 test list against `aioesphomeapi`; then against the owner's HA with a throwaway entry: discovery or host and port, no key typed, the key stored in HA, reconnect after an HA restart and after a daemon restart. **PC part done** (section 8), including a real HA 2026.10.4 on the PC; **TV with the owner's HA done (2026-11-02, section 8)** except an HA restart (an entry reload was used).
+6. **Pairing window:** closes on timeout; refuses connections afterwards; reopens only on the local action; no audio in any keyless session; no key in logs or `ps` output; the key file mode is 0600 and survives a reboot. **PC part done**; on the TV (2026-11-02): no audio before the key, no key in logs or `ps`, file mode 0600; the timeout refuses connections but HA shows `connection_error` instead of the setup-window message (section 8, item 4). Reboot not done.
 7. **Reset and reinstall:** `reset-pairing`, IPK update and reinstall keep the stable MAC and either re-pair cleanly or tell the user what to do in HA.
 8. **Firmware guard through the installer:** an unvalidated firmware keeps the mic closed and the app explains it.
 9. **No secret leakage:** the app screens, `ctl status`, `--check-config`, logs and mDNS TXT contain no key, token or other secret (grep test on a PC run, then on the TV).
@@ -257,7 +258,7 @@ Each item is a bounded experiment with its own plan, run only with the owner's a
 
 ## 8. Implementation status (milestone 3b)
 
-Implemented on 2026-11-02 in commits 84de706 (API crate) and 849a1dd (daemon). Everything below is PC-only; nothing ran on a TV or against the owner's HA.
+Implemented on 2026-11-02 in commits 84de706 (API crate) and 849a1dd (daemon). The implementation notes and test results below are from the PC; the TV verification against the owner's HA (2026-11-02) is at the end of this section.
 
 **What exists**
 
@@ -279,14 +280,19 @@ Implemented on 2026-11-02 in commits 84de706 (API crate) and 849a1dd (daemon). E
 
 **Test results (2026-11-02, host x86_64):** API crate 54 unit tests, 4 loopback tests and 7 pairing loopback tests; satellite 51 unit tests; `fake_ha.py` 58 checks (16 new: scenarios D and E); `satellite_e2e.py` 29 checks (12 new: scenarios P and W); `cargo fmt`, `clippy -D warnings`, the armv7 and aarch64 musl release builds and `tools/check_docs.py` pass. Real HA 2026.10.4 on the PC: the flow worked end to end without typing a key ([development](../development.md#testing-without-ha-reaching-the-device) has the observations and how to repeat it).
 
-**Pending verification on a TV with real HA** (owner authorization; use a **new** test device name and MAC seed, never the permanent `lg-c3-a` entry, and remove the test entry afterwards):
+**Verification on a TV with the owner's HA (2026-11-02, [P3 TV verification](../discovery/c3-a/P3-tv-verify-aec-pairing.md#3-pairing-on-the-tv-with-the-owners-ha)).** A new test device (`webos-sat-pairtest`, new `mac_seed`) on c3-a, HA 2026.10.4 in its pod, removed afterwards:
 
-1. HA in the owner's cluster adds the TV by host and port with `[pairing] enabled = true`, no key typed; the key appears in the new entry and in `<state_dir>/noise_psk` (0600) on the TV.
-2. HA's reconnect after pairing, after an HA restart and after a daemon restart on the TV.
-3. `reset-pairing` on the TV, then HA's re-authentication confirm.
-4. Window timeout and HA's "closed its setup window" message in the real UI.
-5. Logs on the TV contain no key; the microphone PCM stays closed (`/proc/asound/.../status`) until the key is set.
-6. Optional, separate experiment: mDNS discovery on the same L2 as HA (verification item 4), which the owner's pod setup cannot see.
+1. **verified-on-target:** HA added the TV by host and port with `[pairing] enabled = true`, no key typed. The key in the new entry, in HA's key storage and in `<state_dir>/noise_psk` on the TV are the same (hashes compared); the file is mode 0600 in a 0700 directory.
+2. **verified-on-target:** HA reconnected with Noise 5 s after pairing, after a daemon restart (4 s) and after a reload of the entry (25 ms). An HA restart was **not** done (the reload stands in for it).
+3. **verified-on-target:** the `reset-pairing` trigger file deleted the key, closed the session and the mic and reopened the window; HA opened `reauth_encryption_removed_confirm` on the test entry only; confirming it made HA set its stored key again and reconnect.
+4. **negative:** after the window timed out, HA's config flow showed `connection_error` (4 of 4), not "closed its setup window", although the daemon sent `DisconnectRequest(PROVISIONING_CLOSED)` after the hello. From the PC on the TV's L2 the same client code got `provisioning_closed` 5 of 5. Hypothesis: aioesphomeapi 46.6.0 reports the reason only when the disconnect arrives after `connect()` finished, so the two back-to-back frames race. Proposed fix (not implemented): send the `DisconnectRequest` only after the client's next message or about 250 ms.
+5. **verified-on-target:** the mic PCM stayed `closed` until the key was set and opened 33 ms after it; the key appears in no log file under the prefix and not in `ps`.
+6. **partly verified:** with `device.mdns = true` the PC on the TV's L2 saw `_esphomelib._tcp` (no `api_encryption` TXT while unpaired) and LG's `mdnsd`, `avahi-daemon` and `iconnectivity` kept running and answering; the record disappeared on stop. The owner's HA (pod network) saw no discovery, as expected; discovery by an HA on the same L2 is still open.
+
+Findings for the design:
+
+- **Entry removal:** HA 2026.10.4 tries to clear a dynamically provisioned key on the device (empty `SetKey`) when the entry is deleted. The daemon refuses it (rule 6), so HA keeps the generated key in its `esphome.encryption_keys` storage and the device stays paired. Re-adding the same device works because HA reuses its stored key. Whether to accept HA's clear (ESPHome does) is open (question 11).
+- **Same port, other identity:** an existing entry that reaches a device with another MAC logs `Unexpected device found` and **stops reconnecting** until the entry is reloaded or HA restarts (no re-authentication, no change to the entry). Testing a second identity on a TV's only reachable port therefore needs a reload of the permanent entry afterwards.
 
 ## Sources
 
