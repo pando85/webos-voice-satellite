@@ -121,11 +121,11 @@ Research tasks and implementation work are tracked in GitHub Issues. This roadma
 - **Goal:** a wake word and interaction experience suited to daily use.
 - **Scope:** custom wake word model in openWakeWord, a listening and mute indicator, timers, announcements. Wake word stays server-side ([ADR 0003](../decisions/0003-server-side-wake-word-for-mvp.md)); on-TV detection is a backlog item.
 - **Deliverables:**
-  - Custom wake word model trained and deployed through the owner's GitOps homelab repository. The change is **referenced** from here (link or commit id), not stored in this repository.
+  - **Deferred (owner, 2026-11-02: keep `alexa` for now; see [backlog](backlog.md#owner-priorities-2026-11-02)).** Custom wake word model trained and deployed through the owner's GitOps homelab repository. The change is **referenced** from here (link or commit id), not stored in this repository.
   - Listening and microphone-mute indicator that is truthful (tied to the real capture state) and documented, as required by the privacy gate F7.
   - Timers and announcements supported by the ESPHome Assist satellite features that Home Assistant exposes, with the TV-side behaviour verified.
   - Audio front-end integration in the daemon (AEC with the SpeakerFeedback reference and other stages that Phase 2 measurements justify), earlier if Phase 2 shows the reference is usable (backlog #1, interleaved). The integration decision goes into an ADR.
-- **Exit criteria:** custom wake word false accepts per hour and missed wakes measured with the Phase 2 corpus and compared with the stock `alexa` model; the indicator cannot show "not listening" while capture runs (tested); timers and announcements work audibly.
+- **Exit criteria:** **deferred (owner, 2026-11-02: keep `alexa` for now; see [backlog](backlog.md#owner-priorities-2026-11-02))**: custom wake word false accepts per hour and missed wakes measured with the Phase 2 corpus and compared with the stock `alexa` model. Remaining criteria: the indicator cannot show "not listening" while capture runs (tested); timers and announcements work audibly.
 - **Needs-owner:**
   - Training data and recorded voices (consent), model approval, GitOps repository changes and deployment.
   - Choice of the indicator form (on-screen versus LED or none) and mute policy.
