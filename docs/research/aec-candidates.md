@@ -2,6 +2,7 @@
 
 - **Date:** 2026-11-02. **Scope:** PC only (host measurements, cross-builds, emulated runs). Nothing was run on the TV and no sound was played.
 - **Question:** which echo canceller (and optional noise suppression or AGC) can the satellite realistically ship for the static `armv7-unknown-linux-musleabi` target, and at what CPU cost?
+- **Follow-up:** `sonora` is integrated in the daemon (off by default) and was re-measured through the satellite's own front-end on the same recordings: [AEC front-end design](../design/aec-frontend.md).
 - **Related:** [backlog item 1, audio front-end](../project/backlog.md), [EXP-006](../experiments/EXP-006-aec-reference.md), [ADR 0002](../decisions/0002-rust-implementation.md), [build setup](../development.md), [P2 session 1 on c3-a](../discovery/c3-a/P2-session1-audible-and-echo.md) (the device evidence below comes from there).
 
 Labels follow [AGENTS.md](../../AGENTS.md): **documented** (crate docs, source, licence files), **verified-on-host** (measured on the PC in this work), **verified-on-host, device recordings** (a host run on real c3-a recordings; still not a TV measurement), **hypothesis**. Synthetic numbers are labelled **synthetic** and are not device evidence.

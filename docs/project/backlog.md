@@ -22,7 +22,7 @@ Items not in the ranked list stay in the backlog without a priority or a phase: 
 
 ## 1. Professional audio front-end
 
-- **Status:** owner priority 1 (2026-11-02): evaluate in Phase 2, integrate in Phase 4 (earlier if the reference is usable).
+- **Status:** owner priority 1 (2026-11-02): evaluate in Phase 2, integrate in Phase 4 (earlier if the reference is usable). Echo cancellation with the SoundEngineCapture reference is implemented in the daemon, **off by default**, and measured on real c3-a recordings on the PC only; the TV CPU benchmark and the content A/B are pending ([AEC front-end](../design/aec-frontend.md)).
 - **Why:** commercial assistants combine echo cancellation, beamforming, noise suppression and gain control. The built-in mic path on c3-a is near-raw (DC removal plus a fixed +16 dB gain, no AGC or noise suppression; [D3](../discovery/c3-a/D3-mic-identification.md)), so all of that is left to the satellite or to Home Assistant. TV playback in the mic is the main expected quality problem.
 - **Approach options:**
   - Acoustic echo cancellation using a TV reference tap: WebRTC AEC3 or speexdsp (cheaper CPU, weaker). P2 session 1 found `hw:LGSIC,1` SpeakerFeedback unusable as a linear reference and `hw:LGSIC,3` SoundEngineCapture clean and drift-free but with a delay that changes per open, so the AEC needs delay estimation at start ([P2 session 1](../discovery/c3-a/P2-session1-audible-and-echo.md#other-lgsic-taps-mixercapture-soundenginecapture)).
