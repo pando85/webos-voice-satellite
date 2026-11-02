@@ -349,6 +349,12 @@ impl Daemon {
                 }
                 log::info!("microphone {}", if muted { "MUTED" } else { "unmuted" });
             }
+            AppEvent::Timer {
+                event,
+                id,
+                seconds_left,
+                ..
+            } => log::info!("timer {event} id={id} seconds_left={seconds_left}"),
             other => log::debug!("event {other:?}"),
         }
     }

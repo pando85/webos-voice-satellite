@@ -65,6 +65,17 @@ fn event_line(ev: &AppEvent) -> String {
         } => format!(
             "StartStreaming {{ wake_word: {wake_word}, conversation_id: {conversation_id:?} }}"
         ),
+        // The harness prints the (otherwise hidden) timer name in full.
+        AppEvent::Timer {
+            event,
+            id,
+            name,
+            total_seconds,
+            seconds_left,
+            is_active,
+        } => format!(
+            "Timer {{ event: {event}, id: {id:?}, name: {name:?}, total_seconds: {total_seconds}, seconds_left: {seconds_left}, is_active: {is_active} }}"
+        ),
         other => format!("{other:?}"),
     }
 }

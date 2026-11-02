@@ -22,6 +22,8 @@
 //!   `VOICE_ASSISTANT | SPEAKER | API_AUDIO | ANNOUNCE`): microphone audio and,
 //!   with SPEAKER, the TTS reply travel over the API connection. Without SPEAKER
 //!   HA sends a TTS URL instead ([`AppEvent::TtsUrl`]).
+//! - Timers: with [`features::TIMERS`] enabled (off by default), HA's timer events
+//!   arrive as [`AppEvent::Timer`]; [`TimerTable`] keeps their state.
 //! - Entities: a media player whose single ANNOUNCEMENT format (default
 //!   flac/22050/mono/16-bit) is HA's TTS format in URL mode and the format of
 //!   proxied announcement media, and a "Mute microphone" switch.
@@ -105,6 +107,7 @@ pub mod frame;
 mod mdns;
 pub mod proto;
 mod server;
+pub mod timers;
 pub mod varint;
 mod voice;
 
@@ -112,6 +115,7 @@ pub use app::{AppCommand, AppEvent, PipelineMode};
 pub use config::{AudioFormat, Config, ConfigError, Mac, features};
 pub use frame::{NOISE_PREAMBLE, PLAINTEXT_PREAMBLE};
 pub use server::{Server, ServerError};
+pub use timers::{Timer, TimerEvent, TimerTable};
 
 /// Default TCP port of the ESPHome native API.
 pub const DEFAULT_PORT: u16 = 6053;

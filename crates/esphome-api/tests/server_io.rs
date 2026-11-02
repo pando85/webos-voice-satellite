@@ -9,13 +9,24 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::time::{Duration, timeout};
 use webos_esphome_api::frame::{self, Codec, NOISE_PROLOGUE, NOISE_PROTOCOL, RawMessage};
-use webos_esphome_api::proto::{self as pb, ApiMessage};
-use webos_esphome_api::{AppCommand, AppEvent, Config, PipelineMode, Server};
+use webos_esphome_api::proto::{self as pb, ApiMessage, VoiceAssistantTimerEvent as E};
+use webos_esphome_api::{AppCommand, AppEvent, Config, PipelineMode, Server, TimerEvent};
 
 const PSK_B64: &str = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=";
 
 async fn start(
     psk: Option<&str>,
+) -> (
+    u16,
+    mpsc::UnboundedReceiver<AppEvent>,
+    mpsc::Sender<AppCommand>,
+) {
+    start_with(psk, webos_esphome_api::features::DEFAULT).await
+}
+
+async fn start_with(
+    psk: Option<&str>,
+    voice_features: u32,
 ) -> (
     u16,
     mpsc::UnboundedReceiver<AppEvent>,
@@ -27,6 +38,7 @@ async fn start(
         port: 0,
         mac: Some("02:11:22:33:44:55".into()),
         noise_psk: psk.map(str::to_owned),
+        voice_features,
         ..Config::default()
     };
     let server = Server::bind(cfg).await.unwrap();
@@ -229,4 +241,88 @@ async fn noise_handshake_and_wrong_key() {
 /// Wraps a client-side snow transport in the crate's codec (symmetric API).
 fn test_transport(state: snow::TransportState) -> frame::NoiseTransport {
     frame::NoiseTransport::from_state(state)
+}
+
+fn timer_msg(
+    event: pb::VoiceAssistantTimerEvent,
+    left: u32,
+) -> pb::VoiceAssistantTimerEventResponse {
+    pb::VoiceAssistantTimerEventResponse {
+        event_type: event as i32,
+        timer_id: "t1".into(),
+        name: "tea".into(),
+        total_seconds: 120,
+        seconds_left: left,
+        is_active: true,
+    }
+}
+
+async fn connect_plain(port: u16) -> Client {
+    let mut c = Client {
+        stream: TcpStream::connect(("127.0.0.1", port)).await.unwrap(),
+        codec: Codec::Plaintext,
+        buf: Vec::new(),
+    };
+    c.hello().await;
+    c
+}
+
+#[tokio::test]
+async fn timer_events_reach_the_app_when_timers_are_enabled() {
+    let features = webos_esphome_api::features::DEFAULT_WITH_TIMERS;
+    let (port, mut events, _cmds) = start_with(None, features).await;
+    let mut c = connect_plain(port).await;
+    c.send(&pb::DeviceInfoRequest {}).await;
+    let info: pb::DeviceInfoResponse = c.recv_as().await;
+    assert_eq!(info.voice_assistant_feature_flags, features);
+
+    c.send(&timer_msg(E::VoiceAssistantTimerStarted, 120)).await;
+    c.send(&timer_msg(E::VoiceAssistantTimerFinished, 0)).await;
+    loop {
+        match events.recv().await.expect("events closed") {
+            AppEvent::Timer {
+                event: TimerEvent::Started,
+                id,
+                name,
+                total_seconds: 120,
+                seconds_left: 120,
+                is_active: true,
+            } => {
+                assert_eq!((id.as_str(), name.as_str()), ("t1", "tea"));
+                break;
+            }
+            AppEvent::HaConnected { .. } => {}
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    assert!(matches!(
+        events.recv().await,
+        Some(AppEvent::Timer {
+            event: TimerEvent::Finished,
+            seconds_left: 0,
+            ..
+        })
+    ));
+}
+
+#[tokio::test]
+async fn timer_events_are_ignored_when_timers_are_not_advertised() {
+    let (port, mut events, _cmds) = start(None).await;
+    let mut c = connect_plain(port).await;
+    c.send(&pb::DeviceInfoRequest {}).await;
+    let info: pb::DeviceInfoResponse = c.recv_as().await;
+    assert_eq!(info.voice_assistant_feature_flags & 8, 0);
+    c.send(&timer_msg(
+        pb::VoiceAssistantTimerEvent::VoiceAssistantTimerStarted,
+        5,
+    ))
+    .await;
+    // The ping answer proves the timer message was processed before it.
+    c.send(&pb::PingRequest {}).await;
+    let _: pb::PingResponse = c.recv_as().await;
+    assert!(matches!(
+        events.recv().await,
+        Some(AppEvent::HaConnected { .. })
+    ));
+    assert!(events.try_recv().is_err(), "no timer event expected");
 }

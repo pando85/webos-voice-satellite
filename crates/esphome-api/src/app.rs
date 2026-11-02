@@ -3,6 +3,8 @@
 use std::fmt;
 use std::net::SocketAddr;
 
+use crate::timers::TimerEvent;
+
 /// How a pipeline run starts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PipelineMode {
@@ -95,6 +97,23 @@ pub enum AppEvent {
     },
     /// Microphone mute changed (from HA's switch or [`AppCommand::SetMuted`]).
     MuteChanged(bool),
+    /// A timer event from HA. Only sent when the `TIMERS` feature
+    /// ([`crate::features::TIMERS`]) is enabled. HA owns and counts the timers;
+    /// the device shows or sounds them (see [`crate::TimerTable`]).
+    Timer {
+        /// What happened.
+        event: TimerEvent,
+        /// HA's timer id.
+        id: String,
+        /// User-chosen timer name (may be empty).
+        name: String,
+        /// Seconds on the timer when it was created.
+        total_seconds: u32,
+        /// Seconds left when HA sent the event.
+        seconds_left: u32,
+        /// Ticking (false while paused).
+        is_active: bool,
+    },
 }
 
 /// Command from the application to the server.
@@ -193,6 +212,22 @@ impl fmt::Debug for AppEvent {
                 .field("message_bytes", &message.len())
                 .finish(),
             Self::MuteChanged(m) => write!(f, "MuteChanged({m})"),
+            // The timer name is user speech: id, event and seconds only.
+            Self::Timer {
+                event,
+                id,
+                name: _,
+                total_seconds,
+                seconds_left,
+                is_active,
+            } => f
+                .debug_struct("Timer")
+                .field("event", event)
+                .field("id", id)
+                .field("total_seconds", total_seconds)
+                .field("seconds_left", seconds_left)
+                .field("is_active", is_active)
+                .finish(),
         }
     }
 }
@@ -245,6 +280,14 @@ mod tests {
             AppEvent::Error {
                 code: "stt-failed".to_owned(),
                 message: "SECRET".to_owned(),
+            },
+            AppEvent::Timer {
+                event: TimerEvent::Started,
+                id: "t1".to_owned(),
+                name: "SECRET".to_owned(),
+                total_seconds: 60,
+                seconds_left: 60,
+                is_active: true,
             },
         ];
         for e in &events {

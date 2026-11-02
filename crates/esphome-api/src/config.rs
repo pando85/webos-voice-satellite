@@ -14,7 +14,10 @@ pub mod features {
     pub const SPEAKER: u32 = 2;
     /// Audio travels over the API connection, not UDP (required here).
     pub const API_AUDIO: u32 = 4;
-    /// Timer events (not implemented; rejected).
+    /// Timer events: HA forwards its timers to the device, which receives them
+    /// as `AppEvent::Timer`. Implemented, but not in [`DEFAULT`]: enable it with
+    /// [`DEFAULT_WITH_TIMERS`] once the application handles timers, because HA
+    /// would otherwise register a handler whose events nothing acts on.
     pub const TIMERS: u32 = 8;
     /// Announcements (`VoiceAssistantAnnounceRequest`).
     pub const ANNOUNCE: u32 = 16;
@@ -24,10 +27,13 @@ pub mod features {
     pub const MULTI_CHANNEL_AUDIO: u32 = 64;
     /// Bits this crate implements.
     pub const SUPPORTED: u32 =
-        VOICE_ASSISTANT | SPEAKER | API_AUDIO | ANNOUNCE | START_CONVERSATION;
+        VOICE_ASSISTANT | SPEAKER | API_AUDIO | ANNOUNCE | TIMERS | START_CONVERSATION;
     /// Default: TTS streamed over the API (no URL fetch, which matters when
     /// HA's URLs are not reachable from the TV) plus announcements.
     pub const DEFAULT: u32 = VOICE_ASSISTANT | SPEAKER | API_AUDIO | ANNOUNCE;
+    /// [`DEFAULT`] plus [`TIMERS`] (= 31): set `Config::voice_features` to this
+    /// to receive timer events.
+    pub const DEFAULT_WITH_TIMERS: u32 = DEFAULT | TIMERS;
 }
 
 /// Audio format announced to Home Assistant on the media player entity.
@@ -355,8 +361,12 @@ mod tests {
         let mut cfg = Config::default();
         cfg.voice_features = features::VOICE_ASSISTANT | features::SPEAKER;
         assert_eq!(cfg.validate(), Err(ConfigError::InvalidFeatures));
-        cfg.voice_features = features::DEFAULT | features::TIMERS;
+        cfg.voice_features = features::DEFAULT | features::MULTI_CHANNEL_AUDIO;
         assert_eq!(cfg.validate(), Err(ConfigError::InvalidFeatures));
+        assert_eq!(features::DEFAULT_WITH_TIMERS, 31);
+        cfg.voice_features = features::DEFAULT_WITH_TIMERS;
+        cfg.validate().unwrap();
+        assert_eq!(Config::default().voice_features & features::TIMERS, 0);
         cfg.voice_features = features::SUPPORTED;
         cfg.validate().unwrap();
     }

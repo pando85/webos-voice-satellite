@@ -35,6 +35,7 @@ from aioesphomeapi import (
     SwitchInfo,
     SwitchState,
     VoiceAssistantEventType as Ev,
+    VoiceAssistantTimerEventType as TimerEv,
 )
 from aioesphomeapi.model import APIVersion, VoiceAssistantCommandFlag
 
@@ -347,6 +348,13 @@ async def scenario_plaintext_speaker(binary: str) -> None:
         while not ha.stops.empty():
             ha.stops.get_nowait()
 
+        # TIMERS is not advertised (A3), so HA would never forward timers; a
+        # stray timer event must be ignored.
+        before = len(dev.events)
+        cli.send_voice_assistant_timer_event(TimerEv.VOICE_ASSISTANT_TIMER_STARTED, "stray", "x", 30, 30, True)
+        await asyncio.sleep(0.4)
+        check("A21b timer event without TIMERS is ignored", dev.count_since("Timer", before) == 0)
+
         # Mute switch from HA.
         ha.states.clear()
         cli.switch_command(mute_key, True)
@@ -422,12 +430,69 @@ async def scenario_noise_url(binary: str) -> None:
         await dev.stop()
 
 
+async def scenario_timers(binary: str) -> None:
+    """TIMERS enabled (31 = default | TIMERS): HA's timer events reach the app."""
+    print("\n== scenario C: TIMERS feature, timer events from HA ==")
+    dev = Device(binary, ["--mode", "none", "--features", "31", "--mac", "02:00:00:00:00:0c"], None)
+    os.environ["FAKE_DEVICE_LOG"] = "debug"  # debug lines print every AppEvent via Debug
+    try:
+        await dev.start()
+    finally:
+        del os.environ["FAKE_DEVICE_LOG"]
+    ha = FakeHA(dev.port)
+    try:
+        cli = await ha.connect()
+        info = await cli.device_info()
+        flags = info.voice_assistant_feature_flags_compat(cli.api_version)
+        check("C1 device info advertises TIMERS", flags == 31 and flags & 8, str(flags))
+        ha.subscribe_voice()
+        await dev.wait_event("HaConnected")
+
+        # What HA's handle_timer_event sends for: set a timer, add a minute,
+        # pause, resume, finish; and a second timer that is cancelled.
+        T = TimerEv
+        cli.send_voice_assistant_timer_event(T.VOICE_ASSISTANT_TIMER_STARTED, "t-1", "pasta", 300, 300, True)
+        ev = await dev.wait_event("Timer ")
+        check("C2 STARTED reaches the app with all fields",
+              ev == 'Timer { event: started, id: "t-1", name: "pasta", total_seconds: 300, '
+                    'seconds_left: 300, is_active: true }', ev)
+        cli.send_voice_assistant_timer_event(T.VOICE_ASSISTANT_TIMER_UPDATED, "t-1", "pasta", 360, 342, True)
+        ev = await dev.wait_event("Timer ")
+        check("C3 UPDATED (time added)", "event: updated" in ev and "total_seconds: 360" in ev
+              and "seconds_left: 342" in ev, ev)
+        cli.send_voice_assistant_timer_event(T.VOICE_ASSISTANT_TIMER_UPDATED, "t-1", "pasta", 360, 330, False)
+        ev = await dev.wait_event("Timer ")
+        check("C4 UPDATED (paused) carries is_active=false", "is_active: false" in ev and "seconds_left: 330" in ev, ev)
+        cli.send_voice_assistant_timer_event(T.VOICE_ASSISTANT_TIMER_UPDATED, "t-1", "pasta", 360, 330, True)
+        await dev.wait_event("Timer ")
+        cli.send_voice_assistant_timer_event(T.VOICE_ASSISTANT_TIMER_FINISHED, "t-1", "pasta", 360, 0, False)
+        ev = await dev.wait_event("Timer ")
+        check("C5 FINISHED", "event: finished" in ev and "seconds_left: 0" in ev and '"t-1"' in ev, ev)
+
+        cli.send_voice_assistant_timer_event(T.VOICE_ASSISTANT_TIMER_STARTED, "t-2", None, 60, 60, True)
+        ev = await dev.wait_event("Timer ")
+        check("C6 a timer without a name", 'name: ""' in ev, ev)
+        cli.send_voice_assistant_timer_event(T.VOICE_ASSISTANT_TIMER_CANCELLED, "t-2", None, 60, 41, True)
+        ev = await dev.wait_event("Timer ")
+        check("C7 CANCELLED", "event: cancelled" in ev and "seconds_left: 41" in ev, ev)
+
+        # The device log shows ids and seconds but never the timer name.
+        await cli.disconnect()
+        await dev.wait_event("HaDisconnected")
+        await dev.stop()
+        log_text = open(dev.log.name).read()
+        check("C8 device log never contains the timer name", "pasta" not in log_text and "t-1" in log_text,
+              "debug log checked")
+    finally:
+        await dev.stop()
+
+
 async def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--device", required=True, help="path to the fake_device binary")
     args = parser.parse_args()
     failed = False
-    for scenario in (scenario_plaintext_speaker, scenario_noise_url):
+    for scenario in (scenario_plaintext_speaker, scenario_noise_url, scenario_timers):
         try:
             await scenario(args.device)
         except Exception as err:  # noqa: BLE001

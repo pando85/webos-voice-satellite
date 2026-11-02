@@ -20,6 +20,7 @@ use crate::frame::{
     encode_noise_frame,
 };
 use crate::proto::{self as pb, ApiMessage};
+use crate::timers;
 use crate::voice::{FLAG_USE_WAKE_WORD, Out, ToHa, Voice};
 use crate::{API_VERSION_MAJOR, API_VERSION_MINOR, ESPHOME_VERSION, MANUFACTURER};
 
@@ -689,8 +690,19 @@ impl Ctx {
             | pb::SubscribeLogsRequest::ID
             | pb::SubscribeHomeassistantServicesRequest::ID
             | pb::SubscribeHomeAssistantStatesRequest::ID
-            | pb::VoiceAssistantTimerEventResponse::ID
             | pb::GetTimeResponse::ID => {}
+            pb::VoiceAssistantTimerEventResponse::ID => {
+                // HA only registers a timer handler when TIMERS is advertised.
+                if self.cfg.voice_features & features::TIMERS == 0 {
+                    log::debug!("esphome-api: timer event ignored (TIMERS not advertised)");
+                } else if let Some(ev) = decode::<pb::VoiceAssistantTimerEventResponse>(msg)
+                    .and_then(timers::to_app_event)
+                {
+                    self.emit(ev);
+                } else {
+                    log::debug!("esphome-api: undecodable timer event ignored");
+                }
+            }
             other => log::debug!(
                 "esphome-api: ignoring message {other} ({})",
                 pb::message_name(other).unwrap_or("unknown")

@@ -20,8 +20,9 @@ Code generation: `build.rs` compiles the proto with `protox` (pure Rust, so no `
 - **Voice feature flags** are configurable (`Config::voice_features`). The default is `VOICE_ASSISTANT | SPEAKER | API_AUDIO | ANNOUNCE` = 23:
   - With SPEAKER, HA streams the TTS reply as 16 kHz mono s16le PCM over the API, between the `TTS_STREAM_START` and `TTS_STREAM_END` events. The PCM chunks are 512 samples and carry no WAV header. The owner's HA builds media URLs from the pod IP, which the TV cannot reach (orchestrator note, [integration notes](../research/ha-esphome-integration-notes.md)).
   - Without SPEAKER, HA sends `TTS_END{url}` and the app fetches it (`AppEvent::TtsUrl`). After playback the device sends `VoiceAssistantAnnounceFinished`.
-  - `START_CONVERSATION` (32) is implemented but off by default.
-  - `TIMERS` and `MULTI_CHANNEL_AUDIO` are rejected by config validation because they are not implemented.
+  - `START_CONVERSATION` (32) is implemented but off by default (see [START_CONVERSATION status](#start_conversation-status)).
+  - `TIMERS` (8) is implemented but off by default (see [Timers](#timers)).
+  - `MULTI_CHANNEL_AUDIO` (64) is rejected by config validation because it is not implemented.
 - **Request flags:** `USE_WAKE_WORD` (2) is set for wake word runs. `USE_VAD` is never set, because HA 2026.10.4 ignores it.
 - **Entities:**
   - One `media_player`. Its single ANNOUNCEMENT format is `flac`, 22050 Hz, 1 channel, 2 bytes. That is Piper's native rate, it streams well and symphonia can decode it. `sample_rate` is always set, to work around the HA 2026.10.4 bug. The only media feature is STOP. In URL mode this format becomes HA's TTS format. In all modes it is the format of announcement media proxied through ffmpeg.
@@ -38,6 +39,36 @@ Code generation: `build.rs` compiles the proto with `protox` (pure Rust, so no `
   - The delay is capped at 60 s.
   - HA's start reply must arrive within 10 s.
 - **mDNS:** optional (`Config::mdns`, cargo feature `mdns`, on by default). It advertises `_esphomelib._tcp` with TXT records `friendly_name`, `version`, `mac`, `platform`, `board`, `network` and `api_encryption`, using `mdns-sd`. If the advertisement fails, the server logs a warning and keeps running.
+
+## Timers
+
+Status: **implemented in the API crate (soundless groundwork for Phase 4), off by default, not yet wired into the satellite config.** Verified against aioesphomeapi 46.6.0 acting as HA, not against a real HA.
+
+How HA behaves (HA 2026.10.4 `esphome/assist_satellite.py`, `intent/timers.py`; source reading):
+
+- When the device advertises `TIMERS` (bit 8) in its voice feature flags, the ESPHome integration registers a timer handler for the device. It forwards each HA intent timer event as a `VoiceAssistantTimerEventResponse` with `timer_id`, `name`, `total_seconds` (the created seconds, which grow when time is added), `seconds_left` and `is_active`.
+- The event types are `STARTED` (timer created), `UPDATED` (time added or removed, paused, resumed; a pause is `UPDATED` with `is_active = false`), `CANCELLED` and `FINISHED`.
+- HA owns the timers and counts them down. The device never reports timers back. There is no message to list timers.
+- HA does **not** replay existing timers when the device reconnects. After a reconnect the handler sees only later events. A device that wants to survive a reconnect must keep its own state.
+
+What the crate does:
+
+- Enable it with `Config::voice_features = features::DEFAULT_WITH_TIMERS` (31). The default stays `features::DEFAULT` (23) until the satellite handles timers. `fake_device` takes `--features 31`. The satellite's config file has no key for the voice features yet; adding one is satellite work.
+- With TIMERS advertised, each HA timer message becomes `AppEvent::Timer { event: TimerEvent, id, name, total_seconds, seconds_left, is_active }`. Unknown event types are dropped with a debug line. Without TIMERS the messages are ignored.
+- `AppEvent`'s hand-written `Debug` prints event, id and seconds only. The timer name is user speech and stays out of logs (`name_bytes` in `Timer`'s `Debug`). `AppEvent` was already `#[non_exhaustive]`, so adding the variant breaks no match.
+- `TimerTable` is an optional helper for the application: `apply(&AppEvent, Instant)` keeps the timers HA reported (at most 64), `Timer::remaining(now)` counts down locally while the timer is active, and `by_remaining` lists them soonest first. It lives in the application and so survives HA reconnects, which is the only state recovery available given that HA does not replay. The server itself keeps no timer state.
+- The satellite logs each event at info level (`timer <event> id=... seconds_left=...`) and does nothing else.
+
+What the TV will do (Phase 4, not now): on `FINISHED` the satellite will play a repeating chime through the playback path until the user stops it (voice command to HA, which cancels the timer, or the media player STOP) or a time limit passes. The chime asset, the stop gesture, the volume and the interaction with a running pipeline run (duck or queue) are open Phase 4 and Phase 2 audio decisions. A disconnected HA cannot send `FINISHED`, so the application may sound a known timer from its local `remaining` time. HA's own `FINISHED` after a reconnect must not sound it twice, which `TimerTable` supports by dropping the timer on the first `FINISHED`.
+
+## START_CONVERSATION status
+
+Status: **works in the implementation, tested with aioesphomeapi 46.6.0, off by default in the advertised flags; the satellite behaves the same either way.** Not yet exercised against a real HA.
+
+- HA side (`assist_satellite.py`): `assist_satellite.start_conversation` calls `async_start_conversation`, which is `_do_announce(..., run_pipeline_after=True)`. It sends `VoiceAssistantAnnounceRequest` with `start_conversation = true` and waits for `VoiceAssistantAnnounceFinished`. HA adds the `START_CONVERSATION` supported feature to the satellite entity only when the device advertises bit 32. Without the bit, HA does not offer the feature for this entity (the service gating itself is in the `assist_satellite` component, which was not read).
+- Device side: `Voice::on_announce` aborts any run, plays the announcement (`AppEvent::Announce`, `start_conversation` flag), and after `AppCommand::AnnounceFinished` sends `AnnounceFinished` to HA and then starts a run without wake word (at STT) instead of re-arming. This happens regardless of the advertised bit, because the request itself carries the flag. Harness check A21 covers it (announce, then a run with `USE_WAKE_WORD` unset, then re-arm after `RUN_END`).
+- So, to let `assist_satellite.start_conversation` be called for the TV, advertise bit 32 (`features::DEFAULT | features::START_CONVERSATION` = 55). `ANNOUNCE` (16) is also needed because HA waits for the announcement first. Announcements still arrive as URLs, which fail while HA's internal URL is unreachable from the TV (see the announcement note under the open points).
+- Not verified: the real HA flow end to end (including HA's 5 minute announcement timeout, `_ANNOUNCEMENT_TIMEOUT_SEC`, when playback fails) and the TV audio path for the announcement.
 
 ## Existing crate vs own implementation
 
@@ -78,6 +109,8 @@ The harness plays HA:
   - `wake-engine-missing` backoff, `continue_conversation`, a run without TTS;
   - an announcement that aborts the wake word run, and `start_conversation`;
   - the mute switch, and disconnect.
+- **Scenario A** also checks that a stray timer event is ignored while TIMERS is not advertised.
+- **Scenario C** (plaintext, features 31) covers the TIMERS flag in device info and the app events for started, updated (time added, paused, resumed), finished and cancelled timers, a timer without a name, and that the device log (at debug level) never contains the timer name.
 - **Scenario B** (Noise, URL mode, push-to-talk) covers:
   - refusal of a plaintext client and of a wrong key, with the exceptions HA maps to its UI;
   - an encrypted session;
@@ -91,6 +124,8 @@ Results on 2026-11-02 (host x86_64, Python 3.14, aioesphomeapi 46.6.0):
 
 - 35 unit tests and 2 loopback tests passed.
 - All 33 harness checks passed, against the host build and against the static armv7 build under `qemu-arm-static`.
+
+Results on 2026-11-02 after the timers work (host x86_64 only): 42 unit tests and 4 loopback tests in the crate (the timer ones are new), 42 `fake_ha.py` checks and 13 satellite end-to-end checks passed. The armv7 and qemu run was not repeated.
 
 Cross-build: the armv7 binary is static EABI5 with VFPv3, about 0.9 MB.
 
