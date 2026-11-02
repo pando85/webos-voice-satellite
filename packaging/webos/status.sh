@@ -24,6 +24,7 @@ fi
 [ ! -e "$DISABLE" ] || note "marker $DISABLE present: starts are refused"
 [ ! -e "$CRASHLOOP" ] || note "marker $CRASHLOOP present: the supervisor gave up ($(head -n 1 "$CRASHLOOP"))"
 [ ! -e "$KILL_SWITCH_DEFAULT" ] || note "kill switch $KILL_SWITCH_DEFAULT present: the microphone is off"
+note "binary: $("$BIN" --version 2>/dev/null || echo "$BIN does not run")"
 pid=$(read_pid "$PIDFILE")
 if is_ours "$pid"; then
     # shellcheck disable=SC2012 # fd names are numbers

@@ -9,7 +9,11 @@ SSH_OPTS      ?= -o ControlMaster=auto -o ControlPersist=60 -o ControlPath=$(SSH
 TIMEOUT       ?= 30
 TV_PREFIX     ?= /tmp/webos-satellite
 TV_STAGE      ?= /tmp/webos-satellite-stage
+# Build install.sh picks on the TV: auto (uname -m), armv7 or aarch64.
+TV_ARCH       ?= auto
 PKG           := packaging/webos
+PKG_OUT       := target/webos-package
+PKG_TAR       := target/webos-satellite-package.tar.gz
 
 BIN           := webos-satellite
 TARGET_ARM    := armv7-unknown-linux-musleabi
@@ -17,19 +21,39 @@ TARGET_A64    := aarch64-unknown-linux-musl
 OUT_ARM       := target/$(TARGET_ARM)/release/$(BIN)
 OUT_A64       := target/$(TARGET_A64)/release/$(BIN)
 
-.PHONY: build-tv build-tv64 test lint fmt deploy-tv run-tv-selftest clean-tv tv-install-tmp tv-uninstall-tmp
+.PHONY: build-tv build-tv64 build-tv-all package-tv test lint fmt deploy-tv run-tv-selftest clean-tv tv-install-tmp tv-uninstall-tmp
 
-# Static 32-bit ARM EABI5 softfp binary (flags come from .cargo/config.toml).
+# Static 32-bit ARM EABI5 binary (flags come from .cargo/config.toml). Runs on
+# every supported TV; the build verified on c3-a.
 build-tv:
 	cargo zigbuild --release -p webos-satellite --target $(TARGET_ARM)
 	@file $(OUT_ARM)
 	@sha256sum $(OUT_ARM)
 
-# Static aarch64 binary, for comparison.
+# Static aarch64 binary, for TVs with a 64-bit kernel (install.sh selects it
+# by `uname -m` and falls back to armv7). The daemon as aarch64 is not yet
+# verified on a TV.
 build-tv64:
 	cargo zigbuild --release -p webos-satellite --target $(TARGET_A64)
 	@file $(OUT_A64)
 	@sha256sum $(OUT_A64)
+
+build-tv-all: build-tv build-tv64
+
+# Package directory and tarball: the ops scripts plus both builds, named
+# webos-satellite-armv7 and webos-satellite-aarch64, and SHA256SUMS.
+# On the TV: sh install.sh --prefix DIR --config FILE [--arch armv7|aarch64].
+package-tv: build-tv-all
+	rm -rf $(PKG_OUT)
+	mkdir -p $(PKG_OUT)
+	cp $(PKG)/*.sh $(PKG_OUT)/
+	cp $(OUT_ARM) $(PKG_OUT)/$(BIN)-armv7
+	cp $(OUT_A64) $(PKG_OUT)/$(BIN)-aarch64
+	chmod 755 $(PKG_OUT)/$(BIN)-armv7 $(PKG_OUT)/$(BIN)-aarch64
+	cd $(PKG_OUT) && sha256sum $(BIN)-armv7 $(BIN)-aarch64 *.sh >SHA256SUMS
+	tar -C $(dir $(PKG_OUT)) -czf $(PKG_TAR) $(notdir $(PKG_OUT))
+	@cat $(PKG_OUT)/SHA256SUMS
+	@echo "package: $(PKG_OUT) and $(PKG_TAR)"
 
 test:
 	cargo test --workspace
@@ -57,14 +81,17 @@ clean-tv:
 
 # Installs under TV_PREFIX on the TV's tmpfs (lost at reboot; nothing else is
 # written, no autostart). Needs TV_CONFIG=<local toml> and, for an encrypted
-# API, TV_PSK=<local key file>. Starts nothing: run
+# API, TV_PSK=<local key file>. Copies the package (both builds); install.sh
+# picks one with TV_ARCH (default auto: aarch64 on a 64-bit kernel if it
+# runs, else armv7; TV_ARCH=armv7 pins the build verified on c3-a). Starts
+# nothing: run
 #   ssh $(TV) 'sh $(TV_PREFIX)/bin/start.sh'
 # Each TV session needs the owner's authorization (docs/development.md).
-tv-install-tmp: build-tv
+tv-install-tmp: package-tv
 	@test -n "$(TV_CONFIG)" || { echo "set TV_CONFIG=<config.toml> (and TV_PSK=<key file>)"; exit 2; }
 	timeout $(TIMEOUT) ssh $(SSH_OPTS) $(TV) 'rm -rf $(TV_STAGE) && mkdir -m 700 $(TV_STAGE)'
-	timeout $(TIMEOUT) scp $(SSH_OPTS) $(PKG)/*.sh $(OUT_ARM) $(TV_CONFIG) $(TV_PSK) $(TV):$(TV_STAGE)/
-	timeout $(TIMEOUT) ssh $(SSH_OPTS) $(TV) 'cd $(TV_STAGE) && sh ./install.sh --prefix $(TV_PREFIX) --binary ./$(BIN) --config ./$(notdir $(TV_CONFIG)) $(if $(TV_PSK),--psk-file ./$(notdir $(TV_PSK))); rc=$$?; cd /; rm -rf $(TV_STAGE); exit $$rc'
+	timeout $(TIMEOUT) scp $(SSH_OPTS) $(PKG_OUT)/*.sh $(PKG_OUT)/$(BIN)-armv7 $(PKG_OUT)/$(BIN)-aarch64 $(TV_CONFIG) $(TV_PSK) $(TV):$(TV_STAGE)/
+	timeout $(TIMEOUT) ssh $(SSH_OPTS) $(TV) 'cd $(TV_STAGE) && sh ./install.sh --prefix $(TV_PREFIX) --arch $(TV_ARCH) --config ./$(notdir $(TV_CONFIG)) $(if $(TV_PSK),--psk-file ./$(notdir $(TV_PSK))); rc=$$?; cd /; rm -rf $(TV_STAGE); exit $$rc'
 
 # Stops the daemon and removes TV_PREFIX (and the staging directory) from the TV.
 tv-uninstall-tmp:

@@ -166,3 +166,43 @@ stop_daemon() {
     fi
     rm -f "$PIDFILE" "$ROTPID" "$SUPPID"
 }
+
+# --- Binary selection (install.sh) -------------------------------------------
+# A package carries webos-satellite-armv7 (static armv7 musl, the build
+# verified on c3-a) and webos-satellite-aarch64 (static aarch64 musl).
+
+# Prints the build to try first for `uname -m` output $1. aarch64 means a
+# 64-bit kernel: c3-a reports it for every process although its userland is
+# 32-bit (P1 runtime smoke), and a static aarch64 binary ran there. armv7l
+# (32-bit kernel), armv8l (32-bit personality on a 64-bit kernel) and anything
+# unknown get armv7, which runs on both.
+arch_for_machine() {
+    case $1 in
+    aarch64 | arm64) echo aarch64 ;;
+    *) echo armv7 ;;
+    esac
+}
+
+# Rust target triple that `--version` of the build for arch $1 reports.
+triple_of_arch() {
+    case $1 in
+    aarch64) echo aarch64-unknown-linux-musl ;;
+    armv7) echo armv7-unknown-linux-musleabi ;;
+    *) echo "" ;;
+    esac
+}
+
+# True if binary $1 runs here: `--version` exits 0 and prints
+# "webos-satellite <version> (<triple>)", with triple $2 when it is given.
+binary_runs() {
+    out=$("$1" --version 2>/dev/null) || return 1
+    case $out in
+    "webos-satellite "*) ;;
+    *) return 1 ;;
+    esac
+    [ -z "${2:-}" ] && return 0
+    case $out in
+    *"($2)"*) return 0 ;;
+    esac
+    return 1
+}

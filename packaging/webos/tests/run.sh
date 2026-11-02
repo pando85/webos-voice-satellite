@@ -1,7 +1,8 @@
 #!/bin/sh
 # Host test of the ops scripts: install, start --supervise, restart after a
 # crash, crash-loop guard, autostart gating (disable marker, firmware guard),
-# stop and uninstall. Runs the host build of webos-satellite with a file mic,
+# stop and uninstall, and install.sh's choice between the armv7 and aarch64
+# builds (stand-in binaries, `uname -m` replaced by WEBOS_SAT_UNAME_M). Runs the host build of webos-satellite with a file mic,
 # the null sink and plaintext on 127.0.0.1. Touches nothing outside a
 # temporary directory, except that it refuses to run while the default kill
 # switch /tmp/webos-satellite.disable exists.
@@ -19,6 +20,7 @@ if [ -z "$BIN" ]; then
     BIN=${CARGO_TARGET_DIR:-$ROOT/target}/debug/webos-satellite
 fi
 [ -x "$BIN" ] || { echo "binary not found: $BIN" >&2; exit 2; }
+HOST_BIN=$BIN # BIN is reused by lib.sh's set_paths below
 [ ! -e /tmp/webos-satellite.disable ] || { echo "/tmp/webos-satellite.disable exists; remove it first" >&2; exit 2; }
 
 T=$(mktemp -d "${TMPDIR:-/tmp}/webos-sat-pkgtest.XXXXXX")
@@ -145,6 +147,75 @@ check "uninstall: stops everything and removes the prefix" '[ ! -e "$P" ] && ! i
 t0=$(date +%s)
 out=$(sh "$PKG/init.d/webos-satellite" 2>&1) && rc=0 || rc=$?
 check "init.d hook without an install: exit 0 at once, no output" '[ "$rc" -eq 0 ] && [ -z "$out" ] && [ $(($(date +%s) - t0)) -le 1 ]'
+
+echo "== install.sh: armv7 / aarch64 selection =="
+# Stand-ins: "ok" answers --version with the build's triple and runs the host
+# binary otherwise (for --check-config); "bad" fails like a binary for another
+# CPU.
+SEL=$T/sel
+mkdir -p "$SEL"
+cp "$PKG"/*.sh "$SEL/"
+stand_in() { # ARCH ok|bad|ARCH_REPORTED
+    f=$SEL/webos-satellite-$1
+    if [ "$2" != bad ]; then
+        reported=$1
+        [ "$2" = ok ] || reported=$2
+        printf '#!/bin/sh\n[ "$1" != --version ] || { echo "webos-satellite 0.0.1 (%s)"; exit 0; }\nexec "%s" "$@"\n' \
+            "$(triple_of_arch "$reported")" "$HOST_BIN" >"$f"
+    else
+        printf '#!/bin/sh\necho "Exec format error" >&2\nexit 126\n' >"$f"
+    fi
+    chmod 755 "$f"
+}
+n=0
+sel_install() { # UNAME_M [INSTALL ARGS...]; sets out, rc and dir
+    n=$((n + 1))
+    dir=$T/sel-$n
+    m=$1
+    shift
+    out=$(WEBOS_SAT_UNAME_M=$m sh "$SEL/install.sh" --prefix "$dir" --config "$T/sat.toml" --persistent "$@" 2>&1) && rc=0 || rc=$?
+}
+installed() { # TRIPLE: the installed binary is that build
+    "$dir/bin/webos-satellite" --version | grep -q "($1)"
+}
+A64=aarch64-unknown-linux-musl
+A32=armv7-unknown-linux-musleabi
+stand_in armv7 ok
+stand_in aarch64 ok
+sel_install aarch64
+check "uname aarch64 (64-bit kernel): the aarch64 build" '[ "$rc" -eq 0 ] && installed $A64 && [ ! -e "$dir/bin/.webos-satellite.new" ]'
+good=$dir
+sel_install armv7l
+check "uname armv7l (32-bit kernel): the armv7 build" '[ "$rc" -eq 0 ] && installed $A32'
+sel_install armv8l
+check "uname armv8l (32-bit personality): the armv7 build" '[ "$rc" -eq 0 ] && installed $A32'
+sel_install x86_64
+check "unknown uname: the armv7 build" '[ "$rc" -eq 0 ] && installed $A32'
+sel_install aarch64 --arch armv7
+check "--arch armv7 overrides an aarch64 kernel" '[ "$rc" -eq 0 ] && installed $A32'
+sel_install armv7l --arch aarch64
+check "--arch aarch64 is tried first on any kernel" '[ "$rc" -eq 0 ] && installed $A64'
+sel_install aarch64 --arch mips
+check "--arch with an unknown value is refused" '[ "$rc" -ne 0 ] && [ ! -e "$dir" ]'
+stand_in aarch64 armv7
+sel_install aarch64
+check "a file named aarch64 that reports another target: armv7" '[ "$rc" -eq 0 ] && installed $A32'
+stand_in aarch64 bad
+sel_install aarch64
+check "aarch64 build does not run: falls back to armv7" '[ "$rc" -eq 0 ] && installed $A32 && echo "$out" | grep -q "falling back to armv7"'
+stand_in armv7 bad
+sel_install aarch64
+check "nothing runs: install refused, no prefix left behind" '[ "$rc" -ne 0 ] && [ ! -e "$dir" ]'
+out=$(WEBOS_SAT_UNAME_M=aarch64 sh "$SEL/install.sh" --prefix "$good" --config "$T/sat.toml" --persistent 2>&1) && rc=0 || rc=$?
+dir=$good
+check "nothing runs: a re-install keeps the installed binary" '[ "$rc" -ne 0 ] && installed $A64 && [ ! -e "$dir/bin/.webos-satellite.new" ] && echo "$out" | grep -q "unchanged"'
+rm -f "$SEL/webos-satellite-aarch64"
+stand_in armv7 ok
+sel_install aarch64
+check "no aarch64 build in the package: armv7" '[ "$rc" -eq 0 ] && installed $A32'
+sel_install aarch64 --binary "$HOST_BIN"
+check "--binary installs that binary without selection" '[ "$rc" -eq 0 ] && cmp -s "$dir/bin/webos-satellite" "$HOST_BIN"'
+check "status.sh names the installed build" 'sh "$dir/bin/status.sh" | grep -q "binary: webos-satellite "'
 
 if [ "$fails" -eq 0 ]; then
     echo "all checks passed"

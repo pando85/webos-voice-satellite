@@ -2,18 +2,29 @@
 # Installs webos-satellite under one prefix directory. Writes nothing outside
 # it. No autostart, no init integration (see docs/development.md).
 #
-# usage: install.sh --prefix DIR --config FILE [--binary FILE] [--psk-file FILE]
-#                   [--persistent]
+# usage: install.sh --prefix DIR --config FILE [--arch auto|armv7|aarch64]
+#                   [--binary FILE] [--psk-file FILE] [--persistent]
 #
 #   --prefix DIR    install directory; must be under /tmp, /run or /dev/shm
 #                   (non-persistent) unless --persistent is given, which needs
 #                   the owner's authorization on a real TV
 #   --config FILE   TOML config (see config/example.toml); installed as etc/config.toml
-#   --binary FILE   the static armv7 binary (default: ./webos-satellite next to this script)
+#   --arch A        which build of the package to install (default auto):
+#                   auto: aarch64 if `uname -m` is aarch64 (64-bit kernel),
+#                   else armv7; armv7 or aarch64: that build first. An aarch64
+#                   build that does not run falls back to armv7. Builds are
+#                   webos-satellite-armv7 and webos-satellite-aarch64 next to
+#                   this script (a lone ./webos-satellite is used as is)
+#   --binary FILE   install this binary instead (no selection)
 #   --psk-file FILE Noise key; installed as etc/noise_psk (config key
 #                   device.noise_psk_file = "noise_psk" resolves to it)
 #
+# The chosen binary is copied into DIR/bin under a temporary name and must
+# answer --version before it replaces the installed one. If nothing runs, an
+# existing install is left unchanged.
+#
 # Layout: DIR/{bin,etc,run,log,out}; DIR/.webos-satellite-install marks it.
+# Test hook: WEBOS_SAT_UNAME_M replaces `uname -m`.
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
 # shellcheck source=lib.sh
@@ -22,6 +33,7 @@ here=$(cd "$(dirname "$0")" && pwd)
 prefix_arg=
 config=
 binary=
+arch=auto
 psk=
 persistent=0
 while [ $# -gt 0 ]; do
@@ -29,17 +41,27 @@ while [ $# -gt 0 ]; do
     --prefix) [ $# -ge 2 ] || die "--prefix needs a value"; prefix_arg=$2; shift 2 ;;
     --config) [ $# -ge 2 ] || die "--config needs a value"; config=$2; shift 2 ;;
     --binary) [ $# -ge 2 ] || die "--binary needs a value"; binary=$2; shift 2 ;;
+    --arch) [ $# -ge 2 ] || die "--arch needs a value"; arch=$2; shift 2 ;;
     --psk-file) [ $# -ge 2 ] || die "--psk-file needs a value"; psk=$2; shift 2 ;;
     --persistent) persistent=1; shift ;;
-    -h | --help) sed -n '2,17p' "$0"; exit 0 ;;
+    -h | --help) sed -n '2,27p' "$0"; exit 0 ;;
     *) die "unknown argument: $1 (see --help)" ;;
     esac
 done
 
 [ -n "$prefix_arg" ] || die "missing --prefix DIR"
 [ -n "$config" ] || die "missing --config FILE (there is no default: the example config plays audio)"
-[ -n "$binary" ] || binary=$here/webos-satellite
-[ -f "$binary" ] || die "binary not found: $binary"
+case $arch in
+auto | armv7 | aarch64) ;;
+*) die "--arch must be auto, armv7 or aarch64" ;;
+esac
+bin_a32=$here/webos-satellite-armv7
+bin_a64=$here/webos-satellite-aarch64
+if [ -z "$binary" ] && [ ! -f "$bin_a32" ] && [ ! -f "$bin_a64" ]; then
+    # Older layout: one binary next to the script.
+    binary=$here/webos-satellite
+fi
+[ -z "$binary" ] || [ -f "$binary" ] || die "binary not found: $binary"
 [ -f "$config" ] || die "config not found: $config"
 [ -z "$psk" ] || [ -f "$psk" ] || die "key file not found: $psk"
 
@@ -48,9 +70,13 @@ if ! is_volatile_prefix "$PREFIX" && [ "$persistent" -ne 1 ]; then
     die "$PREFIX is not under /tmp, /run or /dev/shm; pass --persistent only with the owner's authorization"
 fi
 
+created=1
+had_install=0
 if [ -e "$PREFIX" ]; then
+    created=0
     [ -d "$PREFIX" ] || die "$PREFIX exists and is not a directory"
     if [ -f "$PREFIX/$MARKER" ]; then
+        had_install=1
         pid=$(read_pid "$PIDFILE")
         ! is_ours "$pid" || die "the daemon is running (pid $pid); run stop.sh first"
         note "re-installing over $PREFIX"
@@ -63,8 +89,47 @@ umask 077
 mkdir -p "$PREFIX/bin" "$PREFIX/etc" "$PREFIX/run" "$PREFIX/log" "$PREFIX/out"
 chmod 700 "$PREFIX" "$PREFIX/bin" "$PREFIX/etc" "$PREFIX/run" "$PREFIX/log" "$PREFIX/out"
 
-cp "$binary" "$PREFIX/bin/webos-satellite"
-chmod 700 "$PREFIX/bin/webos-satellite"
+# Binary: copy the candidate next to its final name, check that it runs,
+# then rename it over the installed one.
+new=$PREFIX/bin/.webos-satellite.new
+give_up() {
+    rm -f "$new"
+    if [ "$had_install" -eq 0 ]; then
+        # Only what this run created: the directory was new or empty.
+        rm -rf "${PREFIX:?}/bin" "${PREFIX:?}/etc" "${PREFIX:?}/run" "${PREFIX:?}/log" "${PREFIX:?}/out"
+        [ "$created" -eq 0 ] || rmdir "$PREFIX"
+    fi
+    die "$* (an existing install is unchanged)"
+}
+try_binary() { # FILE [TRIPLE]
+    rm -f "$new"
+    cp "$1" "$new" && chmod 700 "$new" && binary_runs "$new" "${2:-}"
+}
+if [ -n "$binary" ]; then
+    try_binary "$binary" || give_up "$binary does not run here (--version failed)"
+    chosen="$binary"
+else
+    machine=${WEBOS_SAT_UNAME_M:-$(uname -m)}
+    want=$arch
+    [ "$want" != auto ] || want=$(arch_for_machine "$machine")
+    chosen=
+    if [ "$want" = aarch64 ]; then
+        if [ ! -f "$bin_a64" ]; then
+            note "no aarch64 build in the package; using armv7"
+        elif try_binary "$bin_a64" "$(triple_of_arch aarch64)"; then
+            chosen=aarch64
+        else
+            note "the aarch64 build does not run here (uname -m: $machine); falling back to armv7"
+        fi
+    fi
+    if [ -z "$chosen" ]; then
+        [ -f "$bin_a32" ] || give_up "no armv7 build in the package: $bin_a32"
+        try_binary "$bin_a32" "$(triple_of_arch armv7)" || give_up "the armv7 build does not run here (--version failed)"
+        chosen=armv7
+    fi
+    note "uname -m: $machine, --arch $arch: installing the $chosen build"
+fi
+mv -f "$new" "$PREFIX/bin/webos-satellite"
 for f in lib.sh start.sh stop.sh status.sh uninstall.sh rotate.sh supervise.sh autostart.sh; do
     cp "$here/$f" "$PREFIX/bin/$f"
     chmod 700 "$PREFIX/bin/$f"
