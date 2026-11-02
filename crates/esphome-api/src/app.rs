@@ -16,6 +16,34 @@ pub enum PipelineMode {
     PushToTalk,
 }
 
+/// Pairing (HA-driven key provisioning, [`crate::pairing`]) changes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PairingEvent {
+    /// The pairing window opened (or restarted); it closes after `seconds`.
+    WindowOpened {
+        /// Window length in seconds.
+        seconds: u64,
+    },
+    /// The window closed without a key; keyless connections are now refused
+    /// until it is opened again.
+    WindowClosed,
+    /// A key was stored and activated. Every keyless session was closed; HA
+    /// reconnects with the key.
+    Paired {
+        /// `client_info` of the session that set the key (e.g. "Home
+        /// Assistant 2026.10.4").
+        client_info: String,
+        /// Its address.
+        peer: SocketAddr,
+    },
+    /// A session that proved the old key replaced it with a new one.
+    KeyRotated,
+    /// The stored key was deleted ([`AppCommand::ResetPairing`]); the device
+    /// is unpaired again.
+    Reset,
+}
+
 /// Event from the server to the application.
 ///
 /// `Debug` is written by hand and never prints payloads (audio bytes, URLs,
@@ -97,6 +125,8 @@ pub enum AppEvent {
     },
     /// Microphone mute changed (from HA's switch or [`AppCommand::SetMuted`]).
     MuteChanged(bool),
+    /// Pairing state changed. Never carries key material.
+    Pairing(PairingEvent),
     /// A timer event from HA. Only sent when the `TIMERS` feature
     /// ([`crate::features::TIMERS`]) is enabled. HA owns and counts the timers;
     /// the device shows or sounds them (see [`crate::TimerTable`]).
@@ -146,6 +176,12 @@ pub enum AppCommand {
     },
     /// Mute or unmute the microphone (reported to HA via the switch entity).
     SetMuted(bool),
+    /// Open (or restart) the pairing window. Ignored, with a log line, when a
+    /// key is active or pairing is not enabled.
+    OpenPairingWindow,
+    /// Delete the stored key, close every session and open the pairing
+    /// window. A local action only: HA cannot clear the key.
+    ResetPairing,
 }
 
 impl fmt::Debug for AppEvent {
@@ -212,6 +248,7 @@ impl fmt::Debug for AppEvent {
                 .field("message_bytes", &message.len())
                 .finish(),
             Self::MuteChanged(m) => write!(f, "MuteChanged({m})"),
+            Self::Pairing(p) => f.debug_tuple("Pairing").field(p).finish(),
             // The timer name is user speech: id, event and seconds only.
             Self::Timer {
                 event,
@@ -249,6 +286,8 @@ impl fmt::Debug for AppCommand {
                 .field("success", success)
                 .finish(),
             Self::SetMuted(m) => write!(f, "SetMuted({m})"),
+            Self::OpenPairingWindow => f.write_str("OpenPairingWindow"),
+            Self::ResetPairing => f.write_str("ResetPairing"),
         }
     }
 }

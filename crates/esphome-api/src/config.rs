@@ -4,6 +4,7 @@ use std::fmt;
 use std::net::{IpAddr, Ipv4Addr};
 
 use crate::DEFAULT_PORT;
+use crate::pairing::Provisioning;
 
 /// `VoiceAssistantFeature` bits (aioesphomeapi 46.6.0 `model.py`), reported in
 /// `DeviceInfoResponse.voice_assistant_feature_flags`.
@@ -93,6 +94,11 @@ pub struct Config {
     /// Base64 32-byte Noise key (ESPHome `api: encryption: key:`). `None` means
     /// **plaintext**, intended for development only.
     pub noise_psk: Option<String>,
+    /// HA-driven key provisioning ([`crate::pairing`]). Only with
+    /// [`Config::noise_psk`] unset: the server then starts unpaired (or with
+    /// the key stored in [`Provisioning::key_file`]). `None` and no key means
+    /// **plaintext** (development only).
+    pub provisioning: Option<Provisioning>,
     /// Advertise `_esphomelib._tcp` over mDNS (fails soft).
     pub mdns: bool,
     /// Announcement/TTS format announced on the media player entity.
@@ -112,6 +118,7 @@ impl Default for Config {
             bind_addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             port: DEFAULT_PORT,
             noise_psk: None,
+            provisioning: None,
             mdns: false,
             announcement_format: AudioFormat::default(),
             voice_features: features::DEFAULT,
@@ -129,6 +136,7 @@ impl fmt::Debug for Config {
             .field("bind_addr", &self.bind_addr)
             .field("port", &self.port)
             .field("noise_psk", &self.noise_psk.as_ref().map(|_| "<redacted>"))
+            .field("provisioning", &self.provisioning)
             .field("mdns", &self.mdns)
             .field("announcement_format", &self.announcement_format)
             .field("voice_features", &self.voice_features)
@@ -145,6 +153,9 @@ pub enum ConfigError {
     InvalidMac,
     /// `noise_psk` is not base64 of exactly 32 bytes.
     InvalidPsk(&'static str),
+    /// Both `noise_psk` and `provisioning` are set, or the pairing window is
+    /// zero.
+    InvalidProvisioning(&'static str),
     /// Announcement format is not usable (empty name or zero sample rate).
     InvalidFormat,
     /// `voice_features` lacks VOICE_ASSISTANT or API_AUDIO, or has
@@ -157,7 +168,7 @@ impl fmt::Display for ConfigError {
         match self {
             Self::InvalidName => f.write_str("name must be 1-31 chars of [a-z0-9-]"),
             Self::InvalidMac => f.write_str("mac must look like 02:AB:CD:EF:01:23"),
-            Self::InvalidPsk(why) => f.write_str(why),
+            Self::InvalidPsk(why) | Self::InvalidProvisioning(why) => f.write_str(why),
             Self::InvalidFormat => f.write_str("announcement format needs a name and a sample rate"),
             Self::InvalidFeatures => f.write_str(
                 "voice_features must include VOICE_ASSISTANT and API_AUDIO and only implemented bits",
@@ -234,6 +245,7 @@ pub(crate) struct Resolved {
     pub(crate) mac: Mac,
     pub(crate) model: String,
     pub(crate) psk: Option<[u8; 32]>,
+    pub(crate) provisioning: Option<Provisioning>,
     pub(crate) mdns: bool,
     pub(crate) announcement_format: AudioFormat,
     pub(crate) voice_features: u32,
@@ -289,6 +301,23 @@ impl Config {
             .map(crate::frame::decode_psk)
             .transpose()
             .map_err(ConfigError::InvalidPsk)?;
+        if let Some(p) = &self.provisioning {
+            if psk.is_some() {
+                return Err(ConfigError::InvalidProvisioning(
+                    "noise_psk and provisioning are mutually exclusive",
+                ));
+            }
+            if p.window.is_zero() {
+                return Err(ConfigError::InvalidProvisioning(
+                    "the pairing window must be longer than zero",
+                ));
+            }
+            if p.key_file.file_name().is_none() {
+                return Err(ConfigError::InvalidProvisioning(
+                    "the pairing key file needs a file name",
+                ));
+            }
+        }
         Ok(Resolved {
             name: self.name.clone(),
             friendly_name: if self.friendly_name.is_empty() {
@@ -299,6 +328,7 @@ impl Config {
             mac: self.effective_mac()?,
             model: self.model.clone(),
             psk,
+            provisioning: self.provisioning.clone(),
             mdns: self.mdns,
             announcement_format: fmt.clone(),
             voice_features: self.voice_features,
@@ -369,6 +399,26 @@ mod tests {
         assert_eq!(Config::default().voice_features & features::TIMERS, 0);
         cfg.voice_features = features::SUPPORTED;
         cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn provisioning_excludes_a_fixed_key() {
+        let mut cfg = Config {
+            provisioning: Some(Provisioning::default()),
+            ..Config::default()
+        };
+        cfg.validate().unwrap();
+        cfg.noise_psk = Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned());
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConfigError::InvalidProvisioning(_))
+        ));
+        cfg.noise_psk = None;
+        cfg.provisioning = Some(Provisioning {
+            window: std::time::Duration::ZERO,
+            ..Provisioning::default()
+        });
+        assert!(cfg.validate().is_err());
     }
 
     #[test]

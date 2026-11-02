@@ -18,6 +18,11 @@
 //! - Framing: plaintext (no key configured) or Noise
 //!   `Noise_NNpsk0_25519_ChaChaPoly_SHA256` (key configured; plaintext clients
 //!   are then refused with the "requires encryption" signal HA understands).
+//! - Pairing ([`pairing`], optional): with [`Config::provisioning`] the device
+//!   starts without a key and HA 2026.9+ sets one over a zero-PSK Noise
+//!   session (`NoiseEncryptionSetKeyRequest`) while a timed pairing window is
+//!   open. Keyless sessions get hello, device info, an empty entity list,
+//!   ping and `SetKey` only; voice messages are never served on them.
 //! - Voice features ([`config::features`], default
 //!   `VOICE_ASSISTANT | SPEAKER | API_AUDIO | ANNOUNCE`): microphone audio and,
 //!   with SPEAKER, the TTS reply travel over the API connection. Without SPEAKER
@@ -53,7 +58,9 @@
 //! (Noise + `HelloRequest`) in a separate task; when it completes it
 //! **replaces** the current connection (HA reconnecting after a network drop
 //! must not be locked out by a half-dead socket; with Noise only key holders
-//! get that far). Unknown messages are ignored. HA pings every 20 s; the server
+//! get that far). Keyless pairing sessions never replace it: each runs in its
+//! own restricted task (at most four) and is closed when a key is activated,
+//! the pairing is reset or the window closes. Unknown messages are ignored. HA pings every 20 s; the server
 //! pings after 60 s of silence and drops the link after 150 s.
 //!
 //! # Voice state machine
@@ -105,15 +112,17 @@ pub mod config;
 pub mod entities;
 pub mod frame;
 mod mdns;
+pub mod pairing;
 pub mod proto;
 mod server;
 pub mod timers;
 pub mod varint;
 mod voice;
 
-pub use app::{AppCommand, AppEvent, PipelineMode};
+pub use app::{AppCommand, AppEvent, PairingEvent, PipelineMode};
 pub use config::{AudioFormat, Config, ConfigError, Mac, features};
 pub use frame::{NOISE_PREAMBLE, PLAINTEXT_PREAMBLE};
+pub use pairing::Provisioning;
 pub use server::{Server, ServerError};
 pub use timers::{Timer, TimerEvent, TimerTable};
 

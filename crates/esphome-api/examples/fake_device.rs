@@ -5,12 +5,16 @@
 //! ```text
 //! cargo run -p webos-esphome-api --example fake_device -- \
 //!     [--bind 127.0.0.1] [--port 6053] [--name fake-tv] [--mode wake|ptt|none] \
-//!     [--features 23] [--mac 02:00:00:00:00:01] [--mdns]
+//!     [--features 23] [--mac 02:00:00:00:00:01] [--mdns] \
+//!     [--pair-key-file FILE [--pair-window SECS] [--pair-closed]]
 //! ```
 //!
 //! The Noise key is read from the `WEBOS_ESPHOME_PSK` environment variable
-//! (plaintext if unset). Stdin commands: `ptt`, `wake`, `stop`, `mute`,
-//! `unmute`, `quit`. Log level: `FAKE_DEVICE_LOG=info|debug|trace`.
+//! (plaintext if unset). `--pair-key-file` enables pairing instead: the device
+//! starts unpaired (or with the key stored in FILE) and HA can set a key while
+//! the window is open (`--pair-closed`: closed at start). Stdin commands:
+//! `ptt`, `wake`, `stop`, `mute`, `unmute`, `pair` (open the window),
+//! `reset-pairing`, `quit`. Log level: `FAKE_DEVICE_LOG=info|debug|trace`.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -19,7 +23,7 @@ use std::time::Duration;
 
 use tokio::io::AsyncBufReadExt as _;
 use tokio::sync::mpsc;
-use webos_esphome_api::{AppCommand, AppEvent, Config, PipelineMode, Server};
+use webos_esphome_api::{AppCommand, AppEvent, Config, PipelineMode, Provisioning, Server};
 
 struct StderrLogger(log::LevelFilter);
 
@@ -120,6 +124,22 @@ fn parse_args() -> (Config, Option<PipelineMode>) {
             "--mac" => cfg.mac = Some(val()),
             "--features" => cfg.voice_features = val().parse().expect("--features: number"),
             "--mdns" => cfg.mdns = true,
+            "--pair-key-file" => {
+                cfg.provisioning
+                    .get_or_insert_with(Provisioning::default)
+                    .key_file = val().into();
+            }
+            "--pair-window" => {
+                let secs: f64 = val().parse().expect("--pair-window: seconds");
+                cfg.provisioning
+                    .get_or_insert_with(Provisioning::default)
+                    .window = Duration::from_secs_f64(secs);
+            }
+            "--pair-closed" => {
+                cfg.provisioning
+                    .get_or_insert_with(Provisioning::default)
+                    .open_at_start = false;
+            }
             "--mode" => {
                 mode = match val().as_str() {
                     "wake" => Some(PipelineMode::WakeWord),
@@ -144,7 +164,10 @@ async fn main() {
     let _ = log::set_logger(Box::leak(Box::new(StderrLogger(level))));
     log::set_max_level(level);
 
-    let (cfg, mode) = parse_args();
+    let (mut cfg, mode) = parse_args();
+    if cfg.provisioning.is_some() {
+        cfg.noise_psk = None;
+    }
     let server = Server::bind(cfg).await.expect("bind");
     print_line(&format!("LISTENING {}", server.local_addr().unwrap()));
 
@@ -173,6 +196,8 @@ async fn main() {
                 "stop" => AppCommand::StopPipeline,
                 "mute" => AppCommand::SetMuted(true),
                 "unmute" => AppCommand::SetMuted(false),
+                "pair" => AppCommand::OpenPairingWindow,
+                "reset-pairing" => AppCommand::ResetPairing,
                 "quit" => std::process::exit(0),
                 "" => continue,
                 other => {

@@ -26,7 +26,11 @@ import time
 from dataclasses import dataclass, field
 
 from aioesphomeapi import (
+    ZERO_NOISE_PSK,
     APIClient,
+    APIConnectionError,
+    ConnectionClosedEvent,
+    DisconnectReason,
     InvalidEncryptionKeyAPIError,
     MediaPlayerInfo,
     MediaPlayerFormatPurpose,
@@ -487,12 +491,157 @@ async def scenario_timers(binary: str) -> None:
         await dev.stop()
 
 
+async def provision_over_zero_psk(port: int, key: bytes) -> bool:
+    """What HA 2026.10.4's _async_provision_key_over_noise does."""
+    cli = APIClient("127.0.0.1", port, "", client_info="fake-ha-provision", noise_psk=ZERO_NOISE_PSK)
+    try:
+        await asyncio.wait_for(cli.connect(login=True), TIMEOUT)
+        return await asyncio.wait_for(cli.noise_encryption_set_key(key), TIMEOUT)
+    finally:
+        await cli.disconnect(force=True)
+
+
+async def fetch_device_info_like_ha(port: int, psk: str | None) -> str:
+    """HA 2026.10.4 config_flow._fetch_device_info: returns an error key or "ok"."""
+    cli = APIClient("127.0.0.1", port, "", noise_psk=psk)
+    closed = False
+
+    def on_closed(event: ConnectionClosedEvent) -> None:
+        nonlocal closed
+        if event.reason is DisconnectReason.PROVISIONING_CLOSED:
+            closed = True
+
+    cli.add_connection_closed_callback(on_closed)
+    try:
+        await asyncio.wait_for(cli.connect(), TIMEOUT)
+        await asyncio.wait_for(cli.device_info(), TIMEOUT)
+        return "ok"
+    except RequiresEncryptionAPIError:
+        return "requires_encryption_key"
+    except InvalidEncryptionKeyAPIError:
+        return "invalid_psk"
+    except (APIConnectionError, TimeoutError):
+        return "provisioning_closed" if closed else "connection_error"
+    finally:
+        await cli.disconnect(force=True)
+
+
+async def scenario_pairing(binary: str) -> None:
+    """Unpaired device; HA's provisioning flow sets a key over zero-PSK Noise."""
+    print("\n== scenario D: pairing (HA-driven key provisioning) ==")
+    key_dir = os.path.join(LOG_DIR, "pairing-d")
+    os.makedirs(key_dir, exist_ok=True)
+    key_file = os.path.join(key_dir, "noise_psk")
+    dev = Device(binary, ["--mode", "wake", "--mac", "02:00:00:00:00:0d", "--pair-key-file", key_file], None)
+    os.environ["FAKE_DEVICE_LOG"] = "trace"  # every message name and event
+    try:
+        await dev.start()
+    finally:
+        del os.environ["FAKE_DEVICE_LOG"]
+    try:
+        await dev.wait_event("Pairing(WindowOpened { seconds: 600 })")
+        # HA's main connection: no key yet.
+        ha = FakeHA(dev.port)
+        cli = await ha.connect()
+        info, entities, _ = await cli.device_info_and_list_entities()
+        flags = info.voice_assistant_feature_flags_compat(cli.api_version)
+        check("D1 unpaired: encryption supported + provisionable, no voice features, no entities",
+              info.api_encryption_supported and info.api_encryption_provisionable and flags == 0
+              and entities == [], f"flags={flags} entities={len(entities)}")
+        ha.subscribe_voice()
+        cli.subscribe_states(ha.states.append)
+        ok = await ha.expect_no_start(1.0)
+        check("D2 keyless session: no pipeline start, no audio, no states, app not told HA connected",
+              ok and ha.audio.empty() and ha.states == [] and dev.count_since("StartStreaming", 0) == 0
+              and dev.count_since("HaConnected", 0) == 0)
+        new_key = base64.b64encode(os.urandom(32))
+        ok = await asyncio.wait_for(cli.noise_encryption_set_key(new_key), TIMEOUT)
+        check("D3 SetKey over plaintext refused (zero-PSK Noise only)",
+              ok is False and not os.path.exists(key_file))
+        await asyncio.sleep(1.1)  # one SetKey attempt per second
+        ok = await provision_over_zero_psk(dev.port, new_key)
+        check("D4 HA's zero-PSK provisioning: SetKey accepted", ok is True)
+        await dev.wait_event('Pairing(Paired { client_info: "fake-ha-provision"')
+        ok = await until_true(lambda: ha.stopped.is_set())
+        check("D5 the keyless main session is closed after activation (HA reconnects)", ok)
+        mode = os.stat(key_file).st_mode & 0o777
+        with open(key_file, "rb") as f:
+            stored = f.read()
+        check("D6 key stored with mode 0600", mode == 0o600 and stored == new_key + b"\n", f"mode={mode:o}")
+
+        ha2 = FakeHA(dev.port, new_key.decode())
+        cli2 = await ha2.connect()
+        info2, entities2, _ = await cli2.device_info_and_list_entities()
+        flags2 = info2.voice_assistant_feature_flags_compat(cli2.api_version)
+        check("D7 reconnect with the new key: full device, no longer provisionable",
+              info2.api_encryption_supported and not info2.api_encryption_provisionable
+              and flags2 == 23 and len(entities2) == 2, f"flags={flags2}")
+        ha2.subscribe_voice()
+        _conv, vflags, _ = await ha2.next_start()
+        await asyncio.sleep(0.4)
+        check("D8 audio flows only after pairing", bool(vflags & USE_WAKE_WORD) and len(ha2.drain_audio()) >= 5)
+        await cli2.disconnect()
+        await dev.wait_event("HaDisconnected")
+
+        results = [await fetch_device_info_like_ha(dev.port, k) for k in
+                   (None, base64.b64encode(os.urandom(32)).decode(), ZERO_NOISE_PSK)]
+        check("D9 no key / wrong key / zero PSK refused as HA expects",
+              results == ["requires_encryption_key", "invalid_psk", "invalid_psk"], str(results))
+        try:
+            await provision_over_zero_psk(dev.port, base64.b64encode(os.urandom(32)))
+            check("D10 provisioning after pairing refused", False, "connected")
+        except InvalidEncryptionKeyAPIError:
+            check("D10 provisioning after pairing refused (HA: 'already has an encryption key')", True)
+
+        await dev.command("reset-pairing")
+        await dev.wait_event("Pairing(Reset)")
+        res = await fetch_device_info_like_ha(dev.port, new_key.decode())
+        check("D11 reset-pairing: key file deleted, old key refused, keyless allowed again",
+              not os.path.exists(key_file) and res == "invalid_psk"
+              and await fetch_device_info_like_ha(dev.port, None) == "ok", res)
+        await dev.stop()
+        log_text = open(dev.log.name).read()
+        check("D12 device log never contains the key", new_key.decode() not in log_text
+              and "key set by" in log_text)
+    finally:
+        await dev.stop()
+
+
+async def scenario_pairing_window(binary: str) -> None:
+    """The pairing window closes on timeout; HA's flow sees PROVISIONING_CLOSED."""
+    print("\n== scenario E: pairing window timeout ==")
+    key_file = os.path.join(LOG_DIR, "pairing-e", "noise_psk")
+    os.makedirs(os.path.dirname(key_file), exist_ok=True)
+    dev = Device(binary, ["--mode", "wake", "--mac", "02:00:00:00:00:0e", "--pair-key-file", key_file,
+                          "--pair-window", "1.5"], None)
+    await dev.start()
+    try:
+        check("E1 open window: HA's config flow reads device info", await fetch_device_info_like_ha(dev.port, None) == "ok")
+        await dev.wait_event("Pairing(WindowClosed)", timeout=5)
+        res = [await fetch_device_info_like_ha(dev.port, k) for k in (None, ZERO_NOISE_PSK)]
+        check("E2 closed window: plaintext and zero-PSK get PROVISIONING_CLOSED",
+              res == ["provisioning_closed", "provisioning_closed"], str(res))
+        try:
+            await provision_over_zero_psk(dev.port, base64.b64encode(os.urandom(32)))
+            ok = False
+        except APIConnectionError:
+            ok = True
+        check("E3 closed window: no key can be set", ok and not os.path.exists(key_file))
+        await dev.command("pair")
+        await dev.wait_event("Pairing(WindowOpened")
+        check("E4 explicit pair command reopens the window",
+              await fetch_device_info_like_ha(dev.port, None) == "ok")
+    finally:
+        await dev.stop()
+
+
 async def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--device", required=True, help="path to the fake_device binary")
     args = parser.parse_args()
     failed = False
-    for scenario in (scenario_plaintext_speaker, scenario_noise_url, scenario_timers):
+    for scenario in (scenario_plaintext_speaker, scenario_noise_url, scenario_timers,
+                     scenario_pairing, scenario_pairing_window):
         try:
             await scenario(args.device)
         except Exception as err:  # noqa: BLE001

@@ -2,23 +2,25 @@
 
 use std::io;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use prost::Message as _;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinSet;
 use tokio::time::{Duration, Instant, sleep_until, timeout};
 
-use crate::app::{AppCommand, AppEvent};
+use crate::app::{AppCommand, AppEvent, PairingEvent};
 use crate::config::{Config, ConfigError, Resolved, features};
 use crate::entities;
 use crate::frame::{
     self, Codec, FrameError, HANDSHAKE_MAC_FAILURE, NoiseResponder, RawMessage, decode_noise_frame,
     encode_noise_frame,
 };
+use crate::pairing::{self, KeyState, OpenResult, Origin, Pairing, Transport, ZERO_PSK};
 use crate::proto::{self as pb, ApiMessage};
 use crate::timers;
 use crate::voice::{FLAG_USE_WAKE_WORD, Out, ToHa, Voice};
@@ -34,6 +36,9 @@ const PING_AFTER: Duration = Duration::from_secs(60);
 const DEAD_AFTER: Duration = Duration::from_secs(150);
 /// Concurrent connections still in the handshake.
 const MAX_PENDING: usize = 4;
+/// Concurrent keyless (pairing) sessions. HA uses two: its plaintext main
+/// connection and the short zero-PSK session that sets the key.
+const MAX_KEYLESS: usize = 4;
 const READ_CHUNK: usize = 8192;
 
 /// Error starting the server.
@@ -43,6 +48,9 @@ pub enum ServerError {
     Config(ConfigError),
     /// Socket error.
     Io(io::Error),
+    /// The stored pairing key cannot be read or is corrupt. The daemon does
+    /// not fall back to an open pairing window: reset the pairing explicitly.
+    KeyFile(PathBuf, io::Error),
 }
 
 impl std::fmt::Display for ServerError {
@@ -50,6 +58,11 @@ impl std::fmt::Display for ServerError {
         match self {
             Self::Config(err) => write!(f, "invalid configuration: {err}"),
             Self::Io(err) => write!(f, "i/o error: {err}"),
+            Self::KeyFile(path, err) => write!(
+                f,
+                "cannot use the stored pairing key {}: {err} (reset the pairing to start over)",
+                path.display()
+            ),
         }
     }
 }
@@ -66,6 +79,7 @@ impl From<io::Error> for ServerError {
 pub struct Server {
     listener: TcpListener,
     cfg: Arc<Resolved>,
+    pairing: Pairing,
 }
 
 impl Server {
@@ -74,18 +88,48 @@ impl Server {
     /// # Errors
     ///
     /// Invalid configuration or a socket error (e.g. port in use).
+    /// With [`Config::provisioning`], the stored key is read here: a missing
+    /// file means unpaired.
+    ///
+    /// # Errors
+    ///
+    /// Invalid configuration, an unreadable or corrupt stored key, or a
+    /// socket error (e.g. port in use).
     pub async fn bind(config: Config) -> Result<Self, ServerError> {
         let cfg = config.resolve().map_err(ServerError::Config)?;
+        let (state, window) = match (&cfg.psk, &cfg.provisioning) {
+            (Some(psk), _) => (KeyState::Fixed(*psk), Duration::ZERO),
+            (None, Some(p)) => match pairing::load_key(&p.key_file) {
+                Ok(Some(key)) => (KeyState::Paired(key), p.window),
+                Ok(None) => (KeyState::Unpaired { window_until: None }, p.window),
+                Err(err) => return Err(ServerError::KeyFile(p.key_file.clone(), err)),
+            },
+            (None, None) => (KeyState::Plaintext, Duration::ZERO),
+        };
         let listener = TcpListener::bind((config.bind_addr, config.port)).await?;
-        if cfg.psk.is_none() {
-            log::warn!(
+        match &state {
+            KeyState::Plaintext => log::warn!(
                 "esphome-api: no noise_psk configured; serving PLAINTEXT (development only)"
-            );
+            ),
+            KeyState::Paired(_) => log::info!("esphome-api: paired (stored key)"),
+            KeyState::Unpaired { .. } => log::warn!(
+                "esphome-api: NOT PAIRED: no key yet; keyless sessions get device info and SetKey only"
+            ),
+            KeyState::Fixed(_) => {}
         }
+        let pairing = Pairing::new(state, window, cfg.provisioning.is_some());
         Ok(Self {
             listener,
             cfg: Arc::new(cfg),
+            pairing,
         })
+    }
+
+    /// Pairing is enabled and no key is active yet: the application must keep
+    /// the microphone closed until [`PairingEvent::Paired`].
+    #[must_use]
+    pub fn needs_pairing(&self) -> bool {
+        self.pairing.needs_pairing()
     }
 
     /// Address the server listens on.
@@ -112,19 +156,34 @@ impl Server {
         mut commands: mpsc::Receiver<AppCommand>,
     ) -> io::Result<()> {
         let bind = self.listener.local_addr()?;
-        let _mdns = if self.cfg.mdns {
-            crate::mdns::advertise(&self.cfg, bind.ip(), bind.port())
-        } else {
-            None
-        };
+        let (key_tx, mut key_rx) = mpsc::channel::<KeyRequest>(MAX_KEYLESS);
         let mut ctx = Ctx {
             voice: Voice::new(self.cfg.voice_features & features::SPEAKER != 0),
             cfg: Arc::clone(&self.cfg),
             events,
             session: None,
+            epoch: watch::channel(self.pairing.epoch()).0,
+            pairing: self.pairing,
+            mdns: None,
+            bind,
         };
         let mut pending: JoinSet<Result<Session, (SocketAddr, FrameError)>> = JoinSet::new();
+        let mut keyless: JoinSet<()> = JoinSet::new();
         log::info!("esphome-api: listening on {bind}");
+        if ctx.pairing.needs_pairing()
+            && ctx
+                .cfg
+                .provisioning
+                .as_ref()
+                .is_some_and(|p| p.open_at_start)
+        {
+            ctx.open_window(Instant::now());
+        } else if ctx.pairing.needs_pairing() {
+            log::warn!(
+                "esphome-api: pairing window closed; open it to pair (keyless connections are refused)"
+            );
+        }
+        ctx.refresh_mdns();
 
         loop {
             ctx.drain_buffered().await;
@@ -134,7 +193,13 @@ impl Server {
                 accepted = self.listener.accept() => match accepted {
                     Ok((stream, peer)) if pending.len() < MAX_PENDING => {
                         log::debug!("esphome-api: connection from {peer}");
-                        pending.spawn(handshake(stream, peer, Arc::clone(&self.cfg)));
+                        pending.spawn(handshake(
+                            stream,
+                            peer,
+                            Arc::clone(&self.cfg),
+                            ctx.pairing.transport(),
+                            ctx.pairing.epoch(),
+                        ));
                     }
                     Ok((_, peer)) => log::warn!("esphome-api: too many pending handshakes; dropping {peer}"),
                     Err(err) => {
@@ -143,10 +208,31 @@ impl Server {
                     }
                 },
                 Some(joined) = pending.join_next(), if !pending.is_empty() => match joined {
+                    Ok(Ok(session)) if session.epoch != ctx.pairing.epoch() => log::info!(
+                        "esphome-api: dropping {}: the pairing state changed during its handshake",
+                        session.peer
+                    ),
+                    Ok(Ok(session)) if session.kind.keyless() => {
+                        if keyless.len() < MAX_KEYLESS {
+                            keyless.spawn(serve_keyless(
+                                session,
+                                keyless_device_info(&self.cfg),
+                                ctx.epoch.subscribe(),
+                                key_tx.clone(),
+                            ));
+                        } else {
+                            log::warn!(
+                                "esphome-api: too many keyless sessions; dropping {}",
+                                session.peer
+                            );
+                        }
+                    }
                     Ok(Ok(session)) => ctx.adopt(session),
                     Ok(Err((peer, err))) => log::info!("esphome-api: handshake with {peer} failed: {err}"),
                     Err(err) => log::warn!("esphome-api: handshake task failed: {err}"),
                 },
+                Some(_) = keyless.join_next(), if !keyless.is_empty() => {}
+                Some(req) = key_rx.recv() => ctx.on_key_request(req).await,
                 read = fill_opt(ctx.session.as_mut()) => {
                     if let Err(err) = read {
                         ctx.close(&err.to_string());
@@ -176,7 +262,37 @@ async fn fill_opt(session: Option<&mut Session>) -> Result<(), FrameError> {
     }
 }
 
-/// One authenticated HA connection.
+/// How a session was established.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionKind {
+    /// Noise with the active key.
+    Authenticated,
+    /// Plaintext development mode (no key, no pairing): full access.
+    DevPlaintext,
+    /// Unpaired, plaintext: hello, device info and an empty entity list.
+    KeylessPlaintext,
+    /// Unpaired, zero-PSK Noise: as plaintext, plus `SetKey`.
+    KeylessNoise,
+}
+
+impl SessionKind {
+    fn keyless(self) -> bool {
+        matches!(self, Self::KeylessPlaintext | Self::KeylessNoise)
+    }
+
+    fn origin(self) -> Origin {
+        match self {
+            Self::Authenticated => Origin::Authenticated,
+            Self::DevPlaintext => Origin::DevPlaintext,
+            Self::KeylessPlaintext => Origin::KeylessPlaintext,
+            Self::KeylessNoise => Origin::ZeroPsk,
+        }
+    }
+}
+
+/// One HA connection after the handshake. Only `Authenticated` and
+/// `DevPlaintext` sessions become the server's main session (voice, entities);
+/// keyless ones are served by [`serve_keyless`].
 struct Session {
     rd: OwnedReadHalf,
     wr: OwnedWriteHalf,
@@ -189,10 +305,13 @@ struct Session {
     last_rx: Instant,
     ping_sent: bool,
     states_subscribed: bool,
+    kind: SessionKind,
+    /// [`Pairing::epoch`] when the connection was accepted.
+    epoch: u64,
 }
 
 impl Session {
-    fn new(stream: TcpStream, peer: SocketAddr) -> Self {
+    fn new(stream: TcpStream, peer: SocketAddr, epoch: u64) -> Self {
         let (rd, wr) = stream.into_split();
         Self {
             rd,
@@ -206,6 +325,8 @@ impl Session {
             last_rx: Instant::now(),
             ping_sent: false,
             states_subscribed: false,
+            kind: SessionKind::DevPlaintext,
+            epoch,
         }
     }
 
@@ -270,8 +391,15 @@ async fn handshake(
     stream: TcpStream,
     peer: SocketAddr,
     cfg: Arc<Resolved>,
+    transport: Transport,
+    epoch: u64,
 ) -> Result<Session, (SocketAddr, FrameError)> {
-    match timeout(HANDSHAKE_TIMEOUT, handshake_inner(stream, peer, &cfg)).await {
+    match timeout(
+        HANDSHAKE_TIMEOUT,
+        handshake_inner(stream, peer, &cfg, transport, epoch),
+    )
+    .await
+    {
         Ok(res) => res.map_err(|e| (peer, e)),
         Err(_) => Err((peer, FrameError::Timeout)),
     }
@@ -281,11 +409,30 @@ async fn handshake_inner(
     stream: TcpStream,
     peer: SocketAddr,
     cfg: &Resolved,
+    transport: Transport,
+    epoch: u64,
 ) -> Result<Session, FrameError> {
     stream.set_nodelay(true)?;
-    let mut s = Session::new(stream, peer);
-    if let Some(psk) = cfg.psk {
-        noise_handshake(&mut s, &psk, cfg).await?;
+    let mut s = Session::new(stream, peer, epoch);
+    match transport {
+        Transport::Noise(psk) => {
+            noise_handshake(&mut s, &psk, cfg).await?;
+            s.kind = SessionKind::Authenticated;
+        }
+        Transport::Plaintext => s.kind = SessionKind::DevPlaintext,
+        Transport::Keyless { .. } => {
+            // Unpaired: plaintext or a Noise hello, told apart by the first
+            // byte as ESPHome does. Noise runs with the all-zero PSK.
+            while s.rbuf.is_empty() {
+                s.fill().await?;
+            }
+            if s.rbuf[0] == frame::NOISE_PREAMBLE {
+                noise_handshake(&mut s, &ZERO_PSK, cfg).await?;
+                s.kind = SessionKind::KeylessNoise;
+            } else {
+                s.kind = SessionKind::KeylessPlaintext;
+            }
+        }
     }
     let msg = match s.read_message().await {
         Err(FrameError::BadPreamble(frame::NOISE_PREAMBLE)) => {
@@ -303,10 +450,15 @@ async fn handshake_inner(
     let hello = pb::HelloRequest::decode(msg.payload.as_slice())
         .map_err(|_| FrameError::Protocol("bad HelloRequest"))?;
     log::info!(
-        "esphome-api: hello from {peer}: {:?} (API {}.{})",
+        "esphome-api: hello from {peer}: {:?} (API {}.{}){}",
         hello.client_info,
         hello.api_version_major,
-        hello.api_version_minor
+        hello.api_version_minor,
+        match s.kind {
+            SessionKind::KeylessPlaintext => " [keyless plaintext, pairing]",
+            SessionKind::KeylessNoise => " [keyless zero-PSK Noise, pairing]",
+            _ => "",
+        }
     );
     s.send(&pb::HelloResponse {
         api_version_major: API_VERSION_MAJOR,
@@ -316,6 +468,17 @@ async fn handshake_inner(
     })
     .await?;
     s.client_info = hello.client_info;
+    if transport == (Transport::Keyless { open: false }) {
+        // As ESPHome's `provisioning:` after its window: acknowledge the hello
+        // (the client learns the name), then disconnect with the reason HA
+        // shows as "closed its setup window".
+        log::warn!("esphome-api: {peer} refused: the pairing window is closed");
+        s.send(&pb::DisconnectRequest {
+            reason: pb::DisconnectReason::ProvisioningClosed as i32,
+        })
+        .await?;
+        return Err(FrameError::Protocol("pairing window closed"));
+    }
     Ok(s)
 }
 
@@ -369,11 +532,122 @@ struct Ctx {
     voice: Voice,
     events: mpsc::UnboundedSender<AppEvent>,
     session: Option<Session>,
+    pairing: Pairing,
+    /// Publishes [`Pairing::epoch`]; keyless sessions close when it changes.
+    epoch: watch::Sender<u64>,
+    mdns: Option<crate::mdns::Advertiser>,
+    bind: SocketAddr,
 }
 
 enum Flow {
     Continue,
     Close,
+    /// A key was activated on this session: reply sent, now close everything.
+    KeyChanged,
+}
+
+/// A `SetKey` from a keyless session, decided by the server loop (which owns
+/// the key state). Deliberately not `Debug`, so it cannot be logged.
+struct KeyRequest {
+    key: Vec<u8>,
+    origin: Origin,
+    peer: SocketAddr,
+    client_info: String,
+    reply: oneshot::Sender<bool>,
+}
+
+/// Serves one keyless (pairing) session: hello is done; answers device info,
+/// an empty entity list, ping, disconnect and `SetKey`. Everything else,
+/// voice in particular, is ignored. Ends when the client leaves, after
+/// [`DEAD_AFTER`] of silence, or when the pairing epoch changes (key
+/// activated, reset, window closed), with a `DisconnectRequest`.
+async fn serve_keyless(
+    mut s: Session,
+    info: pb::DeviceInfoResponse,
+    mut epoch: watch::Receiver<u64>,
+    keys: mpsc::Sender<KeyRequest>,
+) {
+    let reason: String = 'session: loop {
+        loop {
+            let msg = match s.codec.decode(&mut s.rbuf) {
+                Ok(Some(msg)) => msg,
+                Ok(None) => break,
+                Err(err) => break 'session err.to_string(),
+            };
+            match keyless_message(&mut s, &msg, &info, &keys).await {
+                Ok(Flow::Continue | Flow::KeyChanged) => {}
+                Ok(Flow::Close) => break 'session "disconnect requested".to_owned(),
+                Err(err) => break 'session err.to_string(),
+            }
+        }
+        if *epoch.borrow_and_update() != s.epoch {
+            let _ = s.send(&pb::DisconnectRequest::default()).await;
+            break "pairing state changed".to_owned();
+        }
+        let dead_at = s.last_rx + DEAD_AFTER;
+        tokio::select! {
+            read = s.fill() => if let Err(err) = read {
+                break err.to_string();
+            },
+            changed = epoch.changed() => if changed.is_err() {
+                break "server stopped".to_owned();
+            },
+            () = sleep_until(dead_at) => break "idle timeout".to_owned(),
+        }
+    };
+    log::info!("esphome-api: keyless session {} closed: {reason}", s.peer);
+}
+
+async fn keyless_message(
+    s: &mut Session,
+    msg: &RawMessage,
+    info: &pb::DeviceInfoResponse,
+    keys: &mpsc::Sender<KeyRequest>,
+) -> Result<Flow, FrameError> {
+    let name = pb::message_name(msg.type_id).unwrap_or("unknown");
+    log::trace!("esphome-api: <- {name} (keyless)");
+    match msg.type_id {
+        pb::DisconnectRequest::ID => {
+            let _ = s.send(&pb::DisconnectResponse::default()).await;
+            return Ok(Flow::Close);
+        }
+        pb::DisconnectResponse::ID => return Ok(Flow::Close),
+        pb::PingRequest::ID => s.send(&pb::PingResponse::default()).await?,
+        pb::DeviceInfoRequest::ID => s.send(info).await?,
+        // HA lists entities before it provisions the key; the list is empty
+        // until a key is active.
+        pb::ListEntitiesRequest::ID => s.send(&pb::ListEntitiesDoneResponse::default()).await?,
+        pb::NoiseEncryptionSetKeyRequest::ID => {
+            let key = decode::<pb::NoiseEncryptionSetKeyRequest>(msg)
+                .map(|r| r.key)
+                .unwrap_or_default();
+            let (reply, answer) = oneshot::channel();
+            let req = KeyRequest {
+                key,
+                origin: s.kind.origin(),
+                peer: s.peer,
+                client_info: s.client_info.clone(),
+                reply,
+            };
+            let success = keys.send(req).await.is_ok() && answer.await.unwrap_or(false);
+            s.send(&pb::NoiseEncryptionSetKeyResponse { success })
+                .await?;
+        }
+        pb::SubscribeVoiceAssistantRequest::ID
+        | pb::VoiceAssistantResponse::ID
+        | pb::VoiceAssistantEventResponse::ID
+        | pb::VoiceAssistantAudio::ID
+        | pb::VoiceAssistantAnnounceRequest::ID
+        | pb::VoiceAssistantConfigurationRequest::ID
+        | pb::VoiceAssistantSetConfiguration::ID
+        | pb::VoiceAssistantTimerEventResponse::ID
+        | pb::SwitchCommandRequest::ID
+        | pb::MediaPlayerCommandRequest::ID => {
+            log::info!("esphome-api: {name} from {} ignored: not paired", s.peer);
+        }
+        _ => log::debug!("esphome-api: {name} ignored on a keyless session"),
+    }
+    Ok(Flow::Continue)
 }
 
 fn decode<M: ApiMessage>(msg: &RawMessage) -> Option<M> {
@@ -393,6 +667,15 @@ impl Ctx {
     }
 
     fn adopt(&mut self, session: Session) {
+        // Invariant: a keyless session never becomes the main session (no
+        // voice, entities or audio without a key).
+        if session.kind.keyless() || self.pairing.needs_pairing() {
+            log::error!(
+                "esphome-api: refusing to adopt an unauthenticated session from {}",
+                session.peer
+            );
+            return;
+        }
         if self.session.is_some() {
             self.close("replaced by a new connection");
         }
@@ -415,6 +698,9 @@ impl Ctx {
     fn next_deadline(&self) -> Instant {
         let far = Instant::now() + Duration::from_secs(3600);
         let mut deadline = self.voice.next_deadline().unwrap_or(far);
+        if let Some(window) = self.pairing.deadline() {
+            deadline = deadline.min(window);
+        }
         if let Some(s) = &self.session {
             let keepalive = if s.ping_sent {
                 s.last_rx + DEAD_AFTER
@@ -429,6 +715,14 @@ impl Ctx {
     async fn tick(&mut self) {
         let now = Instant::now();
         self.voice.on_tick(now);
+        if self.pairing.on_tick(now) {
+            log::warn!(
+                "esphome-api: pairing window closed without a key; keyless connections are refused until it is opened again"
+            );
+            self.epoch.send_replace(self.pairing.epoch());
+            self.refresh_mdns();
+            self.emit(AppEvent::Pairing(PairingEvent::WindowClosed));
+        }
         let mut dead = false;
         if let Some(s) = self.session.as_mut() {
             let idle = now.saturating_duration_since(s.last_rx);
@@ -462,6 +756,10 @@ impl Ctx {
                 Ok(Flow::Continue) => {}
                 Ok(Flow::Close) => {
                     self.close("disconnect requested");
+                    return;
+                }
+                Ok(Flow::KeyChanged) => {
+                    self.after_key_change(PairingEvent::KeyRotated).await;
                     return;
                 }
                 Err(err) => {
@@ -545,7 +843,21 @@ impl Ctx {
     }
 }
 
-fn device_info(cfg: &Resolved) -> pb::DeviceInfoResponse {
+/// Device info for keyless (pairing) sessions: identity only, no voice
+/// features (no satellite before a key is active), and the provisioning
+/// flags HA 2026.9+ looks for.
+fn keyless_device_info(cfg: &Resolved) -> pb::DeviceInfoResponse {
+    pb::DeviceInfoResponse {
+        voice_assistant_feature_flags: 0,
+        api_encryption_supported: true,
+        api_encryption_provisionable: true,
+        ..device_info(cfg, false)
+    }
+}
+
+/// Device info for the main session. `has_key`: a key is active (fixed or
+/// paired), so HA already holds it and never tries to provision one.
+fn device_info(cfg: &Resolved, has_key: bool) -> pb::DeviceInfoResponse {
     pb::DeviceInfoResponse {
         name: cfg.name.clone(),
         mac_address: cfg.mac.pretty(),
@@ -554,9 +866,10 @@ fn device_info(cfg: &Resolved) -> pb::DeviceInfoResponse {
         manufacturer: MANUFACTURER.to_owned(),
         friendly_name: cfg.friendly_name.clone(),
         voice_assistant_feature_flags: cfg.voice_features,
-        // True only when a key is configured: HA then already holds the key
-        // and never tries to provision one (no key storage here).
-        api_encryption_supported: cfg.psk.is_some(),
+        // False in plaintext development mode, so HA never tries to provision
+        // a key there (no key storage without pairing).
+        api_encryption_supported: has_key,
+        api_encryption_provisionable: false,
         ..Default::default()
     }
 }
@@ -580,7 +893,8 @@ impl Ctx {
             pb::DisconnectResponse::ID => return Ok(Flow::Close),
             pb::PingRequest::ID => s.send(&pb::PingResponse::default()).await?,
             pb::DeviceInfoRequest::ID => {
-                s.send(&device_info(&self.cfg)).await?;
+                s.send(&device_info(&self.cfg, self.pairing.has_key()))
+                    .await?;
             }
             pb::DeviceCapabilitiesRequest::ID => {
                 s.send(&pb::DeviceCapabilitiesResponse {
@@ -681,9 +995,19 @@ impl Ctx {
                 }
             }
             pb::NoiseEncryptionSetKeyRequest::ID => {
-                log::warn!("esphome-api: HA tried to set an encryption key; not supported");
-                s.send(&pb::NoiseEncryptionSetKeyResponse { success: false })
+                let key = decode::<pb::NoiseEncryptionSetKeyRequest>(msg)
+                    .map(|r| r.key)
+                    .unwrap_or_default();
+                let (origin, peer) = (s.kind.origin(), s.peer);
+                let (success, activated) = self.apply_set_key(&key, origin, peer, now);
+                let Some(s) = self.session.as_mut() else {
+                    return Ok(Flow::Close);
+                };
+                s.send(&pb::NoiseEncryptionSetKeyResponse { success })
                     .await?;
+                if activated {
+                    return Ok(Flow::KeyChanged);
+                }
             }
             pb::HelloRequest::ID
             | pb::PingResponse::ID
@@ -715,7 +1039,9 @@ impl Ctx {
         let now = Instant::now();
         match cmd {
             AppCommand::Audio(samples) => {
-                if !self.voice.is_streaming() {
+                // Never any microphone audio while unpaired (belt and braces:
+                // without a main session the voice layer cannot stream).
+                if !self.voice.is_streaming() || self.pairing.needs_pairing() {
                     return;
                 }
                 let Some(s) = self.session.as_mut() else {
@@ -742,6 +1068,152 @@ impl Ctx {
                 self.voice.on_announce_finished(now, success);
             }
             AppCommand::SetMuted(muted) => self.voice.on_mute(now, muted),
+            AppCommand::OpenPairingWindow => self.open_window(now),
+            AppCommand::ResetPairing => self.reset_pairing(now).await,
+        }
+    }
+}
+
+/// Pairing: window, `SetKey`, activation and reset.
+impl Ctx {
+    fn key_file(&self) -> Option<&std::path::Path> {
+        self.cfg.provisioning.as_ref().map(|p| p.key_file.as_path())
+    }
+
+    fn open_window(&mut self, now: Instant) {
+        match self.pairing.open_window(now) {
+            OpenResult::Opened(d) => {
+                log::warn!(
+                    "esphome-api: PAIRING WINDOW OPEN for {} s: add this device in Home Assistant (2026.9 or newer sets the key)",
+                    d.as_secs()
+                );
+                self.refresh_mdns();
+                self.emit(AppEvent::Pairing(PairingEvent::WindowOpened {
+                    seconds: d.as_secs(),
+                }));
+            }
+            OpenResult::AlreadyPaired => log::warn!(
+                "esphome-api: pairing window not opened: already paired (reset the pairing first)"
+            ),
+            OpenResult::Disabled => log::warn!(
+                "esphome-api: pairing window not opened: pairing is not enabled (fixed key or plaintext mode)"
+            ),
+        }
+    }
+
+    /// Checks and stores a key. Returns (reply success, key activated). Never
+    /// logs the key.
+    fn apply_set_key(
+        &mut self,
+        key: &[u8],
+        origin: Origin,
+        peer: SocketAddr,
+        now: Instant,
+    ) -> (bool, bool) {
+        let key = match self.pairing.check_set_key(key, origin, now) {
+            Err(why) => {
+                log::warn!("esphome-api: SetKey from {peer} refused: {why}");
+                return (false, false);
+            }
+            Ok(None) => {
+                log::info!("esphome-api: SetKey from {peer}: that key is already active");
+                return (true, false);
+            }
+            Ok(Some(key)) => key,
+        };
+        let Some(path) = self.key_file() else {
+            return (false, false);
+        };
+        if let Err(err) = pairing::store_key(path, &key) {
+            log::error!(
+                "esphome-api: SetKey from {peer}: cannot store the key in {}: {err}",
+                path.display()
+            );
+            return (false, false);
+        }
+        log::warn!(
+            "esphome-api: key set by {peer} and stored in {} (mode 0600); closing sessions opened before it",
+            path.display()
+        );
+        self.pairing.activate(key);
+        (true, true)
+    }
+
+    async fn on_key_request(&mut self, req: KeyRequest) {
+        let (success, activated) =
+            self.apply_set_key(&req.key, req.origin, req.peer, Instant::now());
+        // The keyless task sends the reply before it sees the new epoch.
+        let _ = req.reply.send(success);
+        if activated {
+            self.after_key_change(PairingEvent::Paired {
+                client_info: req.client_info,
+                peer: req.peer,
+            })
+            .await;
+        }
+    }
+
+    /// After a key change or reset: every session opened before it is closed
+    /// (keyless ones through the epoch, the main one here) and mDNS updated.
+    async fn after_key_change(&mut self, ev: PairingEvent) {
+        self.epoch.send_replace(self.pairing.epoch());
+        if let Some(s) = self.session.as_mut() {
+            let _ = s.send(&pb::DisconnectRequest::default()).await;
+        }
+        self.close("the key changed");
+        self.refresh_mdns();
+        self.emit(AppEvent::Pairing(ev));
+    }
+
+    async fn reset_pairing(&mut self, now: Instant) {
+        let Some(path) = self.key_file().map(std::path::Path::to_path_buf) else {
+            log::warn!("esphome-api: reset-pairing ignored: pairing is not enabled");
+            return;
+        };
+        match pairing::remove_key(&path) {
+            Ok(existed) => log::warn!(
+                "esphome-api: PAIRING RESET: stored key {} ({})",
+                if existed { "deleted" } else { "was absent" },
+                path.display()
+            ),
+            Err(err) => {
+                log::error!(
+                    "esphome-api: reset-pairing failed: cannot delete {}: {err}; the key stays active",
+                    path.display()
+                );
+                return;
+            }
+        }
+        if !self.pairing.reset(now) {
+            return;
+        }
+        self.after_key_change(PairingEvent::Reset).await;
+        let seconds = self
+            .pairing
+            .deadline()
+            .map_or(0, |d| d.saturating_duration_since(now).as_secs());
+        log::warn!(
+            "esphome-api: PAIRING WINDOW OPEN for {seconds} s (remove the old device in Home Assistant before re-adding it)"
+        );
+        self.emit(AppEvent::Pairing(PairingEvent::WindowOpened { seconds }));
+    }
+
+    /// (Re)starts the mDNS advertisement for the current key state: with
+    /// `api_encryption` when a key is active, without it while the window is
+    /// open, none while unpaired with the window closed.
+    fn refresh_mdns(&mut self) {
+        if !self.cfg.mdns {
+            return;
+        }
+        self.mdns = None;
+        let advertise = !self.pairing.needs_pairing() || self.pairing.window_open();
+        if advertise {
+            self.mdns = crate::mdns::advertise(
+                &self.cfg,
+                self.bind.ip(),
+                self.bind.port(),
+                self.pairing.has_key(),
+            );
         }
     }
 }

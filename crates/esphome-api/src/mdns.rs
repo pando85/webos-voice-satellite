@@ -5,6 +5,11 @@
 //! informational keys ESPHome sends (`version`, `platform`, `board`, `network`).
 //! HA can always add the device by IP instead; mDNS only speeds up discovery
 //! and reconnects. Whether UDP 5353 is free on the TV is still unverified.
+//!
+//! Pairing: `api_encryption` follows the runtime key state, so an unpaired
+//! device is offered to HA as keyless (HA then tries plaintext and provisions
+//! a key) and a paired one as encrypted. While unpaired with the pairing
+//! window closed the server does not advertise at all.
 
 use std::net::IpAddr;
 
@@ -16,7 +21,7 @@ pub(crate) const SERVICE_TYPE: &str = "_esphomelib._tcp.local.";
 
 /// TXT records for the advertisement.
 #[cfg(any(feature = "mdns", test))]
-pub(crate) fn txt_records(cfg: &Resolved) -> Vec<(&'static str, String)> {
+pub(crate) fn txt_records(cfg: &Resolved, encrypted: bool) -> Vec<(&'static str, String)> {
     let mut txt = vec![
         ("friendly_name", cfg.friendly_name.clone()),
         ("version", crate::ESPHOME_VERSION.to_owned()),
@@ -25,7 +30,7 @@ pub(crate) fn txt_records(cfg: &Resolved) -> Vec<(&'static str, String)> {
         ("board", cfg.model.clone()),
         ("network", "ethernet".to_owned()),
     ];
-    if cfg.psk.is_some() {
+    if encrypted {
         txt.push(("api_encryption", crate::frame::NOISE_PROTOCOL.to_owned()));
     }
     txt
@@ -48,8 +53,13 @@ impl Drop for Advertiser {
 
 /// Starts advertising; logs and returns `None` on any failure.
 #[cfg(feature = "mdns")]
-pub(crate) fn advertise(cfg: &Resolved, bind: IpAddr, port: u16) -> Option<Advertiser> {
-    let txt = txt_records(cfg);
+pub(crate) fn advertise(
+    cfg: &Resolved,
+    bind: IpAddr,
+    port: u16,
+    encrypted: bool,
+) -> Option<Advertiser> {
+    let txt = txt_records(cfg, encrypted);
     let props: Vec<(&str, &str)> = txt.iter().map(|(k, v)| (*k, v.as_str())).collect();
     let host = format!("{}.local.", cfg.name);
     let info = if bind.is_unspecified() {
@@ -65,7 +75,11 @@ pub(crate) fn advertise(cfg: &Resolved, bind: IpAddr, port: u16) -> Option<Adver
     });
     match result {
         Ok(daemon) => {
-            log::info!("mdns: advertising {} on port {port}", cfg.name);
+            log::info!(
+                "mdns: advertising {} on port {port} ({})",
+                cfg.name,
+                if encrypted { "encrypted" } else { "no key" }
+            );
             Some(Advertiser { daemon })
         }
         Err(err) => {
@@ -77,7 +91,12 @@ pub(crate) fn advertise(cfg: &Resolved, bind: IpAddr, port: u16) -> Option<Adver
 
 /// Built without the `mdns` feature: logs and returns `None`.
 #[cfg(not(feature = "mdns"))]
-pub(crate) fn advertise(cfg: &Resolved, _bind: IpAddr, _port: u16) -> Option<Advertiser> {
+pub(crate) fn advertise(
+    cfg: &Resolved,
+    _bind: IpAddr,
+    _port: u16,
+    _encrypted: bool,
+) -> Option<Advertiser> {
     log::warn!(
         "mdns: requested for {} but built without the `mdns` feature",
         cfg.name
@@ -93,11 +112,15 @@ mod tests {
     fn txt_has_mac_and_encryption_marker() {
         let mut cfg = crate::Config::default();
         cfg.mac = Some("02:AB:CD:EF:01:23".to_owned());
-        let txt = txt_records(&cfg.resolve().unwrap());
+        let resolved = cfg.resolve().unwrap();
+        let txt = txt_records(&resolved, false);
         assert!(txt.contains(&("mac", "02abcdef0123".to_owned())));
         assert!(!txt.iter().any(|(k, _)| *k == "api_encryption"));
-        cfg.noise_psk = Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned());
-        let txt = txt_records(&cfg.resolve().unwrap());
+        let txt = txt_records(&resolved, true);
         assert!(txt.iter().any(|(k, _)| *k == "api_encryption"));
+        // The key itself is never in the TXT records.
+        cfg.noise_psk = Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned());
+        let txt = txt_records(&cfg.resolve().unwrap(), true);
+        assert!(!txt.iter().any(|(_, v)| v.contains("AAAA")));
     }
 }
