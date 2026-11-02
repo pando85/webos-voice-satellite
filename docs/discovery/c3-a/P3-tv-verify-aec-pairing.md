@@ -159,8 +159,8 @@ ESPHome 2026.10.1 also sends the two messages back to back (`api_connection.cpp`
 
 ## Open items
 
-1. Implement and re-test the deferred `DisconnectRequest` for the closed window.
-2. Decide whether the satellite should accept HA's empty-key clear on entry removal (as ESPHome does) or keep "reset is local" and document HA's leftover key. Re-adding works either way, because HA reuses its stored key.
+1. Implement and re-test the deferred `DisconnectRequest` for the closed window. **Implemented after this session (PC only, [ESPHome API crate](../../development/esphome-api.md#pairing-ha-driven-key-provisioning)); the hypothesis above was confirmed from the aioesphomeapi 46.6.0 and HA 2026.10.4 sources and reproduced on a PC with a frame-batching proxy. The re-test with the owner's HA is still open.**
+2. Decide whether the satellite should accept HA's empty-key clear on entry removal (as ESPHome does) or keep "reset is local" and document HA's leftover key. Re-adding works either way, because HA reuses its stored key. **Decided after this session: accepted from the key holder only, then unpaired with the window closed until a local action ([design, question 11](../../design/install-and-config-ux.md#6-open-questions)). Not yet run on a TV.**
 3. Measure the delay lock and ERLE in the daemon with content on the TV (owner's sound window), then section 9 step 3.
-4. Decide the TV build: aarch64 makes the canceller four times cheaper. Run the daemon as aarch64 on c3-a (capture, `pacat`, the watchdog) before switching.
+4. Decide the TV build: aarch64 makes the canceller four times cheaper. Run the daemon as aarch64 on c3-a (capture, `pacat`, the watchdog) before switching. **After this session:** the package carries both builds and `install.sh` picks aarch64 on an aarch64 kernel when it runs, else armv7 ([development](../../development.md#choosing-the-build-armv7-or-aarch64)); the daemon run as aarch64 on c3-a is still pending.
 5. HA restart (not reload) and mDNS discovery from an HA on the TV's L2.
