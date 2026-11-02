@@ -27,6 +27,10 @@ Labels: **verified-on-target** = observed against the owner's HA (and, for audio
 
 The satellite listened on TCP 6053 of the dev PC with a Noise key. The ESPHome config flow was started through HA's REST API (`POST /api/config/config_entries/flow`, handler `esphome`, then the host and port). HA answered `connection_error`, and HA's log showed `[Errno 111] Connect call failed` (connection refused) for the PC on 6053. Probing other hosts and ports through the same flow step showed the same reset for the PC on 22 and the TV on 22, and `[Errno 101] Network unreachable` for the PC's IPv6 address. From the TV, the PC's port 6053 accepted a TCP connection (the satellite logged it). The PC's own firewall is therefore not the cause; the reset comes from the path between HA's cluster network and the LAN (router policy, **hypothesis** for the exact place). The flow was then aborted (`DELETE /api/config/config_entries/flow/<id>`), so HA has no entry and no leftover state from this step.
 
+### Relay attempt (2026-11-02, later the same night)
+
+A temporary TCP relay forwarded to the TV's 6053, to let HA's real integration reach the satellite. It ran on a host on the LAN that HA's network was expected to reach on certain ports. It accepted connections from the LAN (the TV connected through it). From HA, the config flow still got `[Errno 111]` on both relay ports tried. A service already listening on that host on another allowed port was reachable from HA (HA connected and got that service's own reply). So pass rules exist, but they did not cover the relay ports as configured. Whether a router rule or a filter on the relay host caused the reset could not be told without administrator access (**unknown**). The relay was stopped, the flow aborted, and the satellite on the TV stopped and removed from `/tmp`. Nothing was left in HA.
+
 ### Bridge (stands in for HA's ESPHome integration)
 
 Because HA cannot reach the satellite, `tools/esphome-fake-ha/ha_bridge.py` runs on the dev PC and plays the role of HA's ESPHome integration:

@@ -169,6 +169,10 @@ The config's `noise_psk_file = "noise_psk"` resolves to `etc/noise_psk`. For sil
 
 The before/after result on c3-a is in [P1 ops](discovery/c3-a/P1-ops.md).
 
+### Network prerequisite
+
+Home Assistant's ESPHome integration opens the connection: HA must be able to reach the TV on **TCP 6053** (or the configured `device.port`). With HA in a container or Kubernetes pod, check the path from HA's network to the TV, including router rules between network segments. The owner's network blocked it as of 2026-11-02 ([P1 HA integration](discovery/c3-a/P1-ha-integration.md#network-check)). A failed config flow shows `connection_error`, and HA's log shows `[Errno 111] Connect call failed`. Firewall details specific to one installation belong with that installation's infrastructure docs, not in this repository.
+
 ### Testing without HA reaching the device
 
 `tools/esphome-fake-ha/run.sh` runs the protocol harness and an end-to-end check of the real binary (file mic, WAV sink, wake and push-to-talk runs, SIGTERM, log policy). Everything stays on 127.0.0.1.
