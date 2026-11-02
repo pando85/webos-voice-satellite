@@ -29,9 +29,10 @@ mod fft;
 mod frontend;
 
 pub use aec::{
-    AecConfig, AecMetrics, BYPASS_HOLD, BYPASS_WARMUP, DelayApply, DelayEvent, DelayMode,
-    EchoCanceller, FRAME, MAX_DELAY_SAMPLES, MAX_WAIT_SAMPLES, MIN_CONFIDENCE, PREDELAY_MARGIN,
-    RATE as AEC_RATE, RECHECK_SAMPLES, SILENT_PEAK, SONORA_LATENCY,
+    AecConfig, AecMetrics, AecOutput, BYPASS_HOLD, BYPASS_WARMUP, DelayApply, DelayEvent,
+    DelayMode, EchoCanceller, FRAME, LINEAR_LATENCY, MAX_DELAY_SAMPLES, MAX_RENDER_CHANNELS,
+    MAX_WAIT_SAMPLES, MIN_CONFIDENCE, PREDELAY_MARGIN, RATE as AEC_RATE, RECHECK_SAMPLES,
+    SILENT_PEAK, SONORA_LATENCY,
 };
 pub use delay::DelayEstimate;
 pub use frontend::{ChannelMode, Frontend, FrontendConfig, Stats, sign_extend_s24};

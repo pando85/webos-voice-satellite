@@ -254,6 +254,22 @@ conversation language matches nothing in Spanish or English (checked with the de
 first) and scored intents with the recognition-only endpoint. Check this on your own HA before a
 run.
 
+## Offline front-end A/B (`aec_eval/`)
+
+Used in [P2 offline A/B](../../docs/experiments/P2-aec-offline-ab.md). PC only: no TV, no Home
+Assistant. Separate venv: `numpy scipy soundfile pyopen-wakeword==1.1.0 faster-whisper`.
+
+- `aec_eval/oww_wyoming.py`: wake word scorer that repeats HA's Wyoming openWakeWord 2.1.0 loop
+  (`pyopen-wakeword` TFLite models, threshold strictly above 0.5, trigger level 1, 2 s refractory,
+  fresh state per stream). It matched session 2's HA results on 387 of 388 items.
+- `aec_eval/semisyn_ab.py`: mixes corpus items into the raw mic of a `tv_dualcap` recording with
+  session 2's bed offsets and level, runs `aec_offline` variants with a warm-up, and scores them
+  (`@py` and `@digital` reproduce session 2's inputs; `@oracle` adds the speech after the canceller).
+- `aec_eval/content_eval.py`: content-only false-wake proxy and in-band ERLE per content segment.
+- `aec_eval/ab_report.py`: tables with Wilson intervals, per voice, paired McNemar tests, and the
+  calibration against HA. `aec_eval/stt_eval.py`: faster-whisper WER on the command segments.
+- Tests: `python3 -m unittest discover -s tools/audio-rig/aec_eval -p 'test_*.py'`.
+
 ## Privacy
 
 Recordings can contain people's voices from the room. Keep them short, local and opt-in; tell

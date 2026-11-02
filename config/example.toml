@@ -168,13 +168,26 @@ link = true
 # passed to AEC3 as a hint; AEC3 also tracks it itself) or a fixed number
 # of ms (0 to 500). It changes on every open on c3-a (12.9 to 19.1 ms).
 delay_ms = "auto"
-# Noise suppression after the echo canceller. Not evaluated for wake word
-# or STT yet.
+# Noise suppression after the echo canceller. Offline on c3-a recordings it
+# raised wake detection in a quiet room and did not hurt with content
+# (docs/experiments/P2-aec-offline-ab.md); not evaluated on a TV.
 ns = false
 # Skip the canceller while the reference has been silent for 2 s (never in
 # the first 5 s of a stream), to save CPU. Not evaluated on the TV.
 bypass_when_silent = false
 reference_gain_db = 0.0  # digital gain on the reference, -20 to 40
+# Reference channels given to the canceller: 1 = the downmix of all
+# reference channels; 2 = the first two as a stereo render (AEC3 detects
+# stereo content itself). Evaluated offline only (docs/experiments/
+# P2-aec-offline-ab.md).
+render_channels = 1
+# Which AEC3 output: "full" (linear filter plus residual-echo suppression),
+# "linear" (the linear filter only) or "nearend" (full, with AEC3's near-end
+# suppressor tuning all the time). The last two are experimental and need
+# render_channels = 1.
+# Offline on c3-a recordings, the suppressor also removed most of a quiet
+# talker under TV content (docs/experiments/P2-aec-offline-ab.md).
+output = "full"
 # File reference for mic.source = "file" (PC tests): raw interleaved frames
 # in reference_format/channels/rate, read in lockstep with mic.path.
 # reference_path = "ref.raw"  # example

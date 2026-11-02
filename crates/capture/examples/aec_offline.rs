@@ -7,7 +7,8 @@
 //!             [--mic-channels 2] [--ref-channels 2] [--ref-rate 48000]
 //!             [--ref-format s32_le|s24_le] [--skip-ms 250]
 //!             [--no-aec] [--delay auto|MS] [--apply predelay|hint|none]
-//!             [--ns] [--bypass] [--ref-gain-db G]
+//!             [--ns] [--bypass] [--ref-gain-db G] [--render-channels 1|2]
+//!             [--output full|linear|nearend]
 //!             [--gain-db 24] [--hpf-hz 120] [--channel left|right|mix]
 //!             [--timeline]
 //! ```
@@ -29,8 +30,8 @@ use std::time::Instant;
 
 use webos_capture::{AudioSource, FilePair, FileSource, SampleFormat};
 use webos_dsp::{
-    AecConfig, AecMetrics, ChannelMode, DelayApply, DelayEvent, DelayMode, EchoCanceller, Frontend,
-    FrontendConfig,
+    AecConfig, AecMetrics, AecOutput, ChannelMode, DelayApply, DelayEvent, DelayMode,
+    EchoCanceller, Frontend, FrontendConfig,
 };
 
 const READ_FRAMES: usize = 256;
@@ -110,6 +111,17 @@ fn parse() -> Result<Args, String> {
             "--ns" => a.aec_cfg.ns = true,
             "--bypass" => a.aec_cfg.bypass_when_silent = true,
             "--ref-gain-db" => a.aec_cfg.reference_gain_db = num(val()?, "--ref-gain-db")?,
+            "--output" => {
+                a.aec_cfg.output = match val()?.as_str() {
+                    "full" => AecOutput::Full,
+                    "linear" => AecOutput::Linear,
+                    "nearend" => AecOutput::Nearend,
+                    other => return Err(format!("--output: unknown {other:?}")),
+                };
+            }
+            "--render-channels" => {
+                a.aec_cfg.render_channels = val()?.parse().map_err(|e| format!("{flag}: {e}"))?;
+            }
             "--gain-db" => a.fe.gain_db = num(val()?, "--gain-db")?,
             "--hpf-hz" => a.fe.hpf_hz = num(val()?, "--hpf-hz")?,
             "--channel" => {

@@ -25,6 +25,7 @@ rustix = { version = "1", default-features = false, features = ["std", "system",
 # Echo canceller: pure Rust port of WebRTC audio processing (AEC3, NS), BSD-3-Clause.
 # Needs rustc 1.91. docs/research/aec-candidates.md, docs/design/aec-frontend.md.
 sonora = { version = "0.2.0", default-features = false }
+sonora-aec3 = { version = "0.2.0", default-features = false }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

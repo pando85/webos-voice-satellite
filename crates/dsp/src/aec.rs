@@ -5,6 +5,12 @@
 //!   and **before** its fixed gain, as `f32` in `[-1, 1)`; reference frames
 //!   as captured (interleaved, S24 scale, 16 or 48 kHz), downmixed and
 //!   decimated here ([`crate::decimate`]).
+//! - **Render channels** ([`AecConfig::render_channels`]). 1 (the default)
+//!   gives AEC3 the downmix of all reference channels. 2 gives it the first
+//!   two reference channels as a stereo render: AEC3 then detects stereo
+//!   content itself and switches to its multichannel configuration while
+//!   the channels differ. The delay estimator, the bypass and the metrics
+//!   use the downmix in both modes.
 //! - **Framing.** sonora takes 10 ms frames (160 samples). Mic and reference
 //!   are matched by absolute sample index from the start of the stream (both
 //!   streams start on one trigger, see the capture crate). A mic frame waits
@@ -21,12 +27,20 @@
 //! - **Bypass** (off by default). With [`AecConfig::bypass_when_silent`] (and
 //!   NS off), sonora is skipped while the reference has been silent for
 //!   [`BYPASS_HOLD`] frames, never in the first [`BYPASS_WARMUP`] frames of
-//!   a stream; the mic then goes through a [`SONORA_LATENCY`]-sample delay
+//!   a stream; the mic then goes through a delay line of the engine's
+//!   latency ([`SONORA_LATENCY`] or [`LINEAR_LATENCY`] samples
 //!   line, so the output timing does not change. With AEC3's high-pass
 //!   filter off and a zero reference, sonora's output is the input delayed
 //!   by exactly that latency (a unit test checks it), and on resume one
 //!   frame of history is fed to sonora first so its internal buffer matches
 //!   the delay line.
+//! - **Output** ([`AecOutput`], experimental). `Full` (the default) is
+//!   sonora's `AudioProcessing`: AEC3's linear filter followed by its
+//!   nonlinear residual-echo suppressor. `Linear` returns the linear
+//!   filter's output alone (sonora-aec3 driven directly, see `direct.rs`),
+//!   keeping a quiet near-end talker that the suppressor attenuates, at the
+//!   cost of more residual echo. `Nearend` keeps the suppressor but with
+//!   AEC3's near-end tuning all the time.
 //! - **Metrics** ([`AecMetrics`]): delay, ERLE (mic over output power while
 //!   the reference is active) and sonora's own ERLE, processing time per
 //!   frame, bypass share, reference underruns. Never audio content.
@@ -48,6 +62,8 @@ use sonora::config::{EchoCanceller as Aec3Config, NoiseSuppression};
 use sonora::{AudioProcessing, Config, StreamConfig};
 
 use crate::decimate::RefResampler;
+
+mod direct;
 use crate::delay::{DelayEstimate, DelayEstimator};
 
 /// Processing rate.
@@ -56,6 +72,9 @@ pub const RATE: u32 = 16_000;
 pub const FRAME: usize = 160;
 /// sonora's capture latency in samples with AEC3 and without NS (8 ms).
 pub const SONORA_LATENCY: usize = 128;
+/// Latency of [`AecOutput::Linear`] in samples (4 ms): AEC3's 64-sample
+/// block framing, without the suppression filter's overlap.
+pub const LINEAR_LATENCY: usize = 64;
 /// A mic frame waits at most this long for its reference (30 ms).
 pub const MAX_WAIT_SAMPLES: usize = 480;
 /// Reference frames with a peak below this (-80 dBFS) count as silent.
@@ -81,6 +100,9 @@ const APPLY_STEP: usize = 16;
 /// Reference RMS (full scale 1.0) above which a frame counts as "reference
 /// active" for the ERLE metric (-70 dBFS).
 const ERLE_REF_RMS: f32 = 3.16e-4;
+/// Most render channels the canceller accepts.
+pub const MAX_RENDER_CHANNELS: u16 = 2;
+const MAX_RENDER: usize = MAX_RENDER_CHANNELS as usize;
 
 /// Where the bulk delay comes from.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -106,13 +128,33 @@ pub enum DelayApply {
     PreDelay,
 }
 
+/// Which AEC3 output the stage returns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AecOutput {
+    /// AEC3's final output (linear filter, then residual-echo suppression),
+    /// through sonora's `AudioProcessing`. The default.
+    #[default]
+    Full,
+    /// The linear filter's output only (no suppression, no comfort noise),
+    /// followed by sonora's NS if `ns` is set. Experimental: mono render.
+    Linear,
+    /// AEC3's final output with the suppressor's near-end tuning used all
+    /// the time (AEC3 otherwise uses it only while it detects a dominant
+    /// near-end talker), followed by NS if set. Experimental: mono render.
+    Nearend,
+}
+
 /// Echo canceller settings.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AecConfig {
     /// Reference sample rate (16000 or 48000).
     pub reference_rate: u32,
-    /// Reference channels (downmixed to mono).
+    /// Reference channels as captured.
     pub reference_channels: u16,
+    /// Channels given to the canceller: 1 = the downmix of all reference
+    /// channels (the default), 2 = the first two reference channels as a
+    /// stereo render (needs `reference_channels >= 2`).
+    pub render_channels: u16,
     /// Digital gain applied to the reference, in dB.
     pub reference_gain_db: f32,
     /// Delay source.
@@ -124,6 +166,8 @@ pub struct AecConfig {
     /// Skip sonora while the reference is silent (ignored with `ns`). Off by
     /// default: it saves CPU but cost ERLE on some c3-a recordings.
     pub bypass_when_silent: bool,
+    /// Which AEC3 output to return.
+    pub output: AecOutput,
 }
 
 impl Default for AecConfig {
@@ -131,11 +175,13 @@ impl Default for AecConfig {
         Self {
             reference_rate: 48_000,
             reference_channels: 2,
+            render_channels: 1,
             reference_gain_db: 0.0,
             delay: DelayMode::Auto,
             apply: DelayApply::Hint,
             ns: false,
             bypass_when_silent: false,
+            output: AecOutput::Full,
         }
     }
 }
@@ -214,12 +260,21 @@ pub enum DelayEvent {
 pub struct EchoCanceller {
     cfg: AecConfig,
     apm: AudioProcessing,
-    resampler: RefResampler,
+    /// The direct engine (`AecOutput::Linear` or `Nearend`); `apm` then
+    /// runs without an echo canceller and only carries NS (if enabled).
+    direct: Option<Box<direct::DirectAec3>>,
+    /// One decimator per render channel (with one render channel, it
+    /// downmixes all reference channels).
+    resamplers: Vec<RefResampler>,
     ref_ch: usize,
-    /// 16 kHz reference samples; `ref_buf[0]` has absolute index `ref_base`.
-    ref_buf: VecDeque<f32>,
+    /// Render channels (1 or 2).
+    render_ch: usize,
+    /// 16 kHz reference samples per render channel, all the same length;
+    /// `ref_bufs[c][0]` has absolute index `ref_base`.
+    ref_bufs: Vec<VecDeque<f32>>,
     ref_base: u64,
     ref_scratch: Vec<f32>,
+    chan_scratch: Vec<i32>,
     /// Pending mic samples; `mic_buf[0]` has absolute index `mic_pos`.
     mic_buf: Vec<f32>,
     mic_pos: u64,
@@ -236,7 +291,7 @@ pub struct EchoCanceller {
     silent_frames: u32,
     delay_line: VecDeque<f32>,
     prev_mic: [f32; FRAME],
-    prev_ref: [f32; FRAME],
+    prev_ref: [[f32; FRAME]; MAX_RENDER],
     have_prev: bool,
     /// Frames since creation (the bypass warm-up).
     stream_frames: u64,
@@ -255,11 +310,11 @@ impl std::fmt::Debug for EchoCanceller {
     }
 }
 
-fn build_apm(ns: bool) -> AudioProcessing {
+fn build_apm(ns: bool, render_channels: u16, aec: bool) -> AudioProcessing {
     let mut c = Config {
         // The front-end already high-passes the mic; AEC3's own filter would
         // make the stage non-transparent, which the bypass relies on.
-        echo_canceller: Some(Aec3Config {
+        echo_canceller: aec.then(|| Aec3Config {
             enforce_high_pass_filtering: false,
             ..Aec3Config::default()
         }),
@@ -269,11 +324,10 @@ fn build_apm(ns: bool) -> AudioProcessing {
     if ns {
         c.noise_suppression = Some(NoiseSuppression::default());
     }
-    let sc = StreamConfig::new(RATE, 1);
     AudioProcessing::builder()
         .config(c)
-        .capture_config(sc)
-        .render_config(sc)
+        .capture_config(StreamConfig::new(RATE, 1))
+        .render_config(StreamConfig::new(RATE, render_channels))
         .build()
 }
 
@@ -289,10 +343,21 @@ fn samples_to_ms(s: f32) -> f32 {
 
 impl EchoCanceller {
     /// Creates the stage. Returns `None` if the reference rate is not 16000
-    /// or 48000 or the channel count is zero.
+    /// or 48000, the channel count is zero, `render_channels` is not 1 or 2
+    /// or exceeds the reference channels, or a direct output (`Linear`,
+    /// `Nearend`) is combined with a stereo render.
     #[must_use]
     pub fn new(cfg: AecConfig) -> Option<Self> {
-        if cfg.reference_channels == 0 {
+        let direct = match cfg.output {
+            AecOutput::Full => None,
+            AecOutput::Linear => Some(direct::DirectOutput::Linear),
+            AecOutput::Nearend => Some(direct::DirectOutput::Nearend),
+        };
+        if cfg.reference_channels == 0
+            || !(1..=MAX_RENDER_CHANNELS).contains(&cfg.render_channels)
+            || cfg.render_channels > cfg.reference_channels
+            || (direct.is_some() && cfg.render_channels != 1)
+        {
             return None;
         }
         let gain = if cfg.reference_gain_db.is_finite() {
@@ -300,16 +365,22 @@ impl EchoCanceller {
         } else {
             1.0
         };
-        let resampler = RefResampler::new(cfg.reference_rate, gain)?;
+        let render_ch = usize::from(cfg.render_channels);
+        let resamplers = (0..render_ch)
+            .map(|_| RefResampler::new(cfg.reference_rate, gain))
+            .collect::<Option<Vec<_>>>()?;
         let max = MAX_DELAY_SAMPLES as i32;
         let mut s = Self {
             cfg,
-            apm: build_apm(cfg.ns),
-            resampler,
+            apm: build_apm(cfg.ns, cfg.render_channels, direct.is_none()),
+            direct: direct.map(|d| Box::new(direct::DirectAec3::new(d))),
+            resamplers,
             ref_ch: usize::from(cfg.reference_channels),
-            ref_buf: VecDeque::new(),
+            render_ch,
+            ref_bufs: vec![VecDeque::new(); render_ch],
             ref_base: 0,
             ref_scratch: Vec::new(),
+            chan_scratch: Vec::new(),
             mic_buf: Vec::with_capacity(4 * FRAME),
             mic_pos: 0,
             predelay: 0,
@@ -324,7 +395,7 @@ impl EchoCanceller {
             silent_frames: 0,
             delay_line: VecDeque::with_capacity(SONORA_LATENCY + FRAME),
             prev_mic: [0.0; FRAME],
-            prev_ref: [0.0; FRAME],
+            prev_ref: [[0.0; FRAME]; MAX_RENDER],
             have_prev: false,
             stream_frames: 0,
             acc: Acc::default(),
@@ -346,31 +417,49 @@ impl EchoCanceller {
     /// reported as "at the tap").
     #[must_use]
     pub fn decimator_delay_ms(&self) -> f32 {
-        samples_to_ms(self.resampler.delay_samples() as f32)
+        samples_to_ms(self.decimator_delay() as f32)
+    }
+
+    fn decimator_delay(&self) -> usize {
+        self.resamplers[0].delay_samples()
     }
 
     /// Output samples held inside the stage (frame buffering plus sonora's
     /// latency); informational.
     #[must_use]
     pub fn latency_samples(&self) -> usize {
-        SONORA_LATENCY + if self.cfg.ns { 96 } else { 0 }
+        self.engine_latency() + if self.cfg.ns { 96 } else { 0 }
     }
 
     /// Appends reference frames (interleaved, S24 scale, at the configured
     /// rate and channel count).
     pub fn push_reference(&mut self, interleaved: &[i32]) {
-        self.ref_scratch.clear();
-        self.resampler
-            .push(interleaved, self.ref_ch, &mut self.ref_scratch);
-        self.ref_buf.extend(self.ref_scratch.iter().copied());
+        if self.render_ch == 1 {
+            self.ref_scratch.clear();
+            self.resamplers[0].push(interleaved, self.ref_ch, &mut self.ref_scratch);
+            self.ref_bufs[0].extend(self.ref_scratch.iter().copied());
+            return;
+        }
+        for c in 0..self.render_ch {
+            self.chan_scratch.clear();
+            self.chan_scratch
+                .extend(interleaved.chunks_exact(self.ref_ch).map(|f| f[c]));
+            self.ref_scratch.clear();
+            self.resamplers[c].push(&self.chan_scratch, 1, &mut self.ref_scratch);
+            self.ref_bufs[c].extend(self.ref_scratch.iter().copied());
+        }
     }
 
     /// Restarts the alignment after a gap in either stream (the source's
     /// reference epoch changed): both streams start again at index 0. The
     /// adaptive filter is kept; an estimated delay is re-acquired.
     pub fn reset_alignment(&mut self) {
-        self.resampler.reset();
-        self.ref_buf.clear();
+        for r in &mut self.resamplers {
+            r.reset();
+        }
+        for b in &mut self.ref_bufs {
+            b.clear();
+        }
         self.ref_base = 0;
         self.mic_buf.clear();
         self.mic_pos = 0;
@@ -395,6 +484,14 @@ impl EchoCanceller {
         self.delay.map(|d| self.estimate_to_tap_ms(&d))
     }
 
+    /// The stream-delay hint in force, in ms (0 until a delay is applied).
+    #[must_use]
+    pub fn delay_hint_ms(&self) -> i32 {
+        self.direct
+            .as_ref()
+            .map_or_else(|| self.apm.stream_delay_ms(), |l| l.delay_hint())
+    }
+
     /// Calls into sonora that returned an error (the mic was passed through).
     #[must_use]
     pub fn errors(&self) -> u64 {
@@ -402,13 +499,13 @@ impl EchoCanceller {
     }
 
     fn estimate_to_tap_ms(&self, d: &DelayEstimate) -> f32 {
-        let total = d.lag_fine + self.predelay as f32 + self.resampler.delay_samples() as f32;
+        let total = d.lag_fine + self.predelay as f32 + self.decimator_delay() as f32;
         samples_to_ms(total)
     }
 
     /// `tap_samples`: mic behind reference at the tap, in samples.
     fn apply_delay_samples(&mut self, tap_samples: f32) {
-        let fed = tap_samples - self.resampler.delay_samples() as f32;
+        let fed = tap_samples - self.decimator_delay() as f32;
         match self.cfg.apply {
             DelayApply::PreDelay => {
                 let p = (fed.round().max(0.0) as usize)
@@ -420,7 +517,12 @@ impl EchoCanceller {
             }
             DelayApply::Hint => {
                 let ms = samples_to_ms(fed.max(0.0)).round() as i32;
-                let _ = self.apm.set_stream_delay_ms(ms);
+                match &mut self.direct {
+                    Some(l) => l.set_delay_hint(ms),
+                    None => {
+                        let _ = self.apm.set_stream_delay_ms(ms);
+                    }
+                }
             }
             DelayApply::None => {}
         }
@@ -455,8 +557,7 @@ impl EchoCanceller {
             self.apply_delay_samples(ms_to_samples(new_ms));
         }
         // Store the estimate relative to the pre-delay now in force.
-        let fed_lag =
-            ms_to_samples(new_ms) - self.predelay as f32 - self.resampler.delay_samples() as f32;
+        let fed_lag = ms_to_samples(new_ms) - self.predelay as f32 - self.decimator_delay() as f32;
         let lag = fed_lag.round() as i32;
         self.delay = Some(DelayEstimate {
             lag,
@@ -467,24 +568,26 @@ impl EchoCanceller {
     }
 
     /// Copies the reference for the mic frame starting at absolute index
-    /// `k` (pre-delayed) into `out`; returns false if some of it has not
-    /// arrived yet (that part is zero).
-    fn reference_frame(&self, k: u64, out: &mut [f32; FRAME]) -> bool {
+    /// `k` (pre-delayed) into `out`, one array per render channel; returns
+    /// false if some of it has not arrived yet (that part is zero).
+    fn reference_frame(&self, k: u64, out: &mut [[f32; FRAME]]) -> bool {
         let start = k as i64 - self.predelay as i64;
         let mut complete = true;
-        for (i, o) in out.iter_mut().enumerate() {
-            let idx = start + i as i64;
-            *o = 0.0;
-            if idx < 0 {
-                continue;
-            }
-            let idx = idx as u64;
-            if idx < self.ref_base {
-                continue;
-            }
-            match self.ref_buf.get((idx - self.ref_base) as usize) {
-                Some(v) => *o = *v,
-                None => complete = false,
+        for (buf, o) in self.ref_bufs.iter().zip(out.iter_mut()) {
+            for (i, o) in o.iter_mut().enumerate() {
+                let idx = start + i as i64;
+                *o = 0.0;
+                if idx < 0 {
+                    continue;
+                }
+                let idx = idx as u64;
+                if idx < self.ref_base {
+                    continue;
+                }
+                match buf.get((idx - self.ref_base) as usize) {
+                    Some(v) => *o = *v,
+                    None => complete = false,
+                }
             }
         }
         complete
@@ -497,10 +600,11 @@ impl EchoCanceller {
     pub fn process(&mut self, mic: &[f32], out: &mut Vec<f32>) {
         self.mic_buf.extend_from_slice(mic);
         let mut consumed = 0;
-        let mut refr = [0.0_f32; FRAME];
+        let mut refr = [[0.0_f32; FRAME]; MAX_RENDER];
+        let nr = self.render_ch;
         while self.mic_buf.len() - consumed >= FRAME {
             let k = self.mic_pos;
-            let ready = self.reference_frame(k, &mut refr);
+            let ready = self.reference_frame(k, &mut refr[..nr]);
             if !ready {
                 if self.mic_buf.len() - consumed < MAX_WAIT_SAMPLES {
                     break;
@@ -509,40 +613,63 @@ impl EchoCanceller {
             }
             let mut m = [0.0_f32; FRAME];
             m.copy_from_slice(&self.mic_buf[consumed..consumed + FRAME]);
-            self.frame(&m, &refr, out);
+            self.frame(&m, &refr[..nr], out);
             consumed += FRAME;
             self.mic_pos += FRAME as u64;
             // Keep enough reference history for the largest pre-delay.
             let keep_from =
                 (self.mic_pos as i64 - MAX_DELAY_SAMPLES as i64 - FRAME as i64).max(0) as u64;
-            while self.ref_base < keep_from && !self.ref_buf.is_empty() {
-                self.ref_buf.pop_front();
-                self.ref_base += 1;
+            if self.ref_base < keep_from {
+                let drop = ((keep_from - self.ref_base) as usize).min(self.ref_bufs[0].len());
+                for b in &mut self.ref_bufs {
+                    b.drain(..drop);
+                }
+                self.ref_base += drop as u64;
             }
         }
         self.mic_buf.drain(..consumed);
         // A reference running far ahead (should not happen: one clock) is
         // trimmed so memory stays bounded.
         let ahead_limit = 2 * RATE as usize;
-        if self.ref_buf.len() > ahead_limit + MAX_DELAY_SAMPLES {
-            let drop = self.ref_buf.len() - ahead_limit - MAX_DELAY_SAMPLES;
-            self.ref_buf.drain(..drop);
+        let len = self.ref_bufs[0].len();
+        if len > ahead_limit + MAX_DELAY_SAMPLES {
+            let drop = len - ahead_limit - MAX_DELAY_SAMPLES;
+            for b in &mut self.ref_bufs {
+                b.drain(..drop);
+            }
             self.ref_base += drop as u64;
         }
     }
 
-    fn frame(&mut self, mic: &[f32; FRAME], refr: &[f32; FRAME], out: &mut Vec<f32>) {
+    /// The engine's latency without NS (what the bypass delay line holds).
+    fn engine_latency(&self) -> usize {
+        if self.cfg.output == AecOutput::Linear {
+            LINEAR_LATENCY
+        } else {
+            SONORA_LATENCY
+        }
+    }
+
+    fn frame(&mut self, mic: &[f32; FRAME], refr: &[[f32; FRAME]], out: &mut Vec<f32>) {
         self.acc.frames += 1;
         self.stream_frames += 1;
-        let ref_peak = refr.iter().fold(0.0_f32, |a, v| a.max(v.abs()));
+        // The downmix drives the estimator, the bypass and the metrics in
+        // both render modes.
+        let mono = if refr.len() == 1 {
+            refr[0]
+        } else {
+            let k = 1.0 / refr.len() as f32;
+            std::array::from_fn(|i| refr.iter().map(|c| c[i]).sum::<f32>() * k)
+        };
+        let ref_peak = refr.iter().flatten().fold(0.0_f32, |a, v| a.max(v.abs()));
         let ref_silent = ref_peak < SILENT_PEAK;
-        let ref_rms = (refr.iter().map(|v| v * v).sum::<f32>() / FRAME as f32).sqrt();
+        let ref_rms = (mono.iter().map(|v| v * v).sum::<f32>() / FRAME as f32).sqrt();
 
         // Delay estimation on what AEC3 sees (the pre-delayed reference).
         let due = self.estimating || self.mic_pos >= self.next_check;
         if due && !ref_silent {
             self.estimating = true;
-            if let Some(e) = self.estimator.push(mic, refr) {
+            if let Some(e) = self.estimator.push(mic, &mono) {
                 self.on_estimate(e);
             }
         }
@@ -561,7 +688,7 @@ impl EchoCanceller {
                 if self.have_prev {
                     let (pm, pr) = (self.prev_mic, self.prev_ref);
                     let mut scratch = [0.0_f32; FRAME];
-                    let _ = self.run_sonora(&pm, &pr, &mut scratch);
+                    let _ = self.run_sonora(&pm, &pr[..self.render_ch], &mut scratch);
                 }
             } else if !self.bypassing
                 && self.silent_frames >= BYPASS_HOLD
@@ -569,12 +696,12 @@ impl EchoCanceller {
             {
                 self.bypassing = true;
                 self.delay_line.clear();
-                let tail = &self.prev_mic[FRAME - SONORA_LATENCY..];
+                let lat = self.engine_latency();
+                let tail = &self.prev_mic[FRAME - lat..];
                 if self.have_prev {
                     self.delay_line.extend(tail.iter().copied());
                 } else {
-                    self.delay_line
-                        .extend(std::iter::repeat_n(0.0, SONORA_LATENCY));
+                    self.delay_line.extend(std::iter::repeat_n(0.0, lat));
                 }
             }
         }
@@ -598,7 +725,9 @@ impl EchoCanceller {
             self.acc.out_energy += y.iter().map(|v| f64::from(v * v)).sum::<f64>();
         }
         self.prev_mic = *mic;
-        self.prev_ref = *refr;
+        for (p, r) in self.prev_ref.iter_mut().zip(refr) {
+            *p = *r;
+        }
         self.have_prev = true;
         out.extend_from_slice(&y);
     }
@@ -606,15 +735,40 @@ impl EchoCanceller {
     fn run_sonora(
         &mut self,
         mic: &[f32; FRAME],
-        refr: &[f32; FRAME],
+        refr: &[[f32; FRAME]],
         y: &mut [f32; FRAME],
     ) -> bool {
         let t = Instant::now();
-        let mut render_out = [0.0_f32; FRAME];
-        let ok = self
-            .apm
-            .process_render_f32(&[&refr[..]], &mut [&mut render_out[..]])
-            .is_ok()
+        if let Some(l) = &mut self.direct {
+            let mut ok = true;
+            if self.cfg.ns {
+                let mut lin = [0.0_f32; FRAME];
+                l.process(mic, &refr[0], &mut lin);
+                ok = self
+                    .apm
+                    .process_capture_f32(&[&lin[..]], &mut [&mut y[..]])
+                    .is_ok();
+            } else {
+                l.process(mic, &refr[0], y);
+            }
+            let ns = u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            self.acc.cpu_ns = self.acc.cpu_ns.saturating_add(ns);
+            self.acc.cpu_max_ns = self.acc.cpu_max_ns.max(ns);
+            return ok;
+        }
+        let mut ro = [[0.0_f32; FRAME]; MAX_RENDER];
+        let render_ok = match (refr, &mut ro) {
+            ([a], [o, _]) => self
+                .apm
+                .process_render_f32(&[&a[..]], &mut [&mut o[..]])
+                .is_ok(),
+            ([a, b], [o0, o1]) => self
+                .apm
+                .process_render_f32(&[&a[..], &b[..]], &mut [&mut o0[..], &mut o1[..]])
+                .is_ok(),
+            _ => false,
+        };
+        let ok = render_ok
             && self
                 .apm
                 .process_capture_f32(&[&mic[..]], &mut [&mut y[..]])

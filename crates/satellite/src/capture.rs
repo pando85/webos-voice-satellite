@@ -310,9 +310,12 @@ fn build_frontend(cfg: &CaptureSettings, src: &dyn AudioSource, rate: u32) -> Fr
                 );
                 return fe;
             };
+            // A stereo render needs two reference channels; with fewer the
+            // canceller falls back to the downmix.
             let dsp = AecConfig {
                 reference_channels: fmt.channels,
                 reference_rate: fmt.rate,
+                render_channels: a.dsp.render_channels.min(fmt.channels).max(1),
                 ..a.dsp
             };
             let Some(aec) = EchoCanceller::new(dsp) else {
@@ -336,10 +339,12 @@ fn build_frontend(cfg: &CaptureSettings, src: &dyn AudioSource, rate: u32) -> Fr
                 _ => format!("PCM {:?}", a.pcm_id),
             };
             log::info!(
-                "aec: echo cancellation on: reference {what} ({} ch, {} Hz, {}), {start}, delay {}, ns={}, bypass_when_silent={}",
+                "aec: echo cancellation on: reference {what} ({} ch, {} Hz, {}), render {} ch, output {:?}, {start}, delay {}, ns={}, bypass_when_silent={}",
                 fmt.channels,
                 fmt.rate,
                 a.format.name(),
+                aec.config().render_channels,
+                aec.config().output,
                 match a.dsp.delay {
                     webos_dsp::DelayMode::Auto => "auto".to_owned(),
                     webos_dsp::DelayMode::FixedMs(ms) => format!("{ms} ms"),

@@ -471,6 +471,20 @@ pub(crate) enum RefFormat {
     S24Le,
 }
 
+/// Which AEC3 output the canceller returns.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum AecOutputKind {
+    /// Linear filter plus residual-echo suppression (AEC3's normal output).
+    #[default]
+    Full,
+    /// The linear filter only (experimental; mono render).
+    Linear,
+    /// AEC3's output with its near-end suppressor tuning always
+    /// (experimental; mono render).
+    Nearend,
+}
+
 /// `[aec]`: echo cancellation with the TV's output as the reference
 /// (docs/design/aec-frontend.md). The ALSA reference is opened on the mic's
 /// card (`mic.card_id`), matched by PCM id or name.
@@ -484,8 +498,12 @@ pub(crate) struct AecSection {
     pub(crate) reference_pcm_id: String,
     /// Reference sample format.
     pub(crate) reference_format: RefFormat,
-    /// Reference channels (downmixed to mono).
+    /// Reference channels as captured.
     pub(crate) reference_channels: u16,
+    /// Channels given to the canceller: 1 = downmix, 2 = stereo render.
+    pub(crate) render_channels: u16,
+    /// AEC3 output: "full" or "linear" (experimental).
+    pub(crate) output: AecOutputKind,
     /// Reference rate: 48000 (decimated to 16 kHz) or 16000.
     pub(crate) reference_rate: u32,
     /// Reference ALSA period size in frames.
@@ -514,6 +532,8 @@ impl Default for AecSection {
             reference_pcm_id: "SoundEngineCapture".to_owned(),
             reference_format: RefFormat::S32Le,
             reference_channels: 2,
+            render_channels: 1,
+            output: AecOutputKind::Full,
             reference_rate: 48_000,
             reference_period_frames: 256,
             reference_buffer_frames: 8192,
@@ -720,6 +740,18 @@ impl Settings {
         if !(1..=8).contains(&a.reference_channels) {
             return Err(err("aec.reference_channels must be between 1 and 8"));
         }
+        if !(1..=webos_dsp::MAX_RENDER_CHANNELS).contains(&a.render_channels)
+            || a.render_channels > a.reference_channels
+        {
+            return Err(err(
+                "aec.render_channels must be 1 (downmix) or 2 (stereo, needs aec.reference_channels >= 2)",
+            ));
+        }
+        if a.output != AecOutputKind::Full && a.render_channels != 1 {
+            return Err(err(
+                "aec.output = \"linear\" or \"nearend\" needs aec.render_channels = 1",
+            ));
+        }
         if a.reference_period_frames == 0 || a.reference_buffer_frames < a.reference_period_frames {
             return Err(err(
                 "aec.reference_period_frames must be non-zero and aec.reference_buffer_frames at least as large",
@@ -804,7 +836,7 @@ impl Settings {
         }
         if self.aec.enabled && self.aec.ns {
             w.push(
-                "aec.ns is on: noise suppression has not been evaluated for wake word or STT yet"
+                "aec.ns is on: noise suppression has been evaluated offline only, not on a TV"
                     .to_owned(),
             );
         }
@@ -905,6 +937,12 @@ impl Settings {
         webos_dsp::AecConfig {
             reference_rate: a.reference_rate,
             reference_channels: a.reference_channels,
+            render_channels: a.render_channels,
+            output: match a.output {
+                AecOutputKind::Full => webos_dsp::AecOutput::Full,
+                AecOutputKind::Linear => webos_dsp::AecOutput::Linear,
+                AecOutputKind::Nearend => webos_dsp::AecOutput::Nearend,
+            },
             reference_gain_db: a.reference_gain_db,
             delay: match a.delay_ms {
                 AecDelay::Auto => webos_dsp::DelayMode::Auto,
@@ -1007,7 +1045,7 @@ impl Settings {
         let a = &self.aec;
         let aec = if a.enabled {
             format!(
-                "on ref={} {}/{}ch/{}Hz link={} delay_ms={} ns={} bypass={} ref_gain_db={}{}",
+                "on ref={} {}/{}ch/{}Hz render_ch={} output={} link={} delay_ms={} ns={} bypass={} ref_gain_db={}{}",
                 a.reference_pcm_id,
                 match a.reference_format {
                     RefFormat::S32Le => "s32_le",
@@ -1015,6 +1053,12 @@ impl Settings {
                 },
                 a.reference_channels,
                 a.reference_rate,
+                a.render_channels,
+                match a.output {
+                    AecOutputKind::Full => "full",
+                    AecOutputKind::Linear => "linear",
+                    AecOutputKind::Nearend => "nearend",
+                },
                 a.link,
                 match a.delay_ms {
                     AecDelay::Auto => "auto".to_owned(),
@@ -1343,6 +1387,14 @@ level = "debug"
         assert!(s.warnings().iter().any(|w| w.contains("aec.ns")));
         let s = Settings::from_toml("[aec]\ndelay_ms = 20\n", base).unwrap();
         assert_eq!(s.aec.delay_ms, AecDelay::Fixed(20.0));
+        assert_eq!(s.aec_config().render_channels, 1);
+        let s = Settings::from_toml("[aec]\nrender_channels = 2\n", base).unwrap();
+        assert_eq!(s.aec_config().render_channels, 2);
+        assert_eq!(s.aec_config().output, webos_dsp::AecOutput::Full);
+        let s = Settings::from_toml("[aec]\noutput = \"linear\"\n", base).unwrap();
+        assert_eq!(s.aec_config().output, webos_dsp::AecOutput::Linear);
+        let e = Settings::from_toml("[aec]\noutput = \"half\"\n", base).unwrap_err();
+        assert!(e.0.contains("half"), "{e}");
         assert!(Settings::default().summary().contains("aec=[off]"));
         // Unknown words and keys are rejected with the key named.
         let e = Settings::from_toml("[aec]\ndelay_ms = \"soon\"\n", base).unwrap_err();
@@ -1365,6 +1417,16 @@ level = "debug"
             ("aec.reference_rate", |s| s.aec.reference_rate = 44_100),
             ("aec.reference_channels", |s| s.aec.reference_channels = 0),
             ("aec.reference_channels", |s| s.aec.reference_channels = 9),
+            ("aec.render_channels", |s| s.aec.render_channels = 0),
+            ("aec.render_channels", |s| s.aec.render_channels = 3),
+            ("aec.render_channels", |s| {
+                s.aec.reference_channels = 1;
+                s.aec.render_channels = 2;
+            }),
+            ("aec.output", |s| {
+                s.aec.output = AecOutputKind::Linear;
+                s.aec.render_channels = 2;
+            }),
             ("aec.reference_period_frames", |s| {
                 s.aec.reference_buffer_frames = 128;
             }),
