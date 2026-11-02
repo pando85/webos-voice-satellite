@@ -1,0 +1,18 @@
+[package]
+name = "bench-speexsys"
+version = "0.0.0"
+edition = "2021"
+
+[[bin]]
+name = "bench-speexsys"
+path = "../../common/main.rs"
+
+[dependencies]
+speexdsp-sys = "0.1.2"
+
+[workspace]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

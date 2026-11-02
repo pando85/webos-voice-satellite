@@ -21,6 +21,10 @@ Test native Luna audio routes first; distinguish PCM speaker output, virtual sin
 - [EXP-005](../experiments/README.md)
 - [EXP-006](../experiments/README.md)
 
+## Candidate implementations
+
+A PC-only comparison of AEC, noise suppression and AGC implementations for the armv7 static musl target (build results, synthetic and real-recording ERLE, host CPU, licences, recommendation) is in [aec-candidates.md](aec-candidates.md).
+
 ## Open decision
 
 **Pending.** Record target TV model, firmware, runtime state and actual evidence before accepting an implementation choice. See [sources](sources.md) and [experiment protocol](../experiments/README.md).
