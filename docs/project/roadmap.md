@@ -102,10 +102,10 @@ Research tasks and implementation work are tracked in GitHub Issues. This roadma
 | Supervisor and crash-loop guard | done (scripts, not installed) | `supervise.sh`: backoff 1 s doubling to 300 s, gives up after 5 exits in 600 s and writes `crashloop` (host test); restart after watchdog exits verified on c3-a |
 | Autostart design | draft, **needs owner** | [Autostart design](../design/autostart.md): run-parts/failsafe review, draft hook `packaging/webos/init.d/webos-satellite` (returns at once, starts after 60 s, honours `disable`, `crashloop`, the kill switch and the firmware guard), rollback by removing one file. Not installed; needs approval and one test reboot |
 | Firmware guard | done | `/var/run/nyx/os_info.json` `webos_manufacturing_version` vs `safety.validated_firmware`; mismatch keeps the mic off; `--check-firmware` exit codes; verified on c3-a with a matching and a non-matching list. Update blocking (item 1) still needs the owner's decision |
-| Resource limits | done | nice 10, `RLIMIT_NOFILE` 256, RSS ceiling 64 MiB; measured about 1 MB RSS, 11 to 12 fds, 3 threads, about 1.5 % of one core |
+| Resource limits | done | nice 10, `RLIMIT_NOFILE` 256, RSS ceiling 64 MiB; measured 10 to 12 fds, 3 threads, 1.5 to 2 % of one core, RSS about 1 to 2 MB with one unexplained rise to 9.5 MB in the soak (then flat; see P3) |
 | Reconnection | partly done | Bridge kill/restart, bridge freeze 60 s, satellite freeze 60/120 s, 20 rapid reconnects and a simulated 180 s partition all recover (re-arm within milliseconds of the new connection); soak with periodic reconnects. **Remaining:** HA's own integration (network block), HA restarts, TV Wi-Fi loss and resume (D5) |
 | D5 power states | procedure ready, **needs owner** | [D5 plan](../discovery/c3-a/D5-plan.md); no power state was changed |
-| Multi-day run | not done | Needs a persistent or long-lived install (owner) |
+| Multi-day run | not done | Needs a persistent or long-lived install (owner). A 35-minute soak (13 bridge sessions, 65 reconnects, 0 failures) is in P3; reproduce the RSS rise with heap instrumentation first |
 
 - **Exit criteria:** after a TV reboot the satellite returns without owner action; a crash loop cannot trigger LG failsafe mode; the kill switch releases the mic in a measured time; D5 states are documented for c3-a with firmware and state labels; the satellite stays inside the resource limits over a multi-day run.
 - **Needs-owner:**

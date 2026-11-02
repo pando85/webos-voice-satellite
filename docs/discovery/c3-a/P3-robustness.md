@@ -1,8 +1,8 @@
 # P3: Lifecycle and robustness without sound or persistence (roadmap Phase 3)
 
-- **Device:** c3-a (LG C3), webOS TV 8.3.0, firmware 03.30.74; TV on, normal use state, LG hands-free off (capture PCM `closed` before each start); uptime about 2.5 h at the start (the TV had been restarted by the owner since the D2 oops)
+- **Device:** c3-a (LG C3), webOS TV 8.3.0, firmware 03.30.74; TV on, normal use state, LG hands-free off (capture PCM `closed` before each start); uptime about 2.5 h at the start (the TV had been restarted since the D2 oops; not by an agent)
 - **Date:** 2026-11-02
-- **Binary:** `webos-satellite` 0.0.1, static `armv7-unknown-linux-musleabi`, built from the commit that adds this file; checksummed on the TV after each install. Installed with `make tv-install-tmp` under `/tmp/webos-satellite`, run with `start.sh --supervise`.
+- **Binary:** `webos-satellite` 0.0.1, static `armv7-unknown-linux-musleabi`, built from the code of commit 7d0ee12 (soak and reconnection tests; earlier builds of the same branch for the first kill-switch runs); checksummed on the TV after each install. Installed with `make tv-install-tmp` under `/tmp/webos-satellite`, run with `start.sh --supervise`.
 - **Config:** `mode = "wake"`, `[mic] source = "alsa"`, `[sink] type = "null"`, `level = "info"`, all `[safety]` and `[limits]` defaults (`validated_firmware = ["03.30.74"]`, kill switch `/tmp/webos-satellite.disable`, nice 10, 256 open files, 64 MiB RSS ceiling, capture stall 5 s, loop stall 30 s).
 - **HA side:** HA still cannot open connections to the TV ([P1 HA integration](P1-ha-integration.md#network-check)). `tools/esphome-fake-ha/ha_bridge.py` on the dev PC stood in for HA's ESPHome integration (HA's own client library, HA's real "Kiwi" pipeline over the WebSocket API, wake word stage only). Mute cycles, state watching and rapid reconnects used `tools/lifecycle/lifecycle_client.py` (same library, no pipeline).
 - **Related:** [autostart design](../../design/autostart.md), [D5 plan](D5-plan.md), [P1 TV live](P1-tv-live.md), [P1 ops](P1-ops.md), [development: running the satellite](../../development.md#running-the-satellite)
@@ -70,18 +70,34 @@ Chosen limits versus c3-a: the daemon needs about 1 MB resident and 1.5 % of a c
 | T5 network partition 180 s (a PC-side relay stopped moving bytes both ways without closing; the TV's network was not touched) | Satellite closed the connection **20 s** after the partition (`closed: timeout`: buffers filled, then the 10 s write timeout); HA's client gave up after 90 s | After the heal, the relay saw a reset for the old connection; a new connection re-armed at once | verified-on-target |
 | HA restart, Wi-Fi loss on the TV, TV resume | Not done: HA cannot reach the TV, the TV's network must not be changed, and power states are D5 | | not done |
 
-## Soak
+## Soak (35 minutes, periodic reconnects)
 
-In progress at the time of this commit (35 minutes of cycles: a 150 s bridge session, 5 rapid reconnects, one mute cycle, one kill-switch cycle); results follow in the next update of this file.
+13 cycles of: a 150 s bridge session in wake mode (live mic streamed to HA's wake word stage), 5 rapid reconnects, one HA mute/unmute, one kill-switch cycle. The same daemon process (no restart) had already run the tests above for 20 minutes. Sampled every 10 s on the TV.
+
+| Measure | Result | Label |
+| --- | --- | --- |
+| Reconnects | 13 bridge sessions and 65 rapid reconnects, **0 failures**; wake word re-armed every time (16 to 76 ms after the connect began) | verified-on-target |
+| Mute and kill switch | 26 mute/unmute commands all confirmed; 13 kill-switch cycles; every one logged `PCM released` | verified-on-target |
+| Descriptors | 10 to 12 (12 while HA is connected, 10 to 11 between connections); no growth | verified-on-target |
+| Threads | 3 throughout | verified-on-target |
+| CPU | 2.0 % of one core averaged over the soak | verified-on-target |
+| Watchdog, supervisor | No trip, no restart, no `ERROR` line; 0 xruns during the soak | verified-on-target |
+| Capture statistics at shutdown (whole process life, about 57 minutes) | 84 184 chunks sent, 248 dropped (most likely during the T5 partition, when writes were blocked for 10 s), 0 xruns | verified-on-target |
+| RSS | 1.7 MB for the first 4 cycles, then a **single rise to 9.5 MB** during the 5th bridge session (a steady 64 kB per second for 2 minutes, ending exactly when that session ended), then flat at 9.46 to 9.65 MB for the remaining 8 cycles (22 minutes). At the end: VmRSS 9648 kB, RssAnon 8600 kB, almost all in one anonymous mapping (the heap). Nothing unusual in the satellite log or the bridge log for that session | verified-on-target (observation) |
+| Cause of the RSS rise | Unknown. Not a steady leak at this rate (it did not repeat in 8 identical sessions). Hypothesis: a backlog buffered in user space during a slow stretch of the connection, freed afterwards but kept by the allocator. Needs a reproduction with heap instrumentation and the drop counter logged per session | hypothesis |
+
+The rise stays far below the 64 MiB ceiling, which would turn a real leak into a restart by the supervisor (exit 72) rather than memory pressure on the TV.
 
 ## Rollback and leftovers
 
-To be recorded after the soak (uninstall, before/after `/tmp` listing, PCM state, processes).
+- `uninstall.sh` stopped the supervisor and the daemon and removed `/tmp/webos-satellite`; the measurement loops, their outputs, the kill-switch and mute files were deleted.
+- The `/tmp` listing after cleanup is identical to the one taken before the session (except the listing files themselves, also deleted). No `webos-satellite`, `supervise.sh`, `rotate.sh`, sampler or `pacat` process; all 10 capture PCMs `closed`; no sink-inputs; `/var/lib/webosbrew/init.d` still empty; no failsafe flag.
+- HA: no configuration was changed; the short-lived token was revoked and its files deleted.
 
 ## Residual unknowns
 
 - Behaviour in screen-off, standby and Always Ready, and on resume: [D5 plan](D5-plan.md) (owner).
 - The capture stall reopen on a real stall (expected in standby).
 - HA's own integration against the TV (network block), including HA restarts and its reconnect backoff.
-- Multi-day memory and descriptor behaviour (Phase 3 exit criterion); this run covered about 1 hour.
+- Multi-day memory and descriptor behaviour (Phase 3 exit criterion); this run covered about 1 hour. The single 8 MB RSS rise in the soak is unexplained.
 - Autostart after a real reboot (needs the owner's approval: [autostart design](../../design/autostart.md)).
