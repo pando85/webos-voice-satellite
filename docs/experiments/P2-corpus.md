@@ -1,6 +1,6 @@
 # P2 corpus and metrics
 
-**Status:** PREPARED (2026-11-02), not yet run · **Phase:** [Phase 2, sound tests](../project/roadmap.md#phase-2-sound-tests) · **Risk:** none to build (PC only, nothing played); every playback run needs the owner's consent and the safety rules in [AGENTS.md](../../AGENTS.md)
+**Status:** IN USE (since 2026-11-02, [P2 session 2](../discovery/c3-a/P2-session2-wake-accuracy.md): digital and semi-synthetic runs and false wakes with content; the rig runs are still open) · **Phase:** [Phase 2, sound tests](../project/roadmap.md#phase-2-sound-tests) · **Risk:** none to build (PC only, nothing played); every playback run needs the owner's consent and the safety rules in [AGENTS.md](../../AGENTS.md)
 
 This page defines the test material and the metrics for the Phase 2 accuracy runs, so that every run is scored the same way and results are comparable. It replaces the single-run results in [D3](../discovery/c3-a/D3-mic-identification.md#conclusions-from-step-5a) with measured rates. Nothing here is a result; no claim in this page is `verified-on-target`.
 
@@ -85,6 +85,15 @@ Every run states the conditions, in the result file or the linked issue:
 - With 97 positives the 95 % Wilson interval is about +-3 points near 97 % and about +-10 points near 50 %; plan repeats if a decision depends on a smaller difference.
 
 Evidence labels follow [AGENTS.md](../../AGENTS.md): results from the TV microphone with the satellite pipeline are `verified-on-target` for that TV, firmware, power state and room only; results from digital or PC-microphone audio are `observed-on-other-device`. Report negative and inconclusive outcomes explicitly. Do not commit audio, recordings, raw logs with identifiers, or the generated corpus; commit the scripts, this definition, and sanitized result tables.
+
+## Implementation and scoring notes (2026-11-02)
+
+- Scoring code: `tools/audio-rig/p2_score.py` (normalization, WER, Wilson and exact Poisson intervals, wake windows, per-category false wakes), with unit tests. Runners: `p2_digital.py` (the digital baseline, and semi-synthetic beds), `p2_runner.py` (live, one item at a time, waits for the re-arm), `ha_assist_watch.py` with `content_play.py` (false wakes). See [the audio rig README](../../tools/audio-rig/README.md#phase-2-accuracy-and-false-wake-runs-through-home-assistant).
+- **Intent mapping** (written before the first run): `INTENT_MAP` in `p2_score.py`. Intent and slots are checked on the built-in agent's recognition result (`conversation/agent/homeassistant/debug`, which executes nothing), on the slot text in `slots` or `unmatched_slots`. Report the reference text's own result next to it ("ceiling"): in a given HA, some reference sentences do not reach the mapped intent (unknown areas are parsed as names, for example).
+- **Do not let a live run act.** The built-in agent executes what it recognizes, and corpus commands can match real, exposed entities. Check with the debug endpoint before a run; session 2 used a pipeline whose conversation language matched nothing for live runs.
+- **WER v1.1** (reported next to v1, not replacing it): the hypothesis' "%" becomes "por ciento" before numerals are spelled, and "veintiun" equals "veintiuno". Whisper writes "21 grados" and "50%"; under v1 these cost 1 and 2 errors per item.
+- **Live detection time:** `p2_runner.py` and `ha_assist_watch.py` time a detection by the PC receive time of the satellite entity's `idle` → `listening` change, about 0.3 s after the end of "alexa" in session 2's two English-voice controls over HDMI. The item start is the PC play start plus the lead-in and an assumed sink latency, so the -0.2/+1.5 s window holds for HDMI; for Bluetooth, set `--sink-latency` from a measurement.
+- **HA's WebSocket pipeline** (`assist_pipeline/run`) defaults to a 3 s wake word timeout; `p2_digital.py` sets 60 s. Audio must be sent at real time: faster sending loses the audio between the detection and the start of STT.
 
 ## Open points
 
