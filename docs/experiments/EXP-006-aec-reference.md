@@ -1,6 +1,6 @@
 # EXP-006 — Echo reference and AEC feasibility
 
-**Status:** PLANNED · **Risk:** controlled audio capture/output with approval
+**Status:** IN PROGRESS: on c3-a (P2 session 1, 2026-11-02) `hw:LGSIC,1` SpeakerFeedback was classified **unusable as a linear AEC reference** (coherence with the mic echo 0.5 to 0.6, linear ceiling 3 to 7 dB in 200 to 4000 Hz, spurious content 7 dB below a pure tone), although it is linked with the mic, 1.4 ms ahead and drift-free. `hw:LGSIC,3` SoundEngineCapture is clean, post-volume, drift-free and reached oracle-level ERLE, but its delay changes per open (12.9 to 19.1 ms): the candidate reference. Open: the AEC evaluation proper, delay behaviour over long sessions, other outputs. See [P2 session 1](../discovery/c3-a/P2-session1-audible-and-echo.md#2-d4-echo-and-the-speakerfeedback-reference-exp-006) · **Risk:** controlled audio capture/output with approval
 
 **Question:** Can the TV provide a sample-aligned reference of what it actually emits, and can we use existing LG DSP output?
 

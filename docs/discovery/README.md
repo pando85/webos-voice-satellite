@@ -17,11 +17,12 @@ Device discovery results, one directory per TV. Each log states the date, firmwa
 | [P1-ha-integration.md](c3-a/P1-ha-integration.md) | Roadmap 1.4: satellite on the PC with TV-mic audio against the owner's HA. HA cannot reach the LAN (no entity yet); wake word id `alexa_v0.1` never fires, `alexa` does (pipeline fixed); wake, STT and streamed TTS verified through a bridge; the conversation agents are broken on HA's side |
 | [P1-tv-live.md](c3-a/P1-tv-live.md) | Roadmap 1.5: `webos-satellite` on c3-a from `/tmp`, silent: the live mic to HA's pipeline (push-to-talk), the full wake → STT → reply chain from TV-mic audio with the reply in PulseAudio at gain 0, an 11-minute stability run, CPU/RSS/bandwidth |
 | [P1-ops.md](c3-a/P1-ops.md) | Roadmap 1.7: install, start, stop, status and uninstall scripts run on c3-a under `/tmp/webos-satellite`; before/after listing of `/tmp`, processes, sink-inputs and sockets shows no residue; log leak review with canary strings |
+| [P2-session1-audible-and-echo.md](c3-a/P2-session1-audible-and-echo.md) | Phase 2 session 1 (D4 part 1): audible replies and the master-volume curve at the mic, an HA end-to-end reply, ducking, linked mic + reference capture; SpeakerFeedback classified unusable as a linear AEC reference, SoundEngineCapture as the clean candidate; barge-in headroom |
 | [P3-robustness.md](c3-a/P3-robustness.md) | Phase 3 without sound or persistence: kill switch and mute release the PCM in tens of milliseconds, firmware guard, watchdog and supervisor, resource limits, reconnection tests and a soak through the HA bridge |
 | [D5-plan.md](c3-a/D5-plan.md) | Owner procedure for screen-off, standby and Always Ready observations (not run) |
 | [rooted-tv-improvements.md](c3-a/rooted-tv-improvements.md) | Hardening and hygiene backlog for the rooted TV (documented only, not applied) |
 
-Not yet done: D4 (behaviour while the TV plays sound, echo, SpeakerFeedback as reference) and D5 (power states). They are scheduled in [roadmap](../project/roadmap.md) Phases 2 and 3.
+D4 (behaviour while the TV plays sound) is partly done in [P2 session 1](c3-a/P2-session1-audible-and-echo.md); wake accuracy, false wakes with content and the AEC evaluation follow in Phase 2. D5 (power states) is scheduled in [roadmap](../project/roadmap.md) Phase 3.
 
 Naming: `D<n>-*` files are roadmap discovery steps; `P1-*` files are Phase 1 validation runs of the implementation on the target.
 ## Naming convention
@@ -40,4 +41,5 @@ Naming: `D<n>-*` files are roadmap discovery steps; `P1-*` files are Phase 1 val
 - LG hands-free must stay off while the satellite uses `hw:LGSIC,0` ([ADR 0004](../decisions/0004-mvp-capture-device-and-lg-handsfree-off.md)). Do not change native LG voice services.
 - Reboots, service changes, mounts and persistence need explicit authorization. `/tmp` content is lost at reboot, which makes it the preferred place for experiment binaries.
 - Never execute unreviewed binaries or remote install pipes on the TV; inspect and checksum first.
-- `luna-send` printed nothing unless stdout was a pipe and `-w <ms>` was given; silence does not prove "unsupported" ([improvement item 6](c3-a/rooted-tv-improvements.md)).
+- `luna-send` printed nothing unless stdout was a pipe and `-w <ms>` was given; silence does not prove "unsupported" ([improvement item 6](c3-a/rooted-tv-improvements.md)). On 2026-11-02 even that printed nothing; a terminal (`ssh -tt`) worked for every service ([P2 session 1](c3-a/P2-session1-audible-and-echo.md#tv-state-and-restore-point)).
+- Do not read ASoC sysfs to learn PCM parameters; open the PCM (`arecord --dump-hw-params`) instead. `hw:LGSIC,2` and `hw:LGSIC,3` have `PERIOD_BYTES` fixed at 2048, so ask for a channel count and format that give the period you want.

@@ -175,6 +175,40 @@ doubtful provenance (for example uploads with unclear film copyright).
 30 s pink noise, 5 s 1 kHz tone at -20 dBFS, and an alignment train of clicks and chirps with irregular spacing
 (event times in `manifest.json`), each as 48 kHz stereo and 16 kHz mono. Fixed seed.
 
+## Linked TV mic + reference capture and echo analysis
+
+Used in [P2 session 1](../../docs/discovery/c3-a/P2-session1-audible-and-echo.md). Running it on a
+TV needs the owner's authorization for the session, LG hands-free off, and nothing else holding the
+PCMs.
+
+- `tv_dualcap.py` runs **on the TV** (its own Python 3.8 and `libasound` through ctypes; nothing
+  is compiled or copied besides the script). It opens the mic (`hw:LGSIC,0`, S24_LE 2 ch 16 kHz,
+  period 256, buffer 8192) and a reference PCM (default `hw:LGSIC,1` SpeakerFeedback, S32_LE 8 ch
+  48 kHz), links them with `snd_pcm_link` so one trigger starts both, and streams both to stdout in
+  a framed format with `snd_pcm_htimestamp` records once per second. It writes nothing on the TV.
+  Options: `--ref hw:LGSIC,3 --ref-channels 2 --ref-format S32_LE` for SoundEngineCapture
+  (`PERIOD_BYTES` is fixed at 2048 there), `--ref none`, `--no-mic`, `--no-link`.
+- `tv_dualcap_demux.py` splits the stream on the PC into `mic.raw`, `ref.raw` and `meta.jsonl`.
+- `analysis/tvcap.py` (rig venv): `levels` (windowed RMS per channel), `locate DIR STIM.wav`
+  (stimulus position and RMS/peak, optionally band-limited), `echo` (GCC-PHAT delay mic versus
+  reference, coherence and the coherence-bound ERLE, a 4096-tap partitioned-block NLMS ERLE
+  baseline, windowed drift, and with `--digital WAV` the same metrics with the played file as an
+  oracle reference). Tests: `.venv/bin/python -m unittest discover -s tools/audio-rig/analysis`.
+
+```sh
+scp tools/audio-rig/tv_dualcap.py root@<tv>:/tmp/
+ssh root@<tv> 'python3 /tmp/tv_dualcap.py --seconds 30' > cap.tc &
+pw-play --target <hdmi-sink> stimulus.wav          # or pacat on the TV, after owner approval
+wait
+python3 tools/audio-rig/tv_dualcap_demux.py cap.tc --out-dir capdir
+.venv/bin/python tools/audio-rig/analysis/tvcap.py echo capdir --start 1 --digital stimulus.wav
+ssh root@<tv> 'rm /tmp/tv_dualcap.py'
+```
+
+Levels are dBFS of each PCM's own full scale, so mic and reference levels are not comparable in
+absolute terms. Coherence uses 8192-point Welch segments; shorter segments underestimate it for
+reverberant paths.
+
 ## Privacy
 
 Recordings can contain people's voices from the room. Keep them short, local and opt-in; tell

@@ -69,7 +69,7 @@ Research tasks and implementation work are tracked in GitHub Issues. This roadma
 ## Phase 2: Sound tests
 
 - **Goal:** audible replies and an evidence-based view of acoustic behaviour with the TV producing sound.
-- **Scope:** audible TTS, volume and ducking, D4 and echo behaviour, AEC evaluation using `hw:LGSIC,1` SpeakerFeedback as a reference, wake accuracy with real voices and rig stimuli, false triggers from TV content, barge-in.
+- **Scope:** audible TTS, volume and ducking, D4 and echo behaviour, AEC evaluation using `hw:LGSIC,1` SpeakerFeedback as a reference (session 1 found it unusable as a linear reference; `hw:LGSIC,3` SoundEngineCapture is the candidate), wake accuracy with real voices and rig stimuli, false triggers from TV content, barge-in.
 - **Deliverables:**
   - Audible reply path, with a volume policy and measured relationship between sink volume and heard level.
   - D4 results: mic signal while the TV plays content; whether SpeakerFeedback carries a usable reference, its delay and coherence relative to the mic (see [EXP-006](../experiments/EXP-006-aec-reference.md)).
@@ -77,6 +77,17 @@ Research tasks and implementation work are tracked in GitHub Issues. This roadma
   - Wake accuracy at the owner-approved reference level (+12 dB playback gain on the JBL Go 3 at system volume 82 %), plus real voices at normal distance.
   - Barge-in behaviour: what happens when the user speaks during a reply.
   - AEC evaluation report (baseline without AEC versus candidates); any AEC integration decision goes into an ADR.
+- **Status (2026-11-02, session 1 of the unattended sound tests):**
+
+| Deliverable | Status | Evidence / what remains |
+| --- | --- | --- |
+| Audible reply path and volume relationship | done for the TV speaker | `pacat` tones and noise plus HA Piper announcements through the satellite at master volumes 5 to 25, with mic and SpeakerFeedback levels per step (+14, +9, +4, +2.5 dB per 5-step); an HA end-to-end reply at volume 10; `sink.latency_msec = 200` cut the reply start from about 1.5 s to 0.1 s (one run each); no stream-based ducking. **Remaining:** a reply-loudness policy with a listener, outputs other than the TV speaker. See [P2 session 1](../discovery/c3-a/P2-session1-audible-and-echo.md) |
+| D4: mic while the TV plays, the SpeakerFeedback reference | done for test signals; content only at volume 6 | SpeakerFeedback: linked with the mic, 1.4 ms ahead, no drift, carries HDMI and `pacat`, post-volume, but **unusable as a linear AEC reference** (coherence 0.5 to 0.6, 3 to 7 dB ceiling). SoundEngineCapture (`hw:LGSIC,3`) is clean (oracle-level ERLE, no drift) with a per-open delay: the candidate reference. Content at volume 6 reaches the mic only 3 to 5 dB above its floor |
+| Corpus and metrics | defined | [P2 corpus and metrics](../experiments/P2-corpus.md); generators committed, output private |
+| Wake accuracy, false triggers with content | not started | session 2 |
+| Barge-in | quick look done | at volume 10 the reply peaks 28 dB below mic full scale, but after the satellite's +24 dB gain it is near saturation and saturates from about volume 15; wake during a reply is session 2 |
+| AEC evaluation and go/no-go | not started | baseline numbers only (4096-tap NLMS): SpeakerFeedback 3 to 4 dB, SoundEngineCapture 14 dB in 200 to 4000 Hz |
+
 - **Exit criteria:** audible reply works with documented volume limits; wake and STT metrics with and without TV content are recorded with sample counts; a go or no-go on AEC for the MVP, with the SpeakerFeedback reference classified as usable, unusable or unknown. Negative or inconclusive results are recorded explicitly.
 - **Needs-owner:**
   - Explicit consent for each audible test and for any playback by the TV. Start low and raise in steps; never play TV content or replies unannounced.
@@ -124,7 +135,7 @@ Research tasks and implementation work are tracked in GitHub Issues. This roadma
   - **Deferred (owner, 2026-11-02: keep `alexa` for now; see [backlog](backlog.md#owner-priorities-2026-11-02)).** Custom wake word model trained and deployed through the owner's GitOps homelab repository. The change is **referenced** from here (link or commit id), not stored in this repository.
   - Listening and microphone-mute indicator that is truthful (tied to the real capture state) and documented, as required by the privacy gate F7.
   - Timers and announcements supported by the ESPHome Assist satellite features that Home Assistant exposes, with the TV-side behaviour verified.
-  - Audio front-end integration in the daemon (AEC with the SpeakerFeedback reference and other stages that Phase 2 measurements justify), earlier if Phase 2 shows the reference is usable (backlog #1, interleaved). The integration decision goes into an ADR.
+  - Audio front-end integration in the daemon (AEC with a TV reference tap, after P2 session 1 the SoundEngineCapture tap rather than SpeakerFeedback, and other stages that Phase 2 measurements justify), earlier if Phase 2 shows the reference is usable (backlog #1, interleaved). The integration decision goes into an ADR.
 - **Exit criteria:** **deferred (owner, 2026-11-02: keep `alexa` for now; see [backlog](backlog.md#owner-priorities-2026-11-02))**: custom wake word false accepts per hour and missed wakes measured with the Phase 2 corpus and compared with the stock `alexa` model. Remaining criteria: the indicator cannot show "not listening" while capture runs (tested); timers and announcements work audibly.
 - **Needs-owner:**
   - Training data and recorded voices (consent), model approval, GitOps repository changes and deployment.

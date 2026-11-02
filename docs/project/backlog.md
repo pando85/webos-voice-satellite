@@ -14,7 +14,7 @@ Ranked priorities and where each lands:
 
 | Rank | Item | Where it lands |
 | --- | --- | --- |
-| 1 | [#1 Professional audio front-end](#1-professional-audio-front-end) (AEC with the SpeakerFeedback reference, beamforming, noise suppression, AGC) | **Evaluation in Phase 2**: already in scope through D4, [EXP-006](../experiments/EXP-006-aec-reference.md) and the AEC evaluation report. **Integration into the daemon in Phase 4**, alongside wake word and UX work, earlier if Phase 2 shows the SpeakerFeedback reference is usable. Any integration decision goes into an ADR |
+| 1 | [#1 Professional audio front-end](#1-professional-audio-front-end) (AEC with a TV reference tap, beamforming, noise suppression, AGC) | **Evaluation in Phase 2**: already in scope through D4, [EXP-006](../experiments/EXP-006-aec-reference.md) and the AEC evaluation report. **Integration into the daemon in Phase 4**, alongside wake word and UX work, earlier if Phase 2 shows the SpeakerFeedback reference is usable. Any integration decision goes into an ADR |
 | 2 | [#3 Install and configuration UX](#3-install-and-configuration-ux) (Homebrew Channel package, phone configuration through a QR code, pairing without typing the key) | **Phase 3** (with autostart): Homebrew Channel package and first-run configuration pulled forward. **Phase 5** (packaging): the `ipk` and its install flow. The QR and phone configuration needs a **security design first** (authentication, TLS, secrets handling) before any implementation |
 | 3 | [#8 Share findings with the webOS homebrew community](#8-share-findings-with-the-webos-homebrew-community) | **After Phase 2**, because the project is public. Needs a redaction review first |
 
@@ -25,12 +25,12 @@ Items not in the ranked list stay in the backlog without a priority or a phase: 
 - **Status:** owner priority 1 (2026-11-02): evaluate in Phase 2, integrate in Phase 4 (earlier if the reference is usable).
 - **Why:** commercial assistants combine echo cancellation, beamforming, noise suppression and gain control. The built-in mic path on c3-a is near-raw (DC removal plus a fixed +16 dB gain, no AGC or noise suppression; [D3](../discovery/c3-a/D3-mic-identification.md)), so all of that is left to the satellite or to Home Assistant. TV playback in the mic is the main expected quality problem.
 - **Approach options:**
-  - Acoustic echo cancellation using the `hw:LGSIC,1` SpeakerFeedback stream as the reference: WebRTC AEC3 or speexdsp (cheaper CPU, weaker). Needs delay estimation and clock-drift handling between the two PCMs.
+  - Acoustic echo cancellation using a TV reference tap: WebRTC AEC3 or speexdsp (cheaper CPU, weaker). P2 session 1 found `hw:LGSIC,1` SpeakerFeedback unusable as a linear reference and `hw:LGSIC,3` SoundEngineCapture clean and drift-free but with a delay that changes per open, so the AEC needs delay estimation at start ([P2 session 1](../discovery/c3-a/P2-session1-audible-and-echo.md#other-lgsic-taps-mixercapture-soundenginecapture)).
   - Two-microphone beamforming with a spacing of about 6 to 8 cm (inferred, geometry unknown): delay-and-sum, MVDR or GSC. The D3 analysis showed that a naive channel average lowered SNR, so any gain must be measured.
   - Noise suppression: RNNoise, DeepFilterNet, WebRTC NS. Check effects on wake word and STT, since suppression can hurt both.
   - AGC, dereverberation and a tuned VAD.
   - Optional: study LG's own vendor front-end library (`libaec-fe`) with the [REA tool](../tools/rea.md) to learn how it maps the reference and mic, **not to reuse it**. Static analysis only; follow the REA rules in [AGENTS.md](../../AGENTS.md) and do not treat results as device validation.
-- **Dependencies:** Phase 2 D4 results (is SpeakerFeedback a usable reference), the test corpus, CPU and memory budget from Phase 3, a Rust or C library choice under [ADR 0002](../decisions/0002-rust-implementation.md).
+- **Dependencies:** Phase 2 D4 results (SpeakerFeedback is not usable as a linear reference; SoundEngineCapture is the candidate), the test corpus, CPU and memory budget from Phase 3, a Rust or C library choice under [ADR 0002](../decisions/0002-rust-implementation.md).
 - **Evidence needed:** a consented test corpus with TV content playing; metrics for false rejects, false accepts per hour and word error rate (WER) with and without each stage; CPU and latency per stage on the Cortex-A76 cores under the 32-bit userland.
 
 ## 2. On-TV wake word
