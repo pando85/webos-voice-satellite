@@ -5,6 +5,7 @@ use std::io::{self, BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use crate::source::{ReferenceState, SampleFormat, StreamFormat};
 use crate::{AudioSource, CaptureError};
 
 /// `Read + Seek + Send`, boxed inside [`FileSource`].
@@ -17,8 +18,9 @@ pub(crate) fn sign_extend_s24(raw: i32) -> i32 {
     (raw << 8) >> 8
 }
 
-/// Plays back a raw S24_LE interleaved file (32-bit little-endian container,
-/// the layout `arecord -f S24_LE -t raw` writes) as an [`AudioSource`].
+/// Plays back a raw interleaved file with 4-byte little-endian containers as
+/// an [`AudioSource`]: S24_LE by default (the layout `arecord -f S24_LE -t raw`
+/// writes), or S32_LE with [`FileSource::format`].
 ///
 /// At end of file [`AudioSource::read`] returns `Ok(0)`, unless looping is on.
 /// A trailing partial frame is dropped.
@@ -26,6 +28,7 @@ pub struct FileSource {
     reader: Box<dyn ReadSeek>,
     channels: u16,
     rate: u32,
+    format: SampleFormat,
     realtime: bool,
     looping: bool,
     bytes: Vec<u8>,
@@ -40,6 +43,7 @@ impl std::fmt::Debug for FileSource {
         f.debug_struct("FileSource")
             .field("channels", &self.channels)
             .field("rate", &self.rate)
+            .field("format", &self.format)
             .field("realtime", &self.realtime)
             .field("looping", &self.looping)
             .field("frames_done", &self.frames_done)
@@ -75,6 +79,7 @@ impl FileSource {
             reader: Box::new(reader),
             channels,
             rate,
+            format: SampleFormat::S24Le,
             realtime: false,
             looping: false,
             bytes: Vec::new(),
@@ -96,6 +101,26 @@ impl FileSource {
     pub fn looping(mut self, looping: bool) -> Self {
         self.looping = looping;
         self
+    }
+
+    /// Sample format of the file (default S24_LE). Samples are returned in
+    /// the S24 scale whatever the format ([`SampleFormat::to_s24`]).
+    #[must_use]
+    pub fn format(mut self, format: SampleFormat) -> Self {
+        self.format = format;
+        self
+    }
+
+    /// Seeks back to the start of the file and restarts real-time pacing.
+    ///
+    /// # Errors
+    /// [`CaptureError::Io`] if the seek fails.
+    pub fn rewind(&mut self) -> Result<(), CaptureError> {
+        self.reader.seek(SeekFrom::Start(0))?;
+        self.pass_bytes = 0;
+        self.frames_done = 0;
+        self.started = None;
+        Ok(())
     }
 
     fn fill(&mut self, want: usize) -> io::Result<usize> {
@@ -152,7 +177,9 @@ impl AudioSource for FileSource {
             .iter_mut()
             .zip(self.bytes[..whole * ch * 4].chunks_exact(4))
         {
-            *dst = sign_extend_s24(i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+            *dst = self
+                .format
+                .to_s24(i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
         }
         self.frames_done += whole as u64;
         Ok(whole)
@@ -164,6 +191,129 @@ impl AudioSource for FileSource {
 
     fn rate(&self) -> u32 {
         self.rate
+    }
+}
+
+/// A mic file and an echo-reference file read in lockstep (PC tests of the
+/// echo canceller with a recorded mic + reference pair).
+///
+/// Every mic read pulls the matching number of reference frames
+/// (`mic frames * reference rate / mic rate`, carried exactly), so both
+/// files advance on the same clock. A reference file shorter than the mic
+/// is padded with silence. With looping on, the pair rewinds **both** files
+/// when the mic file ends and bumps the reference epoch.
+pub struct FilePair {
+    mic: FileSource,
+    reference: FileSource,
+    looping: bool,
+    mic_total: u64,
+    ref_total: u64,
+    pending: Vec<i32>,
+    scratch: Vec<i32>,
+    epoch: u64,
+}
+
+impl std::fmt::Debug for FilePair {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FilePair")
+            .field("mic", &self.mic)
+            .field("reference", &self.reference)
+            .field("looping", &self.looping)
+            .field("epoch", &self.epoch)
+            .finish_non_exhaustive()
+    }
+}
+
+impl FilePair {
+    /// Pairs two sources. Their own looping flags are ignored (the pair
+    /// loops both together when `looping` is set); real-time pacing should
+    /// be off (the caller paces).
+    #[must_use]
+    pub fn new(mic: FileSource, reference: FileSource, looping: bool) -> Self {
+        Self {
+            mic: mic.looping(false),
+            reference: reference.looping(false),
+            looping,
+            mic_total: 0,
+            ref_total: 0,
+            pending: Vec::new(),
+            scratch: Vec::new(),
+            epoch: 0,
+        }
+    }
+
+    fn pull_reference(&mut self) -> Result<(), CaptureError> {
+        let due = self.mic_total * u64::from(self.reference.rate) / u64::from(self.mic.rate);
+        let want = usize::try_from(due.saturating_sub(self.ref_total)).unwrap_or(0);
+        let ch = usize::from(self.reference.channels);
+        self.scratch.resize(want * ch, 0);
+        let mut got = 0;
+        while got < want {
+            let n = self
+                .reference
+                .read(&mut self.scratch[got * ch..want * ch])?;
+            if n == 0 {
+                break;
+            }
+            got += n;
+        }
+        // Past the end of the reference file: silence.
+        self.scratch[got * ch..].fill(0);
+        self.pending.extend_from_slice(&self.scratch);
+        self.ref_total = due;
+        Ok(())
+    }
+}
+
+impl AudioSource for FilePair {
+    fn read(&mut self, out: &mut [i32]) -> Result<usize, CaptureError> {
+        let mut n = self.mic.read(out)?;
+        if n == 0
+            && self.looping
+            && self.mic_total > 0
+            && out.len() >= usize::from(self.mic.channels)
+        {
+            self.mic.rewind()?;
+            self.reference.rewind()?;
+            self.mic_total = 0;
+            self.ref_total = 0;
+            self.pending.clear();
+            self.epoch += 1;
+            n = self.mic.read(out)?;
+        }
+        self.mic_total += n as u64;
+        self.pull_reference()?;
+        Ok(n)
+    }
+
+    fn channels(&self) -> u16 {
+        self.mic.channels
+    }
+
+    fn rate(&self) -> u32 {
+        self.mic.rate
+    }
+
+    fn reference_format(&self) -> Option<StreamFormat> {
+        Some(StreamFormat {
+            channels: self.reference.channels,
+            rate: self.reference.rate,
+        })
+    }
+
+    fn take_reference(&mut self, out: &mut Vec<i32>) {
+        out.append(&mut self.pending);
+    }
+
+    fn reference_epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    fn reference_state(&self) -> ReferenceState {
+        ReferenceState::Active {
+            linked: true,
+            unlinked_reason: None,
+        }
     }
 }
 
@@ -263,6 +413,82 @@ mod tests {
     fn rejects_zero_channels() {
         assert!(FileSource::from_reader(Cursor::new(Vec::new()), 0, 8_000).is_err());
         assert!(FileSource::from_reader(Cursor::new(Vec::new()), 2, 0).is_err());
+    }
+
+    #[test]
+    fn s32_file_is_scaled_to_s24() {
+        let data = bytes(&[0x1234_5600, -0x100, i32::MAX, i32::MIN]);
+        let mut src = FileSource::from_reader(Cursor::new(data), 2, 48_000)
+            .unwrap_or_else(|e| panic!("{e}"))
+            .format(SampleFormat::S32Le);
+        let mut out = [0; 4];
+        assert_eq!(src.read(&mut out).unwrap_or(99), 2);
+        assert_eq!(out, [0x12_3456, -1, 0x7F_FFFF, -0x80_0000]);
+    }
+
+    #[test]
+    fn rewind_restarts_the_file() {
+        let mut src = FileSource::from_reader(Cursor::new(bytes(&[1, 2, 3])), 1, 8_000)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let mut out = [0; 3];
+        assert_eq!(src.read(&mut out).unwrap_or(99), 3);
+        src.rewind().unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(src.read(&mut out[..2]).unwrap_or(99), 2);
+        assert_eq!(out[..2], [1, 2]);
+    }
+
+    fn pair(mic: &[i32], reference: &[i32], looping: bool) -> FilePair {
+        let mic = FileSource::from_reader(Cursor::new(bytes(mic)), 1, 16_000)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let reference = FileSource::from_reader(Cursor::new(bytes(reference)), 2, 48_000)
+            .unwrap_or_else(|e| panic!("{e}"));
+        FilePair::new(mic, reference, looping)
+    }
+
+    #[test]
+    fn file_pair_reads_the_reference_in_lockstep() {
+        // 4 mic frames at 16 kHz <-> 12 stereo reference frames at 48 kHz.
+        let reference: Vec<i32> = (0..24).collect();
+        let mut p = pair(&[10, 11, 12, 13], &reference, false);
+        let mut out = [0; 3];
+        let mut r = Vec::new();
+        assert_eq!(p.read(&mut out).unwrap_or(99), 3);
+        p.take_reference(&mut r);
+        assert_eq!(r, (0..18).collect::<Vec<_>>());
+        assert_eq!(p.read(&mut out).unwrap_or(99), 1);
+        p.take_reference(&mut r);
+        assert_eq!(r, (0..24).collect::<Vec<_>>());
+        // End of both: no frames, no reference.
+        assert_eq!(p.read(&mut out).unwrap_or(99), 0);
+        let mut r2: Vec<i32> = Vec::new();
+        p.take_reference(&mut r2);
+        assert_eq!(r2.len(), 0);
+        assert_eq!(
+            p.reference_format(),
+            Some(StreamFormat {
+                channels: 2,
+                rate: 48_000
+            })
+        );
+        assert_eq!(p.reference_epoch(), 0);
+    }
+
+    #[test]
+    fn file_pair_pads_a_short_reference_and_loops_together() {
+        let mut p = pair(&[1, 2], &[7, 7, 7, 7], true);
+        let mut out = [0; 2];
+        let mut r = Vec::new();
+        assert_eq!(p.read(&mut out).unwrap_or(99), 2);
+        p.take_reference(&mut r);
+        // 2 mic frames -> 6 stereo frames: 2 from the file, 4 of silence.
+        assert_eq!(r, [7, 7, 7, 7, 0, 0, 0, 0, 0, 0, 0, 0]);
+        r.clear();
+        // Looping: the next read rewinds both and bumps the epoch.
+        assert_eq!(p.read(&mut out[..1]).unwrap_or(99), 1);
+        assert_eq!(out[0], 1);
+        p.take_reference(&mut r);
+        assert_eq!(r, [7, 7, 7, 7, 0, 0]);
+        assert_eq!(p.reference_epoch(), 1);
     }
 
     #[test]

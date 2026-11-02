@@ -46,8 +46,26 @@ const IV_PERIOD_SIZE: usize = 5;
 const IV_BUFFER_SIZE: usize = 9;
 
 const ACCESS_RW_INTERLEAVED: u32 = 3;
-const FORMAT_S24_LE: u32 = 6;
 const SUBFORMAT_STD: u32 = 0;
+
+/// Sample formats this layer can request. Both use a 4-byte container per
+/// sample, so `READI` always fills `i32` slots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Format {
+    /// `SNDRV_PCM_FORMAT_S24_LE` (6): 24 bits in the low bytes of 32.
+    S24Le,
+    /// `SNDRV_PCM_FORMAT_S32_LE` (10): full 32-bit samples.
+    S32Le,
+}
+
+impl Format {
+    const fn alsa(self) -> u32 {
+        match self {
+            Self::S24Le => 6,
+            Self::S32Le => 10,
+        }
+    }
+}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -128,11 +146,17 @@ const IOCTL_PREPARE: u32 = ioc(0, 0x40, 0);
 const IOCTL_START: u32 = ioc(0, 0x42, 0);
 const IOCTL_DROP: u32 = ioc(0, 0x43, 0);
 const IOCTL_READI_FRAMES: u32 = ioc(IOC_READ, 0x51, size_of::<Xferi>());
+/// `SNDRV_PCM_IOCTL_LINK`, `_IOW('A', 0x60, int)`. The argument is the other
+/// PCM's file descriptor passed **by value** (as alsa-lib does), not a pointer.
+const IOCTL_LINK: u32 = ioc(IOC_WRITE, 0x60, size_of::<c_int>());
+/// `SNDRV_PCM_IOCTL_UNLINK`, `_IO('A', 0x61)`.
+const IOCTL_UNLINK: u32 = ioc(0, 0x61, 0);
 
-/// The hardware parameters requested for a capture stream. The format is
-/// always S24_LE, interleaved read access.
+/// The hardware parameters requested for a capture stream, interleaved read
+/// access.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct HwRequest {
+    pub(crate) format: Format,
     pub(crate) channels: u32,
     pub(crate) rate: u32,
     pub(crate) period_frames: u32,
@@ -193,7 +217,7 @@ fn build_hw_params(req: HwRequest) -> HwParams {
         reserved: [0; 64],
     };
     p.masks[0] = single_bit_mask(ACCESS_RW_INTERLEAVED);
-    p.masks[1] = single_bit_mask(FORMAT_S24_LE);
+    p.masks[1] = single_bit_mask(req.format.alsa());
     p.masks[2] = single_bit_mask(SUBFORMAT_STD);
     p.intervals[IV_CHANNELS] = exact_interval(req.channels);
     p.intervals[IV_RATE] = exact_interval(req.rate);
@@ -315,8 +339,24 @@ impl Pcm {
     }
 
     /// `SNDRV_PCM_IOCTL_DROP`: stops immediately, discarding pending frames.
+    /// On a linked PCM this stops every stream of the group.
     pub(crate) fn drop_stream(&self) -> io::Result<()> {
         self.ioctl_none(IOCTL_DROP)
+    }
+
+    /// `SNDRV_PCM_IOCTL_LINK`: puts `other` in this PCM's group, so that
+    /// `START`, `PREPARE`, `DROP` and an overrun stop act on both at once.
+    pub(crate) fn link(&self, other: &Pcm) -> io::Result<()> {
+        let fd = other.file.as_raw_fd();
+        // SAFETY: LINK takes an integer (the other descriptor) by value, not a
+        // pointer, so the kernel reads no user memory. Both descriptors are
+        // valid for the duration of the call (borrowed from `self`/`other`).
+        check(unsafe { libc::ioctl(self.file.as_raw_fd(), IOCTL_LINK as libc::Ioctl, fd) })
+    }
+
+    /// `SNDRV_PCM_IOCTL_UNLINK`: removes this PCM from its group.
+    pub(crate) fn unlink(&self) -> io::Result<()> {
+        self.ioctl_none(IOCTL_UNLINK)
     }
 
     /// Waits until the PCM is readable (or in an error state that a read will
@@ -370,8 +410,9 @@ impl Pcm {
         };
         // SAFETY: `x.buf` points to `buf`, which holds at least
         // `frames * frame_samples` i32 samples = `frames` frames of 4-byte
-        // S24_LE containers per channel (checked above), and stays borrowed for
-        // the duration of the call. The fd is valid for the lifetime of `self`.
+        // containers per channel (checked above; every `Format` has 4-byte
+        // containers), and stays borrowed for the duration of the call. The
+        // fd is valid for the lifetime of `self`.
         check(unsafe {
             libc::ioctl(
                 self.file.as_raw_fd(),
@@ -403,11 +444,14 @@ mod tests {
         assert_eq!(IOCTL_PREPARE, 0x4140);
         assert_eq!(IOCTL_START, 0x4142);
         assert_eq!(IOCTL_DROP, 0x4143);
+        assert_eq!(IOCTL_LINK, 0x4004_4160);
+        assert_eq!(IOCTL_UNLINK, 0x4161);
     }
 
     #[test]
     fn hw_params_request_is_exact() {
         let p = build_hw_params(HwRequest {
+            format: Format::S24Le,
             channels: 2,
             rate: 16_000,
             period_frames: 256,
@@ -422,5 +466,13 @@ mod tests {
         );
         assert_eq!(p.intervals[IV_BUFFER_SIZE].min, 8192);
         assert_eq!(p.rmask, u32::MAX);
+        let p = build_hw_params(HwRequest {
+            format: Format::S32Le,
+            channels: 2,
+            rate: 48_000,
+            period_frames: 256,
+            buffer_frames: 8192,
+        });
+        assert_eq!(p.masks[1].bits[0], 1 << 10);
     }
 }

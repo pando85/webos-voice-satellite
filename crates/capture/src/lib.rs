@@ -7,8 +7,13 @@
 //!   TV's `asound.conf` routes `default` through PulseAudio and the TV build is
 //!   a static musl binary. The card is resolved by **id** and the PCM by
 //!   **name** from `/proc/asound`; indexes are never assumed.
-//! - [`FileSource`]: raw S24_LE interleaved files (what `arecord -t raw` writes),
-//!   optionally paced in real time, for tests on a PC.
+//! - [`AlsaDuplex`] (Linux): the mic plus an echo-reference PCM on the same
+//!   card (SoundEngineCapture on c3-a), linked so both start on one trigger,
+//!   for the echo canceller. A reference that cannot be opened leaves the mic
+//!   running alone ([`ReferenceState::Unavailable`]).
+//! - [`FileSource`]: raw S24_LE (or S32_LE) interleaved files (what
+//!   `arecord -t raw` writes), optionally paced in real time, for tests on a
+//!   PC; [`FilePair`] reads a mic file and a reference file in lockstep.
 //! - [`list_pcms`]: `/proc/asound` listing for diagnostics.
 //!
 //! Verified facts for the LG C3 (c3-a), see
@@ -36,8 +41,8 @@ mod alsa;
 mod sys;
 
 #[cfg(target_os = "linux")]
-pub use alsa::{AlsaCapture, CaptureConfig};
+pub use alsa::{AlsaCapture, AlsaDuplex, CaptureConfig, ReferenceConfig};
 pub use error::CaptureError;
-pub use file::FileSource;
+pub use file::{FilePair, FileSource};
 pub use proc::{PcmInfo, list_pcms};
-pub use source::AudioSource;
+pub use source::{AudioSource, ReferenceState, SampleFormat, StreamFormat};
