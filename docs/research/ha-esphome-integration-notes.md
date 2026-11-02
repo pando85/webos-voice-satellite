@@ -74,6 +74,7 @@ Entities created for a voice device (documented, via unique ids `<mac>-pipeline`
   1. The satellite advertises `SPEAKER` + `API_AUDIO` and plays the streamed WAV from the API, so it never fetches a URL for conversational TTS (preferred for the MVP; it also avoids relying on TLS or DNS on the TV).
   2. The owner sets Internal URL and/or External URL in HA general settings to an address the TV can reach (an owner-side configuration change, not made here). The TV must then be able to resolve and reach that address and validate its TLS certificate.
   Announcements and `start_conversation` with non-TTS media also need a reachable URL even in case 1.
+- Update 2026-11-02 (verified-on-target): the owner set the internal URL to HA's LAN ingress (HTTPS). Announcement URLs then pointed there, the TV fetched them with valid TLS, and announcements worked ([P1 HA integration](../discovery/c3-a/P1-ha-integration.md#announcements-with-has-internal-url-2026-11-02)).
 
 ## Residual unknowns
 

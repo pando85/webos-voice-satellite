@@ -538,11 +538,14 @@ impl Daemon {
         let success = match &done.result {
             Ok(st) => {
                 log::info!(
-                    "playback {} done: {} ms of audio, {} bytes, {} non-zero samples{}",
+                    "playback {} done: {} ms of audio, {} bytes, {}{}",
                     done.id,
                     st.audio.as_millis(),
                     st.bytes,
-                    st.nonzero_samples,
+                    st.nonzero_samples.map_or_else(
+                        || "non-zero samples not counted (decoded URL media)".to_owned(),
+                        |n| format!("{n} non-zero samples")
+                    ),
                     st.file
                         .as_ref()
                         .map(|f| format!(", file {}", f.display()))

@@ -8,6 +8,28 @@
 
 Labels: **verified-on-target** = observed against the owner's HA (and, for audio, using a c3-a recording); **documented** = HA source at tag 2026.10.4; **hypothesis**; **blocked**.
 
+## Announcements with HA's internal URL (2026-11-02)
+
+The owner chose HA's LAN ingress address as HA's internal URL. Results are **verified-on-target** (permanent entry, satellite on c3-a from `/tmp`, sink `pacat` at in-process gain 0).
+
+- **Pre-check from the TV:**
+  - The TV resolves HA's internal URL (LAN ingress hostname) through its normal resolver.
+  - The satellite's own HTTP stack (rustls with the bundled webpki roots, `play_url --fetch-only` from `/tmp`) fetched HA's front page with a valid certificate (200, 8677 bytes).
+  - A self-signed control site was still rejected (`UnknownIssuer`).
+- **Change in HA:** `internal_url` was set through WS `config/core/update`; HA's `network/url` now reports it.
+  - `external_url` was left unset; it was not needed.
+  - Rollback: set `internal_url` back to null, which was its previous value (as was `external_url`).
+  - No warnings or errors appeared in HA's log after the change.
+- **Reconnect:** HA reconnected to the permanent entry by itself 34 s after the satellite started.
+
+| Check | Result |
+| --- | --- |
+| `assist_satellite.announce` (Spanish message, `preannounce: false`) | The URL now uses HA's internal URL, not the pod address. The satellite fetched over TLS 1.3: response headers 135 ms and body done 148 ms after the request arrived, 55 402 bytes, `audio/x-wav` (HA sent WAV, not the media player's flac format). Decode 1 ms, resample to 44.1 kHz stereo 59 ms. `pacat` finished 1987 ms after the request (1729 ms of audio). `AnnounceFinished(success=true)` was sent at once and the wake word re-armed. **HA's service call returned in 2169 ms** (the earlier failure took about 5 s) |
+| Same with `preannounce: true` (HA's default chime) | First the chime through HA's ffmpeg proxy: `application/octet-stream`, which the decoder detected as FLAC; first byte after 15 ms; about 0.5 s of transcoding before the body ended. Then the message WAV (53 172 bytes, decode 0 ms, resample 41 ms). Total 4517 ms from the request to the end of playback; HA's call returned in 4711 ms; success |
+| Silence | Decoded URL media goes through `PacatSink`, which multiplies every sample by the configured gain (0.0) before writing, covered by the test `pacat_sink_applies_software_gain`. The satellite used to print "0 non-zero samples" for URL media, but that number was not a measurement. The log now says the count is not taken for decoded URL media; streamed TTS keeps its real count |
+| HA log during both announcements | no warnings or errors |
+| TV after the test | satellite stopped, `/tmp` clean (including the fetch tool), 0 sink-inputs, mic PCM `closed`, kernel taint value unchanged |
+
 ## Permanent entry, direct connection (2026-11-02 morning)
 
 The owner added a router rule so HA's network reaches the TV on TCP 6053. The satellite (build from commit 0bace3e) ran on c3-a from `/tmp`: wake mode, `lg-c3-a`, Noise, sink `pacat` at in-process gain 0, LG hands-free off. HA connected **directly to the TV**, with no relay or bridge. All results **verified-on-target**.

@@ -151,5 +151,5 @@ The original list follows.
   - that the Piper WAV stream reaches the device in SPEAKER mode with the Spanish voice;
   - that HA's pacing (about 384 ms ahead of real time) suits the playback buffer;
   - whether HA sends `TTS_STREAM_START` before or after `RUN_END` in practice. Both orders are handled, with a 2 s timeout if no stream comes.
-- **Announcements** still arrive as URLs, also in SPEAKER mode. They fail while HA's internal URL is unset or points at the pod IP.
+- **Announcements** still arrive as URLs, also in SPEAKER mode. They need an HA internal URL the TV can reach. Verified on 2026-11-02, with and without the pre-announce chime, after the owner set HA's internal URL to the LAN ingress ([P1 HA integration](../discovery/c3-a/P1-ha-integration.md#announcements-with-has-internal-url-2026-11-02)). Before that, the URL was the pod address: the fetch failed after 5 s and the device answered `AnnounceFinished(false)`.
 - **Audio rate:** the satellite streams continuously at 256 kbit/s while the wake word is armed. Measure HA's CPU use for openWakeWord.

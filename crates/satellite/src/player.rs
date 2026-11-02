@@ -39,8 +39,10 @@ pub(crate) struct PlayStats {
     pub(crate) audio: Duration,
     /// PCM bytes written to the sink.
     pub(crate) bytes: usize,
-    /// Non-zero samples written (0 proves a silent write).
-    pub(crate) nonzero_samples: u64,
+    /// Non-zero samples written (`Some(0)` proves a silent write). `None` for
+    /// decoded URL media (announcements, URL-mode TTS): those samples go
+    /// through `PacatSink`, which applies the same gain but does not count.
+    pub(crate) nonzero_samples: Option<u64>,
     /// WAV file written, if any.
     pub(crate) file: Option<PathBuf>,
 }
@@ -359,7 +361,10 @@ async fn stream_pacat(
         .stdin
         .take()
         .ok_or_else(|| "pacat has no stdin".to_owned())?;
-    let mut stats = PlayStats::default();
+    let mut stats = PlayStats {
+        nonzero_samples: Some(0),
+        ..PlayStats::default()
+    };
     loop {
         tokio::select! {
             // A stop also drops the chunk sender; the cancel must win.
@@ -372,7 +377,7 @@ async fn stream_pacat(
                 let Some(chunk) = chunk else { break };
                 let (out, nonzero) = gain_s16le(&chunk, cfg.gain);
                 stats.bytes += out.len();
-                stats.nonzero_samples += nonzero;
+                *stats.nonzero_samples.get_or_insert(0) += nonzero;
                 if let Err(e) = stdin.write_all(&out).await {
                     let _ = child.kill().await;
                     return Err(format!("writing to pacat failed: {e}"));
@@ -451,7 +456,7 @@ async fn stream_wav(
     Ok(PlayStats {
         audio: duration_of(total, rate, channels),
         bytes: total,
-        nonzero_samples: nonzero,
+        nonzero_samples: Some(nonzero),
         file: Some(path),
     })
 }
@@ -466,7 +471,9 @@ async fn stream_null(
     Ok(PlayStats {
         audio: duration_of(total, rate, channels),
         bytes: total,
-        ..PlayStats::default()
+        // Nothing is written anywhere.
+        nonzero_samples: Some(0),
+        file: None,
     })
 }
 
@@ -542,7 +549,7 @@ async fn play_url_task(
             Ok(PlayStats {
                 audio: t.audio,
                 bytes: t.bytes,
-                nonzero_samples: 0,
+                nonzero_samples: None,
                 file,
             })
         }
@@ -681,7 +688,7 @@ mod tests {
         let stats = done.result.unwrap();
         assert_eq!(stats.bytes, 2048);
         assert_eq!(stats.audio, Duration::from_millis(64));
-        assert_eq!(stats.nonzero_samples, 512);
+        assert_eq!(stats.nonzero_samples, Some(512));
         let file = stats.file.unwrap();
         assert_eq!(std::fs::metadata(&file).unwrap().len(), 44 + 2048);
         let _ = std::fs::remove_dir_all(&dir);
@@ -742,7 +749,7 @@ mod tests {
         p.end_stream();
         let done = rx.recv().await.unwrap();
         let stats = done.result.unwrap();
-        assert_eq!(stats.nonzero_samples, 0);
+        assert_eq!(stats.nonzero_samples, Some(0));
         let written = std::fs::read(&out).unwrap();
         assert_eq!(written.len(), 2048);
         assert!(written.iter().all(|&b| b == 0));
