@@ -1,7 +1,10 @@
 # webos-satellite configuration (TOML). Every key is optional; the values
 # shown are the defaults unless marked "example". Relative paths are resolved
 # against the directory of this file. Command-line options override the file
-# (see `webos-satellite --help`). Check a file with `--check-config`.
+# (see `webos-satellite --help`). Check a file with `--check-config`: it
+# rejects unknown keys and bad values (naming the key) and prints warnings,
+# for example when noise_psk_file is readable by group or other.
+# Reference: docs/development.md#configuration-reference
 
 # "wake": stream continuously while Home Assistant runs the wake word
 #         (server-side openWakeWord, ADR 0003).

@@ -140,7 +140,8 @@ fn map_err(e: ureq::Error) -> PlaybackError {
     match e {
         ureq::Error::StatusCode(s) => PlaybackError::Status(s),
         ureq::Error::Timeout(_) => PlaybackError::Timeout,
-        ureq::Error::BadUri(m) => PlaybackError::BadUrl(m),
+        // The message of `BadUri` can echo the URL, which may carry a token.
+        ureq::Error::BadUri(_) => PlaybackError::BadUrl("malformed URL".into()),
         ureq::Error::BodyExceedsLimit(limit) => PlaybackError::TooLarge { limit },
         ureq::Error::Tls(_) | ureq::Error::Rustls(_) | ureq::Error::Pem(_) => {
             PlaybackError::Tls(e.to_string())

@@ -339,7 +339,8 @@ impl Daemon {
                 Self::log_line(self.runs.run_end());
             }
             AppEvent::Error { code, message } => {
-                log::warn!("HA pipeline error {code}: {message}");
+                log::warn!("HA pipeline error {code}");
+                log::debug!("HA pipeline error message: {message:?}");
                 self.runs.error(&code);
             }
             AppEvent::MuteChanged(muted) => {

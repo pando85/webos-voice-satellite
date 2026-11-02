@@ -1,7 +1,8 @@
 //! Minimal stderr logger with UTC timestamps.
 //!
-//! Policy (enforced by the call sites, not here): never log audio content,
-//! Noise keys or URLs with tokens; transcripts and reply text only at debug.
+//! Policy (enforced by the call sites, not here; see docs/development.md,
+//! "Logging policy"): never log audio content, Noise keys or URLs with
+//! tokens; transcripts and reply text only at debug. Output goes to stderr.
 
 use std::io::Write as _;
 use std::time::{SystemTime, UNIX_EPOCH};

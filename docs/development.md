@@ -1,6 +1,6 @@
 # Development
 
-How to build, test and run the Rust workspace. Status: Phase 1.4/1.5. `webos-satellite` is the working daemon (capture → front-end → ESPHome API → reply playback). For what was verified, see [P1 HA integration](discovery/c3-a/P1-ha-integration.md) and [P1 TV live](discovery/c3-a/P1-tv-live.md); for what comes next, see the [roadmap](project/roadmap.md).
+How to build, test and run the Rust workspace. Status: Phase 1.4/1.5/1.7. `webos-satellite` is the working daemon (capture → front-end → ESPHome API → reply playback). For what was verified, see [P1 HA integration](discovery/c3-a/P1-ha-integration.md) and [P1 TV live](discovery/c3-a/P1-tv-live.md); for what comes next, see the [roadmap](project/roadmap.md).
 
 ## Layout
 
@@ -16,6 +16,7 @@ How to build, test and run the Rust workspace. Status: Phase 1.4/1.5. `webos-sat
 | `crates/esphome-api` | ESPHome native API device server and voice state machine ([details](development/esphome-api.md)) |
 | `crates/playback` | TTS fetch, decode, resample, `pacat`/WAV/null sinks |
 | `config/example.toml` | Commented configuration with all defaults |
+| `packaging/webos/` | POSIX sh install, start, stop, status and uninstall scripts for a TV ([below](#install-on-a-tv-non-persistent)) |
 | `tools/esphome-fake-ha/` | Fake-HA harnesses (`run.sh`) and the HA bridge (`ha_bridge.py`) |
 
 Keep the root files minimal and stable; add per-crate dependencies in the crate's own `Cargo.toml`, with versions declared once in `[workspace.dependencies]`. Workspace lints forbid `unsafe` code; a crate that genuinely needs it (for example tinyalsa ioctls in `capture`) must opt out locally and say why.
@@ -58,8 +59,10 @@ Versions used for the recorded builds: rustc 1.99.1, cargo-zigbuild 0.24.0, zig 
 | `make deploy-tv` | Builds both, then `scp` to the TV's `/tmp` as `webos-satellite-armv7` and `webos-satellite-aarch64` |
 | `make run-tv-selftest` | Runs `--self-test` of each deployed binary over `ssh` |
 | `make clean-tv` | Deletes the deployed binaries from the TV's `/tmp` |
+| `make tv-install-tmp` | Builds, then installs under `TV_PREFIX` (default `/tmp/webos-satellite`) with `TV_CONFIG=<toml>` and `TV_PSK=<key file>`; starts nothing ([below](#install-on-a-tv-non-persistent)) |
+| `make tv-uninstall-tmp` | Runs the installed `uninstall.sh` (stop, remove the prefix) and removes the staging directory |
 
-Variables: `TV` (default `root@webos-tv`; set your TV's address with `TV=root@<host>` or in a gitignored `local.mk` containing `TV = root@<host>`), `TV_DIR` (default `/tmp`), `TIMEOUT`. All `ssh` and `scp` calls use `timeout` and an SSH ControlMaster socket.
+Variables: `TV_PREFIX`, `TV_CONFIG`, `TV_PSK` (install targets), `TV` (default `root@webos-tv`; set your TV's address with `TV=root@<host>` or in a gitignored `local.mk` containing `TV = root@<host>`), `TV_DIR` (default `/tmp`), `TIMEOUT`. All `ssh` and `scp` calls use `timeout` and an SSH ControlMaster socket.
 
 ## Running on a TV: rules
 
@@ -100,10 +103,71 @@ Behaviour:
 - `mode = "wake"`: as soon as HA subscribes, the satellite streams the mic continuously and HA's pipeline runs the wake word. `mode = "ptt"`: `kill -USR1 <pid>` starts one run at speech-to-text. A SIGUSR1 also works in wake mode, where it aborts the wake word run. `--ptt-on-connect` and `--ptt-every SECS` are test aids.
 - Audio is sent only while HA asks for it. If the mic is busy (LG hands-free holds the PCM), the satellite logs `MIC BUSY` and retries with a backoff of up to 30 s.
 - Replies: HA streams the TTS as 16 kHz mono PCM. The `pacat` sink writes it to PulseAudio as it arrives, multiplied by `sink.gain` (use `0.0` for silent tests; `pacat --volume` is ignored on c3-a). The `wav` sink writes one file per reply. Each playback logs its count of non-zero samples.
-- Logs go to stderr: one latency line per run. Transcripts and reply text appear only at `debug`. Keys and token URLs are never logged.
+- Logs go to stderr: one latency line per run. Transcripts and reply text appear only at `debug`. Keys and token URLs are never logged ([policy](#logging-policy)).
 - SIGTERM/SIGINT stop playback (killing `pacat`), release the PCM and disconnect HA.
 
-On the TV (rules in "Running on a TV" above): copy the static armv7 binary, the config and the key to `/tmp`, set `[mic] source = "alsa"` (defaults are the c3-a values), and start it in the background with its log in `/tmp`. Delete everything afterwards. Nothing is installed or persisted.
+On the TV, use the scripts in [Install on a TV](#install-on-a-tv-non-persistent) rather than copying files by hand.
+
+### Configuration reference
+
+[config/example.toml](../config/example.toml) is the reference: every key with its default and a comment, and a unit test fails if the file and the code's defaults drift apart. Rules:
+
+- Every key is optional. Unknown sections and keys are **rejected** with the key name and line (`deny_unknown_fields`), so a typo cannot silently fall back to a default.
+- Relative paths in the file resolve against the file's directory; on the command line against the current directory. Command-line options override the file whatever their position.
+- `validate()` (also run by `--check-config`) rejects, naming the key: an unknown `log.level`, `mic.rate` other than 16000, zero `mic.channels`, `period_frames` or `port`, `buffer_frames` smaller than `period_frames`, `mic.source = "file"` without `mic.path`, `dsp.channel = "right"` on a mono mic, out-of-range `dsp.gain_db` (-20 to 60) or `sink.gain` (0 to 4), zero `sink.rate`, `sink.channels` or `sink.latency_msec`, both `noise_psk` and `noise_psk_file`, no key without `allow_plaintext`, and a node name or key the ESPHome layer rejects.
+- Non-fatal **warnings** (printed by `--check-config`, logged at `warn` at startup, never containing a secret): `noise_psk_file` readable by group or other (with the actual mode and `chmod 600`), `noise_psk` set inline, plaintext allowed, `mic.path` missing.
+
+### Logging policy
+
+Logs go to **stderr**. The ops scripts redirect it to `<prefix>/log/webos-satellite.log`, a file in the (non-persistent) install directory, with size-based rotation (see below); never to syslog or the journal, which may persist and are read by other tools. Format: `UTC-timestamp LEVEL message`.
+
+| Level | Content |
+| --- | --- |
+| `error` | Capture failures other than a busy mic, fatal errors |
+| `warn` | Mic busy past a few retries, HA disconnects, pipeline error **codes**, SPEAKER-mode oddities, config warnings, test triggers enabled |
+| `info` (default) | Startup (version, target, config summary without secrets), HA connect and disconnect with the peer address, run lifecycle, one latency line per run, character **counts** of transcripts and replies, playback statistics, shutdown |
+| `debug` | Transcript text, reply text, announcement text, HA's error message text, event names with payload sizes, retry timing |
+| `trace` | Protocol message names (never payloads) |
+
+Never logged at any level:
+
+- audio (the capture path logs counts only; `AppEvent` and `AppCommand` have a hand-written `Debug` that prints sizes, so `{ev:?}` cannot dump PCM);
+- the Noise key (`Config` and `DeviceSection` redact it in `Debug`; the summary prints only `encryption=noise`);
+- Home Assistant tokens and TTS or announcement URLs, which may carry `authSig` or token parameters: only `scheme://host/first-segment/…` is logged (`redact_url`), and the HTTP client's malformed-URL message is replaced because it can echo the URL;
+- the conversation id (`<set>` only).
+
+What does appear: the LAN address of HA (peer of the API connection) and the device name. A leak review of the logs is part of every Phase 1 TV run: start with `level = "debug"`, send canary strings through a client (transcript, reply, URL with token, error message) and grep the log for them and for the key (done for 1.7, see [P1 ops](discovery/c3-a/P1-ops.md)).
+
+## Install on a TV (non-persistent)
+
+The scripts in [`packaging/webos/`](../packaging/webos) are POSIX sh (checked with `sh -n` and ShellCheck, BusyBox ash compatible). Everything lives under one prefix directory; nothing is written elsewhere. Layout: `bin/` (daemon, scripts), `etc/` (`config.toml`, `noise_psk`, mode 0600), `run/` (pidfiles), `log/`, `out/` (a place for a WAV sink), and a marker file `.webos-satellite-install`.
+
+| Script | Purpose |
+| --- | --- |
+| `install.sh --prefix DIR --config FILE [--binary FILE] [--psk-file FILE]` | Copies binary, scripts, config and key (0700 dirs, 0600 files), validates the config with `--check-config`. Refuses a non-empty directory that is not a previous install. Refuses prefixes outside `/tmp`, `/run` and `/dev/shm` unless `--persistent` (owner authorization required). The config has no default on purpose: the example config plays audio |
+| `start.sh` | Starts the daemon in the background (`nohup`, stdin from `/dev/null`), pidfile in `run/`, log in `log/`; checks after 1 s that it is still alive and prints the log tail if not |
+| `stop.sh` | SIGTERM, waits up to 10 s, then SIGKILL; removes the pidfiles. The pid is only trusted if `/proc/<pid>/exe` is the installed binary |
+| `status.sh` | Running or not (exit 0 or 3), RSS, log size, last log lines |
+| `uninstall.sh` | Stops, then `rm -rf` of the prefix. Refuses `/`, empty or relative paths, `..` components, symbolic links, system directories (`/tmp` itself, `/var`, `/media/developer`, ...) and any directory without the marker file |
+
+The installed scripts find their prefix from their own location (`DIR/bin/..`); from the repository they take `--prefix DIR`.
+
+**Log rotation.** Logs go to a file, not to syslog (`logger`), see the policy above. `start.sh` moves a log larger than `WEBOS_SAT_LOG_MAX` bytes (default 262144) to `webos-satellite.log.1` at each start, and a small sidecar (`rotate.sh`, one `sh` process, stopped with the daemon) checks every 30 s and copies the log to `.log.1` and truncates it above the limit. At most about twice the limit is on the tmpfs. At `info` the volume is a few lines per run.
+
+```sh
+# From the PC, with the owner's authorization for the TV session:
+make tv-install-tmp TV=root@<host> TV_CONFIG=devices/private/<device>/tv.toml TV_PSK=devices/private/<device>/noise_psk
+ssh root@<host> 'sh /tmp/webos-satellite/bin/start.sh'
+ssh root@<host> 'sh /tmp/webos-satellite/bin/status.sh'
+ssh root@<host> 'sh /tmp/webos-satellite/bin/stop.sh'
+make tv-uninstall-tmp TV=root@<host>
+```
+
+The config's `noise_psk_file = "noise_psk"` resolves to `etc/noise_psk`. For silent tests use `[sink] type = "null"` or `"wav"` with `dir = "../out"`, or `"pacat"` with `gain = 0.0`. `pacat --volume` is ignored on c3-a.
+
+**No autostart.** These scripts do not hook into boot. Autostart is Phase 3 and needs the owner's approval; the place it would go is a script in `/var/lib/webosbrew/init.d` (run by `run-parts` at early boot, with failsafe-mode risk, see [D0-D1](discovery/c3-a/D0-D1-runtime.md)) that calls `start.sh` with a persistent prefix. Nothing is added there today, and `--persistent` has not been used.
+
+The before/after result on c3-a is in [P1 ops](discovery/c3-a/P1-ops.md).
 
 ### Testing without HA reaching the device
 
@@ -113,7 +177,7 @@ When HA cannot open a connection to the satellite (the situation on the owner's 
 
 ## CI
 
-- [`.github/workflows/validate.yml`](../.github/workflows/validate.yml): documentation checks (`sh -n tools/probe/probe.sh`, `python3 tools/check_docs.py`).
+- [`.github/workflows/validate.yml`](../.github/workflows/validate.yml): documentation checks (`sh -n tools/probe/probe.sh`, `sh -n` of `packaging/webos/*.sh`, `python3 tools/check_docs.py`).
 - [`.github/workflows/rust.yml`](../.github/workflows/rust.yml): `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test` on the host; then the armv7 and aarch64 cross-builds, ELF checks, a run of the armv7 binary under `qemu-user-static`, and the armv7 binary uploaded as a short-lived workflow artifact.
 
 Actions are pinned to commit SHAs with the version in a comment. Update them deliberately.
@@ -124,4 +188,6 @@ Actions are pinned to commit SHAs with the version in a comment. Update them del
 make lint test
 python3 tools/check_docs.py
 sh -n tools/probe/probe.sh
+for f in packaging/webos/*.sh; do sh -n "$f"; done
+shellcheck -x -P SCRIPTDIR -s sh packaging/webos/*.sh   # if installed
 ```

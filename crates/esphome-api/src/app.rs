@@ -1,5 +1,6 @@
 //! Messages between the server and the application (capture, playback).
 
+use std::fmt;
 use std::net::SocketAddr;
 
 /// How a pipeline run starts.
@@ -14,7 +15,11 @@ pub enum PipelineMode {
 }
 
 /// Event from the server to the application.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Debug` is written by hand and never prints payloads (audio bytes, URLs,
+/// transcripts, reply text): it shows variant names and sizes only, so
+/// `{ev:?}` in a log line cannot leak them.
+#[derive(Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum AppEvent {
     /// HA completed the hello exchange.
@@ -93,7 +98,9 @@ pub enum AppEvent {
 }
 
 /// Command from the application to the server.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Debug` never prints the audio samples (sizes only).
+#[derive(Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum AppCommand {
     /// Microphone audio: 16 kHz, signed 16-bit, mono. Forwarded only while
@@ -120,4 +127,133 @@ pub enum AppCommand {
     },
     /// Mute or unmute the microphone (reported to HA via the switch entity).
     SetMuted(bool),
+}
+
+impl fmt::Debug for AppEvent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::HaConnected { client_info, peer } => f
+                .debug_struct("HaConnected")
+                .field("client_info", client_info)
+                .field("peer", peer)
+                .finish(),
+            Self::HaDisconnected => f.write_str("HaDisconnected"),
+            Self::StartStreaming {
+                wake_word,
+                conversation_id,
+            } => f
+                .debug_struct("StartStreaming")
+                .field("wake_word", wake_word)
+                .field(
+                    "conversation_id",
+                    &conversation_id.as_ref().map(|_| "<set>"),
+                )
+                .finish(),
+            Self::StopStreaming => f.write_str("StopStreaming"),
+            Self::WakeWordDetected => f.write_str("WakeWordDetected"),
+            Self::Transcript(t) => write!(f, "Transcript(<{} bytes>)", t.len()),
+            Self::IntentEnd {
+                speech,
+                continue_conversation,
+            } => f
+                .debug_struct("IntentEnd")
+                .field("speech_bytes", &speech.len())
+                .field("continue_conversation", continue_conversation)
+                .finish(),
+            Self::TtsUrl(u) => write!(f, "TtsUrl(<url, {} bytes>)", u.len()),
+            Self::TtsStreamStart {
+                sample_rate,
+                channels,
+                sample_width,
+            } => f
+                .debug_struct("TtsStreamStart")
+                .field("sample_rate", sample_rate)
+                .field("channels", channels)
+                .field("sample_width", sample_width)
+                .finish(),
+            Self::TtsAudio(d) => write!(f, "TtsAudio(<{} bytes>)", d.len()),
+            Self::TtsStreamEnd => f.write_str("TtsStreamEnd"),
+            Self::Announce {
+                url,
+                preannounce_url,
+                text,
+                start_conversation,
+            } => f
+                .debug_struct("Announce")
+                .field("url_bytes", &url.len())
+                .field("preannounce", &preannounce_url.is_some())
+                .field("text_bytes", &text.len())
+                .field("start_conversation", start_conversation)
+                .finish(),
+            Self::StopPlayback => f.write_str("StopPlayback"),
+            Self::RunEnd => f.write_str("RunEnd"),
+            Self::Error { code, message } => f
+                .debug_struct("Error")
+                .field("code", code)
+                .field("message_bytes", &message.len())
+                .finish(),
+            Self::MuteChanged(m) => write!(f, "MuteChanged({m})"),
+        }
+    }
+}
+
+impl fmt::Debug for AppCommand {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Audio(a) => write!(f, "Audio(<{} samples>)", a.len()),
+            Self::StartPipeline { mode } => {
+                f.debug_struct("StartPipeline").field("mode", mode).finish()
+            }
+            Self::StopPipeline => f.write_str("StopPipeline"),
+            Self::PlaybackFinished { success } => f
+                .debug_struct("PlaybackFinished")
+                .field("success", success)
+                .finish(),
+            Self::AnnounceFinished { success } => f
+                .debug_struct("AnnounceFinished")
+                .field("success", success)
+                .finish(),
+            Self::SetMuted(m) => write!(f, "SetMuted({m})"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn debug_output_never_contains_payloads() {
+        let events = [
+            AppEvent::Transcript("turn on the secret lamp".to_owned()),
+            AppEvent::TtsUrl("http://h/api/tts_proxy/SECRET.flac?authSig=SECRET".to_owned()),
+            AppEvent::TtsAudio(vec![0x53, 0x45, 0x43, 0x52, 0x45, 0x54]),
+            AppEvent::IntentEnd {
+                speech: "SECRET reply".to_owned(),
+                continue_conversation: false,
+            },
+            AppEvent::Announce {
+                url: "http://h/a?authSig=SECRET".to_owned(),
+                preannounce_url: Some("http://h/b?authSig=SECRET".to_owned()),
+                text: "SECRET text".to_owned(),
+                start_conversation: false,
+            },
+            AppEvent::StartStreaming {
+                wake_word: true,
+                conversation_id: Some("SECRET".to_owned()),
+            },
+            AppEvent::Error {
+                code: "stt-failed".to_owned(),
+                message: "SECRET".to_owned(),
+            },
+        ];
+        for e in &events {
+            let d = format!("{e:?}");
+            assert!(!d.contains("SECRET") && !d.contains("secret"), "{d}");
+            assert!(!d.contains("83, 69"), "{d}");
+        }
+        let d = format!("{:?}", AppCommand::Audio(vec![1234, -4321]));
+        assert!(!d.contains("1234"), "{d}");
+        assert!(format!("{:?}", AppEvent::TtsAudio(vec![0; 10])).contains("10 bytes"));
+    }
 }

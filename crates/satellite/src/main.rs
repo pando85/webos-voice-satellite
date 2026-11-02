@@ -46,12 +46,18 @@ fn main() -> ExitCode {
         }
         Command::SelfTest => selftest::self_test(),
         Command::CheckConfig(s) => {
+            for w in s.warnings() {
+                eprintln!("warning: {w}");
+            }
             println!("config ok: {}", s.summary());
             ExitCode::SUCCESS
         }
         Command::Run(s, triggers) => {
             // validate() already checked the level.
             logger::init(s.log_level().unwrap_or(log::LevelFilter::Info));
+            for w in s.warnings() {
+                log::warn!("config: {w}");
+            }
             let rt = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()

@@ -426,7 +426,8 @@ impl Voice {
             Ev::VoiceAssistantError => {
                 let code = get("code").unwrap_or_default();
                 let message = get("message").unwrap_or_default();
-                log::info!("voice: HA error {code}: {message}");
+                log::info!("voice: HA error {code}");
+                log::debug!("voice: HA error message: {message:?}");
                 self.stop_streaming(false);
                 self.run.error = Some(code.clone());
                 self.app(AppEvent::Error { code, message });

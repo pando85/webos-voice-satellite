@@ -38,6 +38,33 @@ impl log::Log for StderrLogger {
 fn event_line(ev: &AppEvent) -> String {
     match ev {
         AppEvent::TtsAudio(data) => format!("TtsAudio(len={})", data.len()),
+        // `AppEvent`'s `Debug` hides payloads (so logs cannot leak them); this
+        // test harness prints them in full for the checks in fake_ha.py.
+        AppEvent::Transcript(t) => format!("Transcript({t:?})"),
+        AppEvent::IntentEnd {
+            speech,
+            continue_conversation,
+        } => format!(
+            "IntentEnd {{ speech: {speech:?}, continue_conversation: {continue_conversation} }}"
+        ),
+        AppEvent::TtsUrl(u) => format!("TtsUrl({u:?})"),
+        AppEvent::Announce {
+            url,
+            preannounce_url,
+            text,
+            start_conversation,
+        } => format!(
+            "Announce {{ url: {url:?}, preannounce_url: {preannounce_url:?}, text: {text:?}, start_conversation: {start_conversation} }}"
+        ),
+        AppEvent::Error { code, message } => {
+            format!("Error {{ code: {code:?}, message: {message:?} }}")
+        }
+        AppEvent::StartStreaming {
+            wake_word,
+            conversation_id,
+        } => format!(
+            "StartStreaming {{ wake_word: {wake_word}, conversation_id: {conversation_id:?} }}"
+        ),
         other => format!("{other:?}"),
     }
 }

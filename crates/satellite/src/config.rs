@@ -280,6 +280,20 @@ impl Default for LogSection {
     }
 }
 
+/// The permission bits of `path` if group or other have any access
+/// (unreadable or non-Unix: `None`).
+#[cfg(unix)]
+fn loose_mode(path: &Path) -> Option<u32> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let mode = std::fs::metadata(path).ok()?.permissions().mode() & 0o777;
+    (mode & 0o077 != 0).then_some(mode)
+}
+
+#[cfg(not(unix))]
+fn loose_mode(_path: &Path) -> Option<u32> {
+    None
+}
+
 /// Error loading or validating the configuration.
 #[derive(Debug)]
 pub(crate) struct ConfigError(pub(crate) String);
@@ -358,6 +372,20 @@ impl Settings {
         if self.sink.rate == 0 || self.sink.channels == 0 {
             return Err(err("sink.rate and sink.channels must be non-zero"));
         }
+        if self.sink.latency_msec == Some(0) {
+            return Err(err("sink.latency_msec must be at least 1 (or unset)"));
+        }
+        if self.device.port == 0 {
+            return Err(err("device.port must be between 1 and 65535"));
+        }
+        if self.mic.period_frames == 0 || self.mic.buffer_frames < self.mic.period_frames {
+            return Err(err(
+                "mic.period_frames must be non-zero and mic.buffer_frames at least as large",
+            ));
+        }
+        if self.dsp.channel == Channel::Right && self.mic.channels < 2 {
+            return Err(err("dsp.channel = \"right\" needs mic.channels >= 2"));
+        }
         if self.device.noise_psk.is_some() && self.device.noise_psk_file.is_some() {
             return Err(err(
                 "set only one of device.noise_psk and device.noise_psk_file",
@@ -375,6 +403,38 @@ impl Settings {
             .validate()
             .map_err(|e| err(format!("device: {e}")))?;
         Ok(())
+    }
+
+    /// Non-fatal findings about the configuration, for the startup log and
+    /// `--check-config`. Never includes secret values.
+    pub(crate) fn warnings(&self) -> Vec<String> {
+        let mut w = Vec::new();
+        if self.device.allow_plaintext
+            && self.device.noise_psk.is_none()
+            && self.device.noise_psk_file.is_none()
+        {
+            w.push("device.allow_plaintext: the API is unencrypted (development only)".to_owned());
+        }
+        if self.device.noise_psk.is_some() {
+            w.push(
+                "device.noise_psk is set inline: the config file now holds a secret; prefer device.noise_psk_file"
+                    .to_owned(),
+            );
+        }
+        if let Some(path) = &self.device.noise_psk_file {
+            if let Some(mode) = loose_mode(path) {
+                w.push(format!(
+                    "device.noise_psk_file {} has mode {mode:04o}: group/other can read the key; run chmod 600",
+                    path.display()
+                ));
+            }
+        }
+        if self.mic.source == MicSource::File {
+            if let Some(p) = self.mic.path.as_ref().filter(|p| !p.exists()) {
+                w.push(format!("mic.path {} does not exist", p.display()));
+            }
+        }
+        w
     }
 
     /// The Noise key, read from the file if configured. Never logged.
@@ -630,6 +690,8 @@ mod tests {
 
     use super::*;
 
+    type Mutate = fn(&mut Settings);
+
     fn args(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| (*s).to_owned()).collect()
     }
@@ -733,6 +795,72 @@ level = "debug"
         let mut bad = s;
         bad.device.noise_psk = Some("AAAA".to_owned());
         assert!(bad.validate().is_err(), "short key must be rejected");
+    }
+
+    #[test]
+    fn validation_messages_name_the_key() {
+        let mut s = Settings::default();
+        s.device.allow_plaintext = true;
+        let cases: [(Mutate, &str); 6] = [
+            (|s| s.mic.rate = 44_100, "mic.rate"),
+            (|s| s.sink.latency_msec = Some(0), "sink.latency_msec"),
+            (|s| s.device.port = 0, "device.port"),
+            (|s| s.mic.buffer_frames = 16, "mic.buffer_frames"),
+            (
+                |s| {
+                    s.dsp.channel = Channel::Right;
+                    s.mic.channels = 1;
+                },
+                "dsp.channel",
+            ),
+            (|s| s.dsp.hpf_hz = -1.0, "dsp.hpf_hz"),
+        ];
+        for (mutate, key) in cases {
+            let mut bad = s.clone();
+            mutate(&mut bad);
+            let e = bad.validate().unwrap_err();
+            assert!(e.0.contains(key), "{key}: {e}");
+        }
+        // TOML syntax and type errors carry the position and key.
+        let e = Settings::from_toml("[mic]\nrate = \"fast\"\n", Path::new(".")).unwrap_err();
+        assert!(e.0.contains("rate") && e.0.contains("line 2"), "{e}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn warns_when_the_psk_file_is_readable_by_others() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = std::env::temp_dir().join(format!("webos-sat-perm-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        let path = dir.join("psk");
+        std::fs::write(&path, key).unwrap();
+        let s = Settings::from_toml("[device]\nnoise_psk_file = \"psk\"\n", &dir).unwrap();
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let w = s.warnings();
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("0644") && w[0].contains("chmod 600"), "{w:?}");
+        assert!(!w[0].contains(key));
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(s.warnings().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn warns_about_plaintext_inline_key_and_missing_mic_file() {
+        let mut s = Settings::default();
+        s.device.allow_plaintext = true;
+        assert!(s.warnings()[0].contains("unencrypted"));
+        s.device.allow_plaintext = false;
+        s.device.noise_psk = Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned());
+        let w = s.warnings();
+        assert!(w[0].contains("inline"), "{w:?}");
+        assert!(!w[0].contains("AAAA"));
+        s.mic.source = MicSource::File;
+        s.mic.path = Some(PathBuf::from("/nonexistent/webos-sat.raw"));
+        assert!(s.warnings().iter().any(|m| m.contains("does not exist")));
     }
 
     #[test]
