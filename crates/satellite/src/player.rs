@@ -323,6 +323,11 @@ impl Player {
     }
 }
 
+/// `--latency-msec` for `pacat`, or nothing when `sink.latency_msec` is 0.
+fn latency_args(cfg: &SinkSection) -> Option<String> {
+    (cfg.latency_msec > 0).then(|| format!("--latency-msec={}", cfg.latency_msec))
+}
+
 fn pacat_stream_args(cfg: &SinkSection, rate: u32, channels: u16) -> Vec<String> {
     let mut a = vec![
         "--playback".to_owned(),
@@ -333,9 +338,7 @@ fn pacat_stream_args(cfg: &SinkSection, rate: u32, channels: u16) -> Vec<String>
         "--client-name=webos-voice-satellite".to_owned(),
         "--stream-name=tts-reply".to_owned(),
     ];
-    if let Some(ms) = cfg.latency_msec {
-        a.push(format!("--latency-msec={ms}"));
-    }
+    a.extend(latency_args(cfg));
     if let Some(d) = &cfg.device {
         a.push(format!("--device={d}"));
     }
@@ -486,6 +489,7 @@ fn url_sink(cfg: &SinkSection, id: u64, kind: Kind) -> (Box<dyn Sink>, Option<Pa
             p.channels = cfg.channels;
             p.gain = cfg.gain;
             p.device.clone_from(&cfg.device);
+            p.extra_args.extend(latency_args(cfg));
             (Box::new(p), None)
         }
         SinkKind::Wav => {
@@ -605,11 +609,21 @@ mod tests {
         assert!(a.contains(&"--rate=16000".to_owned()));
         assert!(a.contains(&"--channels=1".to_owned()));
         assert!(!a.iter().any(|x| x.starts_with("--volume")));
-        cfg.latency_msec = Some(200);
+        assert!(
+            a.contains(&"--latency-msec=200".to_owned()),
+            "200 ms is the default"
+        );
+        cfg.latency_msec = 350;
         cfg.device = Some("pcm_output".to_owned());
         let a = pacat_stream_args(&cfg, 16_000, 1);
-        assert!(a.contains(&"--latency-msec=200".to_owned()));
+        assert!(a.contains(&"--latency-msec=350".to_owned()));
         assert!(a.contains(&"--device=pcm_output".to_owned()));
+        cfg.latency_msec = 0;
+        let a = pacat_stream_args(&cfg, 16_000, 1);
+        assert!(
+            !a.iter().any(|x| x.starts_with("--latency-msec")),
+            "0 leaves PulseAudio's default"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

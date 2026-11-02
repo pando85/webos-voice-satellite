@@ -13,6 +13,13 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
+/// Default `sink.latency_msec`: P2 session 1 on c3-a measured the reply start
+/// about 0.1 s after the TTS stream started with 200 ms, against about 1.5 s
+/// with PulseAudio's default buffering.
+pub(crate) const DEFAULT_LATENCY_MSEC: u32 = 200;
+/// Upper bound accepted for `sink.latency_msec`.
+pub(crate) const MAX_LATENCY_MSEC: u32 = 10_000;
+
 /// Whole configuration.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
@@ -261,8 +268,10 @@ pub(crate) struct SinkSection {
     pub(crate) rate: u32,
     /// Channels for decoded URL/announcement audio sent to `pacat`.
     pub(crate) channels: u16,
-    /// `pacat --latency-msec` for streamed TTS (unset: PulseAudio default).
-    pub(crate) latency_msec: Option<u32>,
+    /// `pacat --latency-msec` for replies and announcements, in ms. 0 omits
+    /// the flag (PulseAudio's default buffering, about 2 s, which delayed the
+    /// start of short streamed replies by about 1.5 s on c3-a).
+    pub(crate) latency_msec: u32,
     /// Output directory of the WAV sink.
     pub(crate) dir: PathBuf,
 }
@@ -276,7 +285,7 @@ impl Default for SinkSection {
             device: None,
             rate: 44_100,
             channels: 2,
-            latency_msec: None,
+            latency_msec: DEFAULT_LATENCY_MSEC,
             dir: PathBuf::from("."),
         }
     }
@@ -455,8 +464,10 @@ impl Settings {
         if self.sink.rate == 0 || self.sink.channels == 0 {
             return Err(err("sink.rate and sink.channels must be non-zero"));
         }
-        if self.sink.latency_msec == Some(0) {
-            return Err(err("sink.latency_msec must be at least 1 (or unset)"));
+        if self.sink.latency_msec > MAX_LATENCY_MSEC {
+            return Err(err(format!(
+                "sink.latency_msec must be between 0 (PulseAudio default) and {MAX_LATENCY_MSEC}"
+            )));
         }
         if !(-20..=19).contains(&self.limits.nice) {
             return Err(err("limits.nice must be between -20 and 19"));
@@ -654,8 +665,9 @@ impl Settings {
         };
         let sink = match self.sink.kind {
             SinkKind::Pacat => format!(
-                "pacat gain={} device={}",
+                "pacat gain={} latency_msec={} device={}",
                 self.sink.gain,
+                self.sink.latency_msec,
                 self.sink.device.as_deref().unwrap_or("default")
             ),
             SinkKind::Wav => format!("wav dir={}", self.sink.dir.display()),
@@ -935,6 +947,29 @@ level = "debug"
     }
 
     #[test]
+    fn sink_latency_defaults_to_200_and_0_means_pulseaudio_default() {
+        let base = Path::new(".");
+        assert_eq!(Settings::default().sink.latency_msec, 200);
+        let mut s = Settings::from_toml("[sink]\nlatency_msec = 0\n", base).unwrap();
+        s.device.allow_plaintext = true;
+        assert_eq!(s.sink.latency_msec, 0);
+        assert!(s.validate().is_ok(), "0 is accepted");
+        assert!(s.summary().contains("latency_msec=0"));
+        s.sink.latency_msec = MAX_LATENCY_MSEC;
+        assert!(s.validate().is_ok());
+        s.sink.latency_msec = MAX_LATENCY_MSEC + 1;
+        let e = s.validate().unwrap_err().to_string();
+        assert!(e.contains("sink.latency_msec"), "{e}");
+        for bad in ["-1", "1.5", "\"200\""] {
+            let toml = format!("[sink]\nlatency_msec = {bad}\n");
+            assert!(
+                Settings::from_toml(&toml, base).is_err(),
+                "latency_msec = {bad} must be rejected"
+            );
+        }
+    }
+
+    #[test]
     fn voice_feature_keys_map_onto_the_flags() {
         use webos_esphome_api::features as f;
         assert_eq!(Settings::default().voice_features(), 23);
@@ -1017,7 +1052,7 @@ level = "debug"
         s.device.allow_plaintext = true;
         let cases: [(Mutate, &str); 11] = [
             (|s| s.mic.rate = 44_100, "mic.rate"),
-            (|s| s.sink.latency_msec = Some(0), "sink.latency_msec"),
+            (|s| s.sink.latency_msec = 10_001, "sink.latency_msec"),
             (|s| s.device.port = 0, "device.port"),
             (|s| s.mic.buffer_frames = 16, "mic.buffer_frames"),
             (

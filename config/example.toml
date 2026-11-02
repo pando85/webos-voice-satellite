@@ -87,7 +87,10 @@ binary = "pacat"
 # 16 kHz mono. rate/channels apply to decoded URL media (announcements).
 rate = 44100
 channels = 2
-# latency_msec = 200     # pacat --latency-msec for streamed TTS (untested)
+# pacat --latency-msec for replies and announcements. 0 = PulseAudio's
+# default buffering (about 2 s), which delayed the start of short streamed
+# replies by about 1.5 s on c3-a; 200 started them within about 0.1 s.
+latency_msec = 200
 dir = "."                # wav sink output directory
 
 [log]
