@@ -209,6 +209,51 @@ Levels are dBFS of each PCM's own full scale, so mic and reference levels are no
 absolute terms. Coherence uses 8192-point Welch segments; shorter segments underestimate it for
 reverberant paths.
 
+## Phase 2 accuracy and false-wake runs through Home Assistant
+
+Used in [P2 session 2](../../docs/discovery/c3-a/P2-session2-wake-accuracy.md). All of them talk to
+HA's WebSocket API with a token file (a bare access token, or the JSON from HA's `/auth/token`
+with a refresh token, renewed in place with mode 0600; tokens are never printed). They need
+`aiohttp` in the rig venv (`.venv/bin/pip install aiohttp`). Scoring follows
+[P2 corpus and metrics](../../docs/experiments/P2-corpus.md).
+
+- `ha_ws.py`: the small WebSocket client, plus `summarize_run()` (wake word id and audio
+  timestamp, STT text, intent response type, errors of one `assist_pipeline/pipeline_debug` run).
+- `p2_digital.py`: the **digital baseline**. Streams each corpus item (16 kHz mono, 2 s lead-in,
+  3 s tail, at real-time speed) into HA's pipeline as `assist_pipeline/run` from `wake_word` to
+  `stt`, so the conversation agent is never called. Faster than real time loses the audio between
+  the detection and the start of STT. The pipeline's wake word timeout is set to 60 s (the API's
+  default is 3 s). `--bed mic.raw` mixes each item, at `--speech-gain-db` (default -39 dB: the rig
+  reference level at the TV mic, from D3), into a real TV-mic recording and applies the satellite's
+  front-end emulation before streaming ("semi-synthetic" conditions); `--per-voice N` selects a
+  stratified subset of positives.
+- `p2_runner.py`: live runs through the satellite and HA's real integration. Plays one item at a
+  time with `pw-play --target <sink>` at the `play_record.py` level convention (`--gain-db 12` is
+  the reference), waits until the satellite is idle **and** the next wake word run is armed (newest
+  pipeline run in the `wake_word` stage) plus `--settle`, and records detections (entity `idle` →
+  `listening`, PC time), the pipeline run (STT text, intent response) and the built-in agent's
+  recognition of the transcript and of the reference. `--per-voice N` picks a stratified subset
+  of positives (every voice, alternating alone and with a command).
+- `ha_assist_watch.py`: logs the satellite entity's state changes and condensed pipeline runs with
+  PC times, for false-wake runs while content plays.
+- `content_play.py`: plays content clips from `manifest.csv` one after another on a named sink
+  (`pw-play`), logging start and end times and the category of each.
+- `p2_score.py`: WER normalization (with Spanish numerals), Wilson and exact Poisson intervals,
+  the wake windows, the intent mapping (`INTENT_MAP`, written before the runs), per-condition
+  tables (`--by voice|subkind|expected_intent`) and `--false-wakes WATCH PLAYLOG` per category.
+- `oww_offline.py`: offline python `openwakeword` (ONNX) over a TV-mic recording with the
+  satellite's front-end emulated (ch0, 120 Hz high-pass, +24 dB, S16 saturation). A baseline for
+  recordings the satellite did not stream; it is not HA's Wyoming openWakeWord service.
+
+Tests (synthetic, no network): `.venv/bin/python -m unittest discover -s tools/audio-rig -p 'test_p2_*.py'`.
+
+**No actuation.** HA's built-in agent executes what it recognizes. Several corpus commands match
+real, exposed entities of a home (for example "apaga todas las luces"), so live runs must not use
+a pipeline that can act on uncontrolled transcripts. Session 2 used a temporary pipeline whose
+conversation language matches nothing in Spanish or English (checked with the debug endpoint
+first) and scored intents with the recognition-only endpoint. Check this on your own HA before a
+run.
+
 ## Privacy
 
 Recordings can contain people's voices from the room. Keep them short, local and opt-in; tell
