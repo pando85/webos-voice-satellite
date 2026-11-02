@@ -55,6 +55,16 @@ fn cfg16() -> AecConfig {
     }
 }
 
+#[test]
+fn defaults_follow_the_measurements() {
+    let c = AecConfig::default();
+    assert_eq!(
+        (c.apply, c.delay, c.ns, c.bypass_when_silent),
+        (DelayApply::Hint, DelayMode::Auto, false, false)
+    );
+    assert_eq!((c.reference_rate, c.reference_channels), (48_000, 2));
+}
+
 fn energy(x: &[f32]) -> f64 {
     x.iter().map(|&v| f64::from(v) * f64::from(v)).sum()
 }
@@ -118,8 +128,9 @@ fn cancels_a_synthetic_echo_and_finds_its_delay() {
     };
     assert!((delay_ms - 15.0).abs() < 0.2, "delay {delay_ms}");
     assert!(confidence >= MIN_CONFIDENCE);
-    // Pre-delay applied: 240 - 32 margin.
-    assert_eq!(aec.predelay, 208);
+    // The default passes the delay as sonora's hint, no pre-delay.
+    assert_eq!(aec.predelay, 0);
+    assert_eq!(aec.apm.stream_delay_ms(), 15);
     // ERLE over the last 3 s (the output is 128 samples late).
     let tail = 16_000 * 5;
     let e_mic = energy(&mic[tail..n - 256]);
@@ -170,6 +181,28 @@ fn reference_at_48k_is_decimated_and_the_delay_reported_at_the_tap() {
 }
 
 #[test]
+fn pre_delay_mode_shifts_the_reference() {
+    let n = 16_000 * 6;
+    let reference = noise(n, 0.05, 31);
+    let mic = echo(&reference, 240, 0.3);
+    let mut aec = EchoCanceller::new(AecConfig {
+        apply: DelayApply::PreDelay,
+        ..cfg16()
+    })
+    .unwrap_or_else(|| panic!("config"));
+    let out = run(&mut aec, &mic, &reference);
+    // 240 - 32 margin; the reported delay stays the delay at the tap.
+    assert_eq!(aec.predelay, 208);
+    assert!(aec.delay_ms().is_some_and(|d| (d - 15.0).abs() < 0.2));
+    let tail = 16_000 * 4;
+    let erle = 10.0
+        * (energy(&mic[tail..n - 256])
+            / energy(&out[tail + SONORA_LATENCY..n - 256 + SONORA_LATENCY]))
+        .log10();
+    assert!(erle > 20.0, "ERLE {erle} dB");
+}
+
+#[test]
 fn output_does_not_depend_on_chunking() {
     let n = 16_000 * 2;
     let reference = noise(n, 0.05, 5);
@@ -209,31 +242,30 @@ fn missing_reference_never_blocks_the_mic() {
 
 #[test]
 fn bypass_saves_work_and_keeps_the_output_continuous() {
-    // Reference: loud for 1 s, silent for 2 s, then a very quiet reference
-    // (about -75 dBFS: "active" for the bypass, below AEC3's render activity
-    // level, so AEC3 stays transparent). Mic: near-end noise only. Then the
-    // output must equal the mic delayed by the latency through the bypass
-    // and right from the resume: a stale or missing warm-up would show up
-    // as a mismatch at the switch.
-    let n = 16_000 * 5;
+    // Reference: loud for 6 s, silent for 4 s, then very quiet (about -75
+    // dBFS: "active" for the bypass, below AEC3's render activity level, so
+    // AEC3 stays transparent). Mic: near-end noise only. Then the output
+    // must equal the mic delayed by the latency through the bypass and right
+    // from the resume: a stale or missing warm-up would show at the switch.
+    let n = 16_000 * 12;
     let mut reference = noise(n, 0.05, 9);
-    reference[16_000..48_000].fill(0.0);
-    for v in &mut reference[48_000..] {
+    reference[96_000..160_000].fill(0.0);
+    for v in &mut reference[160_000..] {
         *v *= 0.005;
     }
     let mic = noise(n, 0.02, 10);
-    let mut on = EchoCanceller::new(cfg16()).unwrap_or_else(|| panic!("config"));
-    let mut off = EchoCanceller::new(AecConfig {
-        bypass_when_silent: false,
+    let bypass = AecConfig {
+        bypass_when_silent: true,
         ..cfg16()
-    })
-    .unwrap_or_else(|| panic!("config"));
+    };
+    let mut on = EchoCanceller::new(bypass).unwrap_or_else(|| panic!("config"));
+    let mut off = EchoCanceller::new(cfg16()).unwrap_or_else(|| panic!("config"));
     let out_on = run(&mut on, &mic, &reference);
     let out_off = run(&mut off, &mic, &reference);
     let m_on = on.take_metrics();
     let m_off = off.take_metrics();
-    // 2 s silent minus the 0.5 s hold: about 150 frames bypassed.
-    assert!((140..=152).contains(&m_on.bypassed), "{m_on:?}");
+    // 4 s silent minus the 2 s hold: about 200 frames bypassed.
+    assert!((190..=202).contains(&m_on.bypassed), "{m_on:?}");
     assert_eq!(m_off.bypassed, 0);
     assert!(m_on.processed < m_off.processed);
     let resid_db = |o: &[f32], lo: usize, hi: usize| {
@@ -242,15 +274,30 @@ fn bypass_saves_work_and_keeps_the_output_continuous() {
     };
     // The run without bypass is transparent in both quiet stretches, so the
     // comparison is meaningful.
-    assert!(resid_db(&out_off, 26_000, 47_000) < -100.0);
-    assert!(resid_db(&out_off, 48_400, 60_000) < -60.0);
+    assert!(resid_db(&out_off, 130_000, 159_000) < -100.0);
+    assert!(resid_db(&out_off, 160_400, 180_000) < -60.0);
     // Through the bypass, and from the resume on, the output is the delayed
-    // mic (frame by frame around the switch at 48 000).
-    assert!(resid_db(&out_on, 26_000, 47_000) < -100.0);
-    for f in (47_040..50_000).step_by(FRAME) {
+    // mic (frame by frame around the switch at 160 000).
+    assert!(resid_db(&out_on, 130_000, 159_000) < -100.0);
+    for f in (159_040..162_000).step_by(FRAME) {
         let r = resid_db(&out_on, f, f + FRAME);
         assert!(r < -60.0, "frame at {f}: {r:.1} dB");
     }
+}
+
+#[test]
+fn no_bypass_during_the_warm_up() {
+    // Silent reference from the start: the bypass waits for the warm-up.
+    let mut aec = EchoCanceller::new(AecConfig {
+        bypass_when_silent: true,
+        ..cfg16()
+    })
+    .unwrap_or_else(|| panic!("config"));
+    let mic = noise(16_000 * 6, 0.01, 16);
+    let _ = run(&mut aec, &mic, &vec![0.0; mic.len()]);
+    let m = aec.take_metrics();
+    // Bypass from frame 500 (5 s) on: about 100 frames of 600.
+    assert!((95..=101).contains(&m.bypassed), "{m:?}");
 }
 
 #[test]
@@ -276,13 +323,21 @@ fn fixed_delay_is_applied_at_once_and_not_replaced() {
         ..cfg16()
     })
     .unwrap_or_else(|| panic!("config"));
-    assert_eq!(aec.predelay, 240 - PREDELAY_MARGIN);
+    assert_eq!(aec.apm.stream_delay_ms(), 15);
     let n = 16_000 * 3;
     let reference = noise(n, 0.05, 13);
     let mic = echo(&reference, 400, 0.3);
     let _ = run(&mut aec, &mic, &reference);
-    // The estimate (25 ms) is reported but the fixed pre-delay stays.
+    // The estimate (25 ms) is reported but the fixed hint stays.
     assert!(aec.delay_ms().is_some_and(|d| (d - 25.0).abs() < 0.2));
+    assert_eq!(aec.apm.stream_delay_ms(), 15);
+    // Same with a pre-delay.
+    let aec = EchoCanceller::new(AecConfig {
+        delay: DelayMode::FixedMs(15.0),
+        apply: DelayApply::PreDelay,
+        ..cfg16()
+    })
+    .unwrap_or_else(|| panic!("config"));
     assert_eq!(aec.predelay, 240 - PREDELAY_MARGIN);
 }
 
@@ -293,13 +348,13 @@ fn reset_alignment_reacquires_the_delay() {
     let mic = echo(&reference, 240, 0.3);
     let mut aec = EchoCanceller::new(cfg16()).unwrap_or_else(|| panic!("config"));
     let _ = run(&mut aec, &mic, &reference);
-    assert!(aec.predelay > 0);
+    assert!(aec.delay_ms().is_some_and(|d| (d - 15.0).abs() < 0.2));
     aec.reset_alignment();
-    assert_eq!(aec.predelay, 0);
     assert!(aec.delay_ms().is_none());
     let mic2 = echo(&reference, 300, 0.3);
     let _ = run(&mut aec, &mic2, &reference);
     assert!(aec.delay_ms().is_some_and(|d| (d - 18.75).abs() < 0.2));
+    assert_eq!(aec.apm.stream_delay_ms(), 19);
 }
 
 #[test]

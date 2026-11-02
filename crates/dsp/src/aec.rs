@@ -12,12 +12,16 @@
 //!   that the missing reference is zero-filled and counted.
 //! - **Delay.** A GCC-PHAT estimator ([`crate::delay`]) measures the bulk
 //!   delay at start and every [`RECHECK_SAMPLES`] while the reference is
-//!   active. How a delay is used is [`DelayApply`]: pre-delaying the
-//!   reference so AEC3 sees only a small residual delay, passing it as
-//!   sonora's stream-delay hint, or neither (AEC3's own estimator alone).
-//! - **Bypass.** With [`AecConfig::bypass_when_silent`] (and NS off), sonora
-//!   is skipped while the reference has been silent for [`BYPASS_HOLD`]
-//!   frames; the mic then goes through a [`SONORA_LATENCY`]-sample delay
+//!   active. How a delay is used is [`DelayApply`]: as sonora's stream-delay
+//!   hint (the default), not at all (AEC3's own estimator alone), or as a
+//!   pre-delay of the reference so AEC3 sees only a small residual delay. On
+//!   the c3-a recordings the hint made no measurable difference against AEC3
+//!   alone and the pre-delay was harmful (AEC3 output collapsed to its input
+//!   seconds after the jump), see `docs/design/aec-frontend.md`.
+//! - **Bypass** (off by default). With [`AecConfig::bypass_when_silent`] (and
+//!   NS off), sonora is skipped while the reference has been silent for
+//!   [`BYPASS_HOLD`] frames, never in the first [`BYPASS_WARMUP`] frames of
+//!   a stream; the mic then goes through a [`SONORA_LATENCY`]-sample delay
 //!   line, so the output timing does not change. With AEC3's high-pass
 //!   filter off and a zero reference, sonora's output is the input delayed
 //!   by exactly that latency (a unit test checks it), and on resume one
@@ -56,9 +60,13 @@ pub const SONORA_LATENCY: usize = 128;
 pub const MAX_WAIT_SAMPLES: usize = 480;
 /// Reference frames with a peak below this (-80 dBFS) count as silent.
 pub const SILENT_PEAK: f32 = 1e-4;
-/// Silent reference frames before the bypass starts (500 ms, longer than
-/// the room's echo tail).
-pub const BYPASS_HOLD: u32 = 50;
+/// Silent reference frames before the bypass starts (2 s). A 500 ms hold
+/// cost up to 3 dB of ERLE on c3-a recordings with short gaps in the
+/// reference; 2 s cost nothing on three of four.
+pub const BYPASS_HOLD: u32 = 200;
+/// No bypass in the first frames of a stream (5 s): bypassing while AEC3
+/// was still starting up cost 2 dB of ERLE on a c3-a recording.
+pub const BYPASS_WARMUP: u64 = 500;
 /// Delay re-check period while the reference is active (30 s).
 pub const RECHECK_SAMPLES: u64 = 30 * RATE as u64;
 /// Minimum GCC-PHAT confidence (peak over correlation RMS) to accept a delay.
@@ -87,14 +95,15 @@ pub enum DelayMode {
 /// How a known delay is given to AEC3.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DelayApply {
-    /// Delay the reference by the delay minus [`PREDELAY_MARGIN`].
-    PreDelay,
-    /// Pass it to sonora as the stream-delay hint
-    /// (`set_stream_delay_ms`), which AEC3 uses to initialise its render
-    /// buffer alignment.
+    /// Pass it to sonora as the stream-delay hint (`set_stream_delay_ms`),
+    /// which AEC3 uses to initialise its render buffer alignment after a
+    /// reset. AEC3 keeps estimating the delay itself. The default.
     Hint,
     /// Neither: AEC3's own delay estimator alone (the delay is only logged).
     None,
+    /// Delay the reference by the delay minus [`PREDELAY_MARGIN`]. Kept for
+    /// evaluation only: harmful on the c3-a recordings.
+    PreDelay,
 }
 
 /// Echo canceller settings.
@@ -112,7 +121,8 @@ pub struct AecConfig {
     pub apply: DelayApply,
     /// sonora's noise suppression (moderate) after the echo canceller.
     pub ns: bool,
-    /// Skip sonora while the reference is silent (ignored with `ns`).
+    /// Skip sonora while the reference is silent (ignored with `ns`). Off by
+    /// default: it saves CPU but cost ERLE on some c3-a recordings.
     pub bypass_when_silent: bool,
 }
 
@@ -123,9 +133,9 @@ impl Default for AecConfig {
             reference_channels: 2,
             reference_gain_db: 0.0,
             delay: DelayMode::Auto,
-            apply: DelayApply::PreDelay,
+            apply: DelayApply::Hint,
             ns: false,
-            bypass_when_silent: true,
+            bypass_when_silent: false,
         }
     }
 }
@@ -228,6 +238,8 @@ pub struct EchoCanceller {
     prev_mic: [f32; FRAME],
     prev_ref: [f32; FRAME],
     have_prev: bool,
+    /// Frames since creation (the bypass warm-up).
+    stream_frames: u64,
     acc: Acc,
     errors: u64,
 }
@@ -314,6 +326,7 @@ impl EchoCanceller {
             prev_mic: [0.0; FRAME],
             prev_ref: [0.0; FRAME],
             have_prev: false,
+            stream_frames: 0,
             acc: Acc::default(),
             errors: 0,
         };
@@ -520,6 +533,7 @@ impl EchoCanceller {
 
     fn frame(&mut self, mic: &[f32; FRAME], refr: &[f32; FRAME], out: &mut Vec<f32>) {
         self.acc.frames += 1;
+        self.stream_frames += 1;
         let ref_peak = refr.iter().fold(0.0_f32, |a, v| a.max(v.abs()));
         let ref_silent = ref_peak < SILENT_PEAK;
         let ref_rms = (refr.iter().map(|v| v * v).sum::<f32>() / FRAME as f32).sqrt();
@@ -549,7 +563,10 @@ impl EchoCanceller {
                     let mut scratch = [0.0_f32; FRAME];
                     let _ = self.run_sonora(&pm, &pr, &mut scratch);
                 }
-            } else if !self.bypassing && self.silent_frames >= BYPASS_HOLD {
+            } else if !self.bypassing
+                && self.silent_frames >= BYPASS_HOLD
+                && self.stream_frames >= BYPASS_WARMUP
+            {
                 self.bypassing = true;
                 self.delay_line.clear();
                 let tail = &self.prev_mic[FRAME - SONORA_LATENCY..];
