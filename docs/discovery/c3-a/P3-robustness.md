@@ -84,7 +84,7 @@ Chosen limits versus c3-a: the daemon needs about 1 MB resident and 1.5 % of a c
 | Watchdog, supervisor | No trip, no restart, no `ERROR` line; 0 xruns during the soak | verified-on-target |
 | Capture statistics at shutdown (whole process life, about 57 minutes) | 84 184 chunks sent, 248 dropped (most likely during the T5 partition, when writes were blocked for 10 s), 0 xruns | verified-on-target |
 | RSS | 1.7 MB for the first 4 cycles, then a **single rise to 9.5 MB** during the 5th bridge session (a steady 64 kB per second for 2 minutes, ending exactly when that session ended), then flat at 9.46 to 9.65 MB for the remaining 8 cycles (22 minutes). At the end: VmRSS 9648 kB, RssAnon 8600 kB, almost all in one anonymous mapping (the heap). Nothing unusual in the satellite log or the bridge log for that session | verified-on-target (observation) |
-| Cause of the RSS rise | Not reproduced exactly (see the PC investigation below), but a mechanism with the same signature was found and fixed: musl's `malloc` keeps growing under repeated TTS replies while the Rust heap stays flat. The TV step itself happened during a wake-mode session with no logged reply, so it stays **unproven for that event**; re-soak with the fixed build | hypothesis (mechanism verified-on-host) |
+| Cause of the RSS rise | Not reproduced exactly (see the PC investigation below), but a mechanism with the same signature was found and fixed: musl's `malloc` keeps growing under repeated TTS replies while the Rust heap stays flat. The TV step itself happened during a wake-mode session with no logged reply, so it stays **unproven for that event**; the fixed build was re-soaked with 55 streamed replies: see [re-soak](#re-soak-on-the-tv-with-the-dlmalloc-build-2026-11-02) | hypothesis (mechanism verified-on-host); fix verified-on-target |
 
 ### RSS investigation on the PC (2026-11-02, host only, no TV, no HA)
 
@@ -106,16 +106,42 @@ Findings:
 - **Why it matters beyond the soak**: at that rate a 5 s reply costs about 270 kB, so the 64 MiB RSS ceiling (exit 72, supervisor restart) would be reached after a few hundred replies.
 - **Does this explain the TV step (a steady 64 kB/s for 2 minutes, then flat)?** It has the same signature (a linear rise in one heap mapping that stops when the audio stops, never returned to the OS), but on the PC the rise follows TTS audio, while the soak's session is described as wake-mode streaming with nothing unusual in the logs. A reply during that session is possible but not recorded, so this is not proven. On the PC a mic-only session on musl does not grow.
 
-Changes made (host-verified; not yet run on the TV):
+Changes made (host-verified; run on the TV in the [re-soak below](#re-soak-on-the-tv-with-the-dlmalloc-build-2026-11-02)):
 
 - `dlmalloc` (pure Rust, `global` feature) is the global allocator on musl targets only (`crates/satellite/Cargo.toml`); host builds keep the system allocator. armv7 binary +7 kB; the armv7 build under `qemu-arm-static` passes the daemon end-to-end harness (17 checks).
 - The player's TTS queue is byte-bounded (2 MiB, about 65 s of 16 kHz mono audio): beyond that audio is dropped with a warning and a count instead of queueing without limit if the sink stalls (a pacat that never reads). Tested with a fake pacat.
 - The microphone chunk buffer is allocated at its final size (the old `flat_map` collect regrew it eight times per chunk).
 - The watchdog thread now logs `memory: resident size N KiB (last reported M KiB)` at info each time RSS grows 2 MiB beyond the last report, and the size at debug every 10 s, so a rise shows in the log with a timestamp.
 
-To close this on the target (owner-authorized TV session): run the soak again with this build, with `memory:` lines in the log, and include at least one spoken reply in the first sessions. Expected: RSS stays near 1 to 2 MB.
+Closing this on the target was done in the re-soak below.
 
 The rise stays far below the 64 MiB ceiling, which would turn a real leak into a restart by the supervisor (exit 72) rather than memory pressure on the TV.
+
+## Re-soak on the TV with the dlmalloc build (2026-11-02)
+
+Question: does the musl `malloc` growth under streamed TTS replies (about 1.7 bytes of RSS per reply byte on the PC) disappear on c3-a with the `dlmalloc` build?
+
+- **Binary:** `webos-satellite` 0.0.1 from commit 062b1c9, static armv7 musl, sha256 `7f35999dce17cc492e21176f8e86cc814d08588c81881e605170137d4d477cbf`, `make tv-install-tmp` under `/tmp/webos-satellite`, started with `start.sh` (no supervisor, so a restart could not hide a growth).
+- **Config:** `mode = "wake"`, `[mic] source = "alsa"` (live mic, streamed to the bridge), `[sink] type = "pacat"` with `gain = 0.0`, `level = "info"`, defaults for `[safety]` and `[limits]`. Silence is guaranteed in the code: `gain_s16le` (`crates/satellite/src/player.rs`) applies `Pcm::apply_gain(0.0)` to every sample before they reach `pacat`, and every playback logged `0 non-zero samples`. `pacat` really ran, so the PulseAudio path was exercised (not the null sink). LG hands-free was off (PCM `closed` before the start); no `MicBusy`.
+- **Replies:** `tools/esphome-fake-ha/ha_bridge.py` with the new `--synthetic-reply-every 40` soak aid (see below), against HA's real "Kiwi" pipeline: each reply is a real Piper TTS-only run of one fixed Spanish test sentence (8072 ms, 258 300 bytes of 16 kHz mono PCM), fetched from HA's `tts_proxy`, converted by ffmpeg and streamed between `TTS_STREAM_START` and `TTS_STREAM_END` in 512-sample chunks, one reply about every 50 s. This is a **labelled substitute**: no wake word was detected and no speech was involved (HA's conversation agents are still broken); the satellite saw the same event sequence and audio stream as a spoken reply. Nobody spoke; the mic audio went to the bridge, which dropped it.
+- **Sampling:** every 30 s over `ssh` from `/proc/<pid>/status` (VmRSS, VmHWM, RssAnon, Threads) and `/proc/<pid>/fd`, plus the capture PCM state; 118 samples over 58.7 minutes. Raw outputs are in the gitignored `devices/private/c3-a/P3/resoak/`.
+
+| Measure | Result | Label |
+| --- | --- | --- |
+| Replies played | **55** (`playback 55 done` is the last line; 35 in the first 29 minutes, 20 in a second phase of 12.6 minutes), 444 s of audio, 14.2 MB of reply PCM. The 20 retained daemon log lines (the log rotates at 256 KiB, see below) all say `0 non-zero samples`; the bridge logged 55 `TTS streamed` and a device media player `IDLE` after each | verified-on-target |
+| RSS | **716 kB** before the first HA connection, then **976 kB for the whole run** (min 716, max 976, end 976); VmHWM 976 kB (= max), RssAnon 72 kB then 104 kB. One step of 260 kB when HA first connected, **no change over the 55 replies**: slope 0 kB per reply (a regression over all 118 samples gives 13 kB per hour, entirely the first step). The old build would have grown by about 24 MB over the same reply bytes (1.7 bytes per byte), ending at the 64 MiB ceiling after a few hundred replies | verified-on-target |
+| `memory:` log lines | None: RSS never grew 2 MiB beyond the last report | verified-on-target |
+| Threads, descriptors | 3 threads throughout; 11 to 13 descriptors (13 while HA and `pacat` are active), no growth | verified-on-target |
+| Reconnects | 11 bridge sessions that played replies (7 and 4, each 5 replies, ended by the bridge and reconnected by the next one) and **770 rapid reconnects** with `lifecycle_client.py` (0 failures; see the incident below). No watchdog trip, no restart, no `ERROR` line; the only `WARN` lines in the retained log are `HA disconnected` from the reconnect loops. No `dropped` or queue-full line | verified-on-target |
+| PCM after the run | RUNNING during the run (mic live), all capture PCMs `closed` after `stop.sh` | verified-on-target |
+
+Conclusion: the RSS growth under TTS replies is **gone on the target** with the `dlmalloc` build: 55 streamed replies and 770 reconnects left RSS at 976 kB, 0 kB per reply. This confirms the host finding (musl `malloc` was the cause of that growth mechanism). The one-off 8 MB rise seen in the earlier soak was not reproduced either, but it was never explained for that event; the data say only that this build holds under the traffic that most plausibly caused it.
+
+Incident (harness, not the satellite): the HA refresh token stopped working after 29 minutes (`invalid_grant`), so the bridge's access token expired (`auth_invalid`). The driving loop then spun without delay: about 247 bridge attempts failed at the HA login (they never connected to the TV), each followed by 3 `lifecycle_client.py` reconnects, which gave the 770 successful rapid reconnects in about 15 minutes. A new token was minted and a second phase ran 4 more bridge sessions. The reconnect spam rotated the daemon log, so the first 35 replies are counted from the bridge log (35 `TTS streamed` and 35 `run done`), and the log-based count of `playback ... done` in the sampler is not reliable. The satellite was undisturbed (RSS and descriptors flat, HA connection accepted every time).
+
+Tooling change: `ha_bridge.py --synthetic-reply-every SECS --reply-on-intent-failure TEXT` (soak aid): the bridge opens no HA wake word run and ignores mic audio; after SECS it plays WAKE_WORD_END, STT, INTENT events and a real TTS-only reply of TEXT, labelled `synthetic: true` in the run summary. It tests the satellite's reply path, not HA's pipeline.
+
+Rollback and cleanup of this session: `stop.sh`, `uninstall.sh` removed `/tmp/webos-satellite`; no `webos-satellite`, `supervise`, `rotate` or `pacat` process left; the `/tmp` listing is identical to the one taken before the install; all capture PCMs `closed`. Nothing else was written on the TV; no reboot, no power-state change, no iptables change, no LG process touched, no ASoC/DAPM sysfs or debugfs read. HA: no configuration change; the short-lived token was revoked and its files shredded.
 
 ## Rollback and leftovers
 
@@ -128,5 +154,5 @@ The rise stays far below the 64 MiB ceiling, which would turn a real leak into a
 - Behaviour in screen-off, standby and Always Ready, and on resume: [D5 plan](D5-plan.md) (owner).
 - The capture stall reopen on a real stall (expected in standby).
 - HA's own integration against the TV (network block), including HA restarts and its reconnect backoff.
-- Multi-day memory and descriptor behaviour (Phase 3 exit criterion); this run covered about 1 hour. The single 8 MB RSS rise in the soak is not reproduced on the target; the musl allocator mechanism is fixed on the host and needs a TV re-soak.
+- Multi-day memory and descriptor behaviour (Phase 3 exit criterion); this run covered about 1 hour. The single 8 MB RSS rise in the first soak was not reproduced; the musl allocator growth is fixed on the target (re-soak above: 55 replies, RSS flat at 976 kB). The re-soak used synthetic wake and speech (a real HA TTS reply, no spoken input) and about an hour; a spoken reply through HA's conversation agent was not tested.
 - Autostart after a real reboot (needs the owner's approval: [autostart design](../../design/autostart.md)).

@@ -188,7 +188,7 @@ Home Assistant's ESPHome integration opens the connection: HA must be able to re
 
 `tools/esphome-fake-ha/run.sh` runs the protocol harness and an end-to-end check of the real binary (file mic, WAV sink, wake and push-to-talk runs, SIGTERM, log policy). Everything stays on 127.0.0.1.
 
-When HA cannot open a connection to the satellite (the situation on the owner's network as of 2026-11-02), `tools/esphome-fake-ha/ha_bridge.py` plays HA's ESPHome integration from the PC. It connects to the satellite and runs HA's real pipeline over the WebSocket API with an access token read from a file. See its docstring and [P1 HA integration](discovery/c3-a/P1-ha-integration.md#bridge-stands-in-for-has-esphome-integration) for what it does and does not cover.
+When HA cannot open a connection to the satellite (the situation on the owner's network as of 2026-11-02), `tools/esphome-fake-ha/ha_bridge.py` plays HA's ESPHome integration from the PC. It connects to the satellite and runs HA's real pipeline over the WebSocket API with an access token read from a file. `--synthetic-reply-every SECS` (with `--reply-on-intent-failure TEXT`) is a soak aid that answers every device run with a real TTS-only reply instead of running a wake word or STT. See its docstring and [P1 HA integration](discovery/c3-a/P1-ha-integration.md#bridge-stands-in-for-has-esphome-integration) for what it does and does not cover.
 
 ## CI
 

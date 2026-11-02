@@ -25,6 +25,15 @@ Usage:
     .venv/bin/python -I ha_bridge.py --device HOST:6053 --psk-file FILE \
         --ha-url https://ha.example --token-file FILE [--pipeline NAME_OR_ID] \
         [--runs N] [--duration SECS] [--json-log FILE] [--reply-on-intent-failure TEXT]
+        [--synthetic-reply-every SECS --reply-on-intent-failure TEXT]
+
+`--synthetic-reply-every SECS` is a soak aid, not a pipeline test: when the
+device starts a run the bridge opens no HA wake word run and ignores the
+microphone audio; after SECS it plays a "wake, speech, intent" event sequence
+with a fixed text and the reply is a real TTS-only run of the
+`--reply-on-intent-failure` text in HA's pipeline (labelled `synthetic: true`
+in the run summary). It makes a device in wake mode play a streamed TTS reply
+every SECS seconds with no human voice involved.
 
 The access token is read from a file and never printed. Transcripts and
 replies are printed (they are the test's own phrases); keep the output local.
@@ -150,6 +159,17 @@ class Bridge:
 
     async def handle_start(self, conversation_id, flags, audio_settings, wake_word_phrase):
         wake = bool(flags & USE_WAKE_WORD)
+        if self.args.synthetic_reply_every:
+            run = Run(-1, wake)
+            run.info["synthetic"] = True
+            self.run = run
+            log(f"device start request: synthetic reply in {self.args.synthetic_reply_every} s (no HA run)")
+            send = self.cli.send_voice_assistant_event
+            send(Ev.VOICE_ASSISTANT_RUN_START, {})
+            if wake:
+                send(Ev.VOICE_ASSISTANT_WAKE_WORD_START, {})
+            asyncio.create_task(self.synthetic_cycle(run))
+            return 0
         msg_id, q = self.ha.open()
         run = Run(msg_id, wake)
         self.run = run
@@ -177,7 +197,7 @@ class Bridge:
 
     async def handle_audio(self, data: bytes, data2: bytes | None) -> None:
         run = self.run
-        if run is None or not run.audio_open:
+        if run is None or not run.audio_open or run.info.get("synthetic"):
             return
         run.audio_bytes += len(data)
         if run.handler_id is None:
@@ -312,6 +332,24 @@ class Bridge:
             self.finish(run)
             return True
         return False
+
+    async def synthetic_cycle(self, run: Run) -> None:
+        send = self.cli.send_voice_assistant_event
+        await asyncio.sleep(self.args.synthetic_reply_every)
+        if self.run is not run:
+            return  # the device aborted this run meanwhile
+        if run.wake:
+            send(Ev.VOICE_ASSISTANT_WAKE_WORD_END, {})
+        send(Ev.VOICE_ASSISTANT_STT_START, {})
+        send(Ev.VOICE_ASSISTANT_STT_END, {"text": "prueba"})
+        send(Ev.VOICE_ASSISTANT_INTENT_START, {})
+        await self.tts_only(run)
+        send(Ev.VOICE_ASSISTANT_RUN_END, {})
+        if self.tts_task is not None:
+            await self.tts_task
+            self.tts_task = None
+            await self.wait_media_idle(15.0)
+        self.finish(run)
 
     async def tts_only(self, run: Run) -> None:
         text = self.args.reply_on_intent_failure
@@ -460,7 +498,12 @@ def main() -> int:
     ap.add_argument("--reply-on-intent-failure", metavar="TEXT",
                     help="if HA's intent stage fails, reply with TTS of TEXT from the same pipeline "
                          "(labelled 'intent_substituted' in the run summary)")
+    ap.add_argument("--synthetic-reply-every", type=float, metavar="SECS",
+                    help="soak aid: answer every device run after SECS with a TTS-only reply of "
+                         "--reply-on-intent-failure TEXT (no wake word run, mic audio ignored)")
     args = ap.parse_args()
+    if args.synthetic_reply_every and not args.reply_on_intent_failure:
+        ap.error("--synthetic-reply-every needs --reply-on-intent-failure TEXT")
     token = open(args.token_file).read().strip()
     psk = open(args.psk_file).read().strip()
 
