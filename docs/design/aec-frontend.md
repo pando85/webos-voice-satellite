@@ -263,3 +263,17 @@ python3 tools/audio-rig/aec_eval/chain_eval.py --tool target/release/examples/ae
 - Whether SoundEngineCapture's delay jumps within long sessions or on volume, sound-mode or output changes, and how fast AEC3 follows (P2 open question).
 - Behaviour with other outputs (eARC, Bluetooth) and in other power states; on other models the reference PCM may have another name or not exist (the mic then runs without the canceller).
 - Using the satellite's own TTS stream as a second, digital reference during replies (research open question).
+
+## 11. Offline evaluation results
+
+From the [P2 offline A/B](../experiments/P2-aec-offline-ab.md) (2026-11-02): corpus positives mixed into the raw mic of the session 2 AEC recordings, the reference untouched, processed by `aec_offline` and scored with a Wyoming openWakeWord 2.1.0 replica that matched HA's session 2 results on 387 of 388 items. **observed-on-other-device, semi-synthetic**; nothing here ran on a TV.
+
+- **Reference-level talker (about -61 dBFS at the mic), wake rate quiet / volume 10 / volume 15:** no AEC 43 / 11 / 1 %; default canceller 43 / 12 / 4 %; with NS 51 / 14 / 4 %; linear output 43 / 21 / 4 %; linear output + NS 54 / 20 / 6 %. No variant restores detection over content.
+- **Talker 10 dB louder:** no AEC 57 / 34 / 11 %; default canceller 57 / 41 / 15 %; linear output 57 / 46 / **38 %**; linear + NS 61 / **49** / 33 %.
+- **Why:** AEC3's residual-echo suppressor removes a quiet talker together with the echo. Keeping the talker out of the canceller (diagnostic) would give 34 % / 26 % at the reference level. AEC3's linear filter alone removes only 4 to 6 dB in-band on c3-a (full output 10 to 18 dB), so the linear output keeps the talker but more echo.
+- **STT** (faster-whisper large-v3-turbo, WER without the MLS voices; clean items 8.6 %): quiet room 7 to 9 % for every variant; volume 10 no AEC 64 %, default 53 %, linear 29 %; louder talker at volume 15 no AEC 57 %, default 51 %, linear 18 %.
+- **Gain:** +30 or +34 dB after the canceller changes nothing beyond one to three items and clips; the fixed +24 dB stays. **NS** helps in quiet (+7 to +10 of 97) and is neutral with content.
+- **Two-channel reference:** +2.6 to +3.5 dB mean ERLE on the content (+10 to +17 dB on the action scene), but 18.0 → 8.4 dB on session 1's near-mono pink noise; no wake gain at the reference level.
+- **False wakes:** 0 in 10 minutes of content per volume for every variant but `linear+ns` (1 at volume 10); the linear output gives the detector much higher scores on content (up to 0.62 against 0.11 without AEC).
+- **New, experimental keys** (defaults unchanged): `render_channels = 1 | 2` (stereo render to AEC3) and `output = "full" | "linear" | "nearend"` (AEC3 driven directly through sonora-aec3; the direct path with AEC3's defaults is sample-for-sample identical to sonora's `AudioProcessing`, unit-tested). See [configuration](#6-configuration) and [config/example.toml](../../config/example.toml).
+- **Proposal for the live A/B (step 3):** `enabled = true`, `ns = true`, `render_channels = 1`, gain +24 dB; arm A `output = "linear"`, arm B `output = "full"`, plus a no-AEC control. Keep the shipped default off until the A/B passes; measure false wakes per hour with the linear output over the full content set.
