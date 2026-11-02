@@ -10,6 +10,7 @@ Research tasks and implementation work are tracked in GitHub Issues. This roadma
 - **Needs-owner** items are actions only the owner can authorize or perform (TV state changes, sound at audible levels, adding devices in the Home Assistant UI, changes in the homelab GitOps repository, reboots, persistence). Agents prepare the procedure and wait.
 - Device safety rules in [AGENTS.md](../../AGENTS.md) and the [discovery safety rules](../discovery/README.md#safety-rules-learned) apply in every phase. Raw probe output and recordings are never committed.
 - Fixed inputs from discovery and decisions: Rust ([ADR 0002](../decisions/0002-rust-implementation.md)), ESPHome native API ([ADR 0001](../decisions/0001-esphome-native-api.md)), server-side wake word for the MVP ([ADR 0003](../decisions/0003-server-side-wake-word-for-mvp.md)), capture from `hw:LGSIC,0` with LG hands-free off ([ADR 0004](../decisions/0004-mvp-capture-device-and-lg-handsfree-off.md)).
+- **Interleaved improvements (owner, 2026-11-02):** the project is public (other rooted-LG-TV owners as well as the owner's TVs) and improvements are interleaved into the phases below instead of waiting until after Phase 5. Priorities: the audio front-end (backlog #1), install and configuration UX (backlog #3), then sharing findings (backlog #8, after Phase 2). Wake word stays `alexa`, with no custom wake word training. See [owner priorities in the backlog](backlog.md#owner-priorities-2026-11-02).
 - The ESPHome protocol and Rust ecosystem background is in [esphome-rust-satellite](../research/esphome-rust-satellite.md). Treat its claims as `documented` or `hypothesis` until a Phase 1 experiment verifies them on the target.
 
 ## Phase 0: Discovery (largely done)
@@ -94,6 +95,7 @@ Research tasks and implementation work are tracked in GitHub Issues. This roadma
   - Reconnection behaviour after HA restarts, network loss and TV resume; backoff and state recovery.
   - Resource limits (memory, CPU, file descriptors) given about 750 MB available memory, nearly exhausted CMA and 3 of 4 cores online on c3-a ([constraints](../discovery/c3-a/rooted-tv-improvements.md#constraints-not-changes)).
   - Firmware update guard: detect a firmware change and disable or re-validate the satellite; review the update-blocking gaps ([item 1](../discovery/c3-a/rooted-tv-improvements.md)).
+  - Homebrew Channel package and first-run configuration, delivered with autostart (backlog #3, interleaved). The QR and phone configuration is not part of this step until its security design exists.
 - **Status (2026-11-02):** the parts that need no sound and no persistent change are done and measured on c3-a ([P3 robustness](../discovery/c3-a/P3-robustness.md)); everything persistent or power-related waits for the owner.
 
 | Item | Status | Evidence / what remains |
@@ -122,6 +124,7 @@ Research tasks and implementation work are tracked in GitHub Issues. This roadma
   - Custom wake word model trained and deployed through the owner's GitOps homelab repository. The change is **referenced** from here (link or commit id), not stored in this repository.
   - Listening and microphone-mute indicator that is truthful (tied to the real capture state) and documented, as required by the privacy gate F7.
   - Timers and announcements supported by the ESPHome Assist satellite features that Home Assistant exposes, with the TV-side behaviour verified.
+  - Audio front-end integration in the daemon (AEC with the SpeakerFeedback reference and other stages that Phase 2 measurements justify), earlier if Phase 2 shows the reference is usable (backlog #1, interleaved). The integration decision goes into an ADR.
 - **Exit criteria:** custom wake word false accepts per hour and missed wakes measured with the Phase 2 corpus and compared with the stock `alexa` model; the indicator cannot show "not listening" while capture runs (tested); timers and announcements work audibly.
 - **Needs-owner:**
   - Training data and recorded voices (consent), model approval, GitOps repository changes and deployment.
@@ -135,10 +138,11 @@ Research tasks and implementation work are tracked in GitHub Issues. This roadma
   - Second C3 discovery results filed per device and firmware (a new directory next to [c3-a](../discovery/README.md), plus an entry in [compatibility](../compatibility/README.md)).
   - Capability discovery module: finds the capture PCM, supported formats and the playback sink at runtime, with explicit failure messages when it cannot.
   - Reproducible `ipk` build and install and uninstall flow for the Homebrew Channel, with a package inspection checklist.
+  - Install and configuration UX for other users: first-run configuration and pairing without typing the encryption key; the QR and phone configuration only after its security design is accepted (backlog #3, interleaved).
   - Compatibility record scoped by model, firmware and power state, using [DEVICE-TEMPLATE](../compatibility/DEVICE-TEMPLATE.md).
 - **Exit criteria:** a clean install from the `ipk` on the second C3 reaches the Phase 1 exit state; the compatibility record lists what is verified, what is not, and which firmware it applies to; no claim exceeds the evidence.
 - **Needs-owner:** access and consent for the second TV (state changes, rooting status, firmware pinning); approval to publish the `ipk`; decision on the repository license and release policy.
 
 ## After Phase 5
 
-Unprioritized improvements, to be reprioritized by the owner, are in the [backlog](backlog.md).
+Remaining improvements are in the [backlog](backlog.md); the owner priorities of 2026-11-02 are interleaved into the phases above.
