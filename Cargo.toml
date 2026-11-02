@@ -22,6 +22,9 @@ webos-esphome-api = { path = "crates/esphome-api" }
 webos-playback = { path = "crates/playback" }
 # External crates (pure Rust: the TV build is static musl, no system libs)
 rustix = { version = "1", default-features = false, features = ["std", "system", "param", "process"] }
+# Echo canceller: pure Rust port of WebRTC audio processing (AEC3, NS), BSD-3-Clause.
+# Needs rustc 1.91. docs/research/aec-candidates.md, docs/design/aec-frontend.md.
+sonora = { version = "0.2.0", default-features = false }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
@@ -43,6 +46,26 @@ lto = true
 codegen-units = 1
 strip = true
 panic = "abort"
+
+# DSP runs per 10 ms frame on the TV: optimise it for speed, not size
+# (sonora at opt-level "z" cost about 1.5x the CPU on the host,
+# docs/research/aec-candidates.md#cpu-memory-size).
+[profile.release.package.webos-dsp]
+opt-level = 3
+[profile.release.package.sonora]
+opt-level = 3
+[profile.release.package.sonora-aec3]
+opt-level = 3
+[profile.release.package.sonora-ns]
+opt-level = 3
+[profile.release.package.sonora-agc2]
+opt-level = 3
+[profile.release.package.sonora-fft]
+opt-level = 3
+[profile.release.package.sonora-simd]
+opt-level = 3
+[profile.release.package.sonora-common-audio]
+opt-level = 3
 
 [profile.dev]
 panic = "unwind"

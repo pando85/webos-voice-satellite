@@ -2,6 +2,8 @@
 
 use std::f64::consts::{PI, SQRT_2};
 
+use crate::aec::{AecMetrics, DelayEvent, EchoCanceller};
+
 /// Full scale of a signed 24-bit sample, as a float.
 const S24_FULL_SCALE: f64 = 8_388_608.0;
 /// Full scale of a signed 16-bit sample, as a float.
@@ -57,7 +59,8 @@ impl Default for FrontendConfig {
 /// -140 dB.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Stats {
-    /// Number of output samples (equals the number of input frames).
+    /// Number of output samples (equals the number of input frames without
+    /// an echo canceller).
     pub samples: u64,
     /// Peak of the S16 output (after high-pass, gain and saturation).
     pub peak_dbfs: f32,
@@ -121,7 +124,7 @@ impl Biquad {
 }
 
 /// The mic front-end. One instance per stream: it keeps filter state.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Frontend {
     channel: ChannelMode,
     rate: u32,
@@ -131,6 +134,10 @@ pub struct Frontend {
     scale: f64,
     hpf: Option<Biquad>,
     acc: Accum,
+    /// Optional echo canceller between the high-pass filter and the gain.
+    aec: Option<EchoCanceller>,
+    aec_in: Vec<f32>,
+    aec_out: Vec<f32>,
 }
 
 fn linear_gain(gain_db: f32) -> f64 {
@@ -170,7 +177,64 @@ impl Frontend {
             scale: linear_gain(gain_db) * S16_FULL_SCALE / S24_FULL_SCALE,
             hpf,
             acc: Accum::default(),
+            aec: None,
+            aec_in: Vec::new(),
+            aec_out: Vec::new(),
         }
+    }
+
+    /// Inserts an echo canceller after the high-pass filter and before the
+    /// gain, so it sees the unsaturated mic (the +24 dB gain saturated the S16
+    /// stream on the satellite's own replies from TV volume 15 on c3-a). The
+    /// input rate must be 16 kHz; at any other rate the canceller is not
+    /// inserted. With a canceller, [`Frontend::process`] emits whole 10 ms
+    /// frames and holds back the rest (see [`EchoCanceller::process`]).
+    #[must_use]
+    pub fn with_echo_canceller(mut self, aec: EchoCanceller) -> Self {
+        if self.rate == crate::aec::RATE {
+            self.aec = Some(aec);
+        }
+        self
+    }
+
+    /// Whether an echo canceller is in the chain.
+    #[must_use]
+    pub fn has_echo_canceller(&self) -> bool {
+        self.aec.is_some()
+    }
+
+    /// Feeds echo-reference frames (interleaved, S24 scale, the canceller's
+    /// configured rate and channels). Push the reference captured alongside a
+    /// mic read **before** processing that mic read. No-op without a
+    /// canceller.
+    pub fn push_reference(&mut self, interleaved: &[i32]) {
+        if let Some(a) = &mut self.aec {
+            a.push_reference(interleaved);
+        }
+    }
+
+    /// Restarts the mic/reference alignment (the source restarted both
+    /// streams). No-op without a canceller.
+    pub fn reset_reference(&mut self) {
+        if let Some(a) = &mut self.aec {
+            a.reset_alignment();
+        }
+    }
+
+    /// Delay event from the canceller (lock or change), if any.
+    pub fn take_aec_event(&mut self) -> Option<DelayEvent> {
+        self.aec.as_mut().and_then(EchoCanceller::take_event)
+    }
+
+    /// Canceller metrics since the last call, if a canceller is in use.
+    pub fn take_aec_metrics(&mut self) -> Option<AecMetrics> {
+        self.aec.as_mut().map(EchoCanceller::take_metrics)
+    }
+
+    /// The canceller, if any.
+    #[must_use]
+    pub fn echo_canceller(&self) -> Option<&EchoCanceller> {
+        self.aec.as_ref()
     }
 
     /// Output sample rate in Hz (equal to the input rate).
@@ -194,8 +258,8 @@ impl Frontend {
         }
     }
 
-    /// Clears the filter state (use after a gap in the stream). Statistics are
-    /// kept.
+    /// Clears the filter state (use after a gap in the stream). Statistics and
+    /// the echo canceller are kept.
     pub fn reset(&mut self) {
         if let Some(f) = &mut self.hpf {
             f.z1 = 0.0;
@@ -205,9 +269,10 @@ impl Frontend {
 
     /// Converts interleaved S24-in-i32 frames to mono S16.
     ///
-    /// `out` is cleared first, then one sample per input frame is appended. A
-    /// trailing partial frame in `interleaved` is ignored. `channels == 0`
-    /// produces no output.
+    /// `out` is cleared first. Without an echo canceller one sample per input
+    /// frame is appended; with one, whole 10 ms frames are appended as the
+    /// canceller releases them. A trailing partial frame in `interleaved` is
+    /// ignored. `channels == 0` produces no output.
     pub fn process(&mut self, interleaved: &[i32], channels: u16, out: &mut Vec<i16>) {
         out.clear();
         let ch = usize::from(channels);
@@ -217,6 +282,8 @@ impl Frontend {
         let frames = interleaved.len() / ch;
         out.reserve(frames);
         let mut acc = self.acc;
+        let use_aec = self.aec.is_some();
+        self.aec_in.clear();
         for frame in interleaved.chunks_exact(ch) {
             let x = match self.channel {
                 ChannelMode::Left => f64::from(sign_extend_s24(frame[0])),
@@ -236,20 +303,38 @@ impl Frontend {
             acc.in_sumsq += x * x;
 
             let filtered = self.hpf.as_mut().map_or(x, |f| f.run(x));
-            let y = (filtered * self.scale).round();
-            // Hard saturation to the S16 range.
-            let clamped = y.clamp(-S16_FULL_SCALE, S16_FULL_SCALE - 1.0);
-            if (y - clamped).abs() > 0.0 {
-                acc.clipped += 1;
+            if use_aec {
+                #[allow(clippy::cast_possible_truncation)]
+                self.aec_in.push((filtered / S24_FULL_SCALE) as f32);
+            } else {
+                Self::output(filtered * self.scale, &mut acc, out);
             }
-            #[allow(clippy::cast_possible_truncation)]
-            let s = clamped as i16;
-            acc.out_peak = acc.out_peak.max(u32::from(s.unsigned_abs()));
-            acc.out_sumsq += f64::from(s) * f64::from(s);
-            out.push(s);
         }
-        acc.samples += frames as u64;
+        if let Some(aec) = &mut self.aec {
+            self.aec_out.clear();
+            aec.process(&self.aec_in, &mut self.aec_out);
+            let k = self.scale * S24_FULL_SCALE;
+            for &y in &self.aec_out {
+                Self::output(f64::from(y) * k, &mut acc, out);
+            }
+        }
+        acc.samples += out.len() as u64;
         self.acc = acc;
+    }
+
+    /// Gain-scaled sample to S16 with hard saturation and statistics.
+    #[inline]
+    fn output(scaled: f64, acc: &mut Accum, out: &mut Vec<i16>) {
+        let y = scaled.round();
+        let clamped = y.clamp(-S16_FULL_SCALE, S16_FULL_SCALE - 1.0);
+        if (y - clamped).abs() > 0.0 {
+            acc.clipped += 1;
+        }
+        #[allow(clippy::cast_possible_truncation)]
+        let s = clamped as i16;
+        acc.out_peak = acc.out_peak.max(u32::from(s.unsigned_abs()));
+        acc.out_sumsq += f64::from(s) * f64::from(s);
+        out.push(s);
     }
 
     fn stats_from(acc: &Accum) -> Stats {

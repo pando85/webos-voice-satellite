@@ -1,10 +1,15 @@
 [package]
 name = "webos-dsp"
-description = "webos-voice-satellite: mic front-end (S24 stereo to 16 kHz mono S16)"
+description = "webos-voice-satellite: mic front-end (S24 stereo to 16 kHz mono S16, optional echo cancellation)"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
+# sonora needs rustc 1.91; the workspace default (1.85) applies to the other
+# crates. The pinned toolchain (rust-toolchain.toml) is newer than both.
+rust-version = "1.91"
 publish.workspace = true
+
+[dependencies]
+sonora = { workspace = true }
 
 [lints]
 workspace = true
