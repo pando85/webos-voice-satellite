@@ -14,3 +14,5 @@ Use [DEVICE-TEMPLATE.md](DEVICE-TEMPLATE.md). Store private raw output outside G
 ## Verified TVs list (release plan)
 
 The public release will not hard-whitelist firmware in the daemon. Instead this directory will hold the **verified list**: one row per exact model and firmware with what passed, the date and the evidence, and only those rows are announced as supported. Users will send a sanitized compatibility report (model, webOS, firmware, architecture, audio PCM summary, capture and playback checks; never a serial, MAC, IP or hostname) through a GitHub issue template, and the app and Home Assistant will show "verified / not verified" instead of blocking. Design and release prerequisites: [packaging section 9](../design/packaging.md#9-verified-models-list-instead-of-a-firmware-whitelist), [backlog #10](../project/backlog.md#10-official-homebrew-channel-listing). Not implemented yet; the daemon's firmware gate is unchanged until the release.
+
+Per-device records: [c3-b](c3-b.md) (live run 2026-11-03, firmware `03.30.73`; no unit is marked supported).
