@@ -24,6 +24,13 @@ Device discovery results, one directory per TV. Each log states the date, firmwa
 | [D5-plan.md](c3-a/D5-plan.md) | Owner procedure for screen-off, standby and Always Ready observations (not run) |
 | [rooted-tv-improvements.md](c3-a/rooted-tv-improvements.md) | Hardening and hygiene backlog for the rooted TV (documented only, not applied) |
 
+### c3-b (LG C3 55 inch, webOS TV 8.3.0, firmware 03.30.73)
+
+| Log | Content |
+| --- | --- |
+| [D0-quick.md](c3-b/D0-quick.md) | Quick discovery compared with c3-a: same mic PCM and PulseAudio sinks, firmware one build older, Always Ready and wake on LAN off, sound out through ARC |
+| [D5-results.md](c3-b/D5-results.md) | Remote power-off and Always Ready: with Always Ready on the satellite keeps listening in `Active Standby` (59 min) but a reply is not audible; with it off the TV suspends and the process is frozen; first aarch64 daemon run on a TV; real-remote presses |
+
 D4 (behaviour while the TV plays sound) is partly done in [P2 session 1](c3-a/P2-session1-audible-and-echo.md); [session 2](c3-a/P2-session2-wake-accuracy.md) adds false wakes with content, barge-in and AEC recordings; talker-in-the-room accuracy and the AEC evaluation remain. D5 (power states) is scheduled in [roadmap](../project/roadmap.md) Phase 3.
 
 Naming: `D<n>-*` files are roadmap discovery steps; `P1-*` files are Phase 1 validation runs of the implementation on the target.
