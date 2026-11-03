@@ -163,4 +163,4 @@ Research tasks and implementation work are tracked in GitHub Issues. This roadma
 
 ## After Phase 5
 
-Remaining improvements are in the [backlog](backlog.md); the owner priorities of 2026-11-02 are interleaved into the phases above.
+Remaining improvements are in the [backlog](backlog.md); the owner priorities of 2026-11-02 are interleaved into the phases above. Idea added 2026-11-03: [backlog #11, TV control from Home Assistant via the satellite](backlog.md#11-tv-control-from-home-assistant-via-the-satellite) (not started, priority open).

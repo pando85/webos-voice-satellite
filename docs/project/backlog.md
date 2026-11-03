@@ -114,3 +114,27 @@ Items not in the ranked list stay in the backlog without a priority or a phase: 
 - **Release prerequisites (owner decision 2026-11-03: no hard firmware whitelist in the public release; [design](../design/packaging.md#9-verified-models-list-instead-of-a-firmware-whitelist)):** implement and ship before listing: a published **verified-models list** (docs/compatibility plus a README "Verified TVs" section; only listed models are announced as supported); a sanitized compatibility report (`ctl.sh report` and a status-app button: model, webOS, firmware, arch, audio PCM summary, capture and playback check results; no serial, MAC, IP or hostname; allow-list built, with a test); a GitHub issue template "TV compatibility report"; a runtime "verified / not verified" status in the app and as an HA diagnostic entity instead of blocking; and a softer replacement for what the gate protects (silent LG firmware update changing the audio stack): log line, app banner and HA entity when the firmware changed since install, with cheap self-checks. The daemon's current gate (`safety.validated_firmware`) is unchanged until this is done.
 - **Dependencies:** [EXP-009](../experiments/EXP-009-ipk-install-update.md) (install, update and uninstall from the real package on c3-b); the release prerequisites above; a compatibility record that names the models and firmware the listing is tested on; a third-party notice file.
 - **Evidence needed:** the store install and update work on a TV from the published manifest; the disclosure is accepted in review; the listing does not claim models or firmware that were not tested.
+
+## 11. TV control from Home Assistant via the satellite
+
+- **Status:** idea, not started (2026-11-03). Requested by the owner. Priority to be decided with the owner.
+- **Idea:** the satellite already runs as root on the TV and holds an ESPHome API connection to Home Assistant. It could expose TV controls as HA entities:
+  - power and screen on and off (the daemon already calls `tvpower` and `turnOffScreen` for the remote power-off feature, [always-on section 13](../design/always-on.md#13-implemented-in-the-daemon-010-and-checked-on-c3-b));
+  - TV volume and mute;
+  - input or source selection;
+  - launching apps;
+  - possibly notifications or toasts.
+
+  Voice commands such as "turn off the TV" or "TV volume down" would then work through Assist.
+- **Why:** no separate SSAP pairing or token is needed. HA's built-in webOS TV integration needs that pairing, and it does not work while the TV is in standby. The satellite reuses its existing power-state subscription ([always-on](../design/always-on.md), G1). These are reasons to test, not verified claims; the standby limitation of the built-in integration is to be confirmed on the owner's HA before it is cited.
+- **Approach options:**
+  - Entities in the ESPHome device, with the controls implemented by the daemon through public webOS interfaces only (no private Luna endpoints assumed, see [AGENTS.md](../../AGENTS.md)).
+  - Entity design: one ESPHome `media_player` for the TV, or separate entities (switch, number, select, button). The satellite's existing media player already means "reply volume" ([always-on section 13](../design/always-on.md#13-implemented-in-the-daemon-010-and-checked-on-c3-b)), so a TV media player would clash with it unless the existing one is renamed or the TV entities are separate.
+  - Overlap with HA's webOS TV integration: complement it (standby control, voice, no pairing) or replace it. Decide before any build.
+- **Open questions:**
+  - Overlap with HA's `webostv` integration: complement or replace?
+  - Which luna methods are stable across firmware versions? Verify each one on the target and record it per model and firmware in the [compatibility table](../compatibility/README.md); do not assume an interface from webOS OSE documentation.
+  - Safety: every action is user-initiated, and nothing writes TV settings silently. This follows the existing rules in [AGENTS.md](../../AGENTS.md) and the [discovery safety rules](../discovery/README.md#safety-rules-learned). Any action that changes a TV setting must be explicit, reversible and listed with its risk.
+  - Entity design: a TV `media_player` versus separate entities, given that the satellite's media player already means reply volume (see approach options).
+- **Dependencies:** the power-state subscription and remote power-off feature ([always-on](../design/always-on.md)); the ESPHome entity work in [ADR 0001](../decisions/0001-esphome-native-api.md); a verified list of public interfaces per firmware; item 4 (TV integration) for any overlap with ducking or toasts.
+- **Evidence needed:** for each control, a read-only check first, then a single user-initiated test on the target with the state restored afterwards; the luna methods and results recorded per model and firmware; the built-in HA integration's standby behaviour checked on the owner's HA before the comparison is written up.
