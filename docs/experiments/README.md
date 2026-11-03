@@ -21,6 +21,7 @@ All experiments start from a **read-only** baseline. The user must explicitly ap
 | [EXP-006](EXP-006-aec-reference.md) | Echo reference and AEC feasibility | F5 |
 | [EXP-007](EXP-007-assist-pipeline.md) | Wake word and Assist roundtrip | F3 |
 | [EXP-008](EXP-008-airplay-media.md) | Music Assistant and AirPlay | F8 |
+| [EXP-009](EXP-009-ipk-install-update.md) | App package install, update, autostart and removal | Phase 3 / 5 |
 | [P2-corpus](P2-corpus.md) | Phase 2 test corpus and metric definitions | Phase 2 |
 | [P2-aec-offline-ab](P2-aec-offline-ab.md) | Offline A/B of echo cancellation, gain and NS for wake word and STT over TV content (semi-synthetic) | Phase 2 / F5 |
 | [P2-aec-tuning](P2-aec-tuning.md) | Offline AEC3 tuning (suppressor, echo model, `linear_mix`, stereo render, NS/RNNoise/AGC) and wake threshold/trigger-level sweep, voice-split held-out (semi-synthetic) | Phase 2 / F5 (parked) |

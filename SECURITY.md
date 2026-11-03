@@ -22,4 +22,8 @@ The optional `[pairing]` mode lets Home Assistant (2026.9 or newer) set the Nois
 - **After pairing** only the key holder can connect. The key is stored with mode 0600 in `pairing.state_dir` and is never logged. Anyone with root on the TV can read it, as any key file there.
 - **Reset is local; only the key holder can clear remotely.** `--reset-pairing` or the `reset-pairing` file deletes the key and reopens the window. Remotely, only a connection that proved the stored key can clear it (Home Assistant does this when you delete the device); the satellite then stays unpaired with the pairing window **closed**, also after a restart, so nobody else can pair it until you open the window locally (`--pair` or the `pair` file). A clear from a connection without the key is refused. A key in the configuration (`device.noise_psk_file`) is never changed or cleared and disables pairing entirely; prefer it on networks you do not trust.
 
+## App package
+
+The webOS app package ([packaging design](docs/design/packaging.md)) adds no listening socket beyond the satellite's API port. Its status app runs the package's own `ctl.sh` as root through the Homebrew Channel's `exec`, with a fixed list of arguments and never with typed or received text. The daemon runs as root from `/var/lib/webos-satellite`, where the config, the key (mode 0600) and the logs stay until "Remove service and all data" (`ctl.sh purge`); removing only the app keeps them. Start at boot is off until the user turns it on.
+
 For security issues, contact maintainers privately instead of disclosing exploitable device details in a public issue. A dedicated reporting channel will be specified before production releases.

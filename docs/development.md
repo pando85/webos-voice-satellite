@@ -1,6 +1,6 @@
 # Development
 
-How to build, test and run the Rust workspace. Status: Phase 1 plus the non-persistent Phase 3 work (kill switch, watchdog, supervisor, firmware guard, resource limits; [P3 robustness](discovery/c3-a/P3-robustness.md)). `webos-satellite` is the working daemon (capture → front-end → ESPHome API → reply playback). For what was verified, see [P1 HA integration](discovery/c3-a/P1-ha-integration.md) and [P1 TV live](discovery/c3-a/P1-tv-live.md); for what comes next, see the [roadmap](project/roadmap.md).
+How to build, test, package and run the Rust workspace. Status: Phase 1 plus the non-persistent Phase 3 work (kill switch, watchdog, supervisor, firmware guard, resource limits; [P3 robustness](discovery/c3-a/P3-robustness.md)). `webos-satellite` is the working daemon (capture → front-end → ESPHome API → reply playback). For what was verified, see [P1 HA integration](discovery/c3-a/P1-ha-integration.md) and [P1 TV live](discovery/c3-a/P1-tv-live.md); for what comes next, see the [roadmap](project/roadmap.md).
 
 ## Layout
 
@@ -16,7 +16,7 @@ How to build, test and run the Rust workspace. Status: Phase 1 plus the non-pers
 | `crates/esphome-api` | ESPHome native API device server and voice state machine ([details](development/esphome-api.md)) |
 | `crates/playback` | TTS fetch, decode, resample, `pacat`/WAV/null sinks |
 | `config/example.toml` | Commented configuration with all defaults |
-| `packaging/webos/` | POSIX sh install, start, stop, status, uninstall and supervisor scripts for a TV ([below](#install-on-a-tv-non-persistent)); `init.d/` holds the **draft** boot hook ([autostart design](design/autostart.md)); `tests/run.sh` tests the scripts on the host |
+| `packaging/webos/` | POSIX sh install, start, stop, status, uninstall and supervisor scripts for a TV ([below](#install-on-a-tv-non-persistent)); `ctl.sh`, `app/`, `config.default.toml` and `ipk/build_ipk.py` make the installable webOS app package ([below](#install-the-app-package-on-a-rooted-tv-persistent), [packaging design](design/packaging.md)); `init.d/` holds the boot hook template ([autostart design](design/autostart.md)); `tv/appinstall.sh` runs appinstalld on the TV; `tests/` tests all of it on the host |
 | `tools/esphome-fake-ha/` | Fake-HA harnesses (`run.sh`) and the HA bridge (`ha_bridge.py`) |
 | `tools/lifecycle/` | Microphone-gate check of the real binary (`local_check.py`), an HA-side client for mute cycles, state watching and reconnect loops against a TV (`lifecycle_client.py`), `run.sh` for both host checks |
 
@@ -66,8 +66,13 @@ Versions used for the recorded builds: rustc 1.99.1, cargo-zigbuild 0.24.0, zig 
 | `make clean-tv` | Deletes the deployed binaries from the TV's `/tmp` |
 | `make tv-install-tmp` | Packages, copies the package, then installs under `TV_PREFIX` (default `/tmp/webos-satellite`) with `TV_CONFIG=<toml>` and `TV_PSK=<key file>`; `TV_ARCH` (default `auto`, or `armv7`, `aarch64`) is passed to `install.sh --arch`; starts nothing ([below](#install-on-a-tv-non-persistent)) |
 | `make tv-uninstall-tmp` | Runs the installed `uninstall.sh` (stop, remove the prefix) and removes the staging directory |
+| `make ipk` | Both builds, then the webOS app package `target/ipk/<APP_ID>_<VERSION>_all.ipk` with its `.sha256` and an HBC manifest, and the structure check. `VERSION` defaults to the workspace version in `Cargo.toml`; `APP_ID` to `io.github.pando85.voicesatellite`. Reproducible: the same inputs and commit give the same bytes ([packaging design](design/packaging.md)) |
+| `make ipk-check` | Structure check of the built ipk (ar/tar layout, control fields, appinfo.json, icons, payload sums, ELF of both builds) |
+| `make test-packaging` | Host tests: `tests/run.sh` (ops scripts), `tests/ipk.sh` (package lifecycle), `tests/app_smoke.js` (status app; needs `node`) |
+| `make tv-install-ipk` | Builds the ipk, copies it to the TV's `/tmp`, installs it with appinstalld (`dev/install`, waits for the result), deletes the copy and prints `ctl.sh status`. Starts nothing. Persistent: owner authorization |
+| `make tv-remove-ipk` | Removes the app with appinstalld (`dev/remove`); run `ctl.sh uninstall` or `purge` first |
 
-Variables: `TV_PREFIX`, `TV_CONFIG`, `TV_PSK`, `TV_ARCH` (install targets), `TV` (default `root@webos-tv`; set your TV's address with `TV=root@<host>` or in a gitignored `local.mk` containing `TV = root@<host>`), `TV_DIR` (default `/tmp`), `TIMEOUT`. All `ssh` and `scp` calls use `timeout` and an SSH ControlMaster socket.
+Variables: `TV_PREFIX`, `TV_CONFIG`, `TV_PSK`, `TV_ARCH` (install targets), `APP_ID`, `VERSION`, `TV_APP_DIR` (ipk targets), `TV` (default `root@webos-tv`; set your TV's address with `TV=root@<host>` or in a gitignored `local.mk` containing `TV = root@<host>`), `TV_DIR` (default `/tmp`), `TIMEOUT`. All `ssh` and `scp` calls use `timeout` and an SSH ControlMaster socket.
 
 ## Running on a TV: rules
 
@@ -217,11 +222,68 @@ make tv-uninstall-tmp TV=root@<host>
 
 The config's `noise_psk_file = "noise_psk"` resolves to `etc/noise_psk`. For silent tests use `[sink] type = "null"` or `"wav"` with `dir = "../out"`, or `"pacat"` with `gain = 0.0`. `pacat --volume` is ignored on c3-a.
 
-**No autostart.** These scripts do not hook into boot. The reviewed design, the draft hook `packaging/webos/init.d/webos-satellite` and the owner-approval step are in [autostart design](design/autostart.md). Nothing is installed in `/var/lib/webosbrew/init.d`, and `--persistent` has not been used on a TV.
+**No autostart.** These scripts do not hook into boot. The boot hook comes with the app package ([below](#install-the-app-package-on-a-rooted-tv-persistent)); its review is in the [autostart design](design/autostart.md). Nothing is installed in `/var/lib/webosbrew/init.d` on any TV yet, and `--persistent` has not been used on a TV.
 
 **Markers** (files at the top of the prefix): `disable` (do not start; honoured by `start.sh`, `supervise.sh` and `autostart.sh`), `crashloop` (written by the supervisor when it gives up; remove it by hand after fixing the cause). The kill switch is separate: it keeps a running daemon's microphone closed.
 
 The before/after result on c3-a is in [P1 ops](discovery/c3-a/P1-ops.md).
+
+## Install the app package on a rooted TV (persistent)
+
+The webOS app package (`make ipk`) is the permanent, updatable install: an app "Voice Satellite" in the launcher plus the satellite under `/var/lib/webos-satellite`, which keeps config, key, pairing state and logs across updates and reinstalls. Design, sources and what is verified: [packaging design](design/packaging.md). **Status: tested on a PC only; not yet installed on any TV** ([EXP-009](experiments/EXP-009-ipk-install-update.md)). Installing it is a persistent change: owner authorization per TV.
+
+Needs: a TV rooted with the Homebrew Channel, its service elevated (HBC settings show root), SSH as root.
+
+**Install** (from the PC):
+
+```sh
+make ipk                                   # target/ipk/io.github.pando85.voicesatellite_<version>_all.ipk
+make tv-install-ipk TV=root@<host>         # scp to /tmp, dev/install, wait, delete the copy, print status
+```
+
+or by hand, with the command the Homebrew Channel README documents (it subscribes; stop it with Ctrl-C after `"installed"`):
+
+```sh
+scp target/ipk/io.github.pando85.voicesatellite_0.0.1_all.ipk root@<host>:/tmp/
+ssh root@<host> "luna-send-pub -i 'luna://com.webos.appInstallService/dev/install' '{\"id\":\"com.ares.defaultName\",\"ipkUrl\":\"/tmp/io.github.pando85.voicesatellite_0.0.1_all.ipk\",\"subscribe\":true}'"
+ssh root@<host> 'rm -f /tmp/io.github.pando85.voicesatellite_0.0.1_all.ipk'
+```
+
+`ares-install` also works once ares-cli is set up for the rooted TV as the HBC README describes. The package is not in a Homebrew Channel repository yet.
+
+**Set up:** open "Voice Satellite" on the TV and press **Set up** (installs under `/var/lib/webos-satellite`, writes a config with a random device name, starts the supervised daemon, opens a 10-minute pairing window), then add the device in Home Assistant (ESPHome, the TV's address, port 6053); HA 2026.9 or newer sets the key. Over SSH instead (`APP` is the app directory, `/media/developer/apps/usr/palm/applications/io.github.pando85.voicesatellite` on HBC 0.6; `luna-send -n 1 luna://com.webos.applicationManager/dev/listApps '{}'` shows `folderPath` elsewhere):
+
+```sh
+ssh root@<host> "sh $APP/payload/ctl.sh install && sh $APP/payload/ctl.sh start"
+ssh root@<host> "sh $APP/payload/ctl.sh status"             # or: status --json
+# own config or fixed key instead of the generated ones:
+ssh root@<host> "sh $APP/payload/ctl.sh install --config /tmp/tv.toml --psk-file /tmp/noise_psk"
+```
+
+**Start at boot** (off by default): the app's "Start at boot: turn on", or `ctl.sh autostart on`. It writes `/var/lib/webosbrew/init.d/webos-satellite`; the daemon starts about 60 s after boot, never on an unvalidated firmware, after a crash loop, with the kill switch present or with `/var/lib/webos-satellite/disable` present. `ctl.sh autostart off` deletes the hook.
+
+**Update:** bump `version` in the workspace `Cargo.toml`, `make ipk`, install the new ipk exactly as above. The running daemon is not touched by the install; the update is applied when the app is opened next (automatically), at the next boot if start at boot is on, or now with `ssh root@<host> "sh $APP/payload/ctl.sh install"` (stops, installs, keeps `etc/` and `log/`, starts again if it was running; never two daemons).
+
+**Uninstall:**
+
+```sh
+ssh root@<host> "sh $APP/payload/ctl.sh uninstall"   # hook, daemon and binaries removed; config, key, logs KEPT
+ssh root@<host> "sh $APP/payload/ctl.sh purge"       # everything in /var/lib/webos-satellite removed as well
+make tv-remove-ipk TV=root@<host>                    # then remove the app (dev/remove)
+```
+
+The app has the same two buttons. Removing the app in the launcher or HBC without them runs nothing of ours: the boot hook and autostart then start nothing (the app is gone), and the data stays until `sh /var/lib/webos-satellite/bin/ctl.sh purge` (after `uninstall`: `rm -rf /var/lib/webos-satellite`) and `rm -f /var/lib/webosbrew/init.d/webos-satellite`.
+
+**Rollback:**
+
+| Goal | Action |
+| --- | --- |
+| Stop listening now | app "Microphone off", or `ctl.sh mic off` (`touch /tmp/webos-satellite.disable`); undo with `mic on` |
+| Stop the satellite | app "Stop", or `ctl.sh stop` |
+| No start at next boot | `ctl.sh autostart off`, or `touch /var/lib/webos-satellite/disable` |
+| Go back to an older version | install the older ipk the same way, then `ctl.sh install`. Whether appinstalld accepts a downgrade is not verified; if not: `make tv-remove-ipk` (data kept), install the older ipk, `ctl.sh install` |
+| Remove everything | `ctl.sh purge`, then `make tv-remove-ipk` |
+| HBC failsafe mode after a boot | the hooks were skipped; delete `/var/lib/webosbrew/init.d/webos-satellite` over SSH or telnet and reboot ([autostart rollback](design/autostart.md#rollback)) |
 
 ### Network prerequisite
 
@@ -247,7 +309,7 @@ When HA cannot open a connection to the satellite (the situation on the owner's 
 ## CI
 
 - [`.github/workflows/validate.yml`](../.github/workflows/validate.yml): documentation checks (`sh -n tools/probe/probe.sh`, `sh -n` of the packaging and lifecycle scripts, `python3 tools/check_docs.py`).
-- [`.github/workflows/rust.yml`](../.github/workflows/rust.yml): `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test` and `packaging/webos/tests/run.sh` on the host; then the armv7 and aarch64 cross-builds, ELF checks, a run of the armv7 binary under `qemu-user-static`, and the armv7 binary uploaded as a short-lived workflow artifact.
+- [`.github/workflows/rust.yml`](../.github/workflows/rust.yml): `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test`, `packaging/webos/tests/run.sh`, `tests/ipk.sh` and `tests/app_smoke.js` on the host; then the armv7 and aarch64 cross-builds, ELF checks, a run of the armv7 binary under `qemu-user-static`, `make ipk` (built and checked, not uploaded), and the armv7 binary uploaded as a short-lived workflow artifact.
 
 Actions are pinned to commit SHAs with the version in a comment. Update them deliberately.
 
@@ -257,8 +319,10 @@ Actions are pinned to commit SHAs with the version in a comment. Update them del
 make lint test
 python3 tools/check_docs.py
 sh -n tools/probe/probe.sh
-for f in packaging/webos/*.sh packaging/webos/init.d/* packaging/webos/tests/*.sh tools/lifecycle/*.sh; do sh -n "$f"; done
-shellcheck -x -P SCRIPTDIR -s sh packaging/webos/*.sh packaging/webos/init.d/* packaging/webos/tests/*.sh   # if installed
+for f in packaging/webos/*.sh packaging/webos/init.d/* packaging/webos/tests/*.sh packaging/webos/tv/*.sh tools/lifecycle/*.sh; do sh -n "$f"; done
+shellcheck -x -P SCRIPTDIR -s sh packaging/webos/*.sh packaging/webos/init.d/* packaging/webos/tests/*.sh packaging/webos/tv/*.sh   # if installed
+make test-packaging              # ops scripts, ipk lifecycle, status app (node)
+make ipk                         # cross builds, package and its structure check
 tools/esphome-fake-ha/run.sh     # protocol and daemon e2e harness
 tools/lifecycle/run.sh           # microphone gate and ops scripts on the host
 ```

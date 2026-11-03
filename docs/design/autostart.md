@@ -1,6 +1,6 @@
 # Autostart design: boot hook, supervisor and rollback
 
-- **Status:** proposal, **not installed**. Nothing has been written to `/var/lib/webosbrew/init.d` or to any persistent path on c3-a. Installing the hook is the first persistent change of the project and needs the owner's explicit approval (roadmap Phase 3, needs-owner).
+- **Status:** proposal, **not installed**. Nothing has been written to `/var/lib/webosbrew/init.d` or to any persistent path on c3-a. Installing the hook is the first persistent change of the project and needs the owner's explicit approval (roadmap Phase 3, needs-owner). **Update 2026-11-03:** the hook now ships with the webOS app package as a template, written only on the user's "Start at boot" (`ctl.sh autostart on`) with the install directory `/var/lib/webos-satellite`; it also starts nothing once the app is removed, and `autostart.sh` applies a pending package update before starting ([packaging design](packaging.md)). Tested on a PC; the first TV run is planned on c3-b ([EXP-009](../experiments/EXP-009-ipk-install-update.md)).
 - **Date:** 2026-11-02. Device in scope: c3-a (LG C3, webOS TV 8.3.0, firmware 03.30.74, rooted with the Homebrew Channel). Other models and firmware are not covered.
 - **Files:** [`packaging/webos/init.d/webos-satellite`](../../packaging/webos/init.d/webos-satellite) (the draft hook), [`autostart.sh`](../../packaging/webos/autostart.sh), [`supervise.sh`](../../packaging/webos/supervise.sh), [`start.sh`](../../packaging/webos/start.sh), [`stop.sh`](../../packaging/webos/stop.sh). Host test: [`packaging/webos/tests/run.sh`](../../packaging/webos/tests/run.sh).
 - **Related:** [rooted-tv-improvements item 8](../discovery/c3-a/rooted-tv-improvements.md), [D0-D1 root method details](../discovery/c3-a/D0-D1-runtime.md#root-method-details), [P3 robustness](../discovery/c3-a/P3-robustness.md), [development: install on a TV](../development.md#install-on-a-tv-non-persistent).
@@ -36,12 +36,14 @@ Not covered by this design: an HBC-style service instead of `init.d` (item 8 pre
 
 ## Proposed install (needs the owner's approval; not done)
 
+With the app package, steps 1, 2 and 4 are done by the package (`ctl.sh install` installs under `/var/lib/webos-satellite`; `ctl.sh autostart on` writes the hook with that path); the hand-made procedure below stays valid for an install without the app.
+
 Prerequisites: the owner approves (1) a persistent prefix, (2) the one hook file, and (3) one test reboot; LG hands-free stays off; the TV is idle; a working SSH session is open; the owner knows the rollback below.
 
 1. Choose the persistent prefix. Proposal: `/media/developer/webos-satellite` (exec allowed, about 4 GB free; lost together with developer mode, which then disables autostart by itself). Alternative: a directory under `/var/lib`.
 2. Install with the existing script (`install.sh --prefix /media/developer/webos-satellite --persistent --config ... --psk-file ...`). The config must keep `validated_firmware = ["03.30.74"]` and a silent or approved sink. Optionally set `safety.mute_file` inside the prefix so an HA mute survives reboots.
 3. Run it supervised by hand first (`start.sh --supervise`), check `status.sh`, the kill switch and `stop.sh`.
-4. Edit `PREFIX=` in the hook if another prefix was chosen, then copy it: `install -m 0755 packaging/webos/init.d/webos-satellite /var/lib/webosbrew/init.d/webos-satellite` (the name must match `run-parts` rules: letters, digits, `-`, `_`, no dot).
+4. Replace `@PREFIX@` in the hook template with the chosen prefix, then copy it: `sed 's|@PREFIX@|/media/developer/webos-satellite|' packaging/webos/init.d/webos-satellite >hook && install -m 0755 hook /var/lib/webosbrew/init.d/webos-satellite` (the name must match `run-parts` rules: letters, digits, `-`, `_`, no dot). With the app package: `ctl.sh autostart on`.
 5. One test reboot (owner's action). After boot: `cat DIR/log/autostart.log` shows the firmware line and `starting` about 60 s after boot; `status.sh` shows the supervisor and daemon; `/var/luna/preferences/webosbrew_failsafe` is absent; no failsafe toast appeared.
 
 ## Rollback
