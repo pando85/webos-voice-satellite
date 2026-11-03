@@ -29,6 +29,7 @@ while [ $# -gt 0 ]; do
     *) die "unknown argument: $1 (see --help)" ;;
     esac
 done
+close_inherited_fds "$0"
 resolve_prefix "$0" "$prefix_arg"
 require_installed
 [ -x "$BIN" ] || die "binary missing: $BIN"
@@ -59,19 +60,21 @@ if [ -f "$LOG" ] && [ "$(wc -c <"$LOG")" -gt "$max" ]; then
 fi
 
 cd "$PREFIX"
-# New session (setsid when present): the daemon must not depend on the
-# caller's session, for example a Homebrew Channel exec from the app.
+# New session (setsid when present, see lib.sh): the daemon must not depend
+# on the caller's session, for example a Homebrew Channel exec from the app.
+# shellcheck disable=SC2086 # $SETSID is empty or one word
 if [ "$supervise" -eq 1 ]; then
-    detached nohup sh "$PREFIX/bin/supervise.sh" -- "$@" </dev/null >/dev/null 2>&1 &
+    $SETSID nohup sh "$PREFIX/bin/supervise.sh" -- "$@" </dev/null >/dev/null 2>&1 &
     watch=$!
     echo "$watch" >"$SUPPID"
 else
-    detached nohup "$BIN" --config "$CFG" "$@" </dev/null >>"$LOG" 2>&1 &
+    $SETSID nohup "$BIN" --config "$CFG" "$@" </dev/null >>"$LOG" 2>&1 &
     watch=$!
     echo "$watch" >"$PIDFILE"
 fi
 # The rotator exits with the process it watches (the supervisor or the daemon).
-detached nohup sh "$PREFIX/bin/rotate.sh" "$watch" "$LOG" "$max" </dev/null >/dev/null 2>&1 &
+# shellcheck disable=SC2086
+$SETSID nohup sh "$PREFIX/bin/rotate.sh" "$watch" "$LOG" "$max" </dev/null >/dev/null 2>&1 &
 echo $! >"$ROTPID"
 
 sleep 1

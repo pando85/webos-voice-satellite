@@ -165,7 +165,19 @@ cfg_sum=$(sha256sum <"$S/etc/config.toml")
 psk_sum=$(sha256sum <"$S/etc/noise_psk")
 
 echo "== start, status, boot hook =="
-$CTL start >/dev/null
+# As the Homebrew Channel's exec runs it: output read through a pipe until
+# it closes, and descriptors of the caller (its Luna sockets) inherited.
+exec 7>"$T/inherited"
+t0=$(date +%s)
+out=$(timeout 20 $CTL start 2>&1) && rc=0 || rc=$?
+exec 7>&-
+check "start with captured output returns at once (HBC exec waits for the pipe)" '[ "$rc" -eq 0 ] && [ $(($(date +%s) - t0)) -le 5 ] && echo "$out" | grep -q "started pid"'
+leaks=0
+for p in $(pgrep -f "$S/bin/"); do
+    ! ls -l "/proc/$p/fd" 2>/dev/null | grep -q "$T/inherited" || leaks=$((leaks + 1))
+done
+check "daemon, supervisor and rotator keep no descriptor of the caller" '[ "$leaks" -eq 0 ] && [ -n "$(pgrep -f "$S/bin/supervise.sh")" ]'
+check "no start.sh process stays behind; the supervisor pidfile names supervise.sh" '[ -z "$(pgrep -f "$S/bin/start.sh")" ] && tr "\0" " " </proc/$(cat "$S/run/supervise.pid")/cmdline | grep -q supervise.sh'
 check "start: one supervised daemon" 'json "s[\"running\"] and s[\"supervised\"] and s[\"firmware_ok\"]" && [ "$(daemons)" = 1 ] && [ "$(supervisors)" = 1 ]'
 check "status --json: no key material" '! $CTL status --json | grep -q "$(cat "$T/psk")"'
 $CTL start >/dev/null

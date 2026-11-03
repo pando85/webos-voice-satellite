@@ -121,17 +121,38 @@ install_file() {
     cp "$1" "$2.new.$$" && chmod "$3" "$2.new.$$" && mv -f "$2.new.$$" "$2"
 }
 
-# Runs "$@" in a new session when setsid exists, so the job does not share
-# the caller's session or process group (a Homebrew Channel exec, a hook).
-# In a non-interactive shell a background job is not a group leader, so
-# setsid does not fork and $! stays the job's pid.
-detached() {
-    if command -v setsid >/dev/null 2>&1; then
-        setsid "$@"
-    else
-        "$@"
-    fi
+# Closes every descriptor above 2 that this shell inherited, except the one
+# it reads its script $1 from. A Homebrew Channel `exec` hands its children
+# the Luna bus sockets of its service and the sockets it reads the command's
+# output from: a daemon keeping those blocks the exec's reply until the
+# daemon exits and can keep a restarted service from registering (HBC's own
+# startup.sh closes inherited descriptors for the same reason).
+close_inherited_fds() {
+    self=$(readlink -f "$1" 2>/dev/null) || self=$1
+    for f in /proc/"$$"/fd/*; do
+        fd=${f##*/}
+        case $fd in
+        0 | 1 | 2 | '' | *[!0-9]*) continue ;;
+        esac
+        t=$(readlink "$f" 2>/dev/null) || continue
+        [ "$t" != "$self" ] || continue
+        eval "exec $fd>&-" 2>/dev/null || true
+    done
 }
+
+# setsid when present: started jobs get their own session, so they do not
+# depend on the caller's session or process group (a Homebrew Channel exec,
+# a boot hook). Used as a plain command word, never through a function: a
+# function in the background runs in a forked subshell that stays behind,
+# keeps copies of the caller's descriptors and makes $! the subshell's pid.
+# In a non-interactive shell a background job is not a group leader, so
+# setsid does not fork and $! is the job itself (checked on c3-b).
+# shellcheck disable=SC2034 # used by start.sh
+SETSID=
+if command -v setsid >/dev/null 2>&1; then
+    # shellcheck disable=SC2034
+    SETSID=setsid
+fi
 
 # Picks the prefix: --prefix DIR, or the parent of the directory holding the
 # installed script. Call as: resolve_prefix "$0" "$prefix_arg"
