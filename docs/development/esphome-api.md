@@ -25,7 +25,9 @@ Code generation: `build.rs` compiles the proto with `protox` (pure Rust, so no `
   - `MULTI_CHANNEL_AUDIO` (64) is rejected by config validation because it is not implemented.
 - **Request flags:** `USE_WAKE_WORD` (2) is set for wake word runs. `USE_VAD` is never set, because HA 2026.10.4 ignores it.
 - **Entities:**
-  - One `media_player`. Its single ANNOUNCEMENT format is `flac`, 22050 Hz, 1 channel, 2 bytes. That is Piper's native rate, it streams well and symphonia can decode it. `sample_rate` is always set, to work around the HA 2026.10.4 bug. The only media feature is STOP. In URL mode this format becomes HA's TTS format. In all modes it is the format of announcement media proxied through ffmpeg.
+  - Optional, set by the application in `Config`: a diagnostic `text_sensor` "TV power state" (`power_sensor`, fed by `AppCommand::SetPowerState`) and configuration `select` entities (`selects`, state by `AppCommand::SetSelect`, HA's choice by `AppEvent::SelectChanged`; an option outside the list is answered with the current state).
+  - `AppCommand::Resumed` (after a system suspend): the server pings HA and drops the connection without an answer within 5 s, re-announces mDNS and re-arms a wake word waiting out a retry backoff.
+  - One `media_player`. Its single ANNOUNCEMENT format is `flac`, 22050 Hz, 1 channel, 2 bytes. That is Piper's native rate, it streams well and symphonia can decode it. `sample_rate` is always set, to work around the HA 2026.10.4 bug. Its features are STOP, VOLUME_SET and VOLUME_STEP (4096 + 4 + 1024; HA 2026.10.4 takes them from `feature_flags`): the volume is the satellite's reply volume in percent (`AppCommand::SetVolume` at startup, `AppEvent::VolumeChanged` on a change from HA, steps of 5 %). In URL mode this format becomes HA's TTS format. In all modes it is the format of announcement media proxied through ffmpeg.
   - One "Mute microphone" switch, entity category config.
 - **Wake words:** `VoiceAssistantConfigurationResponse` reports no available or active wake words and `max_active_wake_words = 0`. The wake word is whatever the selected HA pipeline configures.
 - **Encryption:**
