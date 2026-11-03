@@ -1,6 +1,6 @@
 # Always-on design: listening and replying while the TV screen is off
 
-- **Status:** **proposal, nothing implemented.** Desk research plus read-only inspection of c3-a on 2026-11-03. No power state was changed, no setting was written, no sound was played. The test procedure that would settle the open points is [D5 plan](../discovery/c3-a/D5-plan.md) (agent-runnable, **not run yet**).
+- **Status:** **proposal, nothing implemented.** Desk research plus read-only inspection of c3-a on 2026-11-03. No power state was changed, no setting was written, no sound was played. The test procedure is the [D5 plan](../discovery/c3-a/D5-plan.md). **It was run on a second unit, c3-b, on 2026-11-03** ([results](../discovery/c3-b/D5-results.md), summary in [section 11](#11-result-on-c3-b-2026-11-03)); it has not been run on c3-a.
 - **Date:** 2026-11-03. Device in scope for TV facts: c3-a (LG C3, webOS TV 8.3.0, firmware 03.30.74, rooted with the Homebrew Channel). Other models and firmware are not covered; a finding from another LG model is not confirmation on this one.
 - **Owner question (2026-11-03):** can the satellite run all the time, listen with the TV screen off and still work, and can it play sound with the screen off?
 - **Related:** [autostart design](autostart.md), [install and configuration UX](install-and-config-ux.md), [EXP-004](../experiments/EXP-004-power-lifecycle.md), [P3 robustness](../discovery/c3-a/P3-robustness.md), [D2 audio stack](../discovery/c3-a/D2-audio-stack.md), [roadmap Phase 3](../project/roadmap.md#phase-3-lifecycle-and-robustness).
@@ -13,8 +13,8 @@ Labels follow [AGENTS.md](../../AGENTS.md): `documented` (vendor or upstream tex
 | --- | --- |
 | Can it run all the time? | **Yes while the TV is on, including with the screen off** (the process, the capture PCM and the HA connection do not depend on the panel; hypothesis until D5). **No while the TV is in standby (Suspend)**: the process is frozen, not killed, and the network is not reliably up (observed-on-other-device). A TV powered off with Quick Start+ off is a cold boot and everything restarts. |
 | How to listen with the screen off? | Use **"screen off" on a running TV** (luna `tvpower/power/turnOffScreen`, the HA webostv "Screen" switch, or the OLED Care "Screen Off" menu), not the remote's power button. This is the recommended mode ([section 4](#4-what-always-on-realistically-means-and-recommended-modes)). |
-| Can the remote's power key keep it listening with the TV looking off? | **Unknown; best candidate is Always Ready as it is already set (dark variant), to be tested in D5.** Remapping POWER at the input layer is not a realistic route (the one documented tool says power is not remappable). Ranked options and the test: [section 10](#10-keeping-the-satellite-alive-on-remote-power-off). |
-| Can it play sound with the screen off? | **Likely yes** in that mode: the feature exists so that the TV "keeps running, so you can keep listening to the sound" (documented, HA) and users play audio through it (observed-on-other-device). Not verified on c3-a with our `pacat` path; that is a D5 step. In standby there is no playback for our process (frozen). |
+| Can the remote's power key keep it listening with the TV looking off? | **Yes on c3-b with Always Ready on** (`Active Standby`, process, mic and HA link alive for 59 min 18 s, wake word chain ran); **no with Always Ready off** (the TV suspends 7 to 15 s later and the process is frozen). The API key and the real IR remote key gave the same state sequences. Panel darkness and power draw not observed. [Section 11](#11-result-on-c3-b-2026-11-03) |
+| Can it play sound with the screen off? | **Yes with `turnOffScreen` (state `Screen Off`)**: a `pacat` tone was heard by the TV's microphone on c3-b. **No in the `Active Standby` state that the remote's power-off gives with Always Ready on**: the tone was silent at the mic in 5 checks, on ARC and on the TV speaker (verified-on-target, c3-b). In `Suspend` nothing runs. |
 
 ## 2. What was observed on c3-a (read-only, 2026-11-03)
 
@@ -246,6 +246,24 @@ If the API key lands in `Suspend` (or something else) while the **owner's real k
 5. `suspend_stats/success` before and after (is it a kernel suspend?).
 6. A passive trace: does the IR POWER key appear as an event, on which node (settles rank 3).
 7. Whether the TV wakes from every state by WoL, the remote and `controls/power` (the way-back gate).
+
+## 11. Result on c3-b (2026-11-03)
+
+- **Run:** the [D5 plan](../discovery/c3-a/D5-plan.md) on a second LG C3 (c3-b, firmware `03.30.73`), with the aarch64 daemon from `/tmp`. Full tables, timings, deviations and what was restored: [D5 results](../discovery/c3-b/D5-results.md); unit facts: [D0 quick](../discovery/c3-b/D0-quick.md). Everything below is `verified-on-target` on that unit and firmware, in the states named; c3-a is a different unit.
+- **State sequence after a power-off** (API key `networkinput/controls/power`, and two real IR-remote presses that a person made, uncontrolled): `Request Power Off` (reason `remoteKey`) then `Active Standby` at +3 to +4 s. With **Always Ready off**: `Request Suspend` (reason `oslbSaving`) at +7 to +15 s, `Suspend`, network down about 10 to 20 s after the key, a kernel suspend (`suspend_stats/success` +1), the process **frozen** (same pid after the wake), the mic PCM `SUSPENDED` then `RUNNING` within about 20 ms of the resume, the HA TCP session kept. With **Always Ready on** (`alwaysReady` and `allEnabled` alike): it **stays in `Active Standby`**, no suspend, network up, process and mic alive, `aod` status `none`.
+- **Duration:** 59 min 18 s, ended by a power-on with reason `remoteKey`; no timer ended it (home app, not an HDMI input). Longer stays not seen.
+- **Wake:** `controls/power` (a toggle) and a real key wake `Active Standby` in 3 s; WoL woke `Suspend` in 2 to 4 s (with `wolwowlOnOff` set to `true`; the unit's own value was `false`, whose effect is untested). No HA turn-on path exists (no webostv entity).
+- **Listening in Always Ready:** no `MIC BUSY` (LG hands-free off), no stalls; six wake word detections ran the whole chain (STT, intent, TTS stream to `pacat`).
+- **Replying in Always Ready: fails.** The tone was not heard by the mic in `Active Standby` (five checks, ARC and TV speaker outputs), though PulseAudio and ALSA playback ran. It is heard in `Active`, `Screen Saver` and `Screen Off`. The cause is not isolated (a mute or power-down in the amp or soundbar path, **hypothesis**).
+- **Input nodes:** the physical IR POWER key is a `KEY_POWER` event on `LGE RCU`; the API key appears on `Smart Remote RCU Input`, not on `LGE Network Input` (an observation for rank 3; it does not change that rank).
+- **Rank 2 probes:** `sleepd` `activityStart` hold (2a): no effect on the suspend. `cancelPowerOff {}` in the window (2c): returned true, no effect. 2b not run. Both negative.
+- **Consequences for the design:**
+  1. With Always Ready on, the "TV looks off and still listens" half of the goal is met by LG's own setting and needs no new code (on this unit; panel and draw not yet observed).
+  2. The "play a reply" half is not met in that state. A reply needs the TV out of `Active Standby`. **Untested idea (hypothesis):** on a wake word in `Active Standby`, the satellite wakes the TV with `controls/power` (3 s to `Active`), then calls `turnOffScreen` (`Screen Off` plays sound). This lights the panel briefly and adds about 3 s before the first sound; it needs its own test, with people in the room warned.
+  3. Mode A (`turnOffScreen` on a running TV) stays the supported state where replies must be heard.
+  4. The sound output can revert to ARC after a power cycle, so a feature that needs `tv_speaker` must set it each time and read it back.
+  5. G6 (keep-awake guard) needs to read `lifeOnScreenMode`, `wolwowlOnOff` and `quickStartMode` and say what each does; `suspend_stats/success` and the power-state log are cheap probes for the satellite itself.
+- **Open:** the long soak with a real remote, the Magic Remote, panel and draw, why `Active Standby` is silent, WoL from `Active Standby` and with `wolwowlOnOff = false`, the wake-and-darken idea. These need a quiet window agreed with the owner; the room is in use.
 
 ## Sources
 
