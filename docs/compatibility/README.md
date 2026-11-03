@@ -1,6 +1,6 @@
 # Device compatibility and evidence
 
-No model or firmware is currently verified. **Do not mark LG C3 supported based on other LG TVs.**
+No model or firmware is currently verified for public announcement. **Do not mark LG C3 supported based on other LG TVs.**
 
 Each result must identify:
 - Alias (not IP/serial/MAC), exact model, webOS version, firmware, kernel and userland architecture.
@@ -10,3 +10,7 @@ Each result must identify:
 - Known regressions and recovery method.
 
 Use [DEVICE-TEMPLATE.md](DEVICE-TEMPLATE.md). Store private raw output outside Git.
+
+## Verified TVs list (release plan)
+
+The public release will not hard-whitelist firmware in the daemon. Instead this directory will hold the **verified list**: one row per exact model and firmware with what passed, the date and the evidence, and only those rows are announced as supported. Users will send a sanitized compatibility report (model, webOS, firmware, architecture, audio PCM summary, capture and playback checks; never a serial, MAC, IP or hostname) through a GitHub issue template, and the app and Home Assistant will show "verified / not verified" instead of blocking. Design and release prerequisites: [packaging section 9](../design/packaging.md#9-verified-models-list-instead-of-a-firmware-whitelist), [backlog #10](../project/backlog.md#10-official-homebrew-channel-listing). Not implemented yet; the daemon's firmware gate is unchanged until the release.

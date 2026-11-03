@@ -26,6 +26,8 @@ Labels follow [AGENTS.md](../../AGENTS.md). Facts about HBC and other apps are `
 | P12 | **The app sends only whitelisted commands** (`status --json`, `install`, `start`, `stop`, `autostart on/off`, `mic off/on`, `pair`, `reset-pairing`, `clear-crashloop`, `uninstall`, `purge`) and builds the path from its own location. Luna calls use the web runtime's `PalmServiceBridge` directly, which is what LG's `webOSTV.js` does inside `webOS.service.request`, so no third-party library ships. The TV's address comes from the documented connection manager `getStatus` | No typed or received text reaches a root shell ([install UX §3.1](install-and-config-ux.md#31-option-a-a-webos-app-ui-on-the-tv-remote-control)) | `webOSTV.js` 1.2.4 as bundled by PicCap; [LG connection manager API](https://webostv.developer.lge.com/develop/references/connection-manager) |
 | P13 | **An HBC package manifest is generated** next to the ipk (`<id>.manifest.json`: id, version, type, title, `iconUri` as a `data:` URI, `rootRequired: true`, relative `ipkUrl`, `ipkHash.sha256`). Not published | The starting point for the `apps-repo` entry under P14. Not published yet | webosbrew/docs `HomebrewPackageManifest.schema.json`; lginputhook `buildmanifest.js` |
 | P14 | **Distribution: manual install only for now.** The target is the official Homebrew Channel apps repository (`webosbrew/apps-repo`), later. There is no self-hosted repository. The listing needs the AI-use disclosure in the PR, and the generated manifest (P13) next to the ipk is the starting point. Follow-up: [backlog #10](../project/backlog.md#10-official-homebrew-channel-listing) | Owner decision, 2026-11-03 (closes [install UX open question 7](install-and-config-ux.md#6-open-questions)). apps-repo rules (AI disclosure, human development and review) from the [apps-repo README](https://github.com/webosbrew/apps-repo) |
+| P15 | **License: GPL-3.0-or-later.** `LICENSE` holds the verbatim GPLv3 text. `license = "GPL-3.0-or-later"` is set once in `[workspace.package]` and inherited by every crate. The ipk control file carries `License: GPL-3.0-or-later` (the opkg convention; `check` verifies it) and the app directory ships `LICENSE`, so the text travels with the binaries. `appinfo.json` has no license field in LG's format and the HBC manifest schema has none either (its properties are id, version, type, title, appDescription, iconUri, sourceUrl, rootRequired, ipkUrl, ipkHash), so nothing is invented there: the store derives "open source" from the `pool: main` entry in `apps-repo` and `sourceUrl`. Dependency audit and flags: [section 8](#8-license-decision-and-dependency-audit) | Owner decision, 2026-11-03 | GPLv3 text from gnu.org; webosbrew/docs `HomebrewPackageManifest.schema.json`; apps-repo README (`pool`) |
+| P16 | **No hard firmware whitelist in the public release; a verified-models list plus a runtime "verified / not verified" status instead.** Documented now, implemented at the Homebrew Channel release. **Today's gate stays unchanged until then.** Design: [section 9](#9-verified-models-list-instead-of-a-firmware-whitelist) | Owner decision, 2026-11-03 | [Section 9](#9-verified-models-list-instead-of-a-firmware-whitelist) |
 
 ## 2. Package contents
 
@@ -87,11 +89,89 @@ All of it, on c3-b first ([EXP-009](../experiments/EXP-009-ipk-install-update.md
 
 ## 7. Open questions
 
-1. App title and repository license before the first publication (P4 settles the app id; the license is needed for `apps-repo`).
+1. App title before the first publication (P4 settles the app id). The repository license is decided: GPL-3.0-or-later (P15).
 2. Does appinstalld accept a downgrade (older version over newer)? If not, rollback is "remove the app (data kept), install the older ipk, `ctl.sh install`".
 3. Does a process started through HBC `exec` stay alive when HBC's service is killed (HBC self-update kills app services with SIGKILL on webOS 4+, per its source comment) or when the luna hub restarts ([always-on](always-on.md#2-what-was-observed-on-c3-a-read-only-2026-11-03))?
-4. Should the first install add the firmware of the TV it runs on to the allow-list after an explicit "I understand" ([install UX open question 5](install-and-config-ux.md#6-open-questions))? Today the owner edits `validated_firmware` by hand after validating capture on that model.
+4. Superseded by P16 for the public release: no allow-list override at install; the status is "verified / not verified" and the gate becomes a warning ([section 9](#9-verified-models-list-instead-of-a-firmware-whitelist)). Until then the owner edits `validated_firmware` by hand after validating capture on that model.
 5. Publication path: decided 2026-11-03, the official `apps-repo` (P14). Still open: the AI-use disclosure wording, which is part of the [backlog #10](../project/backlog.md#10-official-homebrew-channel-listing) step.
+
+## 8. License decision and dependency audit
+
+**Decision (owner, 2026-11-03): GPL-3.0-or-later** for this repository (P15). What was done: `LICENSE` (verbatim, from <https://www.gnu.org/licenses/gpl-3.0.txt>, sha256 `3972dc97...6986`), `license` in `[workspace.package]` inherited by all five crates, `License:` in the ipk control file, `LICENSE` in the app directory, and a `check` rule for both. The vendored ESPHome `.proto` files stay MIT under their own notice (`crates/esphome-api/proto/LICENSE-ESPHOME-MIT`); MIT is GPLv3-compatible.
+
+### 8.1 Rust dependencies (audited 2026-11-03, `cargo metadata --format-version 1 --locked`, 180 external packages, plus `cargo deny check licenses` with a scratch config outside the repo; the whole lock file, all targets)
+
+| License expression (as published) | Packages | GPL-3.0-or-later compatible | Note |
+| --- | --- | --- | --- |
+| `MIT OR Apache-2.0` and spelling variants (`Apache-2.0 OR MIT`, `MIT/Apache-2.0`, `Apache-2.0/MIT`, `Apache-2.0 / MIT`) | 117 | yes | Apache-2.0 is compatible with GPLv3 (not with GPLv2-only; irrelevant here) |
+| `MIT` | 17 | yes | |
+| `BSD-3-Clause` | 10 (sonora family, nnnoiseless, curve25519-dalek, subtle) | yes | sonora also has the WebRTC patent grant ([aec-candidates](../research/aec-candidates.md)) |
+| `MPL-2.0` | 10 (the `symphonia` family) | yes | MPL-2.0 section 3.3 allows combining with GPL code; its file-level copyleft applies to the unmodified crates only. Keep the crate sources available (crates.io) and name them in the release notes |
+| `Apache-2.0` | 6 (miette, prost family) | yes | |
+| `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT` | 5 (linux-raw-sys, rustix, wasi, wasip2, wit-bindgen) | yes | |
+| `Unlicense OR MIT`, `Zlib OR Apache-2.0 OR MIT`, `Zlib`, `ISC`, `MIT OR BSD-3-Clause`, `Apache-2.0 OR ISC OR MIT`, `BlueOak-1.0.0 OR MIT OR Apache-2.0`, `MIT OR Apache-2.0 OR BSD-1-Clause`, `(MIT OR Apache-2.0) AND Unicode-3.0` | 12 | yes | choose the MIT or Apache option where there is a choice |
+| `MIT OR Apache-2.0 OR LGPL-2.1-or-later` | 1 (`r-efi`) | yes | choose MIT or Apache-2.0; the LGPL option is not needed (and is a UEFI crate, not in the TV build) |
+| `Apache-2.0 AND ISC` | 1 (`ring` 0.17.14) | yes, **check on release** | Both terms apply. Its `LICENSE` files list ISC, Apache-2.0 (BoringSSL parts) and once_cell (MIT/Apache-2.0); none of them is the OpenSSL advertising-clause license that GPLv3 rejects. Pulled in by `rustls` through `ureq` (`webos-playback`), so it is in the TV binary. Confirm the file-by-file notices when the release notice file is generated |
+| `CDLA-Permissive-2.0` | 1 (`webpki-roots` 1.0.11, the Mozilla CA bundle as data) | yes (permissive, attribution) | **Not on the FSF list, and `cargo deny` rejects it unless allowed explicitly.** It is a permissive data license with no copyleft; judged compatible, but unclear to a strict reviewer. In the TV binary through `ureq`. Flag for the owner: either accept it, or build `ureq` against the TV's own CA store instead |
+
+No GPL-2.0-only, proprietary, missing or unknown licenses. Nothing is incompatible. Flags for the owner:
+
+1. `webpki-roots` (`CDLA-Permissive-2.0`): unusual license, judged fine.
+2. `ring`: confirm the notices at release time.
+3. **Binary distribution needs a third-party notice file.** MIT, BSD, ISC and Apache-2.0 require that the copyright and license texts of the dependencies are reproduced with the binary. The ipk does not ship one yet. Before the release, generate one (for example with `cargo about`, which is not installed here and was not added) and include it next to `LICENSE`. Release prerequisite in [backlog #10](../project/backlog.md#10-official-homebrew-channel-listing).
+4. The proto files' MIT notice must also stay in the source tree (it does).
+
+### 8.2 Python tools and the status app
+
+The Python tools are development and test aids, **not shipped in the ipk and not part of the TV runtime**; `packaging/webos/ipk/build_ipk.py` is standard library only. Third-party modules they import, with the licenses read from the installed metadata (the local `.venv`) or PyPI on 2026-11-03: `aioesphomeapi` (MIT, pinned in `tools/esphome-fake-ha/requirements.txt`), `aiohttp` 3.14.5 (Apache-2.0 AND MIT, same file), `numpy` (BSD-3-Clause and permissive parts), `scipy` (BSD-3-Clause), `matplotlib` (matplotlib license, BSD-style), `soundfile` (BSD-3-Clause), `wyoming` (MIT), `onnxruntime` (MIT), `faster-whisper` (MIT), `pyopen-wakeword` (Apache-2.0), `openwakeword` (Apache-2.0 code), `piper-tts` 1.8.0 (**GPL-3.0-or-later**, fine: the same license, and it is only run on the PC to synthesize test speech). Flag: upstream publishes the pre-trained openWakeWord models under a more restrictive (non-commercial) license than its code (recalled from its README, not re-checked in this audit), which this repository neither ships nor depends on at runtime (no model files are tracked); keep it that way, and check the model card before anyone bundles a model. The test-content clips and voices have their own licenses, recorded in the audio-rig manifest ([tools/audio-rig/README.md](../../tools/audio-rig/README.md)); none is committed.
+
+The status app (`packaging/webos/app/`) is plain HTML, CSS and JavaScript with **no JS dependencies** (no `package.json`, no bundled library). `packaging/webos/tests/app_smoke.js` uses Node's standard library only.
+
+### 8.3 CI
+
+There is no license check in CI. The `cargo deny` run above used a scratch config outside the repository and found exactly one expression outside the common permissive set (`CDLA-Permissive-2.0`). `cargo-deny` is installed locally but no `deny.toml` was added, because the owner did not ask for new tooling; adding one, with the allow-list from the table above, is a small follow-up if wanted.
+
+## 9. Verified-models list instead of a firmware whitelist
+
+**Decision (owner, 2026-11-03), P16.** The public release will not hard-whitelist firmware. This section is the design; **nothing here is implemented, and the daemon behaves as before: it refuses to open the microphone unless the TV firmware is in `safety.validated_firmware`** ([config](../../config/example.toml), `crates/satellite/src/firmware.rs`, roadmap Phase 3 "Firmware guard", c3-a evidence). The gate stays until the Homebrew Channel release ([backlog #10](../project/backlog.md#10-official-homebrew-channel-listing)).
+
+### 9.1 What the gate protects today
+
+LG can update the firmware silently, and with it the audio stack (ALSA card names and indexes, the capture ioctls, the DAPM and sysfs behaviour behind the [oops hazard](../discovery/c3-a/rooted-tv-improvements.md)). Capture is validated only on c3-a firmware 03.30.74 (and c3-b is being validated). The gate turns "the mic path was never tested on this firmware" into "the mic stays off until the owner has looked". A bare "not verified" label would drop that safety net, so the release replaces it with a softer form, it does not just remove it.
+
+### 9.2 Published list
+
+- A **Verified TVs** table: model (exact), webOS version, firmware, architecture, what passed (capture, playback, wake roundtrip), the date, the experiment or report, and the power states covered. Kept in [docs/compatibility/](../compatibility/README.md) (one row per model and firmware, the per-device record as today) and linked from the README. Only rows in this table are announced as supported; this follows the existing rule that no model is marked supported without device evidence.
+- Everything else is "not verified": it may work, and the user is asked to report.
+
+### 9.3 Compatibility report (to be implemented)
+
+`ctl.sh report` and a button in the status app produce one sanitized block of text:
+
+- model name, webOS version, firmware (`webos_manufacturing_version`), kernel and userland architecture;
+- the ALSA PCM summary (card names, capture and playback device lists, the chosen capture device and its format);
+- results of the built-in checks: capture opened and delivered non-silent frames, playback played the test tone, HA connection and pairing state, build version;
+- the satellite version.
+
+It must **not** contain a serial number, MAC address, IP address, hostname, TV name, pairing key, Wi-Fi name or HA address. Implementation rule: build the report from an allow-list of fields, never by filtering a raw dump, and cover it with a test that seeds fake identifiers and asserts none appears. The report is shown to the user before they copy it; nothing is sent anywhere by the app.
+
+A GitHub issue template, **TV compatibility report**, takes this block (model, firmware and the pass/fail lines as fields, the privacy reminder at the top). A maintainer adds the verified row after reading it; a report alone is `observed-on-other-device` until a maintainer or a second report confirms it.
+
+### 9.4 Runtime behaviour at the release (replaces the block)
+
+| Situation | Today | At the release |
+| --- | --- | --- |
+| Firmware is on the verified list | mic opens | mic opens; status "verified" |
+| Firmware not on the list | mic stays off | mic opens (the user installed it on purpose); status "not verified" in the app, a log line at start, and an HA diagnostic entity (for example a text or binary sensor `verification`: `verified` / `not verified`, with model and firmware as attributes) |
+| Firmware changed since install | mic stays off (firmware not in the list) | **warning, not a block**: the daemon stores the firmware seen at install (and the last firmware it ran on) in its state directory; when `os_info.json` differs it logs a `WARN firmware changed: <old> -> <new>`, shows a banner in the status app, and the HA entity reports `firmware changed` until the user acknowledges it (a button entity, or `ctl.sh ack-firmware`). It also reruns the self-checks that cost nothing (capture opens and delivers frames, playback tone) and puts the result in the same entity |
+| Firmware cannot be read | mic stays off | status "unknown"; the mic opens; log and entity say so |
+| Strict mode wanted | (default) | keep `safety.validated_firmware` as an **optional** list: if it is non-empty it works as today (mic off on another firmware). It becomes empty by default; owners who want the hard gate set it. Decide at the release whether the default list is empty or holds the verified firmware versions |
+
+Open points for that release: whether a failed self-check after a firmware change should close the mic (recommended: yes, with the reason shown, because it is a measured failure rather than an unknown); whether the first capture on an unverified firmware should wait for one explicit confirmation in the app (this reopens [install UX question 5](install-and-config-ux.md#6-open-questions), which this decision answers as "no blocking override, a visible status"); how the DAPM oops hazard on a different audio stack is surfaced, since a warning cannot prevent it (the daemon never touches the ASoC sysfs files, so the hazard comes from probes and tooling, not from capture).
+
+### 9.5 Release prerequisites
+
+Recorded in [backlog #10](../project/backlog.md#10-official-homebrew-channel-listing): the verified-models table with at least the tested TVs, `ctl.sh report` and the app button, the issue template, the status and the HA entity, the firmware-changed warning, and the README "Verified TVs" section. Until all of them exist the current gate is the protection.
 
 ## Sources
 

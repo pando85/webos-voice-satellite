@@ -37,7 +37,7 @@ All crate versions are the latest on crates.io on 2026-11-02. "Last push" is the
 | `corti-aec` 0.5.1, `echo_nlms` 0.1.0 | Offline NLMS tools | MIT; Apache-2.0 OR MPL-2.0 | very new, tiny | Not evaluated (offline use or toy scale) |
 | `deep_filter` 0.2.5, `denoize` 0.90.2 | DeepFilterNet NS / classical NS | MIT/Apache-2.0; MIT | `deep_filter` last release 2022 | Not evaluated (NS only, not needed for the first decision) |
 
-The repository has no licence file yet (the decision is listed as open in the [roadmap](../project/roadmap.md)). Every evaluated candidate is permissive (BSD, MIT or Apache-2.0); the only GPL one is `rlx-aec`. The WebRTC family carries a Google patent grant (documented in its `PATENT`/`PATENTS` files).
+The repository licence is GPL-3.0-or-later (owner decision 2026-11-03; it had no licence file when this was written). Every evaluated candidate is permissive (BSD, MIT or Apache-2.0); the only GPL one is `rlx-aec`. The WebRTC family carries a Google patent grant (documented in its `PATENT`/`PATENTS` files).
 
 ## Build results (armv7 static musl, our setup)
 
@@ -207,7 +207,7 @@ The `RESULT` line reports `rtf_best`, `cpu_s`, `cpu_pct_of_realtime` and `peak_r
 - Does the SoundEngineCapture delay stay fixed for sessions longer than 3 minutes and across volume or sound-mode changes (a P2 open question); what happens to the AEC when it jumps? A delay hint from a start-up estimate versus a free-running estimator.
 - Nonlinear echo at higher volumes (only a synthetic tanh stress here).
 - Whether the satellite's own reply (the main echo source during barge-in) is better handled by using the played TTS stream as an extra digital reference.
-- The repository licence is undecided; all recommended candidates are BSD-3-Clause or Apache-2.0 (the WebRTC family adds a patent grant).
+- The repository licence is GPL-3.0-or-later (decided 2026-11-03); all recommended candidates are BSD-3-Clause or Apache-2.0 (the WebRTC family adds a patent grant).
 
 ## Reproduce
 

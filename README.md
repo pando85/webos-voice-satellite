@@ -32,4 +32,8 @@ An experimental, local-first Home Assistant voice satellite for **rooted LG webO
 
 **Development:** [build, cross-compile and deploy](docs/development.md) · **Architecture:** [overview](docs/architecture/overview.md) (provisional, partly superseded by the ADRs) · **Backlog:** [post-Phase-5 ideas](docs/project/backlog.md) · **Agent skills:** [.agents/skills](.agents/skills) · **CI:** [documentation checks](.github/workflows/validate.yml), [Rust](.github/workflows/rust.yml)
 
+## License
+
+GPL-3.0-or-later. The full text is in [LICENSE](LICENSE). Third-party dependencies and their licenses are audited in the [packaging design](docs/design/packaging.md#8-license-decision-and-dependency-audit). The vendored ESPHome `.proto` files keep their MIT notice.
+
 This is an independent community project, not endorsed by LG or Home Assistant.
