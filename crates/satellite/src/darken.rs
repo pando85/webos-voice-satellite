@@ -18,11 +18,18 @@
 //!    refused with `Keyblock1.5second`. If the TV is still in
 //!    `Active Standby` [`KEY_FALLBACK_AFTER`] later, the toggle key once
 //!    ([`Action::Key`], only while that state holds).
-//! 4. At `Screen On` (or a settled `Active`, whichever comes first),
-//!    [`Action::Darken`]: `turnOffScreen`; one retry if the TV is still
-//!    `Active` [`DARKEN_RETRY_AFTER`] later. Done at a settled `Screen Off`.
-//! 5. Second-press rule: a power-off that starts from a `Screen Off` this
-//!    machine made is the user turning the TV on: wake, do not darken.
+//! 4. At the settled `Active`, [`Action::Darken`]: `turnOffScreen`; one
+//!    retry if the TV is still `Active` [`DARKEN_RETRY_AFTER`] later. Done at
+//!    a settled `Screen Off`. (Earlier, at the `Screen On` step, tvpowerd
+//!    accepted it in D6 but refused it once on c3-b with "The current
+//!    substate must be 'active'", so the daemon waits for `Active`, which
+//!    follows `Screen On` within about 0.1 s.)
+//! 5. Second-press rule: a power-off that starts from `Screen Off` is the
+//!    user turning the TV on: wake, do not darken. D6 applied it to the
+//!    `Screen Off` the watcher made; the daemon applies it to every
+//!    `Screen Off`, because after a daemon restart it cannot know who made
+//!    it, and a wrong guess must leave the TV lit, never dark (the user then
+//!    presses again and gets the normal look-off).
 //!
 //! The machine never changes a TV setting; it only wakes the TV and turns
 //! the screen off, as the remote and LG's own "screen off" would.
@@ -183,10 +190,10 @@ impl Darkener {
             key_sent,
         } = self.phase
         {
-            let screen_on = p == "ScreenOn" || (p.is_empty() && s == "Active");
-            if darken && screen_on {
+            let active = p.is_empty() && s == "Active";
+            if darken && active {
                 log::info!(
-                    "remote power-off: screen on {} ms after the wake; turning it off",
+                    "remote power-off: on {} ms after the wake; turning the screen off",
                     now.saturating_duration_since(since).as_millis()
                 );
                 self.phase = Phase::Darkening {
@@ -194,7 +201,7 @@ impl Darkener {
                     retried: false,
                 };
                 action = Some(Action::Darken);
-            } else if !darken && p.is_empty() && s == "Active" {
+            } else if !darken && active {
                 log::info!(
                     "remote power-off: the TV is on again ({} ms after the wake; second press)",
                     now.saturating_duration_since(since).as_millis()
@@ -256,10 +263,11 @@ impl Darkener {
             }
         }
         self.actions.push_back(now);
-        let second_press = req.from == "ScreenOff" && self.dark;
+        let second_press = req.from == "ScreenOff";
         if second_press {
             log::info!(
-                "remote power-off from the satellite's screen off: second press, waking the TV with the screen on"
+                "remote power-off from screen off (dark by the satellite: {}): second press, waking the TV with the screen on",
+                self.dark
             );
         } else {
             log::info!(
@@ -508,7 +516,7 @@ mod tests {
         let mut t = T::new(RemoteOff::KeepListening);
         t.up(0, &st("Active"));
         assert_eq!(t.power_off(1000, "Active", "remoteKey"), Some(Action::Wake));
-        // Darken at Screen On, once.
+        // Darken at the settled Active, once (not at Screen On).
         assert_eq!(t.wake(5000), vec![Action::Darken]);
         assert!(t.d.busy());
         assert_eq!(t.up(7300, &st("Screen Off")), None);
@@ -522,12 +530,21 @@ mod tests {
         assert_eq!(t.wake(44_000), vec![]);
         assert!(!t.d.busy());
         assert!(!t.d.screen_dark_by_us());
-        // A power-off from Active again is a normal wake and darken.
+        // A Screen Off the satellite did not make (or does not remember, after
+        // a restart) also counts as a second press: the TV ends lit.
+        t.up(60_000, &st("Screen Off"));
+        assert!(!t.d.screen_dark_by_us());
         assert_eq!(
-            t.power_off(80_000, "Active", "remoteKey"),
+            t.power_off(62_000, "Screen Off", "remoteKey"),
             Some(Action::Wake)
         );
-        assert_eq!(t.wake(84_000), vec![Action::Darken]);
+        assert_eq!(t.wake(66_000), vec![]);
+        // A power-off from Active again is a normal wake and darken.
+        assert_eq!(
+            t.power_off(100_000, "Active", "remoteKey"),
+            Some(Action::Wake)
+        );
+        assert_eq!(t.wake(104_000), vec![Action::Darken]);
     }
 
     #[test]
