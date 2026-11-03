@@ -42,7 +42,7 @@ Read-only at the start; the same values were restored and verified at the end.
 - **Playback on the TV:** plain `pacat` (48 kHz stereo, raw) for tones and noise, and the satellite (from `/tmp`, file mic, `pacat` sink at gain 1.0) for HA announcements and the end-to-end run. The satellite used a file mic, so the ALSA mic stayed free for the recorder.
 - **HDMI playback:** `pw-play --target <the HDMI sink>` on the PC.
 - **Stimuli** (synthetic, in `devices/private/stimuli/session1/`; a throwaway generator, not committed): a 1 kHz tone at -12 dBFS peak, pink noise at -20 dBFS RMS (and -26 dBFS RMS), 0.25 s chirps from 300 Hz to 6 kHz, a 6 s exponential sweep from 40 Hz to 20 kHz, and a 3-minute chirp train (one chirp every 10 s). The content clips are 60 s excerpts of the [P2 content set](../../experiments/P2-corpus.md) at -23 LUFS: Spanish audiobook speech, music with vocals and instrumental music.
-- **Safety limits:** volume ceiling 25 for test signals and replies. Content was played at volume 6, the TV's original volume, which is lower than 20. Every test sound lasted 15 s or less, and content clips 60 s. The abort path (`pkill` on both sides, then restoring the volume) was prepared but never needed.
+- **Safety limits:** volume ceiling 25 for test signals and replies. Content was played at volume 6, the volume read at the start of the session and restored exactly afterwards, which is lower than 20. Every test sound lasted 15 s or less, and content clips 60 s. The abort path (`pkill` on both sides, then restoring the volume) was prepared but never needed.
 
 ## 1. Audible reply path and volume curve (EXP-005)
 
@@ -159,7 +159,7 @@ These were checked because SF failed; they were proposed as D4-b in [D2](D2-audi
 
 ### TV content at the owner's normal volume
 
-Three 60 s content clips at -23 LUFS were played over HDMI at volume 6 (the TV's original volume; the PC sink at 0 dB), with SF linked. **verified-on-target**, one run each.
+Three 60 s content clips at -23 LUFS were played over HDMI at volume 6 (the volume read at the start of the session, restored exactly afterwards; the PC sink at 0 dB), with SF linked. **verified-on-target**, one run each.
 
 | Clip | Mic ch0 RMS (60 s) | SF RMS | SF − mic delay drift over 60 s |
 | --- | --- | --- | --- |
@@ -178,7 +178,7 @@ Three 60 s content clips at -23 LUFS were played over HDMI at volume 6 (the TV's
 ## Negative results, deviations and residual unknowns
 
 - **Negative:** SpeakerFeedback fails as a linear AEC reference (see above). The previous working assumption (the [backlog](../../project/backlog.md) and [roadmap](../../project/roadmap.md) item "AEC with the SpeakerFeedback reference") should move to SoundEngineCapture, pending an AEC evaluation.
-- **Not done:** content at volume 10 and 20, as the brief asked. The session's own content limit (the original volume, 6, being lower than 20) took precedence, so content ran only at volume 6. Test signals ran at 10 and 20.
+- **Not done:** content at volume 10 and 20, as the brief asked. The session's own content limit (the volume read at the start of the session, restored exactly afterwards, being lower than 20) took precedence, so content ran only at volume 6. Test signals ran at 10 and 20.
 - **Not tested:** the luna input switch (not needed), mute changes, outputs other than the TV speaker, the screen saver off, and the TV's sound mode and auto-volume settings (not read).
 - **Unknown:** why SF is distorted; whether SoundEngineCapture's delay stays fixed beyond 3 minutes and across volume or sound-mode changes; whether opening `LGSIC,2` or `LGSIC,3` affects LG's own voice features (hands-free stayed off throughout); ERLE with real double-talk; a nonlinear echo component at higher volumes.
 - One run per condition. No rates or confidence intervals are claimed.

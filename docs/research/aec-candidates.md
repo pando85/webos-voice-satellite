@@ -93,7 +93,7 @@ Recordings: c3-a P2 session 1 captures under the gitignored `devices/private/c3-
 - The fixed-point speexdsp is level sensitive: the +20 dB reference gain improved its canceller by 3.5 dB. Its preprocessor does the heavy lifting here, and it is also the component that attenuates quiet near-end speech in the synthetic runs (below).
 - The same ordering holds on the pre-volume MixerCapture tap (`tap2-v10`, delay 47.8 ms, reference -20.8 dBFS): AEC3 family 17.4 to 17.7 dB, `decibri-aec` 14.4 dB, speexdsp 5.5 dB (16.6 dB with preprocessor), oracle PBFDAF 14.6 dB. The AEC3 family found the 47.8 ms delay without being told.
 - The short chirp captures at volume 20 (`tap3-v20a`, `tap3-v20b`, 5 s of chirps, reference -39.5 dBFS) gave 14 to 28 dB for the AEC3 family depending on the implementation and the reference gain, with an oracle PBFDAF of only 4.4 dB. They are too short and non-stationary to rank the implementations, and are not used for the recommendation.
-- Content at volume 6 (the TV's normal level) is noise limited (mic echo about -64 dBFS against a -68 dBFS floor, per P2), so no ERLE can be shown there; those captures also used SpeakerFeedback, not SoundEngineCapture. They were not used.
+- Content at volume 6 (the volume read at the start of the session, restored exactly afterwards) is noise limited (mic echo about -64 dBFS against a -68 dBFS floor, per P2), so no ERLE can be shown there; those captures also used SpeakerFeedback, not SoundEngineCapture. They were not used.
 
 ## Synthetic results (not device evidence)
 
