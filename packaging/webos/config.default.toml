@@ -28,6 +28,15 @@ pcm_name = "WoV PDM Mic"
 [sink]
 type = "pacat"
 gain = 1.0
+# Reply volume in percent until Home Assistant sets one on the satellite's
+# media player (then stored in etc/reply_volume). 40 is -30 dB: replies stay
+# comfortable even with a loud TV volume.
+volume = 40
+
+[power]
+# The TV power state is shown in Home Assistant. "When the TV is turned off
+# with the remote" is a select there (default: turn off normally).
+watch = true
 
 [log]
 level = "info"

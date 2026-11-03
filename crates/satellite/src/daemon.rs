@@ -29,10 +29,26 @@ use crate::capture::{
     self, CaptureSettings, KILL_SWITCH_POLL, OFF_FIRMWARE, OFF_KILL, OFF_MUTED, OFF_NONE,
     OFF_UNPAIRED, Shared,
 };
-use crate::config::{Hang, MicSource, Mode, Settings, TestTriggers};
+use crate::config::{Hang, MicSource, Mode, RemoteOff, Settings, TestTriggers};
+use crate::darken::{self, Action, Darkener};
 use crate::firmware::{self, Verdict};
 use crate::player::{Done, Kind, Player, redact_url};
+use crate::power::{self, PowerUpdate};
+use crate::volume::{self, SharedGain};
 use crate::watchdog::{self, Beats};
+use crate::{resume, volume::Origin};
+
+/// Two resume signals (the clock jump, the power state's `Prepare Resume`)
+/// this close together are one resume.
+const RESUME_DEDUP: Duration = Duration::from_secs(30);
+/// tvpower's luna methods used by wake-and-darken.
+const TVPOWER: &str = "luna://com.webos.service.tvpower/power";
+/// The remote's power key as a toggle (fallback wake, D6 A3).
+const POWER_KEY_URI: &str = "luna://com.webos.service.networkinput/controls/power";
+/// `powerOn` attempts while tvpowerd answers `Keyblock1.5second`.
+const POWER_ON_TRIES: u32 = 3;
+/// Pause before a `powerOn` retry (the key block is 1.5 s).
+const POWER_ON_RETRY: Duration = Duration::from_millis(1600);
 
 /// The pairing trigger files are checked this often.
 const PAIRING_POLL: Duration = Duration::from_secs(1);
@@ -191,6 +207,15 @@ impl RunTracker {
     }
 }
 
+/// A luna reply for the log.
+fn reply(r: &Result<String, String>) -> String {
+    match r {
+        Ok(t) if t.is_empty() => "no output".to_owned(),
+        Ok(t) => t.chars().take(160).collect(),
+        Err(e) => format!("failed: {e}"),
+    }
+}
+
 fn finished(kind: Kind, success: bool) -> AppCommand {
     match kind {
         Kind::Tts => AppCommand::PlaybackFinished { success },
@@ -198,7 +223,7 @@ fn finished(kind: Kind, success: bool) -> AppCommand {
     }
 }
 
-async fn sleep_opt(at: Option<Instant>) {
+pub(crate) async fn sleep_opt(at: Option<Instant>) {
     match at {
         Some(t) => tokio::time::sleep_until(t).await,
         None => std::future::pending().await,
@@ -405,6 +430,17 @@ struct Daemon {
     /// `pair` and `reset-pairing` trigger files, with pairing enabled.
     pairing_triggers: Option<(PathBuf, PathBuf)>,
     trigger_warned: bool,
+    /// Reply volume gain shared with the player.
+    volume_gain: SharedGain,
+    volume_file: PathBuf,
+    /// `luna-send`, when the power watch runs.
+    luna: Option<PathBuf>,
+    /// Last power state update (for change-only logging and the sensor).
+    last_power: Option<PowerUpdate>,
+    darkener: Darkener,
+    remote_off_file: PathBuf,
+    resume: resume::Detector,
+    last_resume: Option<Instant>,
 }
 
 impl Daemon {
@@ -533,6 +569,136 @@ impl Daemon {
         if let Some(l) = line {
             log::info!("{l}");
         }
+    }
+
+    /// HA set the reply volume: apply it to the next samples and store it.
+    fn on_volume(&self, percent: u8) {
+        self.volume_gain.set(volume::gain_for(percent));
+        log::info!(
+            "reply volume {percent} % ({}) set by Home Assistant",
+            volume::db_for(percent).map_or_else(|| "silent".to_owned(), |db| format!("{db:.1} dB"))
+        );
+        if let Err(e) = volume::store(&self.volume_file, percent) {
+            log::warn!(
+                "cannot store the reply volume in {}: {e} (it is lost at the next restart)",
+                self.volume_file.display()
+            );
+        }
+    }
+
+    /// HA chose a select option.
+    fn on_select(&mut self, object_id: &str, option: &str) {
+        if object_id != darken::SELECT_OBJECT_ID {
+            return;
+        }
+        let Some(mode) = darken::mode_for(option) else {
+            return;
+        };
+        self.darkener.set_mode(mode);
+        match mode {
+            RemoteOff::KeepListening => log::warn!(
+                "remote power-off set to KEEP LISTENING by Home Assistant: after the remote turns the TV off the satellite wakes it and turns the screen off (the TV stays on with a dark screen; more power than standby, OLED panel care may not run)"
+            ),
+            RemoteOff::Normal => {
+                log::info!("remote power-off set to turn off normally by Home Assistant");
+            }
+        }
+        let word = darken::file_word(mode);
+        if let Err(e) = volume::write_atomic(&self.remote_off_file, &format!("{word}\n")) {
+            log::warn!(
+                "cannot store the remote power-off setting in {}: {e}",
+                self.remote_off_file.display()
+            );
+        }
+    }
+
+    /// A power state update: log, report, resume and wake-and-darken.
+    async fn on_power(&mut self, u: PowerUpdate) {
+        let now = Instant::now();
+        let changed = self.last_power.as_ref() != Some(&u);
+        if changed {
+            log::info!("power: {}", u.describe());
+        }
+        let text_changed = self
+            .last_power
+            .as_ref()
+            .is_none_or(|l| l.text() != u.text());
+        // A processing-only update keeps the last known state in the text.
+        let mut shown = u.clone();
+        if shown.state.is_none() {
+            shown.state = self.last_power.as_ref().and_then(|l| l.state.clone());
+        }
+        if text_changed {
+            self.send(AppCommand::SetPowerState(shown.text())).await;
+        }
+        if u.processing_key() == "PrepareResume" {
+            self.on_resume("the TV reported Prepare Resume").await;
+        }
+        let inhibit = self.gate.kill.then_some("the kill switch is on");
+        let action = self.darkener.on_update(now, &shown, inhibit);
+        self.last_power = Some(shown);
+        self.run_action(action);
+    }
+
+    /// Runs a wake-and-darken call in the background (logged).
+    fn run_action(&self, action: Option<Action>) {
+        let (Some(action), Some(luna)) = (action, self.luna.clone()) else {
+            return;
+        };
+        tokio::spawn(async move {
+            match action {
+                Action::Wake => {
+                    let uri = format!("{TVPOWER}/powerOn");
+                    for n in 1..=POWER_ON_TRIES {
+                        let r = power::call(&luna, &uri, r#"{"reason":"remoteKey"}"#).await;
+                        log::info!("remote power-off: powerOn try {n}: {}", reply(&r));
+                        match r {
+                            Ok(t) if t.contains("Keyblock") => {
+                                tokio::time::sleep(POWER_ON_RETRY).await;
+                            }
+                            _ => break,
+                        }
+                    }
+                }
+                Action::Key => {
+                    let r = power::call(&luna, POWER_KEY_URI, "{}").await;
+                    log::info!("remote power-off: power key: {}", reply(&r));
+                }
+                Action::Darken => {
+                    let r = power::call(&luna, &format!("{TVPOWER}/turnOffScreen"), "{}").await;
+                    log::info!("remote power-off: turnOffScreen: {}", reply(&r));
+                }
+            }
+        });
+    }
+
+    /// The system resumed (clock jump or power state). Deduplicated.
+    async fn on_resume(&mut self, why: &str) {
+        let now = Instant::now();
+        if self
+            .last_resume
+            .is_some_and(|t| now.saturating_duration_since(t) < RESUME_DEDUP)
+        {
+            log::debug!("resume signal ignored (already handled): {why}");
+            return;
+        }
+        self.last_resume = Some(now);
+        log::info!(
+            "RESUMED from a system suspend ({why}); capture recovers by itself (xruns so far {}); checking the HA connection",
+            self.shared.xruns.load(Ordering::Relaxed)
+        );
+        self.send(AppCommand::Resumed).await;
+    }
+
+    /// Called every kill-switch poll: resume detection and the darkener's
+    /// timers.
+    async fn poll_power(&mut self) {
+        if let Some(gap) = self.resume.observe(resume::suspended_total()) {
+            self.on_resume(&format!("suspended for {} s", gap.as_secs()))
+                .await;
+        }
+        let action = self.darkener.on_tick(Instant::now());
+        self.run_action(action);
     }
 
     /// Logs a timer event and keeps the table. The audible chime is not
@@ -666,6 +832,8 @@ impl Daemon {
                 self.runs.error(&code);
             }
             AppEvent::Pairing(ev) => self.on_pairing(ev).await,
+            AppEvent::VolumeChanged(percent) => self.on_volume(percent),
+            AppEvent::SelectChanged { object_id, option } => self.on_select(&object_id, &option),
             AppEvent::MuteChanged(muted) => {
                 if muted {
                     self.set_streaming(false);
@@ -735,7 +903,59 @@ pub(crate) async fn run(mut settings: Settings, triggers: TestTriggers) -> Resul
     if settings.pairing_active() {
         prepare_pairing(&mut settings)?;
     }
-    let esp = settings.esphome_config().map_err(|e| e.to_string())?;
+    let mut esp = settings.esphome_config().map_err(|e| e.to_string())?;
+    // Power watch: only where luna-send exists (the TV), never on a PC.
+    let luna = if settings.power.watch {
+        let found = power::find_binary(&settings.power.luna_send);
+        if found.is_none() {
+            log::info!(
+                "power: {} not found; the TV power state is not watched (normal off the TV)",
+                settings.power.luna_send.display()
+            );
+        }
+        found
+    } else {
+        log::info!("power: the TV power state watch is off (power.watch = false)");
+        None
+    };
+    let remote_off = match darken::load_mode(&settings.power.remote_off_file) {
+        Ok(Some(m)) => m,
+        Ok(None) => settings.power.remote_off,
+        Err(why) => {
+            log::warn!(
+                "power: {} is not usable ({why}); using {:?}",
+                settings.power.remote_off_file.display(),
+                settings.power.remote_off
+            );
+            settings.power.remote_off
+        }
+    };
+    if luna.is_some() {
+        esp.power_sensor = true;
+        esp.selects.push(darken::select_entity());
+        if remote_off == RemoteOff::KeepListening {
+            log::warn!(
+                "power: remote power-off is KEEP LISTENING: the satellite wakes the TV after a remote power-off and turns its screen off"
+            );
+        }
+    } else if remote_off == RemoteOff::KeepListening {
+        log::warn!("power: remote_off = keep_listening needs the power watch; ignored");
+    }
+    // Reply volume.
+    let (reply_volume, origin) = volume::load(&settings.sink.volume_file, settings.sink.volume);
+    match origin {
+        Origin::Stored => log::info!(
+            "reply volume {reply_volume} % (stored in {})",
+            settings.sink.volume_file.display()
+        ),
+        Origin::Default => {
+            log::info!("reply volume {reply_volume} % (sink.volume; none stored yet)");
+        }
+        Origin::Invalid(why) => log::warn!(
+            "reply volume: {} is not usable ({why}); using sink.volume {reply_volume} %",
+            settings.sink.volume_file.display()
+        ),
+    }
     let server = Server::bind(esp).await.map_err(|e| e.to_string())?;
     let unpaired = server.needs_pairing();
     if unpaired {
@@ -821,13 +1041,25 @@ pub(crate) async fn run(mut settings: Settings, triggers: TestTriggers) -> Resul
     if start_muted {
         let _ = cmd_tx.send(AppCommand::SetMuted(true)).await;
     }
+    let _ = cmd_tx.send(AppCommand::SetVolume(reply_volume)).await;
+    if luna.is_some() {
+        let _ = cmd_tx
+            .send(AppCommand::SetSelect {
+                object_id: darken::SELECT_OBJECT_ID.to_owned(),
+                option: darken::option_for(remote_off).to_owned(),
+            })
+            .await;
+    }
     let server_task = tokio::spawn(server.run(ev_tx, cmd_rx));
 
     let (done_tx, mut done_rx) = mpsc::unbounded_channel();
+    let (power_tx, mut power_rx) = mpsc::unbounded_channel();
+    let power_watch = luna.clone().map(|l| power::spawn(l, power_tx));
+    let volume_gain = SharedGain::new(volume::gain_for(reply_volume));
     let mut d = Daemon {
         cmd_tx,
         shared: Arc::clone(&shared),
-        player: Player::new(settings.sink.clone(), done_tx),
+        player: Player::new(settings.sink.clone(), volume_gain.clone(), done_tx),
         runs: RunTracker::default(),
         connected: false,
         gate,
@@ -841,7 +1073,21 @@ pub(crate) async fn run(mut settings: Settings, triggers: TestTriggers) -> Resul
             )
         }),
         trigger_warned: false,
+        volume_gain,
+        volume_file: settings.sink.volume_file.clone(),
+        luna,
+        last_power: None,
+        darkener: Darkener::new(
+            remote_off,
+            settings.power.max_actions_per_hour,
+            Duration::from_secs(u64::from(settings.power.cooldown_s)),
+        ),
+        remote_off_file: settings.power.remote_off_file.clone(),
+        resume: resume::Detector::default(),
+        last_resume: None,
     };
+    // The first reading is the baseline.
+    d.resume.observe(resume::suspended_total());
     let mut pairing_poll = settings.pairing_active().then(|| {
         let mut iv = tokio::time::interval_at(Instant::now() + PAIRING_POLL, PAIRING_POLL);
         iv.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -872,6 +1118,7 @@ pub(crate) async fn run(mut settings: Settings, triggers: TestTriggers) -> Resul
                 }
             }
             Some(done) = done_rx.recv() => d.on_done(done).await,
+            Some(u) = power_rx.recv() => d.on_power(u).await,
             _ = sigterm.recv() => {
                 log::info!("SIGTERM: shutting down");
                 break;
@@ -884,6 +1131,7 @@ pub(crate) async fn run(mut settings: Settings, triggers: TestTriggers) -> Resul
             _ = kill_poll.tick() => {
                 beats.event_loop.fetch_add(1, Ordering::Relaxed);
                 d.poll_kill_switch().await;
+                d.poll_power().await;
             }
             () = tick_opt(ptt_timer.as_mut()) => d.ptt("--ptt-every").await,
             () = tick_opt(pairing_poll.as_mut()) => d.poll_pairing().await,
@@ -914,6 +1162,9 @@ pub(crate) async fn run(mut settings: Settings, triggers: TestTriggers) -> Resul
     // Shutdown: stop streaming and playback (kills pacat), release the mic,
     // then close the command channel so the server says goodbye to HA.
     beats.disarmed.store(true, Ordering::Relaxed);
+    if let Some(w) = power_watch {
+        w.shutdown().await;
+    }
     d.set_streaming(false);
     d.player.shutdown().await;
     Daemon::log_line(d.runs.flush());

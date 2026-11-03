@@ -22,7 +22,7 @@ webos-dsp = { path = "crates/dsp" }
 webos-esphome-api = { path = "crates/esphome-api" }
 webos-playback = { path = "crates/playback" }
 # External crates (pure Rust: the TV build is static musl, no system libs)
-rustix = { version = "1", default-features = false, features = ["std", "system", "param", "process"] }
+rustix = { version = "1", default-features = false, features = ["std", "system", "param", "process", "time", "pty", "fs"] }
 # Echo canceller: pure Rust port of WebRTC audio processing (AEC3, NS), BSD-3-Clause.
 # Needs rustc 1.91. docs/research/aec-candidates.md, docs/design/aec-frontend.md.
 sonora = { version = "0.2.0", default-features = false }

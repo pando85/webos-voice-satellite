@@ -7,8 +7,11 @@
 //!
 //! Streamed TTS is written to `pacat` as it arrives, at its native 16 kHz mono
 //! (PulseAudio converts it), with the software gain applied to every sample
-//! before the write. With `sink.gain = 0` every byte written is zero: that is
-//! how silent tests on c3-a work, because `pacat --volume` is ignored there.
+//! before the write. The gain is `sink.gain` times the reply volume
+//! ([`crate::volume`]), read for every chunk so a volume change from HA also
+//! affects a reply that is playing; URL media takes the gain at its start.
+//! With `sink.gain = 0` every byte written is zero: that is how silent tests
+//! on c3-a work, because `pacat --volume` is ignored there.
 
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -22,6 +25,7 @@ use tokio::sync::{mpsc, oneshot};
 use webos_playback::{FetchConfig, NullSink, PacatSink, Pcm, Sink, SinkFormat, WavFileSink};
 
 use crate::config::{SinkKind, SinkSection};
+use crate::volume::SharedGain;
 
 /// What a playback was for; decides which "finished" message HA gets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -143,6 +147,8 @@ struct Active {
 /// The playback controller owned by the daemon loop.
 pub(crate) struct Player {
     cfg: SinkSection,
+    /// Reply volume gain (multiplies `cfg.gain`).
+    volume: SharedGain,
     done_tx: mpsc::UnboundedSender<Done>,
     next_id: u64,
     current: Option<Active>,
@@ -195,9 +201,14 @@ fn wav_path(dir: &std::path::Path, prefix: &str, id: u64) -> PathBuf {
 }
 
 impl Player {
-    pub(crate) fn new(cfg: SinkSection, done_tx: mpsc::UnboundedSender<Done>) -> Self {
+    pub(crate) fn new(
+        cfg: SinkSection,
+        volume: SharedGain,
+        done_tx: mpsc::UnboundedSender<Done>,
+    ) -> Self {
         Self {
             cfg,
+            volume,
             done_tx,
             next_id: 0,
             current: None,
@@ -222,10 +233,13 @@ impl Player {
         let (id, cancel_rx, cancel_tx) = self.begin();
         let (chunk_tx, chunk_rx) = chunk_queue(MAX_QUEUED_BYTES);
         let cfg = self.cfg.clone();
+        let volume = self.volume.clone();
         let done_tx = self.done_tx.clone();
         let task = tokio::spawn(async move {
             let result = match cfg.kind {
-                SinkKind::Pacat => stream_pacat(&cfg, rate, channels, chunk_rx, cancel_rx).await,
+                SinkKind::Pacat => {
+                    stream_pacat(&cfg, &volume, rate, channels, chunk_rx, cancel_rx).await
+                }
                 SinkKind::Wav => {
                     let path = wav_path(&cfg.dir, "reply", id);
                     stream_wav(path, rate, channels, chunk_rx, cancel_rx).await
@@ -276,10 +290,19 @@ impl Player {
         let stopped = self.stop();
         let (id, cancel_rx, cancel_tx) = self.begin();
         let cfg = self.cfg.clone();
+        let gain = self.cfg.gain * self.volume.get();
         let done_tx = self.done_tx.clone();
         let task = tokio::spawn(async move {
-            let result =
-                play_url_task(&cfg, id, kind, &url, preannounce.as_deref(), cancel_rx).await;
+            let result = play_url_task(
+                &cfg,
+                gain,
+                id,
+                kind,
+                &url,
+                preannounce.as_deref(),
+                cancel_rx,
+            )
+            .await;
             let _ = done_tx.send(Done { id, kind, result });
         });
         self.current = Some(Active {
@@ -347,6 +370,7 @@ fn pacat_stream_args(cfg: &SinkSection, rate: u32, channels: u16) -> Vec<String>
 
 async fn stream_pacat(
     cfg: &SinkSection,
+    volume: &SharedGain,
     rate: u32,
     channels: u16,
     mut rx: ChunkRx,
@@ -378,7 +402,7 @@ async fn stream_pacat(
             }
             chunk = rx.recv() => {
                 let Some(chunk) = chunk else { break };
-                let (out, nonzero) = gain_s16le(&chunk, cfg.gain);
+                let (out, nonzero) = gain_s16le(&chunk, cfg.gain * volume.get());
                 stats.bytes += out.len();
                 *stats.nonzero_samples.get_or_insert(0) += nonzero;
                 if let Err(e) = stdin.write_all(&out).await {
@@ -480,14 +504,15 @@ async fn stream_null(
     })
 }
 
-fn url_sink(cfg: &SinkSection, id: u64, kind: Kind) -> (Box<dyn Sink>, Option<PathBuf>) {
+/// `gain`: `sink.gain` times the reply volume, for `pacat` only.
+fn url_sink(cfg: &SinkSection, gain: f32, id: u64, kind: Kind) -> (Box<dyn Sink>, Option<PathBuf>) {
     match cfg.kind {
         SinkKind::Pacat => {
             let mut p = PacatSink::new();
             p.binary.clone_from(&cfg.binary);
             p.rate = cfg.rate;
             p.channels = cfg.channels;
-            p.gain = cfg.gain;
+            p.gain = gain;
             p.device.clone_from(&cfg.device);
             p.extra_args.extend(latency_args(cfg));
             (Box::new(p), None)
@@ -511,13 +536,14 @@ fn url_sink(cfg: &SinkSection, id: u64, kind: Kind) -> (Box<dyn Sink>, Option<Pa
 
 async fn play_url_task(
     cfg: &SinkSection,
+    gain: f32,
     id: u64,
     kind: Kind,
     url: &str,
     preannounce: Option<&str>,
     mut cancel: oneshot::Receiver<()>,
 ) -> Result<PlayStats, String> {
-    let (mut sink, file) = url_sink(cfg, id, kind);
+    let (mut sink, file) = url_sink(cfg, gain, id, kind);
     let stop = sink.stop_handle();
     let fetch = FetchConfig::default();
     let started = Instant::now();
@@ -660,7 +686,7 @@ mod tests {
         let mut cfg = SinkSection::default();
         cfg.binary.clone_from(&script);
         let (tx, _rx) = mpsc::unbounded_channel();
-        let mut p = Player::new(cfg, tx);
+        let mut p = Player::new(cfg, SharedGain::new(1.0), tx);
         p.start_stream(16_000, 1);
         // 16 MiB offered; the pipe (64 KiB) plus the queue limit can hold far less.
         for _ in 0..16 {
@@ -691,7 +717,7 @@ mod tests {
         cfg.kind = SinkKind::Wav;
         cfg.dir.clone_from(&dir);
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut p = Player::new(cfg, tx);
+        let mut p = Player::new(cfg, SharedGain::new(1.0), tx);
         assert!(p.start_stream(16_000, 1).is_none());
         p.push(chunk(100, 512));
         p.push(chunk(0, 512));
@@ -713,7 +739,7 @@ mod tests {
         let mut cfg = SinkSection::default();
         cfg.kind = SinkKind::Null;
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut p = Player::new(cfg, tx);
+        let mut p = Player::new(cfg, SharedGain::new(1.0), tx);
         p.start_stream(16_000, 1);
         p.push(chunk(1, 512));
         assert_eq!(p.stop(), Some(Kind::Tts));
@@ -740,6 +766,54 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn pacat_stream_applies_sink_gain_times_reply_volume() {
+        let dir = std::env::temp_dir().join(format!("webos-sat-pacat-vol-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("written.raw");
+        let script = dir.join("fake-pacat");
+        std::fs::write(&script, format!("#!/bin/sh\ncat > '{}'\n", out.display())).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let mut cfg = SinkSection::default();
+        cfg.binary.clone_from(&script);
+        cfg.gain = 0.5;
+        let volume = SharedGain::new(crate::volume::gain_for(40));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut p = Player::new(cfg, volume.clone(), tx);
+        p.start_stream(16_000, 1);
+        p.push(chunk(10_000, 4));
+        // Wait until the first chunk reached the fake pacat.
+        for _ in 0..300 {
+            if std::fs::metadata(&out).is_ok_and(|m| m.len() >= 8) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // A change from HA applies to the chunks that follow.
+        volume.set(1.0);
+        p.push(chunk(10_000, 4));
+        p.end_stream();
+        let done = rx.recv().await.unwrap();
+        assert!(done.result.is_ok());
+        let written: Vec<i16> = std::fs::read(&out)
+            .unwrap()
+            .chunks_exact(2)
+            .map(|b| i16::from_le_bytes([b[0], b[1]]))
+            .collect();
+        // 10000 * 0.5 * -30 dB (0.0316) = 158; then 10000 * 0.5 = 5000.
+        assert_eq!(written.len(), 8);
+        assert!(
+            written[..4].iter().all(|&s| (157..=159).contains(&s)),
+            "{written:?}"
+        );
+        assert!(written[4..].iter().all(|&s| s == 5000), "{written:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn pacat_stream_with_fake_binary_writes_zeros_at_gain_zero() {
         // `sh -c 'cat > FILE'` stands in for pacat: it records what we write.
         let dir = std::env::temp_dir().join(format!("webos-sat-pacat-{}", std::process::id()));
@@ -756,7 +830,7 @@ mod tests {
         cfg.binary.clone_from(&script);
         cfg.gain = 0.0;
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut p = Player::new(cfg, tx);
+        let mut p = Player::new(cfg, SharedGain::new(1.0), tx);
         p.start_stream(16_000, 1);
         p.push(chunk(12_345, 512));
         p.push(chunk(-7, 512));

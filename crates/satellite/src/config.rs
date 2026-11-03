@@ -44,6 +44,8 @@ pub(crate) struct Settings {
     pub(crate) pairing: PairingSection,
     /// Acoustic echo cancellation against the TV's own output.
     pub(crate) aec: AecSection,
+    /// TV power state watch and the remote power-off behaviour.
+    pub(crate) power: PowerSection,
 }
 
 /// How pipeline runs start.
@@ -278,7 +280,20 @@ pub(crate) struct SinkSection {
     pub(crate) latency_msec: u32,
     /// Output directory of the WAV sink.
     pub(crate) dir: PathBuf,
+    /// Reply volume in percent (0 to 100) used until Home Assistant sets one
+    /// on the media player; 100 is unity gain, each percent below is 0.5 dB
+    /// quieter, 0 is silence. Applies to `pacat` only.
+    pub(crate) volume: u8,
+    /// Where the volume set from Home Assistant is stored (relative to the
+    /// config file's directory).
+    pub(crate) volume_file: PathBuf,
 }
+
+/// Default `sink.volume`: -30 dB. A conservative start for a TV that is
+/// often at a high volume (c3-a at 89 as a PC display); P2 measured replies
+/// at unity gain audible from TV volume 5 and the TV's level rising about
+/// 15 dB from volume 10 to 25 (docs/discovery/c3-a/P2-session1-audible-and-echo.md).
+pub(crate) const DEFAULT_REPLY_VOLUME: u8 = 40;
 
 impl Default for SinkSection {
     fn default() -> Self {
@@ -291,6 +306,55 @@ impl Default for SinkSection {
             channels: 2,
             latency_msec: DEFAULT_LATENCY_MSEC,
             dir: PathBuf::from("."),
+            volume: DEFAULT_REPLY_VOLUME,
+            volume_file: PathBuf::from("reply_volume"),
+        }
+    }
+}
+
+/// What the daemon does after the TV is turned off with the remote.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RemoteOff {
+    /// LG's own behaviour: the daemon does nothing.
+    #[default]
+    Normal,
+    /// "Wake and darken" (always-on design 12, D6 variant A): after a
+    /// power-off by the remote the TV is woken and its screen turned off, so
+    /// it looks off while the satellite keeps listening and replies.
+    KeepListening,
+}
+
+/// `[power]`.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct PowerSection {
+    /// Subscribe to the TV power state (`luna-send -i` child). Turned off
+    /// automatically, with a log line, when `luna_send` is not found.
+    pub(crate) watch: bool,
+    /// The `luna-send` binary (a name is looked up in `PATH`, then in
+    /// `/usr/bin`, `/usr/sbin`, `/bin` and `/sbin`).
+    pub(crate) luna_send: PathBuf,
+    /// Behaviour after a power-off by the remote, until Home Assistant's
+    /// select sets one (stored in `remote_off_file`).
+    pub(crate) remote_off: RemoteOff,
+    /// Where the select's value is stored (relative to the config file).
+    pub(crate) remote_off_file: PathBuf,
+    /// Wake-and-darken actions allowed per hour (a runaway guard).
+    pub(crate) max_actions_per_hour: u32,
+    /// Minimum time between two wake-and-darken actions, in seconds.
+    pub(crate) cooldown_s: u32,
+}
+
+impl Default for PowerSection {
+    fn default() -> Self {
+        Self {
+            watch: true,
+            luna_send: PathBuf::from("luna-send"),
+            remote_off: RemoteOff::Normal,
+            remote_off_file: PathBuf::from("remote_off"),
+            max_actions_per_hour: 10,
+            cooldown_s: 20,
         }
     }
 }
@@ -610,6 +674,8 @@ impl Settings {
             resolve(base, p);
         }
         resolve(base, &mut s.sink.dir);
+        resolve(base, &mut s.sink.volume_file);
+        resolve(base, &mut s.power.remote_off_file);
         resolve(base, &mut s.safety.kill_switch);
         resolve(base, &mut s.safety.mute_file);
         resolve(base, &mut s.safety.firmware_info);
@@ -656,9 +722,7 @@ impl Settings {
         if !self.dsp.hpf_hz.is_finite() || self.dsp.hpf_hz < 0.0 {
             return Err(err("dsp.hpf_hz must be >= 0"));
         }
-        if !self.sink.gain.is_finite() || !(0.0..=4.0).contains(&self.sink.gain) {
-            return Err(err("sink.gain must be between 0.0 and 4.0"));
-        }
+        self.validate_volume_and_power()?;
         if self.sink.rate == 0 || self.sink.channels == 0 {
             return Err(err("sink.rate and sink.channels must be non-zero"));
         }
@@ -737,6 +801,28 @@ impl Settings {
         self.esphome_config()?
             .validate()
             .map_err(|e| err(format!("device: {e}")))?;
+        Ok(())
+    }
+
+    fn validate_volume_and_power(&self) -> Result<(), ConfigError> {
+        if !self.sink.gain.is_finite() || !(0.0..=4.0).contains(&self.sink.gain) {
+            return Err(err("sink.gain must be between 0.0 and 4.0"));
+        }
+        if self.sink.volume > 100 {
+            return Err(err("sink.volume must be between 0 and 100 (percent)"));
+        }
+        if self.sink.volume_file.as_os_str().is_empty() {
+            return Err(err("sink.volume_file must be set"));
+        }
+        if self.power.remote_off_file.as_os_str().is_empty() {
+            return Err(err("power.remote_off_file must be set"));
+        }
+        if !(1..=60).contains(&self.power.max_actions_per_hour) {
+            return Err(err("power.max_actions_per_hour must be between 1 and 60"));
+        }
+        if self.power.cooldown_s > 3600 {
+            return Err(err("power.cooldown_s must be between 0 and 3600"));
+        }
         Ok(())
     }
 
@@ -1019,6 +1105,7 @@ impl Settings {
     }
 
     /// One-line summary for the startup log (no secrets).
+    #[allow(clippy::too_many_lines)] // one flat format
     pub(crate) fn summary(&self) -> String {
         let mic = match self.mic.source {
             MicSource::Alsa => format!(
@@ -1035,8 +1122,9 @@ impl Settings {
         };
         let sink = match self.sink.kind {
             SinkKind::Pacat => format!(
-                "pacat gain={} latency_msec={} device={}",
+                "pacat gain={} volume={}%(default) latency_msec={} device={}",
                 self.sink.gain,
+                self.sink.volume,
                 self.sink.latency_msec,
                 self.sink.device.as_deref().unwrap_or("default")
             ),
@@ -1102,7 +1190,7 @@ impl Settings {
             "off".to_owned()
         };
         format!(
-            "name={} port={} voice_features={} mode={:?} encryption={encryption} mic=[{mic}] dsp=[{:?} gain_db={} hpf_hz={}] aec=[{aec}] sink=[{sink}] safety=[kill_switch={} mute_file={} firmware={fw}] limits=[nice={} nofile={} rss_mb={} capture_stall_s={} loop_stall_s={}]",
+            "name={} port={} voice_features={} mode={:?} encryption={encryption} mic=[{mic}] dsp=[{:?} gain_db={} hpf_hz={}] aec=[{aec}] sink=[{sink}] safety=[kill_switch={} mute_file={} firmware={fw}] limits=[nice={} nofile={} rss_mb={} capture_stall_s={} loop_stall_s={}] power=[watch={} remote_off={:?}(default) max_per_hour={} cooldown_s={}]",
             self.device.name,
             self.device.port,
             self.voice_features(),
@@ -1117,6 +1205,10 @@ impl Settings {
             l.max_rss_mb,
             l.capture_stall_s,
             l.loop_stall_s,
+            self.power.watch,
+            self.power.remote_off,
+            self.power.max_actions_per_hour,
+            self.power.cooldown_s,
         )
     }
 }
@@ -1366,6 +1458,8 @@ level = "debug"
         let mut expected = Settings::default();
         expected.device.noise_psk_file = Some(base.join("noise_psk"));
         expected.sink.dir = base.join(".");
+        expected.sink.volume_file = base.join("reply_volume");
+        expected.power.remote_off_file = base.join("remote_off");
         expected.pairing.state_dir = base.join("pairing");
         assert_eq!(s, expected);
     }
@@ -1576,6 +1670,23 @@ level = "debug"
     }
 
     #[test]
+    fn power_and_volume_keys_parse() {
+        let base = Path::new("/etc/sat");
+        let s = Settings::from_toml(
+            "[sink]\nvolume = 25\nvolume_file = \"/var/v\"\n[power]\nwatch = false\nremote_off = \"keep_listening\"\nremote_off_file = \"ro\"\n",
+            base,
+        )
+        .unwrap();
+        assert_eq!(s.sink.volume, 25);
+        assert_eq!(s.sink.volume_file, PathBuf::from("/var/v"));
+        assert!(!s.power.watch);
+        assert_eq!(s.power.remote_off, RemoteOff::KeepListening);
+        assert_eq!(s.power.remote_off_file, base.join("ro"));
+        assert!(Settings::from_toml("[power]\nremote_off = \"darken\"\n", base).is_err());
+        assert!(Settings::from_toml("[sink]\nvolume = 0.5\n", base).is_err());
+    }
+
+    #[test]
     fn rejects_unknown_keys() {
         let e = Settings::from_toml("[mic]\nsorce = \"file\"\n", Path::new(".")).unwrap_err();
         assert!(e.0.contains("sorce"), "{e}");
@@ -1615,7 +1726,18 @@ level = "debug"
     fn validation_messages_name_the_key() {
         let mut s = Settings::default();
         s.device.allow_plaintext = true;
-        let cases: [(Mutate, &str); 11] = [
+        let cases: [(Mutate, &str); 16] = [
+            (|s| s.sink.volume = 101, "sink.volume"),
+            (|s| s.sink.volume_file = PathBuf::new(), "sink.volume_file"),
+            (
+                |s| s.power.remote_off_file = PathBuf::new(),
+                "power.remote_off_file",
+            ),
+            (
+                |s| s.power.max_actions_per_hour = 0,
+                "power.max_actions_per_hour",
+            ),
+            (|s| s.power.cooldown_s = 3601, "power.cooldown_s"),
             (|s| s.mic.rate = 44_100, "mic.rate"),
             (|s| s.sink.latency_msec = 10_001, "sink.latency_msec"),
             (|s| s.device.port = 0, "device.port"),

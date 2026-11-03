@@ -92,6 +92,15 @@ channels = 2
 # replies by about 1.5 s on c3-a; 200 started them within about 0.1 s.
 latency_msec = 200
 dir = "."                # wav sink output directory
+# Reply volume in percent, independent of the TV's own volume: an in-process
+# gain on replies, announcements (and timer sounds later) before pacat, on a
+# decibel taper: 100 = unity (0 dB), each percent below is 0.5 dB quieter
+# (50 = -25 dB, 40 = -30 dB), 0 = silent. Home Assistant sets it with the
+# volume of the satellite's media player; that value is stored in
+# volume_file and wins over `volume` after the first change. The default is
+# conservative for a TV that is often at a high volume. It multiplies `gain`.
+volume = 40
+volume_file = "reply_volume"
 
 [log]
 # error | warn | info | debug | trace. Audio is never logged; transcripts and
@@ -122,6 +131,33 @@ max_open_files = 256     # soft RLIMIT_NOFILE; 0 keeps the inherited limit
 max_rss_mb = 64          # exit (code 72) above this resident size; 0 = off
 capture_stall_s = 5      # reopen the ALSA device after this long without audio
 loop_stall_s = 30        # exit (code 70/71) if the event loop or capture thread hangs
+
+[power]
+# Subscribe to the TV power state (luna getPowerState through a supervised
+# `luna-send -i` child on a pseudo-terminal), log each change at info and
+# show it as the diagnostic "TV power state" sensor in Home Assistant. Turned
+# off by itself when luna_send is not found (on a PC). Also used to notice a
+# resume from a system suspend (as is a jump of CLOCK_BOOTTIME).
+watch = true
+luna_send = "luna-send"  # a name is looked up in PATH, then /usr/bin, /bin, ...
+# What happens after the TV is turned off with the remote. Home Assistant's
+# select "When the TV is turned off with the remote" changes it (stored in
+# remote_off_file, which then wins over this value).
+#   "normal":         LG's behaviour; the satellite does nothing (default).
+#   "keep_listening": wake and darken: after a power-off by the remote (reason
+#                     remoteKey only, never a timer, CEC or HomeKit) the
+#                     satellite wakes the TV and turns its screen off, so it
+#                     looks off while it keeps listening and replies stay
+#                     audible. The TV stays on with a dark screen: it draws
+#                     more than standby (not measured), LG's OLED care that
+#                     runs at power-off may not run, the panel may light for
+#                     about 0.3 to 0.7 s, and a second press of the power key
+#                     takes about 5 s to turn the TV on. Design and evidence:
+#                     docs/design/always-on.md section 12.
+remote_off = "normal"
+remote_off_file = "remote_off"
+max_actions_per_hour = 10  # wake-and-darken actions allowed per hour
+cooldown_s = 20            # minimum time between two of them
 
 [pairing]
 # Pairing without typing a key: Home Assistant 2026.9 or newer generates the

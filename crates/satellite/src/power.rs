@@ -1,0 +1,588 @@
+//! TV power state (always-on gap G1): a supervised `luna-send -i` child
+//! subscribed to `com.webos.service.tvpower/power/getPowerState`, and one-shot
+//! `luna-send -n 1` calls for the wake-and-darken behaviour
+//! ([`crate::darken`]).
+//!
+//! The subscription runs on a pseudo-terminal: over a pipe `luna-send` printed
+//! nothing for some services on the TV (D0-D1, D5), and a subscription never
+//! exits to flush its output, so the child gets a terminal as it does under
+//! `ssh -tt` (D5, D6 on c3-b). The child is restarted with a backoff when it
+//! exits and killed on shutdown. Each reply line is parsed into a
+//! [`PowerUpdate`]; lines without `state` or `processing` are ignored.
+//!
+//! Reply shape (seen on c3-b, firmware 03.30.73): one JSON object per line,
+//! `{"returnValue":true,"state":"Active Standby","processing":"Request Power
+//! Off","onOff":"off","reason":"remoteKey"}`; settled states carry no
+//! `processing`.
+
+use std::fmt::Write as _;
+use std::io::BufRead as _;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::time::Duration;
+
+use tokio::process::Command;
+use tokio::sync::{mpsc, watch};
+use tokio::time::Instant;
+
+/// The subscription.
+pub(crate) const POWER_STATE_URI: &str = "luna://com.webos.service.tvpower/power/getPowerState";
+/// First restart delay of the subscription child.
+const BACKOFF_BASE: Duration = Duration::from_secs(1);
+/// Longest restart delay.
+const BACKOFF_MAX: Duration = Duration::from_secs(60);
+/// A child that ran this long counts as healthy: the next delay starts over.
+const BACKOFF_STABLE: Duration = Duration::from_secs(60);
+/// A subscription answers at once with the current state; silence for this
+/// long is reported once.
+const FIRST_LINE_WAIT: Duration = Duration::from_secs(10);
+/// Timeout of a one-shot call (`-w` is 3000 ms).
+const CALL_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// One reply of the subscription.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct PowerUpdate {
+    /// `state`, e.g. `Active`, `Screen Off`, `Active Standby`.
+    pub(crate) state: Option<String>,
+    /// `processing`: a transition in progress (`Request Power Off`, ...).
+    pub(crate) processing: Option<String>,
+    /// `reason`, e.g. `remoteKey`, `offTimer`.
+    pub(crate) reason: Option<String>,
+    /// `onOff`: `on` or `off`.
+    pub(crate) on_off: Option<String>,
+}
+
+impl PowerUpdate {
+    /// No transition in progress.
+    #[cfg(test)]
+    pub(crate) fn settled(&self) -> bool {
+        self.processing.is_none()
+    }
+
+    /// `state` without spaces (`ActiveStandby`), for comparisons; LG writes
+    /// both `ScreenSaver` and `Screen Off`.
+    pub(crate) fn state_key(&self) -> String {
+        compact(self.state.as_deref().unwrap_or(""))
+    }
+
+    /// `processing` without spaces, or empty.
+    pub(crate) fn processing_key(&self) -> String {
+        compact(self.processing.as_deref().unwrap_or(""))
+    }
+
+    /// Text for the HA sensor: the state, plus the transition in brackets.
+    pub(crate) fn text(&self) -> String {
+        let state = self.state.as_deref().unwrap_or("unknown");
+        match &self.processing {
+            Some(p) => format!("{state} ({p})"),
+            None => state.to_owned(),
+        }
+    }
+
+    /// One log line with every field present.
+    pub(crate) fn describe(&self) -> String {
+        let mut s = format!("state {}", self.state.as_deref().unwrap_or("-"));
+        for (k, v) in [
+            ("processing", &self.processing),
+            ("reason", &self.reason),
+            ("onOff", &self.on_off),
+        ] {
+            if let Some(v) = v {
+                let _ = write!(s, ", {k} {v}");
+            }
+        }
+        s
+    }
+}
+
+/// `s` without spaces.
+pub(crate) fn compact(s: &str) -> String {
+    s.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+/// A parsed output line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Line {
+    Update(PowerUpdate),
+    /// `returnValue: false`, with `errorText` if any.
+    Error(String),
+    /// Anything else (blank lines, other fields only).
+    Other,
+}
+
+/// The string value of `"key"` in a flat JSON object line, unescaping `\"`
+/// and `\\`. Not a JSON parser: enough for `luna-send` reply lines.
+pub(crate) fn json_str(line: &str, key: &str) -> Option<String> {
+    let pat = format!("\"{key}\"");
+    let mut from = 0;
+    while let Some(i) = line[from..].find(&pat) {
+        let after = from + i + pat.len();
+        let rest = line[after..].trim_start();
+        if let Some(rest) = rest.strip_prefix(':') {
+            let rest = rest.trim_start();
+            let body = rest.strip_prefix('"')?;
+            let mut out = String::new();
+            let mut esc = false;
+            for c in body.chars() {
+                if esc {
+                    out.push(c);
+                    esc = false;
+                } else if c == '\\' {
+                    esc = true;
+                } else if c == '"' {
+                    return Some(out);
+                } else {
+                    out.push(c);
+                }
+            }
+            return None;
+        }
+        from = after;
+    }
+    None
+}
+
+/// The boolean value of `"key"`.
+pub(crate) fn json_bool(line: &str, key: &str) -> Option<bool> {
+    let pat = format!("\"{key}\"");
+    let i = line.find(&pat)?;
+    let rest = line[i + pat.len()..].trim_start().strip_prefix(':')?;
+    let rest = rest.trim_start();
+    if rest.starts_with("true") {
+        Some(true)
+    } else if rest.starts_with("false") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// Parses one line of `luna-send` output.
+pub(crate) fn parse_line(line: &str) -> Line {
+    let line = line.trim();
+    if !line.starts_with('{') {
+        return Line::Other;
+    }
+    if json_bool(line, "returnValue") == Some(false) {
+        return Line::Error(
+            json_str(line, "errorText").unwrap_or_else(|| "returnValue false".to_owned()),
+        );
+    }
+    let u = PowerUpdate {
+        state: json_str(line, "state"),
+        processing: json_str(line, "processing"),
+        reason: json_str(line, "reason"),
+        on_off: json_str(line, "onOff"),
+    };
+    if u.state.is_none() && u.processing.is_none() {
+        Line::Other
+    } else {
+        Line::Update(u)
+    }
+}
+
+/// Restart delays of the subscription child: 1, 2, 4 ... 60 s, starting
+/// over after a child that ran at least a minute.
+#[derive(Debug, Default)]
+pub(crate) struct Backoff {
+    failures: u32,
+}
+
+impl Backoff {
+    /// The delay before the next start, after a child that ran for `ran`.
+    pub(crate) fn after_exit(&mut self, ran: Duration) -> Duration {
+        if ran >= BACKOFF_STABLE {
+            self.failures = 0;
+        }
+        self.failures = self.failures.saturating_add(1);
+        let shift = (self.failures - 1).min(16);
+        BACKOFF_BASE.saturating_mul(1 << shift).min(BACKOFF_MAX)
+    }
+}
+
+/// Finds `luna-send`: a path with a `/` must exist; a name is looked up in
+/// `PATH` and then in the usual system directories (the boot hook's `PATH`
+/// may be short).
+pub(crate) fn find_binary(p: &Path) -> Option<PathBuf> {
+    if p.as_os_str().is_empty() {
+        return None;
+    }
+    if p.components().count() > 1 || p.is_absolute() {
+        return p.is_file().then(|| p.to_path_buf());
+    }
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    std::env::split_paths(&path)
+        .chain(["/usr/bin", "/usr/sbin", "/bin", "/sbin"].map(PathBuf::from))
+        .map(|d| d.join(p))
+        .find(|c| c.is_file())
+}
+
+/// A pseudo-terminal: the master (read by a thread) and the slave (the
+/// child's stdin, stdout and stderr).
+fn open_pty() -> std::io::Result<(std::fs::File, std::os::fd::OwnedFd)> {
+    use rustix::fs::{Mode, OFlags};
+    use rustix::pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt};
+    let master = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY | OpenptFlags::CLOEXEC)?;
+    grantpt(&master)?;
+    unlockpt(&master)?;
+    let name = ptsname(&master, Vec::new())?;
+    let slave = rustix::fs::open(
+        name.as_c_str(),
+        OFlags::RDWR | OFlags::NOCTTY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
+    Ok((std::fs::File::from(master), slave))
+}
+
+/// Starts `luna-send -i` on a pty; lines arrive on the receiver, which
+/// closes when the child's terminal is gone.
+fn start_child(
+    luna: &Path,
+) -> std::io::Result<(tokio::process::Child, mpsc::UnboundedReceiver<String>)> {
+    let (master, slave) = open_pty()?;
+    let mut cmd = Command::new(luna);
+    cmd.arg("-i")
+        .arg(POWER_STATE_URI)
+        .arg(r#"{"subscribe":true}"#)
+        .stdin(Stdio::from(slave.try_clone()?))
+        .stdout(Stdio::from(slave.try_clone()?))
+        .stderr(Stdio::from(slave))
+        .kill_on_drop(true);
+    let child = cmd.spawn()?;
+    // The Command holds the slave descriptors: drop them, so the master
+    // read ends (EIO) when the child is gone.
+    drop(cmd);
+    let (tx, rx) = mpsc::unbounded_channel();
+    std::thread::Builder::new()
+        .name("luna-power".into())
+        .spawn(move || {
+            let mut r = std::io::BufReader::new(master);
+            let mut buf = Vec::new();
+            loop {
+                buf.clear();
+                match r.read_until(b'\n', &mut buf) {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => {
+                        let line = String::from_utf8_lossy(&buf)
+                            .trim_end_matches(['\r', '\n'])
+                            .to_owned();
+                        if tx.send(line).is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+        })?;
+    Ok((child, rx))
+}
+
+/// The running subscription.
+pub(crate) struct Watch {
+    stop: watch::Sender<bool>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Watch {
+    /// Kills the child and waits (bounded) for the task.
+    pub(crate) async fn shutdown(self) {
+        let _ = self.stop.send(true);
+        let mut task = self.task;
+        if tokio::time::timeout(Duration::from_secs(3), &mut task)
+            .await
+            .is_err()
+        {
+            task.abort();
+        }
+    }
+}
+
+/// Starts the supervised subscription; updates go to `tx`.
+pub(crate) fn spawn(luna: PathBuf, tx: mpsc::UnboundedSender<PowerUpdate>) -> Watch {
+    let (stop, stop_rx) = watch::channel(false);
+    let task = tokio::spawn(run(luna, tx, stop_rx));
+    Watch { stop, task }
+}
+
+async fn run(
+    luna: PathBuf,
+    tx: mpsc::UnboundedSender<PowerUpdate>,
+    mut stop: watch::Receiver<bool>,
+) {
+    let mut backoff = Backoff::default();
+    let mut start_warned = false;
+    loop {
+        let started = Instant::now();
+        match start_child(&luna) {
+            Ok((mut child, mut lines)) => {
+                log::info!(
+                    "power: subscribed to the TV power state ({} pid {})",
+                    luna.display(),
+                    child.id().unwrap_or(0)
+                );
+                start_warned = false;
+                let mut first_by = Some(Instant::now() + FIRST_LINE_WAIT);
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = stop.changed() => {
+                            let _ = child.kill().await;
+                            return;
+                        }
+                        line = lines.recv() => {
+                            let Some(line) = line else { break };
+                            match parse_line(&line) {
+                                Line::Update(u) => {
+                                    first_by = None;
+                                    if tx.send(u).is_err() {
+                                        let _ = child.kill().await;
+                                        return;
+                                    }
+                                }
+                                Line::Error(e) => {
+                                    first_by = None;
+                                    log::warn!("power: getPowerState answered an error: {e}");
+                                }
+                                Line::Other => log::debug!("power: luna-send line ignored ({} bytes)", line.len()),
+                            }
+                        }
+                        () = crate::daemon::sleep_opt(first_by) => {
+                            first_by = None;
+                            log::warn!("power: no answer from luna-send within {} s; still waiting", FIRST_LINE_WAIT.as_secs());
+                        }
+                    }
+                }
+                let status = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+                let status = match status {
+                    Ok(Ok(s)) => s.to_string(),
+                    Ok(Err(e)) => e.to_string(),
+                    Err(_) => {
+                        let _ = child.kill().await;
+                        "killed (its terminal closed)".to_owned()
+                    }
+                };
+                log::warn!(
+                    "power: the subscription ended after {} s ({status})",
+                    started.elapsed().as_secs()
+                );
+            }
+            Err(e) => {
+                if start_warned {
+                    log::debug!("power: cannot start {}: {e}", luna.display());
+                } else {
+                    start_warned = true;
+                    log::warn!("power: cannot start {}: {e}", luna.display());
+                }
+            }
+        }
+        let delay = backoff.after_exit(started.elapsed());
+        log::info!(
+            "power: restarting the subscription in {} s",
+            delay.as_secs()
+        );
+        tokio::select! {
+            _ = stop.changed() => return,
+            () = tokio::time::sleep(delay) => {}
+        }
+    }
+}
+
+/// One `luna-send -n 1` call; returns the reply without whitespace (or the
+/// error). Over a pipe: one-shot `tvpower` calls answered that way on c3-b.
+pub(crate) async fn call(luna: &Path, uri: &str, payload: &str) -> Result<String, String> {
+    let child = Command::new(luna)
+        .args(["-n", "1", "-w", "3000", uri, payload])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| format!("cannot start {}: {e}", luna.display()))?;
+    let out = tokio::time::timeout(CALL_TIMEOUT, child.wait_with_output())
+        .await
+        .map_err(|_| format!("no answer within {} s", CALL_TIMEOUT.as_secs()))?
+        .map_err(|e| e.to_string())?;
+    let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+    text.push_str(&String::from_utf8_lossy(&out.stderr));
+    Ok(compact(&text))
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+
+    #[test]
+    fn parses_settled_and_transitional_lines() {
+        let l = r#"{"returnValue":true,"state":"Active","subscribed":true}"#;
+        let Line::Update(u) = parse_line(l) else {
+            panic!()
+        };
+        assert_eq!(u.state.as_deref(), Some("Active"));
+        assert!(u.settled());
+        assert_eq!(u.text(), "Active");
+        // The stub format of the D6 watcher test, with spaces.
+        let l = r#"{ "returnValue": true, "state": "Active Standby", "processing": "Request Power Off", "onOff": "off", "reason": "remoteKey" }"#;
+        let Line::Update(u) = parse_line(l) else {
+            panic!()
+        };
+        assert_eq!(u.state_key(), "ActiveStandby");
+        assert_eq!(u.processing_key(), "RequestPowerOff");
+        assert_eq!(u.reason.as_deref(), Some("remoteKey"));
+        assert_eq!(u.on_off.as_deref(), Some("off"));
+        assert!(!u.settled());
+        assert_eq!(u.text(), "Active Standby (Request Power Off)");
+        assert_eq!(
+            u.describe(),
+            "state Active Standby, processing Request Power Off, reason remoteKey, onOff off"
+        );
+        // A processing-only update.
+        let Line::Update(u) = parse_line(r#"{"processing":"Prepare Resume","reason":"wakeOnLan"}"#)
+        else {
+            panic!()
+        };
+        assert_eq!(u.state, None);
+        assert_eq!(u.text(), "unknown (Prepare Resume)");
+    }
+
+    #[test]
+    fn errors_and_noise() {
+        assert_eq!(
+            parse_line(r#"{"returnValue":false,"errorCode":-1,"errorText":"Denied"}"#),
+            Line::Error("Denied".to_owned())
+        );
+        assert_eq!(parse_line(""), Line::Other);
+        assert_eq!(parse_line("** Message: connecting"), Line::Other);
+        assert_eq!(parse_line(r#"{"returnValue":true}"#), Line::Other);
+        assert_eq!(
+            json_str(r#"{"a":"x\"y","powerState":"no","state":"ok"}"#, "a").as_deref(),
+            Some("x\"y")
+        );
+        assert_eq!(
+            json_str(r#"{"powerState":"no","state":"ok"}"#, "state").as_deref(),
+            Some("ok")
+        );
+        assert_eq!(json_str(r#"{"state":5}"#, "state"), None);
+        assert_eq!(json_str(r#"{"state":"open"#, "state"), None);
+        assert_eq!(
+            json_bool(r#"{"returnValue" : true}"#, "returnValue"),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn backoff_doubles_caps_and_resets_after_a_healthy_run() {
+        let mut b = Backoff::default();
+        let quick = Duration::from_millis(100);
+        let secs: Vec<u64> = (0..8).map(|_| b.after_exit(quick).as_secs()).collect();
+        assert_eq!(secs, [1, 2, 4, 8, 16, 32, 60, 60]);
+        assert_eq!(b.after_exit(Duration::from_secs(61)).as_secs(), 1);
+        assert_eq!(b.after_exit(quick).as_secs(), 2);
+        for _ in 0..100 {
+            assert!(b.after_exit(quick) <= BACKOFF_MAX);
+        }
+    }
+
+    #[test]
+    fn finds_binaries_by_path_and_name() {
+        assert_eq!(find_binary(Path::new("/nonexistent/luna-send")), None);
+        assert_eq!(find_binary(Path::new("")), None);
+        assert_eq!(
+            find_binary(Path::new("definitely-not-a-binary-webos-sat")),
+            None
+        );
+        assert!(find_binary(Path::new("sh")).is_some());
+    }
+
+    fn fake_luna(dir: &Path, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::create_dir_all(dir).unwrap();
+        let p = dir.join("luna-send");
+        std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        p
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn subscription_runs_on_a_terminal_restarts_and_stops() {
+        let dir = std::env::temp_dir().join(format!("webos-sat-power-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // Prints whether stdout is a terminal, two updates, then exits; the
+        // supervisor starts it again after 1 s.
+        let luna = fake_luna(
+            &dir,
+            r#"[ -t 1 ] && t=Active || t=NOTATTY
+printf '{"returnValue":true,"state":"%s","subscribed":true}\n' "$t"
+printf '{"returnValue":true,"state":"Active Standby","processing":"Request Power Off","onOff":"off","reason":"remoteKey"}\n'"#,
+        );
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let w = spawn(luna, tx);
+        let mut got = Vec::new();
+        while got.len() < 4 {
+            let u = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            got.push(u);
+        }
+        assert_eq!(
+            got[0].state.as_deref(),
+            Some("Active"),
+            "stdout must be a tty"
+        );
+        assert_eq!(got[1].reason.as_deref(), Some("remoteKey"));
+        assert_eq!(got[2].state.as_deref(), Some("Active"), "restarted");
+        w.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shutdown_kills_a_running_child() {
+        let dir = std::env::temp_dir().join(format!("webos-sat-power-k-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let pidfile = dir.join("pid");
+        let luna = fake_luna(
+            &dir,
+            &format!(
+                "echo $$ > '{}'\nprintf '{{\"state\":\"Active\"}}\\n'\nexec sleep 30",
+                pidfile.display()
+            ),
+        );
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let w = spawn(luna, tx);
+        let u = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(u.state.as_deref(), Some("Active"));
+        let pid: i32 = std::fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        w.shutdown().await;
+        // The child (exec'd into sleep) is gone and reaped.
+        let alive = Path::new(&format!("/proc/{pid}")).exists()
+            && !std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .unwrap_or_default()
+                .contains(") Z ");
+        assert!(!alive, "child {pid} still running");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn one_shot_call_returns_the_compact_reply() {
+        let dir = std::env::temp_dir().join(format!("webos-sat-power-c-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let luna = fake_luna(
+            &dir,
+            r#"echo "{ \"returnValue\": false, \"errorText\": \"Keyblock1.5second\", \"args\": \"$*\" }""#,
+        );
+        let r = call(&luna, "luna://x/y", r#"{"reason":"remoteKey"}"#)
+            .await
+            .unwrap();
+        assert!(r.contains("Keyblock1.5second"), "{r}");
+        assert!(r.contains("-n1-w3000luna://x/y"), "{r}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

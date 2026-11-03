@@ -28,3 +28,6 @@ dist/
 .zig-cache/
 zig-out/
 local.mk
+# Satellite state written next to a config run from the repository
+/config/reply_volume
+/config/remote_off

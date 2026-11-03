@@ -16,11 +16,15 @@
 mod capture;
 mod config;
 mod daemon;
+mod darken;
 mod firmware;
 mod limits;
 mod logger;
 mod player;
+mod power;
+mod resume;
 mod selftest;
+mod volume;
 mod watchdog;
 
 use std::process::ExitCode;
