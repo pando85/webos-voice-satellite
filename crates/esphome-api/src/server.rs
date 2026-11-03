@@ -51,6 +51,10 @@ const DISCONNECT_LINGER: Duration = Duration::from_secs(1);
 /// still disconnect by itself (HA does right after the `SetKey` reply) before
 /// the server sends `DisconnectRequest`. ESPHome waits 100 ms.
 const KEY_CHANGE_GRACE: Duration = Duration::from_millis(500);
+/// After [`AppCommand::Resumed`]: the HA connection is dropped when HA does
+/// not answer the probe ping within this time (HA answers a ping at once; a
+/// connection that HA closed during the suspend gets no answer or a reset).
+const RESUME_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Error starting the server.
 #[derive(Debug)]
@@ -186,6 +190,9 @@ impl Server {
             pairing: self.pairing,
             mdns: None,
             bind,
+            volume: 100,
+            power_state: None,
+            selects: vec![None; self.cfg.selects.len()],
         };
         let mut pending: JoinSet<Result<Session, (SocketAddr, FrameError)>> = JoinSet::new();
         let mut keyless: JoinSet<()> = JoinSet::new();
@@ -312,6 +319,8 @@ struct Session {
     client_info: String,
     last_rx: Instant,
     ping_sent: bool,
+    /// A probe ping after a resume must be answered by then.
+    probe_until: Option<Instant>,
     states_subscribed: bool,
     kind: SessionKind,
     /// [`Pairing::epoch`] when the connection was accepted.
@@ -332,6 +341,7 @@ impl Session {
             client_info: String::new(),
             last_rx: Instant::now(),
             ping_sent: false,
+            probe_until: None,
             states_subscribed: false,
             kind: SessionKind::DevPlaintext,
             epoch,
@@ -347,6 +357,7 @@ impl Session {
         self.rbuf.extend_from_slice(&self.tmp[..n]);
         self.last_rx = Instant::now();
         self.ping_sent = false;
+        self.probe_until = None;
         Ok(())
     }
 
@@ -590,6 +601,12 @@ struct Ctx {
     epoch: watch::Sender<u64>,
     mdns: Option<crate::mdns::Advertiser>,
     bind: SocketAddr,
+    /// Reply volume in percent, reported as the media player's volume.
+    volume: u8,
+    /// Text of the TV power state sensor (`None` until the first state).
+    power_state: Option<String>,
+    /// State of each select in `cfg.selects` (same order).
+    selects: Vec<Option<String>>,
 }
 
 enum Flow {
@@ -810,6 +827,9 @@ impl Ctx {
                 s.last_rx + PING_AFTER
             };
             deadline = deadline.min(keepalive);
+            if let Some(probe) = s.probe_until {
+                deadline = deadline.min(probe);
+            }
         }
         deadline
     }
@@ -825,18 +845,22 @@ impl Ctx {
             self.refresh_mdns();
             self.emit(AppEvent::Pairing(PairingEvent::WindowClosed));
         }
-        let mut dead = false;
+        let mut dead = None;
         if let Some(s) = self.session.as_mut() {
             let idle = now.saturating_duration_since(s.last_rx);
-            if idle >= DEAD_AFTER {
-                dead = true;
+            if s.probe_until.is_some_and(|t| now >= t) {
+                dead = Some("no answer to the ping after a resume");
+            } else if idle >= DEAD_AFTER {
+                dead = Some("keepalive timeout");
             } else if idle >= PING_AFTER && !s.ping_sent {
                 s.ping_sent = true;
-                dead = s.send(&pb::PingRequest::default()).await.is_err();
+                if s.send(&pb::PingRequest::default()).await.is_err() {
+                    dead = Some("keepalive timeout");
+                }
             }
         }
-        if dead {
-            self.close("keepalive timeout");
+        if let Some(why) = dead {
+            self.close(why);
         }
     }
 
@@ -940,7 +964,8 @@ impl Ctx {
                     .await
             }
             ToHa::MediaState(state) if s.states_subscribed => {
-                s.send(&entities::media_player_state(state)).await
+                s.send(&entities::media_player_state(state, self.volume))
+                    .await
             }
             ToHa::MuteState(muted) if s.states_subscribed => {
                 s.send(&entities::mute_state(muted)).await
@@ -1015,13 +1040,30 @@ impl Ctx {
             pb::ListEntitiesRequest::ID => {
                 s.send(&entities::list_media_player(&self.cfg)).await?;
                 s.send(&entities::list_mute_switch()).await?;
+                if self.cfg.power_sensor {
+                    s.send(&entities::list_power_sensor()).await?;
+                }
+                for sel in &self.cfg.selects {
+                    s.send(&entities::list_select(sel)).await?;
+                }
                 s.send(&pb::ListEntitiesDoneResponse::default()).await?;
             }
             pb::SubscribeStatesRequest::ID => {
                 s.states_subscribed = true;
-                s.send(&entities::media_player_state(self.voice.media_state()))
-                    .await?;
+                s.send(&entities::media_player_state(
+                    self.voice.media_state(),
+                    self.volume,
+                ))
+                .await?;
                 s.send(&entities::mute_state(self.voice.is_muted())).await?;
+                if self.cfg.power_sensor {
+                    s.send(&entities::power_state(self.power_state.as_deref()))
+                        .await?;
+                }
+                for (sel, state) in self.cfg.selects.iter().zip(&self.selects) {
+                    s.send(&entities::select_state(sel, state.as_deref()))
+                        .await?;
+                }
             }
             pb::SubscribeVoiceAssistantRequest::ID => {
                 if let Some(req) = decode::<pb::SubscribeVoiceAssistantRequest>(msg) {
@@ -1092,13 +1134,14 @@ impl Ctx {
                     }
                 }
             }
+            pb::SelectCommandRequest::ID => {
+                if let Some(c) = decode::<pb::SelectCommandRequest>(msg) {
+                    self.select_command(c.key, c.state).await?;
+                }
+            }
             pb::MediaPlayerCommandRequest::ID => {
                 if let Some(c) = decode::<pb::MediaPlayerCommandRequest>(msg) {
-                    if c.has_command && c.command == pb::MediaPlayerCommand::Stop as i32 {
-                        self.voice.on_media_stop();
-                    } else {
-                        log::info!("esphome-api: unsupported media player command ignored");
-                    }
+                    self.media_player_command(&c).await?;
                 }
             }
             pb::NoiseEncryptionSetKeyRequest::ID => {
@@ -1185,7 +1228,157 @@ impl Ctx {
             AppCommand::SetMuted(muted) => self.voice.on_mute(now, muted),
             AppCommand::OpenPairingWindow => self.open_window(now),
             AppCommand::ResetPairing => self.reset_pairing(now).await,
+            AppCommand::SetVolume(percent) => {
+                self.volume = percent.min(100);
+                if let Err(err) = self.send_media_state().await {
+                    self.close(&err.to_string());
+                }
+            }
+            AppCommand::SetPowerState(text) => {
+                self.power_state = Some(text);
+                let Some(s) = self.session.as_mut() else {
+                    return;
+                };
+                if self.cfg.power_sensor && s.states_subscribed {
+                    if let Err(err) = s
+                        .send(&entities::power_state(self.power_state.as_deref()))
+                        .await
+                    {
+                        self.close(&err.to_string());
+                    }
+                }
+            }
+            AppCommand::Resumed => self.resumed(now).await,
+            AppCommand::SetSelect { object_id, option } => {
+                let Some(i) = self
+                    .cfg
+                    .selects
+                    .iter()
+                    .position(|s| s.object_id == object_id)
+                else {
+                    log::warn!("esphome-api: SetSelect for unknown select {object_id:?} ignored");
+                    return;
+                };
+                if !self.cfg.selects[i].options.contains(&option) {
+                    log::warn!(
+                        "esphome-api: SetSelect {object_id:?}: {option:?} is not an option; ignored"
+                    );
+                    return;
+                }
+                self.selects[i] = Some(option);
+                if let Err(err) = self.send_select_state(i).await {
+                    self.close(&err.to_string());
+                }
+            }
         }
+    }
+
+    async fn send_select_state(&mut self, i: usize) -> Result<(), FrameError> {
+        let msg = entities::select_state(&self.cfg.selects[i], self.selects[i].as_deref());
+        match self.session.as_mut() {
+            Some(s) if s.states_subscribed => s.send(&msg).await,
+            _ => Ok(()),
+        }
+    }
+
+    /// `SelectCommandRequest`: a valid option is stored, reported to the
+    /// application and confirmed to HA; anything else is answered with the
+    /// current state.
+    async fn select_command(&mut self, key: u32, option: String) -> Result<(), FrameError> {
+        let Some(i) = self
+            .cfg
+            .selects
+            .iter()
+            .position(|s| entities::entity_key(&s.object_id) == key)
+        else {
+            log::info!("esphome-api: select command for an unknown entity ignored");
+            return Ok(());
+        };
+        let sel = &self.cfg.selects[i];
+        if !sel.options.contains(&option) {
+            log::warn!(
+                "esphome-api: {}: {option:?} is not an option; ignored",
+                sel.object_id
+            );
+        } else if self.selects[i].as_deref() != Some(option.as_str()) {
+            log::info!("esphome-api: {} set to {option:?} by HA", sel.object_id);
+            let object_id = sel.object_id.clone();
+            self.selects[i] = Some(option.clone());
+            self.emit(AppEvent::SelectChanged { object_id, option });
+        }
+        self.send_select_state(i).await
+    }
+
+    /// Sends the media player state (with the reply volume) if HA subscribed.
+    async fn send_media_state(&mut self) -> Result<(), FrameError> {
+        let state = entities::media_player_state(self.voice.media_state(), self.volume);
+        match self.session.as_mut() {
+            Some(s) if s.states_subscribed => s.send(&state).await,
+            _ => Ok(()),
+        }
+    }
+
+    /// `MediaPlayerCommandRequest`: stop, and the reply volume (set, step).
+    async fn media_player_command(
+        &mut self,
+        c: &pb::MediaPlayerCommandRequest,
+    ) -> Result<(), FrameError> {
+        let mut volume = None;
+        if c.has_volume {
+            volume = Some(entities::volume_to_percent(c.volume));
+        }
+        if c.has_command {
+            match pb::MediaPlayerCommand::try_from(c.command) {
+                Ok(pb::MediaPlayerCommand::Stop) => self.voice.on_media_stop(),
+                Ok(pb::MediaPlayerCommand::VolumeUp) => {
+                    volume = Some(entities::volume_step(self.volume, true));
+                }
+                Ok(pb::MediaPlayerCommand::VolumeDown) => {
+                    volume = Some(entities::volume_step(self.volume, false));
+                }
+                _ => log::info!(
+                    "esphome-api: unsupported media player command {} ignored",
+                    c.command
+                ),
+            }
+        } else if !c.has_volume {
+            log::info!("esphome-api: empty media player command ignored");
+        }
+        if let Some(v) = volume {
+            if v != self.volume {
+                log::info!("esphome-api: reply volume {} -> {v} % by HA", self.volume);
+                self.volume = v;
+                self.emit(AppEvent::VolumeChanged(v));
+            }
+            // Always answer, so HA's slider shows the value in effect.
+            self.send_media_state().await?;
+        }
+        Ok(())
+    }
+
+    /// After a system suspend: probe the HA connection, re-announce mDNS and
+    /// re-arm the wake word at once.
+    async fn resumed(&mut self, now: Instant) {
+        let mut failed = false;
+        if let Some(s) = self.session.as_mut() {
+            log::info!(
+                "esphome-api: resumed; probing the HA connection {} (dropped without an answer within {} s)",
+                s.peer,
+                RESUME_PROBE_TIMEOUT.as_secs()
+            );
+            s.ping_sent = true;
+            s.probe_until = Some(now + RESUME_PROBE_TIMEOUT);
+            failed = s.send(&pb::PingRequest::default()).await.is_err();
+        } else {
+            log::info!("esphome-api: resumed; no HA connection (HA reconnects by itself)");
+        }
+        if failed {
+            self.close("the connection did not survive the suspend");
+        }
+        if let Some(m) = &self.mdns {
+            m.reannounce();
+        }
+        self.voice.on_resume(now);
     }
 }
 

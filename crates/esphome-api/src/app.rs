@@ -138,6 +138,20 @@ pub enum AppEvent {
     MuteChanged(bool),
     /// Pairing state changed. Never carries key material.
     Pairing(PairingEvent),
+    /// HA changed the reply volume on the media player entity (set, or one
+    /// volume step up or down), in percent (0 to 100). The server already
+    /// reported the new value back to HA; the application applies and
+    /// stores it.
+    VolumeChanged(u8),
+    /// HA chose an option of a select entity ([`crate::Config::selects`]).
+    /// Only valid options are reported; the server already reported the new
+    /// state back to HA.
+    SelectChanged {
+        /// The select's object id.
+        object_id: String,
+        /// The option chosen.
+        option: String,
+    },
     /// A timer event from HA. Only sent when the `TIMERS` feature
     /// ([`crate::features::TIMERS`]) is enabled. HA owns and counts the timers;
     /// the device shows or sounds them (see [`crate::TimerTable`]).
@@ -195,6 +209,28 @@ pub enum AppCommand {
     /// window. A local action. (The key holder can also clear the key
     /// remotely, but that leaves the window closed: [`PairingEvent::Cleared`].)
     ResetPairing,
+    /// The reply volume, in percent (0 to 100, larger values are clamped),
+    /// reported as the media player's volume. Sent by the application at
+    /// startup (the stored value); not echoed as [`AppEvent::VolumeChanged`].
+    SetVolume(u8),
+    /// The TV power state text for the diagnostic text sensor (only listed
+    /// when [`crate::Config::power_sensor`] is set).
+    SetPowerState(String),
+    /// The system resumed from a suspend (the process was frozen). The server
+    /// probes the HA connection with a ping and drops it when HA does not
+    /// answer within a few seconds, re-announces mDNS (when enabled) so HA
+    /// reconnects at once, and re-arms the wake word without waiting out a
+    /// retry backoff.
+    Resumed,
+    /// The state of a select entity ([`crate::Config::selects`]): the stored
+    /// value at startup, or a local change. Not echoed as an event. An
+    /// option that is not in the list is ignored with a log line.
+    SetSelect {
+        /// The select's object id.
+        object_id: String,
+        /// One of its options.
+        option: String,
+    },
 }
 
 impl fmt::Debug for AppEvent {
@@ -262,6 +298,12 @@ impl fmt::Debug for AppEvent {
                 .finish(),
             Self::MuteChanged(m) => write!(f, "MuteChanged({m})"),
             Self::Pairing(p) => f.debug_tuple("Pairing").field(p).finish(),
+            Self::VolumeChanged(v) => write!(f, "VolumeChanged({v})"),
+            Self::SelectChanged { object_id, option } => f
+                .debug_struct("SelectChanged")
+                .field("object_id", object_id)
+                .field("option", option)
+                .finish(),
             // The timer name is user speech: id, event and seconds only.
             Self::Timer {
                 event,
@@ -301,6 +343,14 @@ impl fmt::Debug for AppCommand {
             Self::SetMuted(m) => write!(f, "SetMuted({m})"),
             Self::OpenPairingWindow => f.write_str("OpenPairingWindow"),
             Self::ResetPairing => f.write_str("ResetPairing"),
+            Self::SetVolume(v) => write!(f, "SetVolume({v})"),
+            Self::SetPowerState(s) => f.debug_tuple("SetPowerState").field(s).finish(),
+            Self::Resumed => f.write_str("Resumed"),
+            Self::SetSelect { object_id, option } => f
+                .debug_struct("SetSelect")
+                .field("object_id", object_id)
+                .field("option", option)
+                .finish(),
         }
     }
 }

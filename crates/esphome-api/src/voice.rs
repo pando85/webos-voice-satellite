@@ -624,6 +624,16 @@ impl Voice {
         }
     }
 
+    /// The system resumed from a suspend: a wake word run waiting out a retry
+    /// backoff is re-armed now (the suspend is no reason to keep waiting).
+    pub(crate) fn on_resume(&mut self, now: Instant) {
+        if let Phase::Waiting { .. } = self.phase {
+            log::info!("voice: resumed; re-arming the wake word without waiting for the backoff");
+            self.failures = 0;
+            self.rearm(now);
+        }
+    }
+
     pub(crate) fn on_tick(&mut self, now: Instant) {
         match self.phase {
             Phase::Waiting { until } if now >= until => self.rearm(now),
@@ -816,6 +826,33 @@ mod tests {
         );
         ev(&mut v, t1, Ev::VoiceAssistantRunEnd, &[]);
         assert_eq!(v.next_deadline(), Some(t1 + 2 * BACKOFF_CONFIG_BASE));
+    }
+
+    #[test]
+    fn resume_rearms_a_waiting_wake_word_at_once() {
+        let t0 = Instant::now();
+        let mut v = armed_and_streaming(t0);
+        ev(
+            &mut v,
+            t0,
+            Ev::VoiceAssistantError,
+            &[("code", "wake-engine-missing")],
+        );
+        ev(&mut v, t0, Ev::VoiceAssistantRunEnd, &[]);
+        v.take();
+        assert_eq!(v.next_deadline(), Some(t0 + BACKOFF_CONFIG_BASE));
+        let t1 = t0 + Duration::from_millis(100);
+        v.on_resume(t1);
+        assert!(matches!(
+            v.take()[..],
+            [Out::Ha(ToHa::Start {
+                wake_word: true,
+                ..
+            })]
+        ));
+        // Not waiting: a resume changes nothing.
+        v.on_resume(t1);
+        assert!(v.take().is_empty());
     }
 
     #[test]

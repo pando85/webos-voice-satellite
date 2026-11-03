@@ -40,6 +40,21 @@ pub(crate) fn txt_records(cfg: &Resolved, encrypted: bool) -> Vec<(&'static str,
 pub(crate) struct Advertiser {
     #[cfg(feature = "mdns")]
     daemon: mdns_sd::ServiceDaemon,
+    #[cfg(feature = "mdns")]
+    info: mdns_sd::ServiceInfo,
+}
+
+impl Advertiser {
+    /// Registers the service again so it is announced again (after a system
+    /// resume). aioesphomeapi's reconnect logic connects at once when it sees
+    /// the device's record while disconnected (`ZeroconfWake`). Fails soft.
+    pub(crate) fn reannounce(&self) {
+        #[cfg(feature = "mdns")]
+        match self.daemon.register(self.info.clone()) {
+            Ok(()) => log::info!("mdns: announced again"),
+            Err(err) => log::warn!("mdns: re-announcement failed: {err}"),
+        }
+    }
 }
 
 impl Drop for Advertiser {
@@ -70,17 +85,17 @@ pub(crate) fn advertise(
     };
     let result = mdns_sd::ServiceDaemon::new().and_then(|daemon| {
         let info = info?;
-        daemon.register(info)?;
-        Ok(daemon)
+        daemon.register(info.clone())?;
+        Ok((daemon, info))
     });
     match result {
-        Ok(daemon) => {
+        Ok((daemon, info)) => {
             log::info!(
                 "mdns: advertising {} on port {port} ({})",
                 cfg.name,
                 if encrypted { "encrypted" } else { "no key" }
             );
-            Some(Advertiser { daemon })
+            Some(Advertiser { daemon, info })
         }
         Err(err) => {
             log::warn!("mdns: advertisement disabled: {err}");

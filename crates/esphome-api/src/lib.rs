@@ -120,7 +120,7 @@ pub mod varint;
 mod voice;
 
 pub use app::{AppCommand, AppEvent, PairingEvent, PipelineMode};
-pub use config::{AudioFormat, Config, ConfigError, Mac, features};
+pub use config::{AudioFormat, Config, ConfigError, Mac, SelectEntity, features};
 pub use frame::{NOISE_PREAMBLE, PLAINTEXT_PREAMBLE};
 pub use pairing::Provisioning;
 pub use server::{Server, ServerError};

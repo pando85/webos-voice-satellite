@@ -69,6 +69,21 @@ impl Default for AudioFormat {
     }
 }
 
+/// A configuration `select` entity (for example a behaviour setting). The
+/// application sets its state ([`crate::AppCommand::SetSelect`]) and is told
+/// of HA's changes ([`crate::AppEvent::SelectChanged`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectEntity {
+    /// Object id (the entity key is derived from it).
+    pub object_id: String,
+    /// Name shown in HA.
+    pub name: String,
+    /// Material Design icon, e.g. `mdi:power`.
+    pub icon: String,
+    /// The options, in display order. HA can only choose one of these.
+    pub options: Vec<String>,
+}
+
 /// Configuration of the ESPHome API server.
 #[derive(Clone)]
 pub struct Config {
@@ -105,6 +120,11 @@ pub struct Config {
     pub announcement_format: AudioFormat,
     /// Voice assistant feature bits ([`features`]); default [`features::DEFAULT`].
     pub voice_features: u32,
+    /// List the diagnostic "TV power state" text sensor (the application
+    /// feeds it with [`crate::AppCommand::SetPowerState`]).
+    pub power_sensor: bool,
+    /// Configuration select entities (entity category `config`).
+    pub selects: Vec<SelectEntity>,
 }
 
 impl Default for Config {
@@ -122,6 +142,8 @@ impl Default for Config {
             mdns: false,
             announcement_format: AudioFormat::default(),
             voice_features: features::DEFAULT,
+            power_sensor: false,
+            selects: Vec::new(),
         }
     }
 }
@@ -140,6 +162,8 @@ impl fmt::Debug for Config {
             .field("mdns", &self.mdns)
             .field("announcement_format", &self.announcement_format)
             .field("voice_features", &self.voice_features)
+            .field("power_sensor", &self.power_sensor)
+            .field("selects", &self.selects)
             .finish_non_exhaustive()
     }
 }
@@ -249,6 +273,8 @@ pub(crate) struct Resolved {
     pub(crate) mdns: bool,
     pub(crate) announcement_format: AudioFormat,
     pub(crate) voice_features: u32,
+    pub(crate) power_sensor: bool,
+    pub(crate) selects: Vec<SelectEntity>,
 }
 
 fn valid_name(name: &str) -> bool {
@@ -332,6 +358,8 @@ impl Config {
             mdns: self.mdns,
             announcement_format: fmt.clone(),
             voice_features: self.voice_features,
+            power_sensor: self.power_sensor,
+            selects: self.selects.clone(),
         })
     }
 }

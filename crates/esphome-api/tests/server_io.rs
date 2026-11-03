@@ -326,3 +326,191 @@ async fn timer_events_are_ignored_when_timers_are_not_advertised() {
     ));
     assert!(events.try_recv().is_err(), "no timer event expected");
 }
+
+async fn start_cfg(
+    cfg: Config,
+) -> (
+    u16,
+    mpsc::UnboundedReceiver<AppEvent>,
+    mpsc::Sender<AppCommand>,
+) {
+    let server = Server::bind(cfg).await.unwrap();
+    let port = server.local_addr().unwrap().port();
+    let (ev_tx, ev_rx) = mpsc::unbounded_channel();
+    let (cmd_tx, cmd_rx) = mpsc::channel(16);
+    tokio::spawn(server.run(ev_tx, cmd_rx));
+    (port, ev_rx, cmd_tx)
+}
+
+fn plain_cfg() -> Config {
+    Config {
+        name: "test-tv".into(),
+        bind_addr: "127.0.0.1".parse().unwrap(),
+        port: 0,
+        mac: Some("02:11:22:33:44:55".into()),
+        ..Config::default()
+    }
+}
+
+async fn next_event(events: &mut mpsc::UnboundedReceiver<AppEvent>) -> AppEvent {
+    loop {
+        match timeout(Duration::from_secs(5), events.recv())
+            .await
+            .expect("timeout")
+            .expect("events closed")
+        {
+            AppEvent::HaConnected { .. } | AppEvent::MuteChanged(_) => {}
+            other => return other,
+        }
+    }
+}
+
+#[tokio::test]
+async fn reply_volume_on_the_media_player() {
+    let (port, mut events, cmds) = start_cfg(plain_cfg()).await;
+    cmds.send(AppCommand::SetVolume(40)).await.unwrap();
+    let mut c = connect_plain(port).await;
+    c.send(&pb::ListEntitiesRequest {}).await;
+    let mp: pb::ListEntitiesMediaPlayerResponse = c.recv_as().await;
+    assert_eq!(
+        mp.feature_flags,
+        webos_esphome_api::entities::MEDIA_PLAYER_FEATURES
+    );
+    c.send(&pb::SubscribeStatesRequest {}).await;
+    let st: pb::MediaPlayerStateResponse = c.recv_as().await;
+    assert!((st.volume - 0.4).abs() < 1e-6, "{}", st.volume);
+
+    // HA's slider.
+    c.send(&pb::MediaPlayerCommandRequest {
+        key: mp.key,
+        has_volume: true,
+        volume: 0.25,
+        ..Default::default()
+    })
+    .await;
+    let st: pb::MediaPlayerStateResponse = c.recv_as().await;
+    assert!((st.volume - 0.25).abs() < 1e-6);
+    assert_eq!(next_event(&mut events).await, AppEvent::VolumeChanged(25));
+
+    // Volume up and down steps of 5 %.
+    for (cmd, want) in [
+        (pb::MediaPlayerCommand::VolumeUp, 30),
+        (pb::MediaPlayerCommand::VolumeDown, 25),
+    ] {
+        c.send(&pb::MediaPlayerCommandRequest {
+            key: mp.key,
+            has_command: true,
+            command: cmd as i32,
+            ..Default::default()
+        })
+        .await;
+        let st: pb::MediaPlayerStateResponse = c.recv_as().await;
+        assert!((st.volume - f32::from(want) / 100.0).abs() < 1e-6);
+        assert_eq!(next_event(&mut events).await, AppEvent::VolumeChanged(want));
+    }
+    // An out-of-range value is clamped; the same value again is not an event.
+    c.send(&pb::MediaPlayerCommandRequest {
+        key: mp.key,
+        has_volume: true,
+        volume: 0.25,
+        ..Default::default()
+    })
+    .await;
+    let _: pb::MediaPlayerStateResponse = c.recv_as().await;
+    c.send(&pb::PingRequest {}).await;
+    let _: pb::PingResponse = c.recv_as().await;
+    assert!(events.try_recv().is_err(), "unchanged volume: no event");
+}
+
+#[tokio::test]
+async fn power_sensor_and_select_entities() {
+    let mut cfg = plain_cfg();
+    cfg.power_sensor = true;
+    cfg.selects.push(webos_esphome_api::SelectEntity {
+        object_id: "remote_power_off".into(),
+        name: "When the TV is turned off with the remote".into(),
+        icon: "mdi:power-standby".into(),
+        options: vec![
+            "Turn off normally".into(),
+            "Keep listening (screen off)".into(),
+        ],
+    });
+    let (port, mut events, cmds) = start_cfg(cfg).await;
+    cmds.send(AppCommand::SetSelect {
+        object_id: "remote_power_off".into(),
+        option: "Turn off normally".into(),
+    })
+    .await
+    .unwrap();
+    let mut c = connect_plain(port).await;
+    c.send(&pb::ListEntitiesRequest {}).await;
+    let ts: pb::ListEntitiesTextSensorResponse = c.recv_as().await;
+    assert_eq!(ts.entity_category, pb::EntityCategory::Diagnostic as i32);
+    let sel: pb::ListEntitiesSelectResponse = c.recv_as().await;
+    assert_eq!(sel.options.len(), 2);
+    assert_eq!(sel.entity_category, pb::EntityCategory::Config as i32);
+    let _: pb::ListEntitiesDoneResponse = c.recv_as().await;
+
+    c.send(&pb::SubscribeStatesRequest {}).await;
+    let p: pb::TextSensorStateResponse = c.recv_as().await;
+    assert!(p.missing_state, "no power state yet");
+    let s: pb::SelectStateResponse = c.recv_as().await;
+    assert_eq!(s.state, "Turn off normally");
+
+    cmds.send(AppCommand::SetPowerState("Active".into()))
+        .await
+        .unwrap();
+    let p: pb::TextSensorStateResponse = c.recv_as().await;
+    assert_eq!((p.state.as_str(), p.missing_state), ("Active", false));
+
+    // An invalid option is answered with the current state, no event.
+    c.send(&pb::SelectCommandRequest {
+        key: sel.key,
+        state: "Darken".into(),
+        ..Default::default()
+    })
+    .await;
+    let s: pb::SelectStateResponse = c.recv_as().await;
+    assert_eq!(s.state, "Turn off normally");
+    c.send(&pb::SelectCommandRequest {
+        key: sel.key,
+        state: "Keep listening (screen off)".into(),
+        ..Default::default()
+    })
+    .await;
+    let s: pb::SelectStateResponse = c.recv_as().await;
+    assert_eq!(s.state, "Keep listening (screen off)");
+    assert_eq!(
+        next_event(&mut events).await,
+        AppEvent::SelectChanged {
+            object_id: "remote_power_off".into(),
+            option: "Keep listening (screen off)".into(),
+        }
+    );
+}
+
+#[tokio::test]
+async fn resume_probe_keeps_a_live_connection_and_drops_a_silent_one() {
+    let (port, mut events, cmds) = start_cfg(plain_cfg()).await;
+    let mut c = connect_plain(port).await;
+    cmds.send(AppCommand::Resumed).await.unwrap();
+    // A live HA answers the probe ping and stays connected.
+    let _: pb::PingRequest = c.recv_as().await;
+    c.send(&pb::PingResponse {}).await;
+    c.send(&pb::PingRequest {}).await;
+    let _: pb::PingResponse = c.recv_as().await;
+
+    // A client that does not answer is dropped after the probe timeout.
+    cmds.send(AppCommand::Resumed).await.unwrap();
+    let _: pb::PingRequest = c.recv_as().await;
+    let ev = timeout(Duration::from_secs(10), async {
+        loop {
+            if events.recv().await.expect("events closed") == AppEvent::HaDisconnected {
+                return true;
+            }
+        }
+    })
+    .await
+    .expect("not dropped");
+    assert!(ev);
+}
