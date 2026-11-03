@@ -17,6 +17,9 @@
 | Wake from standby by WoL | From `Suspend`, `wolwowlOnOff = true` | PASS (2 to 4 s); with the original `false`: INCONCLUSIVE; from `Active Standby`: INCONCLUSIVE | D5 |
 | Assist pipeline (wake, STT, TTS stream) | Active Standby and Active | PASS (HA reached port 6053 directly) | EXP-007 |
 | AirPlay audio | any | INCONCLUSIVE (not tested) | EXP-008 |
+| Wake and darken after a remote power-off (watcher: `powerOn` with a reason, then `turnOffScreen`) | Always Ready on and off | PASS (7 of 7 runs, `Screen Off` 5.3 to 5.9 s after the key; panel dark and power draw not observed) | D6 |
+| Reply playback after wake and darken; 20 min dwell in `Screen Off` | Always Ready off | PASS (beeps 28 of 28, an announcement audible, process and HA link stable, no suspend) | D6 |
+| Wake for a reply from `Active Standby`, return to standby | Always Ready on | PASS (audible 2.75 to 3.77 s after the request) | D6 |
 | App package (`.ipk`): install by appinstalld `dev/install`, HBC 0.7.2 | Active | PASS (built without ares-cli; modes and exec bits kept; `folderPath` under `/media/developer/apps`) | EXP-009 |
 | App package: HBC `exec` as root from the app, daemon survives app close and HBC idle exit | Active | PASS (after fix 6410eff) | EXP-009 |
 | App package: update over a running daemon, applied on app open | Active | PASS (config and identity kept, one daemon; after fixes d749183, 8959a39) | EXP-009 |

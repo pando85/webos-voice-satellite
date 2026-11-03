@@ -138,11 +138,11 @@ The package installed with `--arch aarch64` and `uname -m` `aarch64` (`webos-sat
 
 1. Does the soak last hours, and does anything end it (OLED care, the `automaticStandBy = 4` timer, `autoOff2HourOnTimer`, the no-signal rules on an HDMI input)? Only 59 min were seen, on the home app.
 2. Is the panel dark, and what does the unit draw in `Active Standby` and in `Suspend`? (owner and a plug meter)
-3. Why is nothing audible in `Active Standby`: a mute in the amp path, `avmutemanager`, a CEC power-off of the soundbar, or the TV speaker path? An audio path check inside that state (for example the A/V mute services' getters) was not done.
+3. Why is nothing audible in `Active Standby`: a mute in the amp path, `avmutemanager`, a CEC power-off of the soundbar, or the TV speaker path? **Answered in [D6](D6-poweroff-screenoff.md#variant-c-why-active-standby-is-silent):** the DSP input gain (`Gain Input`) is set to about zero at the power-off request; `avmutemanager` and the volume service report no mute.
 4. Is the physical wake from `Active Standby` by WoL possible (`controls/power` and the remote work; WoL was only tried from `Suspend`)?
 5. Does WoL wake the TV with `wolwowlOnOff = false`, the owner's original value?
 6. Does the **Magic Remote** power key give the same sequence as the IR remote?
-7. **Untested idea (hypothesis):** reply while looking off by waking and darkening in one step: from `Active Standby` call `controls/power` (3 s to `Active`), then `turnOffScreen` (`Screen Off` played the tone). It needs a test of the panel flash and of the delay before the first sound.
+7. **Tested later in [D6](D6-poweroff-screenoff.md): it works** (wake with `powerOn` and a reason, then `turnOffScreen`; `Screen Off` about 5.3 to 5.9 s after the key). Original text: reply while looking off by waking and darkening in one step: from `Active Standby` call `controls/power` (3 s to `Active`), then `turnOffScreen` (`Screen Off` played the tone). It needs a test of the panel flash and of the delay before the first sound.
 
 ## Restore (verified at the end)
 

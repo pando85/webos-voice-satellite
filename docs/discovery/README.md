@@ -30,7 +30,7 @@ Device discovery results, one directory per TV. Each log states the date, firmwa
 | --- | --- |
 | [D0-quick.md](c3-b/D0-quick.md) | Quick discovery compared with c3-a: same mic PCM and PulseAudio sinks, firmware one build older, Always Ready and wake on LAN off, sound out through ARC |
 | [D5-results.md](c3-b/D5-results.md) | Remote power-off and Always Ready: with Always Ready on the satellite keeps listening in `Active Standby` (59 min) but a reply is not audible; with it off the TV suspends and the process is frozen; first aarch64 daemon run on a TV; real-remote presses |
-| [D6-poweroff-screenoff.md](c3-b/D6-poweroff-screenoff.md) | Wake and darken after a remote power-off, and the wake-only-for-a-reply variant: plan (Phase 1) and, once run, results |
+| [D6-poweroff-screenoff.md](c3-b/D6-poweroff-screenoff.md) | Wake and darken after a remote power-off (works: `Screen Off` 5.3 to 5.9 s after the key, with or without Always Ready), the wake-only-for-a-reply variant (audible 3 to 4 s after the wake), why `Active Standby` is silent (DSP input gain), second press, OLED notes |
 
 D4 (behaviour while the TV plays sound) is partly done in [P2 session 1](c3-a/P2-session1-audible-and-echo.md); [session 2](c3-a/P2-session2-wake-accuracy.md) adds false wakes with content, barge-in and AEC recordings; talker-in-the-room accuracy and the AEC evaluation remain. D5 (power states) is scheduled in [roadmap](../project/roadmap.md) Phase 3.
 

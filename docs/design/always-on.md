@@ -263,7 +263,57 @@ If the API key lands in `Suspend` (or something else) while the **owner's real k
   3. Mode A (`turnOffScreen` on a running TV) stays the supported state where replies must be heard.
   4. The sound output can revert to ARC after a power cycle, so a feature that needs `tv_speaker` must set it each time and read it back.
   5. G6 (keep-awake guard) needs to read `lifeOnScreenMode`, `wolwowlOnOff` and `quickStartMode` and say what each does; `suspend_stats/success` and the power-state log are cheap probes for the satellite itself.
-- **Open:** the long soak with a real remote, the Magic Remote, panel and draw, why `Active Standby` is silent, WoL from `Active Standby` and with `wolwowlOnOff = false`, the wake-and-darken idea. These need a quiet window agreed with the owner; the room is in use.
+- **Open:** the long soak with a real remote, the Magic Remote, panel and draw, WoL from `Active Standby` and with `wolwowlOnOff = false`. These need a quiet window agreed with the owner; the room is in use. **Update:** why `Active Standby` is silent (the DSP input gain control) and the wake-and-darken idea were tested in D6: [section 12](#12-recommendation-after-d6-on-c3-b-look-off-keep-listening-reply-audibly).
+
+## 12. Recommendation after D6 on c3-b: look off, keep listening, reply audibly
+
+- **Evidence:** [D6 results](../discovery/c3-b/D6-poweroff-screenoff.md) (c3-b, firmware `03.30.73`, 2026-11-03, `verified-on-target` unless marked). Everything below is design; nothing is implemented in the daemon. The experiment tool is `tools/lifecycle/tv/d6-watcher.sh`, not product code.
+- **Why Active Standby is silent (variant C):** the audio DSP input gain control (`Gain Input`, ALSA mixer card 0) goes to near zero on 8 of 12 inputs at the moment of `Request Power Off` and is restored 0.2 to 0.5 s after `Prepare Power On`, just before `Active`. The avmutemanager audio mute flags, the volume and mute status, and the PulseAudio and ALSA playback state stay unchanged, so this is not a mute flag (see D6 for the numbers). After the gain is back, sound is audible 2 to 3 s later (cause not isolated; hypothesis: the ARC link and soundbar).
+- **What works:** a watcher that sees `Request Power Off` with reason `remoteKey` and then settled `Active Standby` can call `tvpower/power/powerOn` with `{"reason":"remoteKey"}` (after the 1.5 s key block) and then `turnOffScreen`. The TV ends in `Screen Off` about 5.3 to 5.9 s after the key, listening and able to play. It worked with Always Ready on and with Always Ready off (the wake at +4.9 s beat the `Request Suspend` at +7 s).
+
+### 12.1 Variants compared
+
+| Variant | Listening | Reply audible | Panel | Cost |
+| --- | --- | --- | --- | --- |
+| **A. Wake and darken** after each power-off | Yes, in `Screen Off` | Yes, from about 2 to 3 s after the wake, so ready long before any reply | One brief unmute of the panel per power-off: 0.28 to 0.67 s by the panel controller's screen-mute getter (**not verified visually**) | TV stays powered ("on, screen dark") until the user turns it on; no standby, so no standby-time OLED compensation (see 12.4) |
+| **B. Stay in Active Standby, wake for each reply** | Yes (needs Always Ready on) | About 3 to 4 s after the wake call (2.75 s and 3.77 s in two runs), so the wake must start on the wake word, not on the reply | One brief unmute per voice reply (0.4 s measured) and a return to standby after each | Only Always Ready's standby draw; the TV rests in standby |
+| Rejected: audio inside Active Standby | n/a | Not possible without writing the DSP gain, which D6 did not try (hardware control, kernel-oops history on this platform, owner authorization needed) | | |
+
+**Recommendation:** build **A** as an opt-in option, with **Always Ready off** as its default base. With Always Ready off the TV suspends normally if the watcher or the satellite is not running, so the failure mode is LG's own behaviour. Where the 2 s margin before `Request Suspend` is not met, fall back to Always Ready on (the TV then waits in `Active Standby`). Keep **B** as a later option for people who care more about OLED rest than about reply delay; it needs Always Ready on and a wake-word pre-wake.
+
+### 12.2 The setting to expose (app and HA UI)
+
+One `select`, off by default, advanced fold, entity category config: **"When the TV is turned off with the remote"**:
+
+| Value | Meaning |
+| --- | --- |
+| `LG default` (default) | The daemon changes nothing. With Quick Start+ and Always Ready as the owner set them, the TV suspends and the satellite is frozen; or stays in `Active Standby` and is silent |
+| `Look off, keep listening and replying` | Variant A. The daemon wakes the TV after a power-off by the remote and turns the screen off |
+| `Standby, wake for replies` (later) | Variant B |
+
+**Risks, shown next to the control (design text):**
+
+1. **Power draw:** the TV stays on with the panel dark; it does not enter standby. No measurement exists (no plug meter). The only figures are an owner's 8 W for Always Ready on a C2 and LG's under 0.5 W standby spec; expect clearly more than standby. Show "not measured" until a meter reading exists.
+2. **OLED care:** LG runs the Pixel Refresher at power-off after more than four hours of viewing and stops it if the TV is turned on. A TV that is woken within seconds of each power-off may never complete it. Mitigations: an "OLED care window" (the feature pauses for N hours per day so the TV can rest in standby), a reminder to run Pixel Cleaning from the TV menu, and a counter read from `oledepl/getPixelRefresherInfoList` (read-only, units not established).
+3. **Panel flash:** the panel is unmuted for roughly 0.3 to 0.7 s after each power-off; whether it is visible was not observed.
+4. **What stops working / changes:** the remote's power key then turns the TV on only through the second-press rule (about 5 s to `Active`, 3 s of it LG's own power-off sequence); pressing power in `Screen Off` is otherwise a power-off. HDMI-CEC and timer power-offs are left alone (reason filter). A TV that looks off still has an open microphone; the daemon must expose the state (HA sensor, mic mute switch, the standby LED setting).
+5. **How to revert:** set the select to `LG default`; the daemon then stops acting, and the TV behaves as LG made it. Any remote key or `turnOnScreen` brings the picture back. If the TV is ever in a state the user does not understand, the remote's power key wakes it (verified from `Active Standby` and `Screen Off`).
+
+### 12.3 Daemon work this needs (design only)
+
+1. G1 power-state subscription (`getPowerState`, `luna-send -i` child, which needs a terminal to print on this TV), with the transitional `processing` strings, reason and `onOff`.
+2. A classifier: act only on `Request Power Off` with `onOff off` and reason `remoteKey` (also decide on `localKey`, the TV's own button: not tested). Skip `autoOff`, `offTimer`, `sleepTimer`, `nosignal`, `hdmiCec`, `homekit`, `oslbSaving`, `compensation*`, `pnwash*` and unknown reasons. The reason list is the `powerOffReasons` of `/etc/tvpowerd/tvpowerd.json` (read on c3-a). The API key and an HA turn-off both give `remoteKey` and cannot be told apart from the IR remote by reason; the input node can (IR on `LGE RCU`, API and Magic Remote on `Smart Remote RCU Input`), if that distinction is ever needed. A reboot test by another agent saw `qbd` power the TV into `Active Standby` with reason `homekit`: the filter ignores it.
+3. The wake: wait for settled `Active Standby`, then `powerOn {"reason":"remoteKey"}` no sooner than 1.5 s after the settle, retry on `Keyblock1.5second`, and only as a state-checked fallback the toggle key `networkinput/controls/power`.
+4. `turnOffScreen` as soon as `Screen On` appears; read `Screen Off` back; one retry; then stop acting and report.
+5. The second-press rule (power-off that starts from a `Screen Off` the daemon made: wake and do not darken), a cooldown, a maximum number of actions per hour, and a kill file.
+6. Do not stop capture because the state is not `Active`; decide from the PCM (G1 rule). After a wake, expect up to 3 s before sound is audible (variant B); start the wake at the wake word.
+7. HA entities: the select above, the power-state `text_sensor`, a binary sensor "screen dark by the satellite", the existing mic mute and kill switch.
+8. Persistent state: original LG settings read and stored; a restore action (existing G7 rule).
+9. The OLED care window and the refresher read-out (12.2).
+
+### 12.4 Open
+
+Whether the panel is dark and how long it flashes (needs a person looking once); the power draw in `Screen Off` and in `Active Standby` (plug meter); whether the TV's refresher runs in `Active Standby` and is cut by the wake (the `oledepl` counters, over days); the real IR remote in `Screen Off`; whether the 2 to 3 s audio delay after the gain is restored belongs to the ARC link (a TV-speaker run); long dwell beyond the first hour; other firmware and c3-a.
 
 ## Sources
 

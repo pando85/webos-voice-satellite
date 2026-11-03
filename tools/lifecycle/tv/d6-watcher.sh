@@ -133,7 +133,7 @@ stop_all() {
     touch "$D6_DIR/stop"
     for p in /proc/[0-9]*; do
         pid=${p#/proc/}
-        c=$(tr '\0' ' ' <"$p/cmdline" 2>/dev/null)
+        c=$(tr '\0' ' ' 2>/dev/null <"$p/cmdline")
         case "$c" in
             *getPowerState*subscribe*) kill "$pid" 2>/dev/null ;;
             "sh "*d6-watcher.sh*run*) [ "$pid" != $$ ] && kill "$pid" 2>/dev/null ;;

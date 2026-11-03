@@ -1,7 +1,7 @@
 # c3-b: D6, remote power-off that looks off but still replies ("wake and darken")
 
 - **Device:** c3-b (LG C3 55 inch, webOS TV 8.3.0, firmware `03.30.73`), the owner's hall TV. Results apply to this unit and firmware only. c3-a is not touched.
-- **Status:** **plan only (Phase 1, 2026-11-03).** Nothing in this file has been run on the TV yet. The results sections are filled in after the live run and each row there carries its own label.
+- **Status:** plan written in Phase 1; **run on c3-b on 2026-11-03 (Phase 2)**. The plan sections are kept as written; two things in them were wrong or incomplete and are corrected under [Corrections to the plan](#corrections-to-the-plan). Results are in [Results](#results). Raw logs: gitignored `devices/private/c3-b/D6/`.
 - **Owner goal:** pressing power off on the remote makes the TV look off, the satellite keeps listening **and** replies are audible. Owner approval to test on this TV: 2026-11-03 (power states, settings and reboot allowed, every original recorded and restored; c3-a never touched).
 - **Starting point ([D5 results](D5-results.md)):** with Always Ready on, a power-off ends in `Active Standby`; listening works there (59 min seen) but 5 tone checks were silent. In `Screen Off` (reached by `turnOffScreen` on a running TV) the same tone was audible.
 - **Evidence labels:** `documented`, `observed-on-other-device`, `hypothesis`, `verified-on-target`. Anything below that is not `verified-on-target` is not a result.
@@ -116,4 +116,93 @@ All with the satellite running (wake mode, mic open), `soundOutput = external_ar
 
 ## Results
 
-Not run yet. To be filled in: per variant (works, lit-window upper bound, latency, audible, second press), the snapshot diff (variant C), the reasons table, the dwell, the restore table, the commit list. Panel state remains **unverified visually** unless the owner looks.
+### Answer
+
+**Yes: the TV can be made to look off after the remote's power key while the satellite keeps listening and replies are audible, by waking it and turning the screen off ("wake and darken").** On c3-b it ended in `Screen Off` 5.3 to 5.9 s after the key in 7 of 7 wake-and-darken runs (A1 x3, A2 x3, A4 x1). Whether the panel is really dark, and the power draw, were **not observed** (nobody looking, no plug meter).
+
+| Variant | Works | Panel lit (upper bound, indirect) | Latency | Reply audible | Second press |
+| --- | --- | --- | --- | --- | --- |
+| **A1** wake and darken, Always Ready `alwaysReady`, darken at settled `Active` | Yes, 3 runs: A1-1 used the 4 s toggle-key fallback; A1-2 started from `Screen Off` (so it was really a second press with a freshly started watcher); A1-3 is the clean run | 0.31, 0.31, 0.67 s | settled `Active Standby` at +3.0 to +3.3 s after the key; `Active` +5.1 to +5.6 s; `Screen Off` +5.4 to +5.9 s (+8.1 s in the first run) | **Yes, after the wake**: silent from the key (+0.0 s) until about 2.2 to 3.3 s after `Active`; the first audible beep started at +7.9 to +8.4 s after the key (+10.4 s in the first run) | see S below |
+| **A2** darken earlier: at `Screen On`, `LastInput Ready` or `Prepare Power On` | Yes, 1 run each; the TV accepted `turnOffScreen` that early | 0.28, 0.38, 0.28 s | `Screen Off` +5.3 to +5.5 s | Yes, first audible beep +7.4 to +8.3 s | as A1 |
+| **A3** wake with the toggle key instead of `powerOn` | Only as the fallback in A1-1 (it worked); not run on purpose | 0.31 s | `Prepare Power On` at +7.7 s (4 s fallback delay) | Yes | |
+| **A4** wake and darken with **Always Ready off** (the unit's own setting) | **Yes**, 1 run: the wake at +4.9 s beat the `Request Suspend` at about +7 s; network stayed up | 0.63 s | `Screen Off` +5.6 s | Yes, first audible beep +8.3 s | not run |
+| **B** stay in `Active Standby`, wake for a reply | Yes, 2 runs | 0.42 s (B-1) | `powerOn` accepted 0.13 to 0.16 s after the request (the standby had long settled), `Active` +0.30 to +0.36 s, `turnOffScreen` +0.55 to +0.61 s, gain restored +0.84 s; **first audible beep +2.75 s (B-1) and +3.77 s (B-2)**; back in `Active Standby` 3.1 s after the return key | Yes, from about 3 to 4 s after the request; muted again at the return key | not applicable |
+| **C** why `Active Standby` is silent | see [Variant C](#variant-c-why-active-standby-is-silent) | | | | |
+
+"Panel lit" is the time the panel controller's `getScreenMuteStatus` read `false` after the wake (it is `true` in `Active Standby` and `Screen Off`, `false` in `Active`), polled about every 0.1 s on the TV. It is an **upper bound from a getter whose physical meaning is not established**. **Not verified visually.** `isOledScreenVisible` stayed `true` in every state and is not informative.
+
+### S: second press and the power key in `Screen Off`
+
+| Test | Result |
+| --- | --- |
+| **S1**, watcher `darken`, TV in the `Screen Off` the watcher made, API key | `Request Power Off` (reason `remoteKey`) from `Screen Off`, settled `Active Standby` at +3.0 s, second-press rule: `powerOn` 1.7 s after the settle (the watcher waited out the 1.5 s key block), `Active` at **+5.06 s after the key**, no darkening, state `Active` (the panel unmuted). The TV came back on normally |
+| **S2**, watcher `observe` (the TV by itself), TV in `Screen Off`, API key | The same sequence ends in `Active Standby` at +3.0 s and stays there. So **without the watcher a power press in `Screen Off` turns the TV off, and the user would need a second press to turn it on** |
+| `turnOnScreen` 0.4 s after the key from `Screen Off` | Refused: `com.webos.service.tvpower/power is busy`. The sequence cannot be cut short |
+| IR remote | **Not tested** (the API key matched the IR key from `Active` in D5; from `Screen Off` it is unverified) |
+
+So the second press costs about 5 s instead of the normal 0.5 s. Audio after the second press was not checked.
+
+### Variant C: why `Active Standby` is silent
+
+Read-only snapshots (`d6-snapshot.sh`) in `Active`, `Active Standby` (+10 s) and `Screen Off`, compared:
+
+| Item | `Active` | `Active Standby` | `Screen Off` |
+| --- | --- | --- | --- |
+| ALSA mixer `Gain Input` (card 0, numid 76, 12 channel/gain pairs) | all 12 at 8388608 (unity) | **8 of 12 at 3** (about zero) | all 12 at 8388608 |
+| avmutemanager `getMuteInfo`: `audioMuteStatus` | false | false (a second context appears, also false) | false |
+| `audio/master/getVolume`: `muteStatus`, `activeStatus` | false, true | read in the run before: unchanged | unchanged |
+| `panelcontroller/getScreenMuteStatus` | false | true | true |
+| `oledepl/getEplStatus` | false | not different | |
+| PulseAudio and ALSA playback | idle | `pcm_output` and `pcm6p` ran in D5 and `pacat` finished | |
+
+Timing from the audio watcher (`d6-audiowatch.sh`, polls `amixer cget` and the avmutemanager getter every 0.2 s): `Gain Input` goes to the low values **at the `Request Power Off` line (+0.00 s, in 3 runs, within the poll step)** and is restored **0.2 to 0.5 s after `Prepare Power On`**, just before `Active`. The tone is audible **about 2.1 to 3.0 s after that**. The cause of the extra 2 to 3 s is not isolated (**hypothesis**: the ARC link and soundbar). The audio mute flags of avmutemanager never changed, so avmutemanager is not the cause; the volume service did not report a mute either.
+
+**Conclusion (`verified-on-target` for the observation, `hypothesis` for the cause):** in `Active Standby` the DSP input gain is set to about zero by the TV's power-off sequence. An audio path that works inside `Active Standby` would need that control written (`amixer cset` on numid 76 or the owner service that sets it). **Not tried**: it is a hardware control write, the platform has a kernel-oops history on audio sysfs, and the brief limited variant C to read-only inspection. It is the next experiment if the owner authorizes it.
+
+### Can the watcher tell the cause of a power-off?
+
+| Source | `Request Power Off` reason | Seen |
+| --- | --- | --- |
+| API key `networkinput/controls/power` | `remoteKey` | 9 times |
+| IR remote (D5, uncontrolled) | `remoteKey` (input node `LGE RCU`) | D5 |
+| `tvpower/power/powerOff {"reason":"offTimer"}` (simulated, programmatic) | `offTimer`, carried through the whole sequence | 1 run, watcher `observe`: `accepted=no` |
+| `powerOff {}` or `{"reason":"d6probe"}` | refused (`'reason' is needed` / `Invalid reason`) | |
+| Auto-off timers, no-signal, HDMI-CEC, HomeKit, compensation, TV's own button | **not triggerable here.** The valid names are in `powerOffReasons` of `/etc/tvpowerd/tvpowerd.json` (read on c3-a): `autoOff`, `offTimer`, `sleepTimer`, `nosignal`, `hdmiCec`, `homekit`, `localKey`, `compensationStart`, `compensationEnd`, `pnwashStart`, `oslbSaving`, and about 70 others | not seen live |
+
+So a user's power key and an HA or API turn-off are **both** `remoteKey`; timers and CEC and HomeKit have their own reasons. The watcher's reason filter (act only on `remoteKey`) is enough to keep it from fighting an auto-off, and the stub test covers the unaccepted-reason path; a live skip with the new watcher is recorded below if run. An unrelated finding from another agent: after a reboot `qbd` powered the TV into `Active Standby` with reason `homekit`; the filter ignores it, and it was **not seen again** in this run.
+
+### Corrections to the plan
+
+1. `tvpower/power/powerOn {}` is refused (`'reason' is needed`); it takes a reason from `powerOnReasons` (`remoteKey` works from `Active Standby`). A `powerOn` in the first 1.5 s after the settle is refused with `Keyblock1.5second`. The watcher now waits and retries; the first runs used the 4 s toggle-key fallback (+4.4 s latency).
+2. `panelcontroller/getScreenMuteStatus` is a usable (indirect) panel indicator and its subscription does not push changes, so it is polled; `isOledScreenVisible` is not informative; `oledepl` has pixel-refresher getters (below). None of these were in the plan.
+
+### OLED and panel care (measured read-outs)
+
+`oledepl/getPixelRefresherInfoList` and `isPixelRefresherCondition` (read-only getters; the meaning of the numbers is **not documented**): start of the session `offrsInterval 4`, `offrsLastTime 3480`, `offrsCount 641`, `jbInterval 500`, `jbLastTime 3225`, `jbCount 7`, `isCondition true`; `getPixelRefresherMode` `auto`; `getPanelUsageTime` 20908. After the session (about two hours later, 20 minutes of it in `Screen Off`): **all six values and `isCondition` unchanged**. The names suggest an "off refresher" every 4 hours of use (`offrs`) and a longer cycle every 500 (`jb`), which fits LG's four-hour and long-cycle text in the research section above, but that mapping is a **hypothesis**. No refresher was seen to run during the session (the session lasted about two hours and the TV was mostly awake).
+
+### Dwell (D)
+
+After the A4 run (Always Ready **off**, watcher-darkened `Screen Off`, 2026-11-03, 20 min 5 s):
+
+- The state stayed `Screen Off` for the whole time; no timer ended it (`automaticStandBy 4` and `autoOff2HourOnTimer on` act on hours, so **a stay longer than 20 min is not known**).
+- The satellite: same pid, mic PCM `RUNNING` in 239 of 239 samples, HA connection counted in 239 of 239, 0 ping losses (2,613 one-second pings over the whole session), `suspend_stats/success` **0 since boot** (so the A4 run and the dwell never entered a kernel suspend), no stall or watchdog line.
+- Playback after the dwell: 28 of 28 beeps audible (band peak -31.7 dBFS, as in `Active`). An `assist_satellite.announce` of one short Spanish sentence (sink gain 0.2, TV volume 9, the mic paused through HA's mute switch so `arecord` could listen) was audible at the TV microphone: speech at -36 to -55 dBFS for about 2.4 s over a -84 dBFS floor. Volume restored to 12.
+- One full wake word chain ran in the dwell (13:26 UTC, `reply_audio` 14.5 s, played at gain 0, so silent): room speech or a false wake. The pipeline's conversation language `ru` cannot match a command; no HA action ran. Transcripts were not read, and the temporary pipeline was deleted.
+- `MIC BUSY` was logged 8 times, **all caused by my own `arecord` overlapping the satellite's re-open at the end of a measurement window** (the daemon retried and recovered each time); LG hands-free was off for the run.
+
+### Restore (verified at the end)
+
+**Live skip test of the reason filter** (watcher `darken`, Always Ready on to avoid a Suspend): `powerOff {"reason":"offTimer"}` gave `POWEROFF ... accepted=no` then `SKIP reason offTimer not accepted`; the TV stayed in `Active Standby` until I woke it with `powerOn {"reason":"remoteKey"}`.
+
+| Item | Start of the session | End | Verified |
+| --- | --- | --- | --- |
+| `general/lifeOnScreenMode` | `off` | `off` (set `alwaysReady` for the runs, `off` for A4, `alwaysReady` for the skip test, `off` at the end) | read back |
+| `network/wolwowlOnOff` | `false` | `false` (set `true` for the way back) | read back |
+| `sound/soundOutput`, volume, mute | `external_arc`, 12, not muted | `external_arc`, 12, not muted (volume set to 9 for each check, restored each time) | read back |
+| `option/quickStartMode`, `turnOnByVoice`, `standByLight`, `screenOff`, `lifeOnScreenEnergySaving`, `picture/energySaving`, `time/*` | as recorded | identical | read back |
+| LG hands-free ("Hi LG", `setting/setActivation`) | **on** (`settingStatus true`, `activationState true`; it held the mic PCM `RUNNING` at the start, so the satellite would have got `MIC BUSY`) | **on** again: I set `settingStatus false` for the run and `true` at the end; `activationState true` read back | read back |
+| Power state, app | `Active`, `com.webos.app.home` | `Active`, `com.webos.app.home`, screen mute `false`, `aod` status `none` | read back |
+| TV `/tmp` | none of ours | no `d6`, no satellite, no loops, no `pacat` or `arecord`, no luna subscription; mic PCM `closed`; kernel taint `4097` (unchanged), 0 oops lines in `dmesg`, no reboot | listed |
+| HA | 43 entries, 2 pipelines (Kiwi preferred) | 43 entries, 2 pipelines, Kiwi preferred, 0 `c3_b` entities; the temporary entry and the `ru` pipeline deleted; my two access tokens revoked by their own ids (the API answers 401); no other token touched | listed |
+
+The coordinator's message said "Hi LG" was left off by the packaging agent; at the start it **read as on**, which is what I restored. The packaging agent's other values (Always Ready off, WoL false, Quick Start+ on, ARC, volume 12, not muted) matched what I read.
