@@ -6,6 +6,7 @@ edition.workspace = true
 # sonora needs rustc 1.91; the workspace default (1.85) applies to the other
 # crates. The pinned toolchain (rust-toolchain.toml) is newer than both.
 rust-version = "1.91"
+license.workspace = true
 publish.workspace = true
 
 [dependencies]

@@ -4,6 +4,7 @@ description = "webos-voice-satellite: ESPHome native API device-side server (voi
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 publish.workspace = true
 # proto/ holds MIT-licensed ESPHome .proto files (see proto/LICENSE-ESPHOME-MIT).
 
