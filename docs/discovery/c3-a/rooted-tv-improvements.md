@@ -78,7 +78,7 @@
 
 ### 9. Native LG voice services are running while hands-free is off (medium, do not change)
 
-- **Observation:** `voiceinput`, `voiceconductor`, the ThinQ and Alexa adapters, and the wake-on-voice path are running. Hands-free is off on all providers, Always Ready is `none`, and the built-in mic reports `TV`. Behaviour while a session is active or in standby is **unknown**. See [D2 > TV state](D2-audio-stack.md#tv-state-at-snapshot-time) and [D2 > Who holds which sound device](D2-audio-stack.md#who-holds-which-sound-device-snapshot).
+- **Observation:** `voiceinput`, `voiceconductor`, the ThinQ and Alexa adapters, and the wake-on-voice path are running. Hands-free is off on all providers, the Always Ready display status is `none` (the Always Ready setting itself is on, see [always-on](../../design/always-on.md#2-what-was-observed-on-c3-a-read-only-2026-11-03)), and the built-in mic reports `TV`. Behaviour while a session is active or in standby is **unknown**. See [D2 > TV state](D2-audio-stack.md#tv-state-at-snapshot-time) and [D2 > Who holds which sound device](D2-audio-stack.md#who-holds-which-sound-device-snapshot).
 - **Proposed change:** none. AGENTS.md forbids changing native LG voice services during discovery. Observe only (D3-a) and only with user action.
 - **Risk:** disabling them could break LG UI features and is not reversible without a vendor reinstall.
 - **Rollback:** not applicable.

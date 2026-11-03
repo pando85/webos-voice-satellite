@@ -32,7 +32,7 @@ So the failsafe flag is set from step 2 until 10 s after the last hook returns. 
 | A second copy at boot | `start.sh` refuses when the daemon or a supervisor already runs; HBC's `startup.sh` itself runs once per boot |
 | Logs fill the storage | Logs stay in `DIR/log` with size rotation (`rotate.sh`, about 2 × 256 KiB); the autostart log gets a few lines per boot. With a persistent prefix this is flash, so the log volume is kept at `info` |
 
-Not covered by this design: an HBC-style service instead of `init.d` (item 8 prefers it, but the HBC `autostart` trigger chain is still untraced, D0-D1 open question 8), and starting at screen-off/standby transitions (D5, [EXP-004](../experiments/EXP-004-power-lifecycle.md)).
+Not covered by this design: an HBC-style service instead of `init.d` (item 8 prefers it, but the HBC `autostart` trigger chain is still untraced, D0-D1 open question 8), and starting at screen-off/standby transitions (D5, [EXP-004](../experiments/EXP-004-power-lifecycle.md)). What is known about each power state, including that `init.d` hooks run once per boot and not on resume and that a Suspend freezes a running process, is in [always-on](always-on.md#3-power-states).
 
 ## Proposed install (needs the owner's approval; not done)
 
@@ -57,5 +57,6 @@ Prerequisites: the owner approves (1) a persistent prefix, (2) the one hook file
 ## Open questions
 
 - Whether the HBC `autostart` service method is what runs `startup.sh` at every boot on c3-a, or only `jumpstart.sh` (D0-D1 open question 8). The design does not depend on it, since it only uses `init.d`.
-- Behaviour after resume from standby or Quick Start+ (whether `startup.sh` runs again, whether the daemon survives): D5, see [EXP-004](../experiments/EXP-004-power-lifecycle.md).
+- Behaviour after resume from standby or Quick Start+: `startup.sh` does not run again on resume (script guard `/tmp/webosbrew_startup`; reports from other TVs say the same), and a running process is frozen, not killed (observed-on-other-device); both are **unverified on c3-a**, as is the behaviour of the draft hook with Quick Start+ off (every power-on is a cold boot). D5 (see [EXP-004](../experiments/EXP-004-power-lifecycle.md)) and [always-on](always-on.md).
+- A luna hub restart stops everything in its cgroup, a daemon started by the hook included (hypothesis; see [always-on](always-on.md#2-what-was-observed-on-c3-a-read-only-2026-11-03)).
 - Multi-day memory and descriptor behaviour of the daemon under the supervisor (Phase 3 exit criterion).

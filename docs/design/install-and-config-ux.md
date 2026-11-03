@@ -189,6 +189,7 @@ Milestone 3b, HA-driven pairing (PC work first):
 ### 4.2 Phase 5 slice
 
 - Config entities in HA (mic gain, output gain, mic kill switch as the existing mute, optionally pairing window state), `entity_category: config`.
+- **Power options (owner, 2026-11-03; design only, depends on D5):** if D5 shows that a power-related TV setting is critical for the satellite to work (screen off instead of standby, Always Ready, Quick Start+), expose it both as an HA config entity on the device page and in the TV app, with the risks next to the option (power draw, panel/OLED considerations, what stops working, how to revert), a stored original value and a restore action. The daemon never writes a TV setting without an explicit user action. Full design: [always-on section 7](always-on.md#7-exposing-power-options-in-the-ui-design).
 - Capability discovery (already a Phase 5 deliverable) feeds the first-run script so no `LGSIC` name or ALSA index is baked in.
 - Publication: central `apps-repo` PR (with the AI-use disclosure, if the owner agrees) or the self-hosted repository; release checklist with package inspection and published SHA-256.
 - Second-TV validation of the whole flow; compatibility record per model, firmware and HBC version.
@@ -241,6 +242,7 @@ Milestone 3b, HA-driven pairing (PC work first):
 9. **Entities.** Are `number` and `select` config entities worth the extra code in the daemon's ESPHome layer versus a TV app setting for mic gain? HA handles authentication, so the recommendation is entities.
 10. **Window trigger on first run.** Auto-open on the first app launch only, or always require the button? Needs UX testing with non-technical users.
 11. **Key clear on entry removal.** Accept HA's empty-key `SetKey` on an authenticated session (back to unpaired, as ESPHome) or keep reset local only and leave HA's stored key behind (measured 2026-11-02, section 8). **Decided (2026-11-02):** accept it from the key holder only, then unpaired with the window closed until a local action (rule 6). Not yet re-verified with a real HA.
+12. **Power options UI.** Which TV power settings the app and HA expose (screen policy, Always Ready, Quick Start+), whether the daemon may write them through `settingsservice` (private luna API, root caller allowed is a hypothesis), and how the risk text is shown where an HA entity cannot hold a paragraph: [always-on section 7](always-on.md#7-exposing-power-options-in-the-ui-design), decided after the D5 results.
 
 ## 7. What must be verified on a TV before acceptance
 

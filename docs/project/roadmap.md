@@ -102,7 +102,7 @@ Research tasks and implementation work are tracked in GitHub Issues. This roadma
 - **Deliverables:**
   - Autostart design reviewed against the failsafe risk of `run-parts` hooks (see [rooted-tv-improvements item 8](../discovery/c3-a/rooted-tv-improvements.md)), with a documented rollback that does not need a reboot where possible.
   - Watchdog and kill switch (a local file, a Home Assistant switch, and a documented manual stop) that stop capture and release the PCM.
-  - D5 results: behaviour of capture, network and the satellite in screen-off, standby and Always Ready states ([EXP-004](../experiments/EXP-004-power-lifecycle.md)), with power measurements if feasible.
+  - D5 results: behaviour of capture, network and the satellite in screen-off, standby and Always Ready states ([EXP-004](../experiments/EXP-004-power-lifecycle.md), [always-on design](../design/always-on.md)), with power measurements if feasible, and an "always on" operating mode with a playback check per state. Power-related settings that turn out to be critical are exposed as HA entities and in the install/status app with their risks.
   - Reconnection behaviour after HA restarts, network loss and TV resume; backoff and state recovery.
   - Resource limits (memory, CPU, file descriptors) given about 750 MB available memory, nearly exhausted CMA and 3 of 4 cores online on c3-a ([constraints](../discovery/c3-a/rooted-tv-improvements.md#constraints-not-changes)).
   - Firmware update guard: detect a firmware change and disable or re-validate the satellite; review the update-blocking gaps ([item 1](../discovery/c3-a/rooted-tv-improvements.md)).
@@ -118,13 +118,13 @@ Research tasks and implementation work are tracked in GitHub Issues. This roadma
 | Firmware guard | done | `/var/run/nyx/os_info.json` `webos_manufacturing_version` vs `safety.validated_firmware`; mismatch keeps the mic off; `--check-firmware` exit codes; verified on c3-a with a matching and a non-matching list. Update blocking (item 1) still needs the owner's decision |
 | Resource limits | done | nice 10, `RLIMIT_NOFILE` 256, RSS ceiling 64 MiB; measured 10 to 12 fds, 3 threads, 1.5 to 2 % of one core, RSS about 1 to 2 MB with one rise to 9.5 MB in the soak (then flat). PC investigation: musl `malloc` grows about 1.7 bytes per TTS reply byte with a flat Rust heap; fixed with `dlmalloc` on musl targets and a bounded TTS queue; TV re-soak: 55 streamed replies and 770 reconnects, RSS flat at 976 kB (see P3) |
 | Reconnection | partly done | Bridge kill/restart, bridge freeze 60 s, satellite freeze 60/120 s, 20 rapid reconnects and a simulated 180 s partition all recover (re-arm within milliseconds of the new connection); soak with periodic reconnects. **Remaining:** HA's own integration (network block), HA restarts, TV Wi-Fi loss and resume (D5) |
-| D5 power states | procedure ready, **needs owner** | [D5 plan](../discovery/c3-a/D5-plan.md); no power state was changed |
+| D5 power states | procedure ready (agent-runnable, scheduled by the orchestrator), **not run** | [D5 plan](../discovery/c3-a/D5-plan.md); [always-on design](../design/always-on.md) (states, recommended mode, gaps). Desk research and read-only inspection on 2026-11-03: Quick Start+ and Always Ready are both on on c3-a; screen off on a running TV is the candidate mode for listening and replies; Suspend freezes the process. Nothing was changed on the TV |
 | Multi-day run | not done | Needs a persistent or long-lived install (owner). A 35-minute soak (13 bridge sessions, 65 reconnects, 0 failures) is in P3; the 59-minute re-soak with the `dlmalloc` build is done (RSS flat, see P3); the multi-day run is still open |
 
 - **Exit criteria:** after a TV reboot the satellite returns without owner action; a crash loop cannot trigger LG failsafe mode; the kill switch releases the mic in a measured time; D5 states are documented for c3-a with firmware and state labels; the satellite stays inside the resource limits over a multi-day run.
 - **Needs-owner:**
-  - Approval for the first persistent change (startup hook), and for any reboot.
-  - Approval of screen-off and standby test procedures.
+  - Approval for the first persistent change (startup hook). Reboots, power-state changes and TV settings changes for the D5 tests are allowed by the owner (2026-11-03) when a test needs them, with every setting restored; the orchestrator schedules the run.
+  - Owner decision on the power options exposed in the UI after D5 ([always-on section 7](../design/always-on.md#7-exposing-power-options-in-the-ui-design)).
   - A decision on update blocking (DNS on the home network is the preferred option in the improvements document).
 
 ## Phase 4: Wake word and UX
