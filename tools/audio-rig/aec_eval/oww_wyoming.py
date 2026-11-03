@@ -70,6 +70,29 @@ class WyomingOww:
             ts_ms += len(block) * 1000.0 / RATE
         return dets, max_score
 
+    def trace(self, pcm16, chunk=CHUNK, min_prob=0.1):
+        """Streams `pcm16` as one audio stream and returns (trace, max_score): every model
+        probability of at least `min_prob` as `(t, prob)`, with `t` the audio time before the
+        chunk that produced it (the server's timestamp). `detect_from_trace` turns a trace into
+        the detections `run` would give for any threshold of at least `min_prob`, trigger level
+        and refractory time."""
+        pcm16 = np.ascontiguousarray(pcm16, dtype=np.int16)
+        self.features.reset()
+        self.model.reset()
+        ts_ms = 0.0
+        out = []
+        max_score = 0.0
+        for i in range(0, len(pcm16), chunk):
+            block = pcm16[i:i + chunk]
+            for feats in self.features.process_streaming(block.tobytes()):
+                for prob in self.model.process_streaming(feats):
+                    p = float(prob)
+                    max_score = max(max_score, p)
+                    if p >= min_prob:
+                        out.append((round(ts_ms / 1000.0, 4), round(p, 4)))
+            ts_ms += len(block) * 1000.0 / RATE
+        return out, max_score
+
     def run_rearm(self, pcm16, rearm_s=0.0, chunk=CHUNK):
         """Long-stream mode for false wakes: after each detection a new stream starts
         `rearm_s` later (HA ends the wake word stage on a detection; the satellite re-arms
@@ -88,6 +111,28 @@ class WyomingOww:
             armed += int(t_abs * RATE) - pos
             pos = max(end, pos + chunk)
         return dets, max_score, armed / RATE
+
+
+def detect_from_trace(trace, threshold=0.5, trigger_level=1, refractory_s=2.0):
+    """The detections (times in s) of the server loop for one audio stream, from a `trace`
+    (see `WyomingOww.trace`): a probability counts when strictly above `threshold`; the
+    `trigger_level`-th counting probability since the stream started fires a detection (the
+    count is never reset within a stream, as in wyoming-openwakeword 2.1.0); probabilities
+    less than `refractory_s` after a detection are skipped."""
+    left = trigger_level
+    last = None
+    dets = []
+    for t, p in trace:
+        if last is not None and t - last < refractory_s:
+            continue
+        if p <= threshold:
+            continue
+        left -= 1
+        if left > 0:
+            continue
+        last = t
+        dets.append(t)
+    return dets
 
 
 def main():

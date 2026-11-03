@@ -17,7 +17,9 @@ sys.path.insert(0, os.path.join(HERE, ".."))
 import ab_report  # noqa: E402
 import semisyn_ab  # noqa: E402
 import stt_eval  # noqa: E402
-from oww_wyoming import WyomingOww  # noqa: E402
+import tune_eval  # noqa: E402
+import tune_report  # noqa: E402
+from oww_wyoming import WyomingOww, detect_from_trace  # noqa: E402
 
 
 class SemisynTest(unittest.TestCase):
@@ -132,6 +134,47 @@ class SttTest(unittest.TestCase):
         seg = stt_eval.segment(x, it, lead=2.0)
         self.assertEqual(seg[0], int(2.5 * 16000))
         self.assertEqual(len(seg), int(5.3 * 16000) - int(2.5 * 16000))
+
+
+class TraceTest(unittest.TestCase):
+    TRACE = [(0.0, 0.3), (0.064, 0.55), (0.128, 0.7), (1.0, 0.45), (2.2, 0.6), (5.0, 0.35), (5.1, 0.4)]
+
+    def test_threshold_is_strict_and_refractory_applies(self):
+        self.assertEqual(detect_from_trace(self.TRACE, 0.5), [0.064, 2.2])
+        self.assertEqual(detect_from_trace(self.TRACE, 0.55), [0.128, 2.2])
+        self.assertEqual(detect_from_trace(self.TRACE, 0.7), [])
+        self.assertEqual(detect_from_trace(self.TRACE, 0.3), [0.064, 2.2, 5.0])
+
+    def test_trigger_level_counts_never_reset_within_a_stream(self):
+        # Level 2: the second probability above the threshold fires, even far apart, and
+        # after a detection the count stays exhausted (wyoming-openwakeword 2.1.0).
+        self.assertEqual(detect_from_trace(self.TRACE, 0.5, trigger_level=2), [0.128, 2.2])
+        self.assertEqual(detect_from_trace([(0.0, 0.6), (9.0, 0.6)], 0.5, trigger_level=2), [9.0])
+        self.assertEqual(detect_from_trace(self.TRACE, 0.6, trigger_level=2), [])
+
+
+class TuneTest(unittest.TestCase):
+    def test_voice_splits_are_disjoint_and_hold_out_mls(self):
+        self.assertFalse(tune_eval.SPLITS["tune"] & tune_eval.SPLITS["held"])
+        mls = {"voice": "es_ES-mls_9972-low", "speaker": "mls_9972"}
+        self.assertTrue(tune_eval.in_split(mls, "held"))
+        self.assertFalse(tune_eval.in_split(mls, "tune"))
+        self.assertTrue(tune_eval.in_split(mls, None))
+
+    def test_latency_of_tuned_variants(self):
+        lat = semisyn_ab.latency_of
+        self.assertEqual(lat("--aec3 linear_mix=0.3 --render-channels 2"), 128)
+        self.assertEqual(lat("--output linear --render-channels 2 --rnnoise"), 64)
+        self.assertEqual(lat("--aec3 linear_mix=0.3 --ns --agc2-fixed-db 24 --gain-db 0"), 224)
+
+    def test_scoring_of_trace_rows(self):
+        item = {"id": "p", "kind": "pos", "voice": "v", "speaker": "", "wake_start_ms": 300, "wake_end_ms": 800}
+        row = {"item": item, "trace": [(0.5, 0.6), (2.9, 0.6)]}  # lead-in at 0.5 s, wake at 0.9 s
+        self.assertEqual(tune_report.score(row, 0.5, 1), (True, True))
+        self.assertEqual(tune_report.score(row, 0.6, 1), (False, False))
+        neg = {"item": dict(item, kind="neg"), "trace": [(3.0, 0.4)]}
+        self.assertEqual(tune_report.score(neg, 0.3, 1), (False, True))
+        self.assertEqual(tune_report.score(neg, 0.5, 1), (False, False))
 
 
 if __name__ == "__main__":
