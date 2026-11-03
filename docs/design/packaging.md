@@ -1,6 +1,6 @@
 # webOS app package (ipk): design and status
 
-- **Status:** **verified on c3-b (2026-11-03, HBC 0.7.2, firmware 03.30.73)** in [EXP-009](../experiments/EXP-009-ipk-install-update.md): install, set up, update, downgrade, start at boot, uninstall, purge and app removal; three bugs found there are fixed (section 6). Not yet on c3-a or HBC 0.6.x; c3-a needs the owner's separate approval.
+- **Status:** **verified on c3-b (2026-11-03, HBC 0.7.2, firmware 03.30.73)** in [EXP-009](../experiments/EXP-009-ipk-install-update.md): install, set up, update, downgrade, start at boot, uninstall, purge and app removal; three bugs found there are fixed (section 6). Installed on c3-a (HBC 0.6.3, firmware 03.30.74) on 2026-11-03 with the owner's approval: [P4](../discovery/c3-a/P4-permanent-install.md) (install, set up, start, start-at-boot hook written, HA entry reconnected; the first boot with the hook is pending).
 - **Date:** 2026-11-03. External sources were read on 2026-11-03 at the commits listed under [Sources](#sources).
 - **Scope:** milestone 3a of the [install and configuration UX](install-and-config-ux.md#41-phase-3-slice-with-autostart-owner-approval-gated-on-the-tv) and the "reproducible ipk" deliverable of [roadmap Phase 5](../project/roadmap.md#phase-5-second-tv-and-packaging). Manual install only for now. The target is the official Homebrew Channel apps repository, decided 2026-11-03 ([P14](#1-decisions)); there is no self-hosted repository.
 - **Files:** [`packaging/webos/`](../../packaging/webos/): `ctl.sh` (entry point), `install.sh` and the ops scripts, `config.default.toml`, `init.d/webos-satellite` (hook template), `app/` (status app), `ipk/build_ipk.py` (builder and checker), `tv/appinstall.sh` (appinstalld helper), `tests/`.
@@ -93,7 +93,7 @@ Bugs found only on the TV, all fixed with host tests:
 2. **Stop race under `set -e` (d749183).** The supervisor forwards its TERM to the daemon, which can be gone before `stop_daemon`'s own `kill`; the failing `kill` aborted `ctl.sh install` half way with the daemon stopped. Every kill there now tolerates a missing process.
 3. **Two update triggers (8959a39).** An app instance left in the background and the relaunched app both applied one update; the second stopped the daemon the first had started. `ctl.sh install` now does nothing when the payload is already installed (`--force` reinstalls).
 
-Still not verified: HBC 0.6.3 (c3-a), installing through HBC's own `install` from a manifest, survival across an HBC self-update or a luna hub restart.
+On HBC 0.6.3 (c3-a) install, `ctl.sh` set up with the existing HA identity, start and the hook were verified ([P4](../discovery/c3-a/P4-permanent-install.md)); the app UI and a boot there are not. Still not verified: installing through HBC's own `install` from a manifest, survival across an HBC self-update or a luna hub restart.
 
 ## 7. Open questions
 
