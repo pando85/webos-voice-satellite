@@ -339,7 +339,7 @@ fn build_frontend(cfg: &CaptureSettings, src: &dyn AudioSource, rate: u32) -> Fr
                 _ => format!("PCM {:?}", a.pcm_id),
             };
             log::info!(
-                "aec: echo cancellation on: reference {what} ({} ch, {} Hz, {}), render {} ch, output {:?}, {start}, delay {}, ns={}, bypass_when_silent={}",
+                "aec: echo cancellation on: reference {what} ({} ch, {} Hz, {}), render {} ch, output {:?}, {start}, delay {}, ns={}, bypass_when_silent={}, aec3=[{}]",
                 fmt.channels,
                 fmt.rate,
                 a.format.name(),
@@ -350,7 +350,8 @@ fn build_frontend(cfg: &CaptureSettings, src: &dyn AudioSource, rate: u32) -> Fr
                     webos_dsp::DelayMode::FixedMs(ms) => format!("{ms} ms"),
                 },
                 a.dsp.ns,
-                a.dsp.bypass_when_silent
+                a.dsp.bypass_when_silent,
+                a.dsp.aec3
             );
             fe.with_echo_canceller(aec)
         }

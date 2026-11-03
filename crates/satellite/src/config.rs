@@ -523,6 +523,9 @@ pub(crate) struct AecSection {
     /// Raw reference file for `mic.source = "file"` (read in lockstep with
     /// `mic.path`).
     pub(crate) reference_path: Option<PathBuf>,
+    /// `[aec.aec3]`: experimental AEC3 overrides, `"<parameter>" = value`
+    /// (names: `webos_dsp::Aec3Param`). Empty: AEC3's defaults.
+    pub(crate) aec3: std::collections::BTreeMap<String, f32>,
 }
 
 impl Default for AecSection {
@@ -543,8 +546,18 @@ impl Default for AecSection {
             bypass_when_silent: false,
             reference_gain_db: 0.0,
             reference_path: None,
+            aec3: std::collections::BTreeMap::new(),
         }
     }
+}
+
+/// ` aec3={name=value,...}` for the summary line (empty without overrides).
+fn aec3_summary(t: &std::collections::BTreeMap<String, f32>) -> String {
+    if t.is_empty() {
+        return String::new();
+    }
+    let kv: Vec<String> = t.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    format!(" aec3={{{}}}", kv.join(","))
 }
 
 /// Largest accepted fixed `aec.delay_ms` (sonora clamps its hint there).
@@ -747,11 +760,7 @@ impl Settings {
                 "aec.render_channels must be 1 (downmix) or 2 (stereo, needs aec.reference_channels >= 2)",
             ));
         }
-        if a.output != AecOutputKind::Full && a.render_channels != 1 {
-            return Err(err(
-                "aec.output = \"linear\" or \"nearend\" needs aec.render_channels = 1",
-            ));
-        }
+        self.aec3_tuning()?;
         if a.reference_period_frames == 0 || a.reference_buffer_frames < a.reference_period_frames {
             return Err(err(
                 "aec.reference_period_frames must be non-zero and aec.reference_buffer_frames at least as large",
@@ -767,9 +776,9 @@ impl Settings {
         if !a.reference_gain_db.is_finite() || !(-20.0..=40.0).contains(&a.reference_gain_db) {
             return Err(err("aec.reference_gain_db must be between -20 and 40"));
         }
-        if !a.enabled && (a.ns || a.bypass_when_silent) {
+        if !a.enabled && (a.ns || a.bypass_when_silent || !a.aec3.is_empty()) {
             return Err(err(
-                "aec.ns and aec.bypass_when_silent need aec.enabled = true",
+                "aec.ns, aec.bypass_when_silent and [aec.aec3] need aec.enabled = true",
             ));
         }
         if a.enabled && self.mic.source == MicSource::File && a.reference_path.is_none() {
@@ -931,6 +940,17 @@ impl Settings {
         }
     }
 
+    /// `[aec.aec3]` as validated AEC3 overrides.
+    fn aec3_tuning(&self) -> Result<webos_dsp::Aec3Tuning, ConfigError> {
+        let mut t = webos_dsp::Aec3Tuning::default();
+        for (k, v) in &self.aec.aec3 {
+            let p = webos_dsp::Aec3Param::from_name(k)
+                .ok_or_else(|| err(format!("aec.aec3: unknown AEC3 parameter {k:?}")))?;
+            t.set(p, *v).map_err(|e| err(format!("aec.aec3: {e}")))?;
+        }
+        Ok(t)
+    }
+
     /// Echo canceller settings (used only when `aec.enabled`).
     pub(crate) fn aec_config(&self) -> webos_dsp::AecConfig {
         let a = &self.aec;
@@ -951,6 +971,10 @@ impl Settings {
             apply: webos_dsp::DelayApply::Hint,
             ns: a.ns,
             bypass_when_silent: a.bypass_when_silent,
+            // Validated in `validate`; an invalid table falls back to AEC3's
+            // defaults here.
+            aec3: self.aec3_tuning().unwrap_or_default(),
+            agc2: None,
         }
     }
 
@@ -1045,7 +1069,7 @@ impl Settings {
         let a = &self.aec;
         let aec = if a.enabled {
             format!(
-                "on ref={} {}/{}ch/{}Hz render_ch={} output={} link={} delay_ms={} ns={} bypass={} ref_gain_db={}{}",
+                "on ref={} {}/{}ch/{}Hz render_ch={} output={} link={} delay_ms={} ns={} bypass={} ref_gain_db={}{}{}",
                 a.reference_pcm_id,
                 match a.reference_format {
                     RefFormat::S32Le => "s32_le",
@@ -1067,6 +1091,7 @@ impl Settings {
                 a.ns,
                 a.bypass_when_silent,
                 a.reference_gain_db,
+                aec3_summary(&a.aec3),
                 if self.mic.source == MicSource::File {
                     " (file reference)"
                 } else {
@@ -1393,6 +1418,21 @@ level = "debug"
         assert_eq!(s.aec_config().output, webos_dsp::AecOutput::Full);
         let s = Settings::from_toml("[aec]\noutput = \"linear\"\n", base).unwrap();
         assert_eq!(s.aec_config().output, webos_dsp::AecOutput::Linear);
+        let s = Settings::from_toml(
+            "[aec]\nenabled = true\noutput = \"linear\"\nrender_channels = 2\n[aec.aec3]\n\"linear_mix\" = 0.3\n\"suppressor.dominant_nearend_detection.snr_threshold\" = 3\n",
+            base,
+        )
+        .unwrap();
+        let c = s.aec_config();
+        assert_eq!(c.render_channels, 2);
+        assert_eq!(c.aec3.get(webos_dsp::Aec3Param::LinearMix), Some(0.3));
+        assert_eq!(c.aec3.get(webos_dsp::Aec3Param::DneSnrThreshold), Some(3.0));
+        assert!(Settings::default().aec_config().aec3.is_empty());
+        assert!(
+            s.summary().contains("aec3={linear_mix=0.3,"),
+            "{}",
+            s.summary()
+        );
         let e = Settings::from_toml("[aec]\noutput = \"half\"\n", base).unwrap_err();
         assert!(e.0.contains("half"), "{e}");
         assert!(Settings::default().summary().contains("aec=[off]"));
@@ -1423,9 +1463,16 @@ level = "debug"
                 s.aec.reference_channels = 1;
                 s.aec.render_channels = 2;
             }),
-            ("aec.output", |s| {
-                s.aec.output = AecOutputKind::Linear;
-                s.aec.render_channels = 2;
+            ("aec.aec3", |s| {
+                s.aec.enabled = true;
+                s.aec.aec3.insert("nope".into(), 1.0);
+            }),
+            ("aec.aec3", |s| {
+                s.aec.enabled = true;
+                s.aec.aec3.insert("linear_mix".into(), 2.0);
+            }),
+            ("aec.aec3", |s| {
+                s.aec.aec3.insert("linear_mix".into(), 0.3);
             }),
             ("aec.reference_period_frames", |s| {
                 s.aec.reference_buffer_frames = 128;

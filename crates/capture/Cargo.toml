@@ -31,3 +31,6 @@ module_name_repetitions = "allow"
 
 [dev-dependencies]
 webos-dsp = { workspace = true }
+# Experimental RNNoise stage of the aec_offline evaluation example only
+# (docs/experiments/P2-aec-tuning.md); not linked into the daemon.
+nnnoiseless = { version = "0.5.2", default-features = false }

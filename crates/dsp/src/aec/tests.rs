@@ -1,4 +1,6 @@
 #![allow(
+    clippy::many_single_char_names,
+    clippy::large_types_passed_by_value,
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
@@ -530,7 +532,7 @@ fn linear16() -> AecConfig {
 fn linear_output_is_validated_and_transparent_with_a_silent_reference() {
     assert!(
         EchoCanceller::new(AecConfig {
-            render_channels: 2,
+            render_channels: 3,
             ..linear16()
         })
         .is_none()
@@ -633,8 +635,8 @@ fn direct_engine_matches_sonora_audio_processing() {
     let mic: Vec<f32> = (0..n)
         .map(|i| e[i] + if i > 64_000 { talk[i] } else { 0.0 })
         .collect();
-    let mut apm = build_apm(false, 1, true);
-    let mut d = direct::DirectAec3::new(direct::DirectOutput::Final);
+    let mut apm = build_apm(false, 1, true, None);
+    let mut d = direct::DirectAec3::new(direct::DirectOutput::Final, &Aec3Tuning::default(), 1);
     let (mut out_apm, mut out_dir) = (Vec::new(), Vec::new());
     let frames = mic
         .as_chunks::<FRAME>()
@@ -647,7 +649,7 @@ fn direct_engine_matches_sonora_audio_processing() {
             .unwrap_or_else(|e| panic!("{e:?}"));
         apm.process_capture_f32(&[&m[..]], &mut [&mut y1[..]])
             .unwrap_or_else(|e| panic!("{e:?}"));
-        d.process(m, r, &mut y2);
+        d.process(m, &[*r], &mut y2);
         out_apm.extend_from_slice(&y1);
         out_dir.extend_from_slice(&y2);
     }
@@ -672,4 +674,223 @@ fn nearend_tuning_cancels_and_keeps_the_talker_no_worse() {
         keep_ne >= keep_full - 0.5,
         "near-end tuning keeps {keep_ne:.1} dB, default {keep_full:.1} dB"
     );
+}
+
+#[test]
+fn direct_engine_matches_sonora_with_a_stereo_render() {
+    // Stereo content (two different channels) makes AEC3 switch to its
+    // multichannel configuration with two render channels; the direct
+    // engine must repeat sonora's EchoCanceller3 sample for sample, through
+    // the temporary (downmixed) phase and the switch.
+    let n = 16_000 * 8;
+    let l = noise(n, 0.05, 71);
+    let r = noise(n, 0.05, 72);
+    let el = echo(&l, 240, 0.3);
+    let er = echo(&r, 300, -0.2);
+    let talk = noise(n, 0.01, 73);
+    let mic: Vec<f32> = (0..n)
+        .map(|i| el[i] + er[i] + if i > 80_000 { talk[i] } else { 0.0 })
+        .collect();
+    let mut apm = build_apm(false, 2, true, None);
+    let mut d = direct::DirectAec3::new(direct::DirectOutput::Final, &Aec3Tuning::default(), 2);
+    let (mut out_apm, mut out_dir) = (Vec::new(), Vec::new());
+    let frames = mic.as_chunks::<FRAME>().0.iter().zip(
+        l.as_chunks::<FRAME>()
+            .0
+            .iter()
+            .zip(r.as_chunks::<FRAME>().0),
+    );
+    for (m, (a, b)) in frames {
+        let (mut o0, mut o1) = ([0.0_f32; FRAME], [0.0_f32; FRAME]);
+        let (mut y1, mut y2) = ([0.0_f32; FRAME], [0.0_f32; FRAME]);
+        apm.process_render_f32(&[&a[..], &b[..]], &mut [&mut o0[..], &mut o1[..]])
+            .unwrap_or_else(|e| panic!("{e:?}"));
+        apm.process_capture_f32(&[&m[..]], &mut [&mut y1[..]])
+            .unwrap_or_else(|e| panic!("{e:?}"));
+        d.process(m, &[*a, *b], &mut y2);
+        out_apm.extend_from_slice(&y1);
+        out_dir.extend_from_slice(&y2);
+    }
+    assert!(d.stereo_active(), "stereo content not detected");
+    assert_eq!(out_dir, out_apm);
+}
+
+#[test]
+fn aec3_tuning_is_named_range_checked_and_empty_by_default() {
+    let mut t = Aec3Tuning::default();
+    assert!(t.is_empty());
+    assert_eq!(AecConfig::default().aec3, t);
+    assert!(AecConfig::default().agc2.is_none());
+    for p in Aec3Param::ALL {
+        assert_eq!(Aec3Param::from_name(p.name()), Some(*p));
+    }
+    t.set_assignment("suppressor.normal_tuning.mask_lf.enr_suppress = 1.6")
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(t.get(Aec3Param::NormalLfEnrSuppress), Some(1.6));
+    assert_eq!(
+        t.to_string(),
+        "suppressor.normal_tuning.mask_lf.enr_suppress=1.6"
+    );
+    for bad in [
+        "nope=1",
+        "suppressor.normal_tuning.mask_lf.enr_suppress",
+        "suppressor.normal_tuning.mask_lf.enr_suppress=x",
+        "suppressor.normal_tuning.mask_lf.enr_suppress=101",
+        "ep_strength.default_len=-2",
+        "filter.refined.length_blocks=12.5",
+        "filter.refined.length_blocks=0",
+        "ep_strength.bounded_erl=2",
+        "linear_mix=1.5",
+        "comfort_noise.noise_floor_dbfs=NaN",
+    ] {
+        assert!(Aec3Tuning::default().set_assignment(bad).is_err(), "{bad}");
+    }
+    // The overrides land in AEC3's config, filter lengths keep the initial
+    // lengths at or below the new ones, and AEC3's validation accepts them.
+    let mut c = sonora_aec3::config::EchoCanceller3Config::default();
+    let mut t = Aec3Tuning::default();
+    for a in [
+        "filter.refined.length_blocks=8",
+        "filter.coarse.length_blocks=30",
+        "suppressor.dominant_nearend_detection.hold_duration=25",
+        "ep_strength.bounded_erl=1",
+    ] {
+        t.set_assignment(a).unwrap_or_else(|e| panic!("{e}"));
+    }
+    t.apply(&mut c);
+    assert_eq!(
+        (
+            c.filter.refined.length_blocks,
+            c.filter.refined_initial.length_blocks
+        ),
+        (8, 8)
+    );
+    assert_eq!(
+        (
+            c.filter.coarse.length_blocks,
+            c.filter.coarse_initial.length_blocks
+        ),
+        (30, 12)
+    );
+    assert_eq!(c.suppressor.dominant_nearend_detection.hold_duration, 25);
+    assert!(c.ep_strength.bounded_erl);
+    assert!(c.validate());
+}
+
+#[test]
+fn a_tuning_equal_to_the_defaults_is_sample_identical() {
+    // Any override moves AEC3 to the direct engine; with values equal to
+    // AEC3's defaults the output must not change at all.
+    let n = 16_000 * 5;
+    let reference = noise(n, 0.05, 74);
+    let e = echo(&reference, 240, 0.3);
+    let talk = noise(n, 0.01, 75);
+    let mic: Vec<f32> = (0..n)
+        .map(|i| e[i] + if i > 48_000 { talk[i] } else { 0.0 })
+        .collect();
+    let mut t = Aec3Tuning::default();
+    t.set(Aec3Param::NormalLfEnrSuppress, 0.4)
+        .unwrap_or_else(|e| panic!("{e}"));
+    t.set(Aec3Param::LinearMix, 0.0)
+        .unwrap_or_else(|e| panic!("{e}"));
+    let mut a = EchoCanceller::new(cfg16()).unwrap_or_else(|| panic!("config"));
+    let mut b =
+        EchoCanceller::new(AecConfig { aec3: t, ..cfg16() }).unwrap_or_else(|| panic!("config"));
+    assert_eq!(run(&mut a, &mic, &reference), run(&mut b, &mic, &reference));
+}
+
+#[test]
+fn transparent_masks_and_the_linear_mix_keep_more_of_the_talker() {
+    // Higher masking thresholds let more of the near end through the
+    // suppressor and the linear mix bounds its attenuation; both still
+    // cancel the (perfectly linear) synthetic echo.
+    let (erle_full, keep_full) = double_talk(cfg16());
+    let tuned = |assignments: &[&str]| {
+        let mut t = Aec3Tuning::default();
+        for a in assignments {
+            t.set_assignment(a).unwrap_or_else(|e| panic!("{e}"));
+        }
+        double_talk(AecConfig { aec3: t, ..cfg16() })
+    };
+    let (erle_m, keep_m) = tuned(&[
+        "suppressor.normal_tuning.mask_lf.enr_transparent=9.6",
+        "suppressor.normal_tuning.mask_lf.enr_suppress=12.8",
+        "suppressor.normal_tuning.mask_hf.enr_transparent=2.24",
+        "suppressor.normal_tuning.mask_hf.enr_suppress=3.2",
+    ]);
+    let (erle_x, keep_x) = tuned(&["linear_mix=0.5"]);
+    for (name, e, k) in [("masks", erle_m, keep_m), ("mix", erle_x, keep_x)] {
+        assert!(
+            k >= keep_full - 0.5,
+            "{name}: keeps {k:.1} dB, default {keep_full:.1} dB"
+        );
+        assert!(e > 20.0, "{name}: ERLE {e:.1} dB (full {erle_full:.1})");
+    }
+}
+
+#[test]
+fn linear_output_works_with_a_stereo_render() {
+    let n = 16_000 * 12;
+    let l = noise(n, 0.05, 76);
+    let r = noise(n, 0.05, 77);
+    let el = echo(&l, 240, 0.3);
+    let er = echo(&r, 300, -0.2);
+    let mic: Vec<f32> = (0..n).map(|i| el[i] + er[i]).collect();
+    let erle = |render: u16| {
+        let mut aec = EchoCanceller::new(AecConfig {
+            render_channels: render,
+            ..linear16()
+        })
+        .unwrap_or_else(|| panic!("config"));
+        let out = run_pair(&mut aec, &mic, &l, &r);
+        let tail = 16_000 * 8;
+        10.0 * (energy(&mic[tail..n - 256])
+            / energy(&out[tail + LINEAR_LATENCY..n - 256 + LINEAR_LATENCY]))
+        .log10()
+    };
+    let (mono, stereo) = (erle(1), erle(2));
+    assert!(
+        stereo > 15.0 && stereo > mono + 6.0,
+        "linear stereo {stereo:.1} dB vs downmix {mono:.1} dB"
+    );
+}
+
+#[test]
+fn agc2_limits_the_gained_output_and_is_validated() {
+    for g in [-1.0, 51.0] {
+        assert!(
+            EchoCanceller::new(AecConfig {
+                agc2: Some(Agc2 {
+                    fixed_gain_db: g,
+                    adaptive: false,
+                }),
+                ..cfg16()
+            })
+            .is_none()
+        );
+    }
+    // A quiet talker (-30 dBFS peaks) with occasional loud bursts, +24 dB:
+    // the limiter keeps every sample inside full scale and the quiet part
+    // gets about the fixed gain; no bypass with AGC2.
+    let n = 16_000 * 6;
+    let mut mic = noise(n, 0.03, 78);
+    for v in &mut mic[40_000..42_000] {
+        *v *= 30.0;
+    }
+    let mut aec = EchoCanceller::new(AecConfig {
+        agc2: Some(Agc2 {
+            fixed_gain_db: 24.0,
+            adaptive: false,
+        }),
+        bypass_when_silent: true,
+        ..cfg16()
+    })
+    .unwrap_or_else(|| panic!("config"));
+    let out = run(&mut aec, &mic, &vec![0.0; n]);
+    assert!(out.iter().all(|v| v.abs() <= 1.0), "limiter overshoot");
+    let lat = SONORA_LATENCY;
+    let gain =
+        10.0 * (energy(&out[64_000 + lat..90_000 + lat]) / energy(&mic[64_000..90_000])).log10();
+    assert!((20.0..26.0).contains(&gain), "gain {gain:.1} dB");
+    assert_eq!(aec.take_metrics().bypassed, 0);
 }

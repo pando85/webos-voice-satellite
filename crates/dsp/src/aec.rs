@@ -40,7 +40,15 @@
 //!   filter's output alone (sonora-aec3 driven directly, see `direct.rs`),
 //!   keeping a quiet near-end talker that the suppressor attenuates, at the
 //!   cost of more residual echo. `Nearend` keeps the suppressor but with
-//!   AEC3's near-end tuning all the time.
+//!   AEC3's near-end tuning all the time. [`Aec3Tuning`] overrides a subset
+//!   of AEC3's configuration (suppressor masks, near-end detection, echo
+//!   model, filter lengths) and blends in the linear output; any override
+//!   also runs through the direct engine. All of these work with a mono or a
+//!   stereo render.
+//! - **AGC2** ([`Agc2`], experimental): sonora's gain controller 2 (fixed
+//!   gain into a limiter, optionally an adaptive digital gain before it)
+//!   after the canceller and NS, replacing the front-end's fixed gain and
+//!   hard saturation (the caller then sets the front-end gain to 0 dB).
 //! - **Metrics** ([`AecMetrics`]): delay, ERLE (mic over output power while
 //!   the reference is active) and sonora's own ERLE, processing time per
 //!   frame, bypass share, reference underruns. Never audio content.
@@ -58,13 +66,17 @@
 use std::collections::VecDeque;
 use std::time::Instant;
 
-use sonora::config::{EchoCanceller as Aec3Config, NoiseSuppression};
+use sonora::config::{
+    AdaptiveDigital, EchoCanceller as Aec3Config, FixedDigital, GainController2, NoiseSuppression,
+};
 use sonora::{AudioProcessing, Config, StreamConfig};
 
 use crate::decimate::RefResampler;
 
 mod direct;
+mod tuning;
 use crate::delay::{DelayEstimate, DelayEstimator};
+pub use tuning::{Aec3Param, Aec3Tuning};
 
 /// Processing rate.
 pub const RATE: u32 = 16_000;
@@ -136,11 +148,11 @@ pub enum AecOutput {
     #[default]
     Full,
     /// The linear filter's output only (no suppression, no comfort noise),
-    /// followed by sonora's NS if `ns` is set. Experimental: mono render.
+    /// followed by sonora's NS if `ns` is set. Experimental.
     Linear,
     /// AEC3's final output with the suppressor's near-end tuning used all
     /// the time (AEC3 otherwise uses it only while it detects a dominant
-    /// near-end talker), followed by NS if set. Experimental: mono render.
+    /// near-end talker), followed by NS if set. Experimental.
     Nearend,
 }
 
@@ -163,11 +175,30 @@ pub struct AecConfig {
     pub apply: DelayApply,
     /// sonora's noise suppression (moderate) after the echo canceller.
     pub ns: bool,
-    /// Skip sonora while the reference is silent (ignored with `ns`). Off by
+    /// Skip sonora while the reference is silent (ignored with `ns` or
+    /// `agc2`). Off by
     /// default: it saves CPU but cost ERLE on some c3-a recordings.
     pub bypass_when_silent: bool,
     /// Which AEC3 output to return.
     pub output: AecOutput,
+    /// Experimental AEC3 overrides (empty: AEC3's defaults). Any override
+    /// runs AEC3 through the direct engine.
+    pub aec3: Aec3Tuning,
+    /// Experimental: sonora's AGC2 after the canceller (and NS), see
+    /// [`Agc2`]. `None` (the default) leaves the gain to the front-end.
+    pub agc2: Option<Agc2>,
+}
+
+/// sonora's AGC2 (gain controller 2) after the canceller and NS, in place of
+/// the front-end's fixed gain and hard saturation: the caller sets the
+/// front-end gain to 0 dB. Experimental.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Agc2 {
+    /// Fixed gain before AGC2's limiter, dB (0 to 50).
+    pub fixed_gain_db: f32,
+    /// Also run AGC2's adaptive digital gain (speech-level based, VAD
+    /// driven, up to 50 dB) before the fixed gain.
+    pub adaptive: bool,
 }
 
 impl Default for AecConfig {
@@ -182,6 +213,8 @@ impl Default for AecConfig {
             ns: false,
             bypass_when_silent: false,
             output: AecOutput::Full,
+            aec3: Aec3Tuning::default(),
+            agc2: None,
         }
     }
 }
@@ -260,8 +293,9 @@ pub enum DelayEvent {
 pub struct EchoCanceller {
     cfg: AecConfig,
     apm: AudioProcessing,
-    /// The direct engine (`AecOutput::Linear` or `Nearend`); `apm` then
-    /// runs without an echo canceller and only carries NS (if enabled).
+    /// The direct engine (`AecOutput::Linear` or `Nearend`, or any AEC3
+    /// override); `apm` then runs without an echo canceller and only carries
+    /// NS and AGC2 (if enabled).
     direct: Option<Box<direct::DirectAec3>>,
     /// One decimator per render channel (with one render channel, it
     /// downmixes all reference channels).
@@ -310,7 +344,7 @@ impl std::fmt::Debug for EchoCanceller {
     }
 }
 
-fn build_apm(ns: bool, render_channels: u16, aec: bool) -> AudioProcessing {
+fn build_apm(ns: bool, render_channels: u16, aec: bool, agc2: Option<Agc2>) -> AudioProcessing {
     let mut c = Config {
         // The front-end already high-passes the mic; AEC3's own filter would
         // make the stage non-transparent, which the bypass relies on.
@@ -323,6 +357,15 @@ fn build_apm(ns: bool, render_channels: u16, aec: bool) -> AudioProcessing {
     };
     if ns {
         c.noise_suppression = Some(NoiseSuppression::default());
+    }
+    if let Some(g) = agc2 {
+        c.gain_controller2 = Some(GainController2 {
+            input_volume_controller: false,
+            adaptive_digital: g.adaptive.then(AdaptiveDigital::default),
+            fixed_digital: FixedDigital {
+                gain_db: g.fixed_gain_db,
+            },
+        });
     }
     AudioProcessing::builder()
         .config(c)
@@ -344,19 +387,22 @@ fn samples_to_ms(s: f32) -> f32 {
 impl EchoCanceller {
     /// Creates the stage. Returns `None` if the reference rate is not 16000
     /// or 48000, the channel count is zero, `render_channels` is not 1 or 2
-    /// or exceeds the reference channels, or a direct output (`Linear`,
-    /// `Nearend`) is combined with a stereo render.
+    /// or exceeds the reference channels, or the AGC2 fixed gain is outside
+    /// 0 to 50 dB.
     #[must_use]
     pub fn new(cfg: AecConfig) -> Option<Self> {
         let direct = match cfg.output {
-            AecOutput::Full => None,
+            AecOutput::Full if cfg.aec3.is_empty() => None,
+            AecOutput::Full => Some(direct::DirectOutput::Final),
             AecOutput::Linear => Some(direct::DirectOutput::Linear),
             AecOutput::Nearend => Some(direct::DirectOutput::Nearend),
         };
         if cfg.reference_channels == 0
             || !(1..=MAX_RENDER_CHANNELS).contains(&cfg.render_channels)
             || cfg.render_channels > cfg.reference_channels
-            || (direct.is_some() && cfg.render_channels != 1)
+            || cfg
+                .agc2
+                .is_some_and(|g| !(0.0..=50.0).contains(&g.fixed_gain_db))
         {
             return None;
         }
@@ -372,8 +418,14 @@ impl EchoCanceller {
         let max = MAX_DELAY_SAMPLES as i32;
         let mut s = Self {
             cfg,
-            apm: build_apm(cfg.ns, cfg.render_channels, direct.is_none()),
-            direct: direct.map(|d| Box::new(direct::DirectAec3::new(d))),
+            apm: build_apm(cfg.ns, cfg.render_channels, direct.is_none(), cfg.agc2),
+            direct: direct.map(|d| {
+                Box::new(direct::DirectAec3::new(
+                    d,
+                    &cfg.aec3,
+                    usize::from(cfg.render_channels),
+                ))
+            }),
             resamplers,
             ref_ch: usize::from(cfg.reference_channels),
             render_ch,
@@ -390,7 +442,7 @@ impl EchoCanceller {
             delay: None,
             delay_updates: 0,
             event: None,
-            bypass_enabled: cfg.bypass_when_silent && !cfg.ns,
+            bypass_enabled: cfg.bypass_when_silent && !cfg.ns && cfg.agc2.is_none(),
             bypassing: false,
             silent_frames: 0,
             delay_line: VecDeque::with_capacity(SONORA_LATENCY + FRAME),
@@ -741,15 +793,15 @@ impl EchoCanceller {
         let t = Instant::now();
         if let Some(l) = &mut self.direct {
             let mut ok = true;
-            if self.cfg.ns {
+            if self.cfg.ns || self.cfg.agc2.is_some() {
                 let mut lin = [0.0_f32; FRAME];
-                l.process(mic, &refr[0], &mut lin);
+                l.process(mic, refr, &mut lin);
                 ok = self
                     .apm
                     .process_capture_f32(&[&lin[..]], &mut [&mut y[..]])
                     .is_ok();
             } else {
-                l.process(mic, &refr[0], y);
+                l.process(mic, refr, y);
             }
             let ns = u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX);
             self.acc.cpu_ns = self.acc.cpu_ns.saturating_add(ns);
