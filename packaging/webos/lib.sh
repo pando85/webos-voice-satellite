@@ -212,17 +212,20 @@ supervisor_alive() {
 
 # Stops the supervisor (if any), the daemon (TERM, wait, then KILL) and the
 # log rotator, and removes the pidfiles. Argument: seconds to wait (default 10).
+# Every kill tolerates a process that is already gone: the supervisor
+# forwards its TERM to the daemon, which can exit before our own TERM, and
+# callers run with `set -e` (found on c3-b, EXP-009).
 stop_daemon() {
     wait_s=${1:-10}
     pid=$(read_pid "$PIDFILE")
     if supervisor_alive; then
         # The supervisor forwards TERM to the daemon and will not restart it.
         note "stopping supervisor pid $(read_pid "$SUPPID")"
-        kill -TERM "$(read_pid "$SUPPID")" 2>/dev/null
+        kill -TERM "$(read_pid "$SUPPID")" 2>/dev/null || true
     fi
     if is_ours "$pid"; then
         note "stopping pid $pid"
-        kill -TERM "$pid" 2>/dev/null
+        kill -TERM "$pid" 2>/dev/null || true
         i=0
         while is_ours "$pid" && [ "$i" -lt "$wait_s" ]; do
             sleep 1
@@ -230,7 +233,7 @@ stop_daemon() {
         done
         if is_ours "$pid"; then
             note "pid $pid ignored SIGTERM for ${wait_s}s; sending SIGKILL"
-            kill -KILL "$pid" 2>/dev/null
+            kill -KILL "$pid" 2>/dev/null || true
             sleep 1
             note "check 'pactl list short sink-inputs': a killed daemon cannot clean up its pacat child"
         fi
@@ -245,10 +248,10 @@ stop_daemon() {
     done
     if supervisor_alive; then
         note "supervisor still running; sending SIGKILL"
-        kill -KILL "$(read_pid "$SUPPID")" 2>/dev/null
+        kill -KILL "$(read_pid "$SUPPID")" 2>/dev/null || true
     fi
     if rotator_alive; then
-        kill -TERM "$(read_pid "$ROTPID")" 2>/dev/null
+        kill -TERM "$(read_pid "$ROTPID")" 2>/dev/null || true
     fi
     rm -f "$PIDFILE" "$ROTPID" "$SUPPID"
 }

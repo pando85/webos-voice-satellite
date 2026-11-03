@@ -10,7 +10,8 @@
 #
 # usage: packaging/webos/tests/ipk.sh [BINARY]   (default: builds it)
 # The checks are strings run with eval, so single quotes are intended.
-# shellcheck disable=SC2016,SC2034,SC1091
+# CTL is "sh <path>", split on purpose.
+# shellcheck disable=SC2016,SC2034,SC1091,SC2086
 set -eu
 HERE=$(cd "$(dirname "$0")" && pwd)
 PKG=$(cd "$HERE/.." && pwd)
@@ -174,7 +175,9 @@ exec 7>&-
 check "start with captured output returns at once (HBC exec waits for the pipe)" '[ "$rc" -eq 0 ] && [ $(($(date +%s) - t0)) -le 5 ] && echo "$out" | grep -q "started pid"'
 leaks=0
 for p in $(pgrep -f "$S/bin/"); do
-    ! ls -l "/proc/$p/fd" 2>/dev/null | grep -q "$T/inherited" || leaks=$((leaks + 1))
+    for f in /proc/"$p"/fd/*; do
+        [ "$(readlink "$f" 2>/dev/null)" != "$T/inherited" ] || leaks=$((leaks + 1))
+    done
 done
 check "daemon, supervisor and rotator keep no descriptor of the caller" '[ "$leaks" -eq 0 ] && [ -n "$(pgrep -f "$S/bin/supervise.sh")" ]'
 check "no start.sh process stays behind; the supervisor pidfile names supervise.sh" '[ -z "$(pgrep -f "$S/bin/start.sh")" ] && tr "\0" " " </proc/$(cat "$S/run/supervise.pid")/cmdline | grep -q supervise.sh'
@@ -182,6 +185,18 @@ check "start: one supervised daemon" 'json "s[\"running\"] and s[\"supervised\"]
 check "status --json: no key material" '! $CTL status --json | grep -q "$(cat "$T/psk")"'
 $CTL start >/dev/null
 check "a second start does nothing" '[ "$(daemons)" = 1 ] && [ "$(supervisors)" = 1 ]'
+# stop_daemon under `set -e` when every TERM finds its target already gone
+# (the supervisor forwarded the TERM and the daemon exited first).
+# A separate `sh -e`: inside `$(...) || true` errexit would be off.
+out=$(sh -ec '
+    . "$1/lib.sh"
+    set_paths "$2"
+    kill() { command kill "$@"; [ "$1" != -TERM ] || return 1; }
+    stop_daemon 10
+    echo stop-completed
+' sh "$PKG" "$S" 2>&1) || true
+check "stop under set -e survives a daemon that already exited (race on the TV)" 'echo "$out" | grep -q stop-completed && [ "$(daemons)" = 0 ] && [ "$(supervisors)" = 0 ]'
+$CTL start >/dev/null
 $CTL mic off >/dev/null
 check "mic off: kill switch file, status reports it" '[ -e "$T/kill" ] && json "s[\"mic_off\"]"'
 $CTL mic on >/dev/null
