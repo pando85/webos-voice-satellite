@@ -184,11 +184,18 @@ reference_gain_db = 0.0  # digital gain on the reference, -20 to 40
 render_channels = 1
 # Which AEC3 output: "full" (linear filter plus residual-echo suppression),
 # "linear" (the linear filter only) or "nearend" (full, with AEC3's near-end
-# suppressor tuning all the time). The last two are experimental and need
-# render_channels = 1.
+# suppressor tuning all the time). The last two are experimental.
 # Offline on c3-a recordings, the suppressor also removed most of a quiet
 # talker under TV content (docs/experiments/P2-aec-offline-ab.md).
 output = "full"
 # File reference for mic.source = "file" (PC tests): raw interleaved frames
 # in reference_format/channels/rate, read in lockstep with mic.path.
 # reference_path = "ref.raw"  # example
+#
+# Experimental AEC3 overrides (quoted names, webos_dsp::Aec3Param), for the
+# live A/B only; empty = AEC3's defaults. The best offline configuration on
+# c3-a recordings (docs/experiments/P2-aec-tuning.md) was, with
+# render_channels = 2:
+# [aec.aec3]
+# "linear_mix" = 0.4                # blend of the linear output (0 to 1)
+# "ep_strength.default_len" = 0.0

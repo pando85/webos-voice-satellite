@@ -159,6 +159,14 @@ def cmd_items(a):
     cfg = {"corpus": a.corpus, "tool": os.path.abspath(a.tool), "work_dir": os.path.abspath(a.work_dir),
            "warmup_s": a.warmup_s, "keep_wavs": a.keep_wavs, "threshold": a.threshold,
            "trigger_level": a.trigger_level}
+    done = set()
+    if os.path.exists(a.out):  # resume: skip (condition, item) jobs already complete
+        for line in open(a.out):
+            try:
+                r = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            done.add((r["cond"], r["item"]["id"], r["variant"]))
     jobs = []
     for spec in a.bed:
         name, _, rest = spec.partition("=")
@@ -169,6 +177,9 @@ def cmd_items(a):
                 r["item"] = dict(r["item"], _file=manifest[r["item"]["id"]])
                 if r.get("bed_offset_s") is None:
                     r.pop("bed_offset_s", None)
+                cond = f"{name}@{gain:g}"
+                if all((cond, r["item"]["id"], v) in done for v, _ in variants):
+                    continue
                 jobs.append((cfg, i, r, name, capdir, gain, variants))
     with open(a.out, "a", buffering=1) as fo, ProcessPoolExecutor(max_workers=a.jobs) as ex:
         for res in ex.map(process_item, jobs, chunksize=1):
