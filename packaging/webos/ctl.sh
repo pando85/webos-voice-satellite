@@ -299,7 +299,7 @@ cmd_status() {
         0 | 3) fw_ok=true ;; # validated, or the guard is off
         esac
     else
-        fw="firmware $(firmware_version)"
+        fw="$(firmware_version) (checked against the allow-list after set up)"
     fi
     keys=$(key_state)
     name=$(cfg_value name)

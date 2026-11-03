@@ -14,17 +14,18 @@ html, body {
   background: var(--bg);
   color: var(--text);
   font-family: "LG Smart UI", "Museo Sans", sans-serif;
-  font-size: 26px;
+  font-size: 22px;
 }
-main { padding: 48px 72px; }
-h1 { font-size: 52px; margin: 0; }
-h2 { font-size: 30px; margin: 0 0 16px; color: var(--muted); font-weight: normal; }
-.sub { color: var(--muted); margin: 8px 0 24px; }
-.headline { font-size: 36px; margin: 0; }
+main { padding: 32px 64px; }
+h1 { font-size: 44px; margin: 0; }
+h2 { font-size: 26px; margin: 0 0 12px; color: var(--muted); font-weight: normal; }
+.sub { color: var(--muted); margin: 4px 0 16px; }
+.headline { font-size: 32px; margin: 0; }
 .detail { color: var(--muted); margin: 8px 0 0; }
-.grid { display: flex; gap: 32px; margin: 24px 0; }
+.grid { display: flex; gap: 24px; margin: 16px 0; }
 .grid .panel { flex: 1; }
-.panel { background: var(--panel); border-radius: 12px; padding: 24px 32px; margin-bottom: 24px; }
+.panel { background: var(--panel); border-radius: 12px; padding: 16px 28px; margin-bottom: 16px; }
+.panel p { margin: 0 0 8px; }
 dl { display: grid; grid-template-columns: max-content 1fr; gap: 8px 24px; margin: 0; }
 dt { color: var(--muted); }
 dd { margin: 0; }
@@ -44,6 +45,6 @@ button {
 button:focus, button:hover { border-color: var(--accent); outline: none; }
 button[hidden] { display: none; }
 button.armed { background: #5a2a2a; }
-pre { font-size: 20px; white-space: pre-wrap; word-break: break-all; margin: 0; color: var(--muted); }
+pre { font-size: 17px; white-space: pre-wrap; word-break: break-all; margin: 0; color: var(--muted); max-height: 9em; overflow: hidden; }
 code { font-size: 22px; }
 .message { min-height: 32px; color: var(--warn); }

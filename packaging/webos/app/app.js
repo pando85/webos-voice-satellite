@@ -132,7 +132,7 @@
     addFact(facts, 'Address', (tvAddress || 'unknown') + ', port ' + (s.port || '6053'));
     addFact(facts, 'Kernel', s.machine || '?');
 
-    text($('log'), (s.log || []).join('\n') || '(no log yet)');
+    text($('log'), (s.log || []).slice(-4).join('\n') || '(no log yet)');
 
     var inst = root && s.installed;
     show('b-install', root && !s.installed);
