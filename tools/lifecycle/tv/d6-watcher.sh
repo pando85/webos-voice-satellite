@@ -23,7 +23,9 @@
 # Environment (all optional):
 #   D6_DIR=/tmp/d6          work directory (log, flags)
 #   D6_MODE=observe|darken
-#   D6_WAKE=poweron|key     poweron = tvpower/power/powerOn (parameters unverified), key = controls/power
+#   D6_WAKE=poweron|key     poweron = tvpower/power/powerOn {"reason":D6_WAKE_REASON} (powerOn needs a reason from
+#                           tvpowerd's powerOnReasons list; {} is refused), key = controls/power
+#   D6_WAKE_REASON=remoteKey  D6_RETRY_MS=1600 (pause before a powerOn retry after a keyblock refusal)
 #   D6_FALLBACK_KEY=1       if powerOn left the TV in Active Standby for 4 s, send the key (state-checked)
 #   D6_DARKEN_AT=active|screenon|lastinput|preparepoweron   which line triggers turnOffScreen
 #   D6_DELAY_MS=0           pause between "Active Standby" and the wake
@@ -34,6 +36,8 @@
 D6_DIR=${D6_DIR:-/tmp/d6}
 D6_MODE=${D6_MODE:-observe}
 D6_WAKE=${D6_WAKE:-poweron}
+D6_WAKE_REASON=${D6_WAKE_REASON:-remoteKey}
+D6_RETRY_MS=${D6_RETRY_MS:-1600}
 D6_FALLBACK_KEY=${D6_FALLBACK_KEY:-1}
 D6_DARKEN_AT=${D6_DARKEN_AT:-active}
 D6_DELAY_MS=${D6_DELAY_MS:-0}
@@ -80,8 +84,15 @@ wake_job() {
         fi
         return
     fi
-    r=$("$D6_LUNA" -n 1 -w 3000 -f "$TP/powerOn" '{}' 2>&1 | cat | tr -d ' \r\n')
-    log "CALL wake(powerOn) -> $r"
+    # tvpowerd refuses a power-on in the first 1.5 s after the standby settled ("Keyblock1.5second", seen on c3-b);
+    # retry after D6_RETRY_MS, up to 3 times
+    n=0
+    while [ $n -lt 3 ]; do
+        n=$((n + 1))
+        r=$("$D6_LUNA" -n 1 -w 3000 -f "$TP/powerOn" "{\"reason\":\"$D6_WAKE_REASON\"}" 2>&1 | cat | tr -d ' \r\n')
+        log "CALL wake(powerOn) try $n -> $r"
+        case "$r" in *Keyblock*) sleep "$(( D6_RETRY_MS / 1000 )).$(( D6_RETRY_MS % 1000 / 100 ))" ;; *) break ;; esac
+    done
     if [ "$D6_FALLBACK_KEY" = 1 ]; then
         i=0
         while [ $i -lt 8 ]; do
@@ -104,7 +115,8 @@ dark_job() {
     log "CALL turnOffScreen -> $r"
     sleep 3
     st=$(getstate)
-    if [ "$st" = Active ]; then
+    # only while still waiting for Screen Off (a second press meanwhile must not be darkened)
+    if [ "$st" = Active ] && [ -e "$D6_DIR/await.ScreenOff" ]; then
         r=$("$D6_LUNA" -n 1 -w 3000 -f "$TP/turnOffScreen" '{}' 2>&1 | cat | tr -d ' \r\n')
         log "CALL turnOffScreen (retry, state still Active) -> $r"
     fi
@@ -154,6 +166,7 @@ run() {
                         log "DONE darkened: power-off request to Screen Off $(( t - POFF_AT )) ms"
                     fi ;;
                 Active|ScreenSaver)
+                    rm -f "$D6_DIR/await.Active"
                     if [ "$PHASE" = idle ]; then DARK=0; fi ;;
             esac
         fi

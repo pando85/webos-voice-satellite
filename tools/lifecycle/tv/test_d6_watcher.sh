@@ -20,6 +20,13 @@ case "$uri" in
             *subscribe*) cat "$STUB_SCRIPT_RUN" ;;   # replaced below by a generated player
             *) st=$(cat "$STUB_STATE"); printf '{ "returnValue": true, "state": "%s" }\n' "$st" ;;
         esac ;;
+    */powerOn)
+        echo "$uri" >>"$STUB_CALLS"
+        if [ -e "$STUB_BLOCK" ]; then
+            n=$(cat "$STUB_BLOCK"); if [ "$n" -gt 0 ]; then echo $((n - 1)) >"$STUB_BLOCK"
+                echo '{ "errorCode": -110, "returnValue": false, "errorText": "Keyblock1.5second" }'; exit 0; fi
+        fi
+        echo '{ "returnValue": true }' ;;
     *) echo "$uri" >>"$STUB_CALLS"; echo '{ "returnValue": true }' ;;
 esac
 EOF
@@ -34,6 +41,7 @@ while IFS= read -r line; do
         S) printf '%s' "$v" >"$STUB_STATE" ;;
         P) printf '%s\n' "$v" ;;
         Z) sleep "$v" ;;
+        C) i=0; while [ $i -lt 100 ] && [ "$(grep -c powerOn "$STUB_CALLS" 2>/dev/null)" -lt "$v" ]; do sleep 0.1; i=$((i + 1)); done ;;
         W) i=0; while [ $i -lt 100 ] && ! grep -q "$v" "$STUB_CALLS" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done ;;
     esac
 done <"$STUB_SCRIPT"
@@ -51,6 +59,7 @@ run_case() { # name, script file, extra env...; prints calls
     ( env STUB_CALLS="$T/calls" STUB_STATE="$T/state" STUB_SCRIPT="$script" STUB_PLAYER="$T/player.sh" \
         PATH="$T:$PATH" D6_LUNA="$T/luna-send" D6_DIR="$T/d6" D6_COOLDOWN_S=0 "$@" \
         sh "$HERE/d6-watcher.sh" run >/dev/null 2>&1 )
+    sleep 1
     sed 's|luna://com.webos.service.||' "$T/calls" | tr '\n' ' ' >"$T/calls.txt"
     echo "[$name] calls: $(cat "$T/calls.txt")"
 }
@@ -118,6 +127,20 @@ check "log second press" "$T/d6/watcher.log" "second press"
 } >"$T/s5"
 run_case fallback "$T/s5" D6_MODE=darken
 check "key fallback after powerOn" "$T/calls.txt" "powerOn.*networkinput/controls/power"
+
+# 5b. keyblock refusals: powerOn is retried, then the call goes through, no key
+echo 2 >"$T/block"
+{
+    echo "S Active"; echo "P $(ST Active)"
+    echo "P $(echo "$PO" | sed 's/REASON/remoteKey/')"
+    echo "Z 0.2"; echo "S ActiveStandby"; echo "P $(ST 'Active Standby')"
+    echo "C 3"
+    echo "S Active"; echo "P $(ST Active)"
+    echo "W turnOffScreen"
+    echo "S ScreenOff"; echo "P $(ST 'Screen Off')"; echo "Z 0.5"
+} >"$T/s5b"
+run_case keyblock "$T/s5b" D6_MODE=darken STUB_BLOCK="$T/block" D6_RETRY_MS=300
+check "powerOn retried 3 times, then turnOffScreen, no key" "$T/calls.txt" "powerOn.*powerOn.*powerOn.*turnOffScreen" "controls/power"
 
 # 6. hold file blocks the action
 mkdir -p "$T/d6"; : >"$T/d6/hold"
