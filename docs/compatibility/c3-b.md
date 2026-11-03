@@ -17,6 +17,12 @@
 | Wake from standby by WoL | From `Suspend`, `wolwowlOnOff = true` | PASS (2 to 4 s); with the original `false`: INCONCLUSIVE; from `Active Standby`: INCONCLUSIVE | D5 |
 | Assist pipeline (wake, STT, TTS stream) | Active Standby and Active | PASS (HA reached port 6053 directly) | EXP-007 |
 | AirPlay audio | any | INCONCLUSIVE (not tested) | EXP-008 |
+| App package (`.ipk`): install by appinstalld `dev/install`, HBC 0.7.2 | Active | PASS (built without ares-cli; modes and exec bits kept; `folderPath` under `/media/developer/apps`) | EXP-009 |
+| App package: HBC `exec` as root from the app, daemon survives app close and HBC idle exit | Active | PASS (after fix 6410eff) | EXP-009 |
+| App package: update over a running daemon, applied on app open | Active | PASS (config and identity kept, one daemon; after fixes d749183, 8959a39) | EXP-009 |
+| App package: downgrade (older version over newer) | Active | PASS (accepted by appinstalld) | EXP-009 |
+| Boot hook in `/var/lib/webosbrew/init.d` (opt-in), start after 60 s | Reboot (`micomPower`) | PASS (2 boots, no failsafe; update applied at boot; firmware guard honoured at boot) | EXP-009 |
+| App removal, uninstall, purge | Active, 1 boot | PASS (inert hook after app removal; nothing left after purge) | EXP-009 |
 
 ## Notes and redacted evidence
 
@@ -24,6 +30,8 @@
 - `suspend_stats/success` rises for each Suspend and does not rise in Always Ready's `Active Standby`.
 - The firmware guard needed `validated_firmware = ["03.30.73"]`; whether to validate it is an owner decision.
 - The TV's sound output falls back to ARC after a power cycle even if set to `tv_speaker` earlier.
+- One of three `reboot`s over SSH ended in `Active Standby` 53 s after boot (power-off reason `homekit` from `com.webos.service.qbd`); `networkinput/controls/power` brought it back to the home app (EXP-009).
+- Other apps' boot hooks are present in `init.d` (four symlinks); the satellite's hook sorts after them.
 
 ## Firmware regressions and rollback
 

@@ -31,7 +31,7 @@ The TV userland is 32-bit ARM EABI5 with the soft-float `e_flags` `0x05000200`, 
 
 Both run on c3-a, whose kernel is aarch64 under a 32-bit userland ([P1 runtime smoke](discovery/c3-a/P1-runtime-smoke.md)). The echo canceller costs four times less in the aarch64 build there (0.21 against 1.0 ms per 10 ms frame, because sonora has SIMD for aarch64 and not for armv7; [P3 TV verification](discovery/c3-a/P3-tv-verify-aec-pairing.md#1-aec-cpu-benchmark-section-9-step-1)). The package therefore carries both and `install.sh` chooses by `uname -m` ([below](#choosing-the-build-armv7-or-aarch64)).
 
-**Status of the aarch64 daemon: pending.** On c3-a only `--self-test` (P1) and the offline `aec_offline` tool (P3) have run as aarch64. The daemon itself (ALSA capture with the satellite's ioctls, the linked reference PCM, `pacat`, the watchdog, pairing) has run on a TV only as armv7. Until that run, `--arch armv7` pins the verified build.
+**Status of the aarch64 daemon: verified on c3-b** (a different unit, firmware `03.30.73`): in D5 it ran for about 81 min with ALSA capture through the satellite's ioctls, Noise to HA, the full wake, STT and TTS chain, an announcement, the kill switch and two kernel suspend/resume cycles with the same pid ([D5 results](discovery/c3-b/D5-results.md#aarch64-daemon-first-real-run-on-a-tv)); in EXP-009 it ran under the app package with the supervisor, pairing mode and start at boot ([EXP-009](experiments/EXP-009-ipk-install-update.md)). Not yet run as aarch64: the watchdog exits and the linked reference PCM. On **c3-a** only `--self-test` (P1) and the offline `aec_offline` tool (P3) have run as aarch64; there `--arch armv7` still pins the build verified on that unit.
 
 Notes:
 
@@ -207,7 +207,7 @@ The installed scripts find their prefix from their own location (`DIR/bin/..`); 
 - `--arch armv7` or `--arch aarch64` overrides the choice; `--binary FILE` installs one given binary without any choice.
 - The candidate is copied into `DIR/bin` under a temporary name and must answer `--version` with its own target triple (`aarch64-unknown-linux-musl` or `armv7-unknown-linux-musleabi`) before it replaces the installed binary. An aarch64 build that does not run, or is missing, falls back to armv7 with a note. If no build runs, the install stops and an existing install is left unchanged (a new prefix is removed again).
 - `install.sh` prints the choice (`uname -m: aarch64, --arch auto: installing the aarch64 build`) and `status.sh` shows the installed build.
-- Not every LG TV has a 64-bit kernel; nothing here assumes one. Verified: the selection logic on a PC (`packaging/webos/tests/run.sh`, with stand-in binaries and `uname -m` replaced, and once with the real cross builds under qemu). **Pending:** a run of the aarch64 daemon on c3-a (see [Target decision](#target-decision)); until then use `--arch armv7` (or `TV_ARCH=armv7`) for the build verified there.
+- Not every LG TV has a 64-bit kernel; nothing here assumes one. Verified: the selection logic on a PC (`packaging/webos/tests/run.sh`, with stand-in binaries and `uname -m` replaced, and once with the real cross builds under qemu). The aarch64 daemon is verified on c3-b ([Target decision](#target-decision)); **pending** on c3-a, where `--arch armv7` (or `TV_ARCH=armv7`) keeps the build verified there.
 
 **Log rotation.** Logs go to a file, not to syslog (`logger`), see the policy above. `start.sh` moves a log larger than `WEBOS_SAT_LOG_MAX` bytes (default 262144) to `webos-satellite.log.1` at each start, and a small sidecar (`rotate.sh`, one `sh` process, stopped with the daemon) checks every 30 s and copies the log to `.log.1` and truncates it above the limit. At most about twice the limit is on the tmpfs. At `info` the volume is a few lines per run.
 
@@ -230,7 +230,7 @@ The before/after result on c3-a is in [P1 ops](discovery/c3-a/P1-ops.md).
 
 ## Install the app package on a rooted TV (persistent)
 
-The webOS app package (`make ipk`) is the permanent, updatable install: an app "Voice Satellite" in the launcher plus the satellite under `/var/lib/webos-satellite`, which keeps config, key, pairing state and logs across updates and reinstalls. Design, sources and what is verified: [packaging design](design/packaging.md). **Status: tested on a PC only; not yet installed on any TV** ([EXP-009](experiments/EXP-009-ipk-install-update.md)). Installing it is a persistent change: owner authorization per TV.
+The webOS app package (`make ipk`) is the permanent, updatable install: an app "Voice Satellite" in the launcher plus the satellite under `/var/lib/webos-satellite`, which keeps config, key, pairing state and logs across updates and reinstalls. Design, sources and what is verified: [packaging design](design/packaging.md). **Status: verified on c3-b** (HBC 0.7.2, firmware 03.30.73): install, set up through the app's HBC `exec`, update over a running daemon, downgrade, start at boot over two reboots, uninstall, purge and app removal ([EXP-009](experiments/EXP-009-ipk-install-update.md)). Not yet on c3-a or HBC 0.6.x. Installing it is a persistent change: owner authorization per TV.
 
 Needs: a TV rooted with the Homebrew Channel, its service elevated (HBC settings show root), SSH as root.
 
@@ -262,7 +262,7 @@ ssh root@<host> "sh $APP/payload/ctl.sh install --config /tmp/tv.toml --psk-file
 
 **Start at boot** (off by default): the app's "Start at boot: turn on", or `ctl.sh autostart on`. It writes `/var/lib/webosbrew/init.d/webos-satellite`; the daemon starts about 60 s after boot, never on an unvalidated firmware, after a crash loop, with the kill switch present or with `/var/lib/webos-satellite/disable` present. `ctl.sh autostart off` deletes the hook.
 
-**Update:** bump `version` in the workspace `Cargo.toml`, `make ipk`, install the new ipk exactly as above. The running daemon is not touched by the install; the update is applied when the app is opened next (automatically), at the next boot if start at boot is on, or now with `ssh root@<host> "sh $APP/payload/ctl.sh install"` (stops, installs, keeps `etc/` and `log/`, starts again if it was running; never two daemons).
+**Update:** bump `version` in the workspace `Cargo.toml`, `make ipk`, install the new ipk exactly as above. The running daemon is not touched by the install; the update is applied when the app is opened next (automatically), at the next boot if start at boot is on, or now with `ssh root@<host> "sh $APP/payload/ctl.sh install"` (stops, installs, keeps `etc/` and `log/`, starts again if it was running; never two daemons; does nothing when that payload is already installed, `--force` reinstalls). Close the app before installing an update: an instance left running in the background also applies it.
 
 **Uninstall:**
 
@@ -281,7 +281,7 @@ The app has the same two buttons. Removing the app in the launcher or HBC withou
 | Stop listening now | app "Microphone off", or `ctl.sh mic off` (`touch /tmp/webos-satellite.disable`); undo with `mic on` |
 | Stop the satellite | app "Stop", or `ctl.sh stop` |
 | No start at next boot | `ctl.sh autostart off`, or `touch /var/lib/webos-satellite/disable` |
-| Go back to an older version | install the older ipk the same way, then `ctl.sh install`. Whether appinstalld accepts a downgrade is not verified; if not: `make tv-remove-ipk` (data kept), install the older ipk, `ctl.sh install` |
+| Go back to an older version | install the older ipk the same way, then `ctl.sh install` (appinstalld accepted a downgrade on c3-b; if another TV refuses: `make tv-remove-ipk` (data kept), install the older ipk, `ctl.sh install`) |
 | Remove everything | `ctl.sh purge`, then `make tv-remove-ipk` |
 | HBC failsafe mode after a boot | the hooks were skipped; delete `/var/lib/webosbrew/init.d/webos-satellite` over SSH or telnet and reboot ([autostart rollback](design/autostart.md#rollback)) |
 

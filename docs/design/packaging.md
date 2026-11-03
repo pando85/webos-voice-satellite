@@ -1,12 +1,12 @@
 # webOS app package (ipk): design and status
 
-- **Status:** **built and tested on a PC only (2026-11-03).** `make ipk` produces an installable, updatable package; nothing has been installed on a TV yet. The on-TV verification is [EXP-009](../experiments/EXP-009-ipk-install-update.md), planned for c3-b (the second LG C3) with the owner's authorization. c3-a is not a target for it.
+- **Status:** **verified on c3-b (2026-11-03, HBC 0.7.2, firmware 03.30.73)** in [EXP-009](../experiments/EXP-009-ipk-install-update.md): install, set up, update, downgrade, start at boot, uninstall, purge and app removal; three bugs found there are fixed (section 6). Not yet on c3-a or HBC 0.6.x; c3-a needs the owner's separate approval.
 - **Date:** 2026-11-03. External sources were read on 2026-11-03 at the commits listed under [Sources](#sources).
 - **Scope:** milestone 3a of the [install and configuration UX](install-and-config-ux.md#41-phase-3-slice-with-autostart-owner-approval-gated-on-the-tv) and the "reproducible ipk" deliverable of [roadmap Phase 5](../project/roadmap.md#phase-5-second-tv-and-packaging). Manual install only for now. The target is the official Homebrew Channel apps repository, decided 2026-11-03 ([P14](#1-decisions)); there is no self-hosted repository.
 - **Files:** [`packaging/webos/`](../../packaging/webos/): `ctl.sh` (entry point), `install.sh` and the ops scripts, `config.default.toml`, `init.d/webos-satellite` (hook template), `app/` (status app), `ipk/build_ipk.py` (builder and checker), `tv/appinstall.sh` (appinstalld helper), `tests/`.
 - **Related:** [autostart design](autostart.md), [always-on](always-on.md), [development: install the app package](../development.md#install-the-app-package-on-a-rooted-tv-persistent).
 
-Labels follow [AGENTS.md](../../AGENTS.md). Facts about HBC and other apps are `documented` (their README or schema) or `observed-on-other-device` (their source code); nothing in this document is `verified-on-target` yet.
+Labels follow [AGENTS.md](../../AGENTS.md). Facts about HBC and other apps are `documented` (their README or schema) or `observed-on-other-device` (their source code); section 6 holds what is `verified-on-target` on c3-b.
 
 ## 1. Decisions
 
@@ -83,15 +83,23 @@ Shows: whether the HBC service is root, installed and package versions (and a pe
 
 Also: ShellCheck clean, `sh -n` of all scripts, `node --check` of the app.
 
-## 6. Not verified; needs a TV
+## 6. Verified on a TV (c3-b, 2026-11-03)
 
-All of it, on c3-b first ([EXP-009](../experiments/EXP-009-ipk-install-update.md)): appinstalld accepts the package built without ares-cli; the app launches and HBC `exec` runs as root from it; a daemon started through `exec` survives closing the app and HBC's idle exit; the update path with a running daemon; the boot hook with a reboot (no failsafe); update at boot; uninstall, purge and app removal leave nothing behind; downgrade by installing an older ipk (accepted by appinstalld or not). HBC 0.6.3 (c3-a) and 0.7.x differ; each needs its own record.
+[EXP-009](../experiments/EXP-009-ipk-install-update.md), `verified-on-target` for c3-b, firmware 03.30.73, HBC 0.7.2: appinstalld accepts the package built without ares-cli and keeps file modes; the app launches and HBC `exec` runs `ctl.sh` as root from it; a daemon started through `exec` survives closing the app and HBC's idle exit; an app install does not touch the running daemon and opening the app applies the update (config and identity kept, one daemon); the boot hook runs after other apps' hooks, starts the daemon about 100 s after boot, applies a pending update first and honours the firmware guard, with no failsafe over two boots; appinstalld accepts a downgrade; after the app is removed the hook starts nothing; uninstall and purge leave nothing behind.
+
+Bugs found only on the TV, all fixed with host tests:
+
+1. **Inherited descriptors (6410eff).** HBC's `exec` hands its children the service's Luna bus sockets and the sockets it reads the output from. The daemon kept the Luna sockets, and `setsid` called through a shell function in the background left `start.sh` subshells holding the output sockets, so `exec` never answered and the rotator watched the wrong pid. `start.sh` now closes inherited descriptors (as HBC's `startup.sh` does) and runs `setsid` as a plain command.
+2. **Stop race under `set -e` (d749183).** The supervisor forwards its TERM to the daemon, which can be gone before `stop_daemon`'s own `kill`; the failing `kill` aborted `ctl.sh install` half way with the daemon stopped. Every kill there now tolerates a missing process.
+3. **Two update triggers (8959a39).** An app instance left in the background and the relaunched app both applied one update; the second stopped the daemon the first had started. `ctl.sh install` now does nothing when the payload is already installed (`--force` reinstalls).
+
+Still not verified: HBC 0.6.3 (c3-a), installing through HBC's own `install` from a manifest, survival across an HBC self-update or a luna hub restart.
 
 ## 7. Open questions
 
 1. App title before the first publication (P4 settles the app id). The repository license is decided: GPL-3.0-or-later (P15).
-2. Does appinstalld accept a downgrade (older version over newer)? If not, rollback is "remove the app (data kept), install the older ipk, `ctl.sh install`".
-3. Does a process started through HBC `exec` stay alive when HBC's service is killed (HBC self-update kills app services with SIGKILL on webOS 4+, per its source comment) or when the luna hub restarts ([always-on](always-on.md#2-what-was-observed-on-c3-a-read-only-2026-11-03))?
+2. ~~Does appinstalld accept a downgrade?~~ **Yes on c3-b** (EXP-009, 0.0.4 to 0.0.2). Other firmware unverified; the fallback stays "remove the app (data kept), install the older ipk, `ctl.sh install`".
+3. A process started through HBC `exec` survives the app closing and HBC's idle exit (c3-b, EXP-009). Still open: does it stay alive when HBC's service is killed (HBC self-update kills app services with SIGKILL on webOS 4+, per its source comment) or when the luna hub restarts ([always-on](always-on.md#2-what-was-observed-on-c3-a-read-only-2026-11-03))?
 4. Superseded by P16 for the public release: no allow-list override at install; the status is "verified / not verified" and the gate becomes a warning ([section 9](#9-verified-models-list-instead-of-a-firmware-whitelist)). Until then the owner edits `validated_firmware` by hand after validating capture on that model.
 5. Publication path: decided 2026-11-03, the official `apps-repo` (P14). Still open: the AI-use disclosure wording, which is part of the [backlog #10](../project/backlog.md#10-official-homebrew-channel-listing) step.
 
