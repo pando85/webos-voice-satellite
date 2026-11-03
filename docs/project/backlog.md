@@ -100,3 +100,16 @@ Items not in the ranked list stay in the backlog without a priority or a phase: 
 - **Approach options:** see the full list in [rooted-tv-improvements](../discovery/c3-a/rooted-tv-improvements.md): firmware update blocking gaps, SSH hardening, the anonymous PulseAudio socket, the probe denylist for ASoC sysfs files and others.
 - **Dependencies:** owner approval for each change; a rollback plan per item; the PulseAudio item matters once the satellite captures audio.
 - **Evidence needed:** per-item verification steps in the linked document.
+
+## 10. Official Homebrew Channel listing
+
+- **Status:** follow-up, not started (2026-11-03). Decided by the owner: the target is the official Homebrew Channel apps repository (`webosbrew/apps-repo`), later. Until then the app is installed by hand from the ipk. There is no self-hosted repository. Decisions: [packaging P4 and P14](../design/packaging.md#1-decisions).
+- **Why:** owners of rooted TVs find the app in the Homebrew Channel store and get updates there, instead of copying an ipk by hand.
+- **Steps when picked up:**
+  1. Settle the repository license (the listing's `pool` is `main` for open source, `non-free` otherwise), the title and the icon.
+  2. Publish a release with the ipk and the generated repo manifest `<id>.manifest.json` ([packaging P13](../design/packaging.md#1-decisions)). The generated manifest next to the ipk is the starting point, not the finished file: check it against the HBC manifest schema, and check that `ipkUrl` and `ipkHash.sha256` match the published ipk.
+  3. Write the AI-use disclosure. The apps-repo README says AI use must be disclosed in the PR, and it rejects apps made primarily by AI without meaningful human development, testing and review. **The disclosure wording is part of this step** and needs the owner's approval before the PR is opened. It must describe the human development, testing and review, including the TVs it was run on.
+  4. Open a PR to `webosbrew/apps-repo` adding `packages/<name>.yml` (`title`, `iconUri`, `manifestUrl`, `category`, `pool`, `description`, optional `screenshots`), with the disclosure in the PR text.
+  5. Confirm the install from the published entry on a TV before announcing it.
+- **Dependencies:** [EXP-009](../experiments/EXP-009-ipk-install-update.md) (install, update and uninstall from the real package on c3-b); the repository license; a compatibility record that names the models and firmware the listing is tested on.
+- **Evidence needed:** the store install and update work on a TV from the published manifest; the disclosure is accepted in review; the listing does not claim models or firmware that were not tested.
