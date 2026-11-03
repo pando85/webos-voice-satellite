@@ -1,14 +1,18 @@
 #!/bin/sh
 # Installs webos-satellite under one prefix directory. Writes nothing outside
-# it. No autostart, no init integration (see docs/development.md).
+# it. No autostart, no init integration (see docs/development.md; the webOS
+# app's ctl.sh calls this script and adds the boot hook on request).
 #
-# usage: install.sh --prefix DIR --config FILE [--arch auto|armv7|aarch64]
-#                   [--binary FILE] [--psk-file FILE] [--persistent]
+# usage: install.sh --prefix DIR (--config FILE | --keep-config)
+#                   [--arch auto|armv7|aarch64] [--binary FILE]
+#                   [--psk-file FILE] [--persistent]
 #
 #   --prefix DIR    install directory; must be under /tmp, /run or /dev/shm
 #                   (non-persistent) unless --persistent is given, which needs
 #                   the owner's authorization on a real TV
 #   --config FILE   TOML config (see config/example.toml); installed as etc/config.toml
+#   --keep-config   keep an existing etc/config.toml (an update); with
+#                   --config as well, FILE is used only when none exists yet
 #   --arch A        which build of the package to install (default auto):
 #                   auto: aarch64 if `uname -m` is aarch64 (64-bit kernel),
 #                   else armv7; armv7 or aarch64: that build first. An aarch64
@@ -24,6 +28,9 @@
 # existing install is left unchanged.
 #
 # Layout: DIR/{bin,etc,run,log,out}; DIR/.webos-satellite-install marks it.
+# Files are replaced by rename, so a script that runs from DIR/bin keeps
+# its old copy. A package with VERSION and SHA256SUMS next to this script
+# records them as DIR/VERSION and DIR/package.sums (update detection).
 # Test hook: WEBOS_SAT_UNAME_M replaces `uname -m`.
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
@@ -36,6 +43,7 @@ binary=
 arch=auto
 psk=
 persistent=0
+keep_config=0
 while [ $# -gt 0 ]; do
     case $1 in
     --prefix) [ $# -ge 2 ] || die "--prefix needs a value"; prefix_arg=$2; shift 2 ;;
@@ -44,13 +52,14 @@ while [ $# -gt 0 ]; do
     --arch) [ $# -ge 2 ] || die "--arch needs a value"; arch=$2; shift 2 ;;
     --psk-file) [ $# -ge 2 ] || die "--psk-file needs a value"; psk=$2; shift 2 ;;
     --persistent) persistent=1; shift ;;
-    -h | --help) sed -n '2,27p' "$0"; exit 0 ;;
+    --keep-config) keep_config=1; shift ;;
+    -h | --help) sed -n '2,34p' "$0"; exit 0 ;;
     *) die "unknown argument: $1 (see --help)" ;;
     esac
 done
 
 [ -n "$prefix_arg" ] || die "missing --prefix DIR"
-[ -n "$config" ] || die "missing --config FILE (there is no default: the example config plays audio)"
+[ -n "$config" ] || [ "$keep_config" -eq 1 ] || die "missing --config FILE (there is no default: the example config plays audio)"
 case $arch in
 auto | armv7 | aarch64) ;;
 *) die "--arch must be auto, armv7 or aarch64" ;;
@@ -62,10 +71,15 @@ if [ -z "$binary" ] && [ ! -f "$bin_a32" ] && [ ! -f "$bin_a64" ]; then
     binary=$here/webos-satellite
 fi
 [ -z "$binary" ] || [ -f "$binary" ] || die "binary not found: $binary"
-[ -f "$config" ] || die "config not found: $config"
+[ -z "$config" ] || [ -f "$config" ] || die "config not found: $config"
 [ -z "$psk" ] || [ -f "$psk" ] || die "key file not found: $psk"
 
 resolve_prefix "$0" "$prefix_arg"
+if [ "$keep_config" -eq 1 ] && [ -f "$CFG" ]; then
+    config=
+elif [ -z "$config" ]; then
+    die "--keep-config: $CFG does not exist; give --config FILE"
+fi
 if ! is_volatile_prefix "$PREFIX" && [ "$persistent" -ne 1 ]; then
     die "$PREFIX is not under /tmp, /run or /dev/shm; pass --persistent only with the owner's authorization"
 fi
@@ -130,15 +144,31 @@ else
     note "uname -m: $machine, --arch $arch: installing the $chosen build"
 fi
 mv -f "$new" "$PREFIX/bin/webos-satellite"
-for f in lib.sh start.sh stop.sh status.sh uninstall.sh rotate.sh supervise.sh autostart.sh; do
-    cp "$here/$f" "$PREFIX/bin/$f"
-    chmod 700 "$PREFIX/bin/$f"
+for f in lib.sh start.sh stop.sh status.sh uninstall.sh rotate.sh supervise.sh autostart.sh ctl.sh; do
+    # ctl.sh is part of the webOS app package; older trees lack it.
+    [ -f "$here/$f" ] || [ "$f" = ctl.sh ] || die "missing $here/$f"
+    [ ! -f "$here/$f" ] || install_file "$here/$f" "$PREFIX/bin/$f" 700
 done
-cp "$config" "$PREFIX/etc/config.toml"
-chmod 600 "$PREFIX/etc/config.toml"
+# The boot hook template: init.d/webos-satellite in the tree, renamed in a package.
+for h in "$here/webos-satellite.hook" "$here/init.d/webos-satellite"; do
+    if [ -f "$h" ]; then
+        install_file "$h" "$PREFIX/bin/webos-satellite.hook" 600
+        break
+    fi
+done
+if [ -n "$config" ]; then
+    install_file "$config" "$PREFIX/etc/config.toml" 600
+else
+    note "keeping $PREFIX/etc/config.toml"
+fi
 if [ -n "$psk" ]; then
-    cp "$psk" "$PREFIX/etc/noise_psk"
-    chmod 600 "$PREFIX/etc/noise_psk"
+    install_file "$psk" "$PREFIX/etc/noise_psk" 600
+fi
+if [ -f "$here/SHA256SUMS" ]; then
+    install_file "$here/SHA256SUMS" "$PREFIX/package.sums" 600
+fi
+if [ -f "$here/VERSION" ]; then
+    install_file "$here/VERSION" "$PREFIX/VERSION" 600
 fi
 echo "webos-satellite install; remove with bin/uninstall.sh" >"$PREFIX/$MARKER"
 chmod 600 "$PREFIX/$MARKER"

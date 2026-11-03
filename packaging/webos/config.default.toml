@@ -1,0 +1,52 @@
+# webos-satellite configuration written by the webOS app on its first install
+# (ctl.sh install). Updates and reinstalls keep this file; edit it over SSH
+# and restart (ctl.sh restart). Every key and its default:
+# https://github.com/pando85/webos-voice-satellite/blob/main/config/example.toml
+#
+# @NAME@ and @MAC_SEED@ are replaced once with random values, so every TV is
+# a separate device in Home Assistant and keeps its identity across updates.
+mode = "wake"
+
+[device]
+name = "@NAME@"
+friendly_name = "TV Voice Satellite"
+mac_seed = "@MAC_SEED@"
+port = 6053
+# No key here: Home Assistant 2026.9 or newer sets one when you add the
+# device (pairing below). For a fixed key instead, put it in etc/noise_psk
+# (mode 0600), uncomment the next line and set [pairing] enabled = false.
+# noise_psk_file = "noise_psk"
+# mDNS is not yet verified with Home Assistant discovery on a TV: add the
+# device in HA by host and port (the app shows the TV's address).
+mdns = false
+
+[mic]
+source = "alsa"
+card_id = "LGSIC"
+pcm_name = "WoV PDM Mic"
+
+[sink]
+type = "pacat"
+gain = 1.0
+
+[log]
+level = "info"
+
+[safety]
+# Kill switch (the app's "Microphone off"): the PCM stays closed while it
+# exists. Under /tmp it is cleared at reboot.
+kill_switch = "/tmp/webos-satellite.disable"
+# Home Assistant's mute switch, remembered across restarts and reboots.
+mute_file = "muted"
+# The microphone stays off on any other firmware (the capture was validated
+# only on these); the app and the autostart log say so.
+validated_firmware = ["03.30.74"]
+
+[pairing]
+# While no key is stored the pairing window opens at every start for
+# window_s seconds; whoever connects first on the LAN in that time can claim
+# the device, so add it in Home Assistant right after starting.
+enabled = true
+state_dir = "pairing"
+window_s = 600
+open_on_start = true

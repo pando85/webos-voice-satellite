@@ -30,8 +30,11 @@ check_prefix() {
         p=${p%/}
     done
     case $p in
-    / | /bin | /boot | /dev | /etc | /home | /lib | /media | /media/developer | /mnt | /opt | /proc | /root | /run | /sbin | /sys | /tmp | /usr | /var)
+    / | /bin | /boot | /dev | /etc | /home | /home/root | /lib | /media | /media/cryptofs | /media/developer | /media/developer/apps | /mnt | /opt | /proc | /root | /run | /sbin | /sys | /tmp | /usr | /var | /var/lib | /var/lib/webosbrew | /var/luna)
         die "refusing to use a system directory as the prefix: $p"
+        ;;
+    /media/developer/apps/* | /media/cryptofs/* | /var/lib/webosbrew/* | /usr/palm/*)
+        die "refusing a prefix inside a directory managed by webOS or the Homebrew Channel: $p"
         ;;
     esac
     [ ! -L "$p" ] || die "prefix is a symbolic link: $p"
@@ -65,8 +68,70 @@ set_paths() {
 }
 
 # Default kill-switch file of the daemon (safety.kill_switch in the config).
+# WEBOS_SAT_KILL_SWITCH replaces it in host tests.
 # shellcheck disable=SC2034
-KILL_SWITCH_DEFAULT=/tmp/webos-satellite.disable
+KILL_SWITCH_DEFAULT=${WEBOS_SAT_KILL_SWITCH:-/tmp/webos-satellite.disable}
+
+# --- Persistent install of the webOS app (ctl.sh) ---------------------------
+# The app's files live where the TV's installer puts them and are replaced on
+# every update; config, key, logs and the running copy of the daemon live in
+# STATE_PREFIX_DEFAULT, outside the app (docs/design/packaging.md).
+# shellcheck disable=SC2034
+STATE_PREFIX_DEFAULT=/var/lib/webos-satellite
+# shellcheck disable=SC2034
+INITD_DIR_DEFAULT=/var/lib/webosbrew/init.d
+# shellcheck disable=SC2034
+HOOK_NAME=webos-satellite
+LOCK_DEFAULT=/tmp/webos-satellite.lock
+
+# Serialises install, update, start, stop and uninstall (ctl.sh, autostart.sh).
+# The lock is a directory (mkdir is atomic) holding the owner's pid; a lock
+# whose owner is gone is taken over. A child of the owner inherits it through
+# WEBOS_SAT_LOCK_HELD. Argument: seconds to wait (default 30).
+lock_take() {
+    LOCKDIR=${WEBOS_SAT_LOCK:-$LOCK_DEFAULT}
+    [ "${WEBOS_SAT_LOCK_HELD:-}" != "$LOCKDIR" ] || return 0
+    waited=0
+    while ! mkdir "$LOCKDIR" 2>/dev/null; do
+        holder=$(read_pid "$LOCKDIR/pid")
+        if [ -n "$holder" ] && ! kill -0 "$holder" 2>/dev/null; then
+            rm -rf "$LOCKDIR"
+            continue
+        fi
+        waited=$((waited + 1))
+        [ "$waited" -lt "${1:-30}" ] || die "another operation holds $LOCKDIR (pid ${holder:-unknown}); if none runs, remove that directory"
+        sleep 1
+    done
+    echo $$ >"$LOCKDIR/pid"
+    LOCK_OWNED=1
+    WEBOS_SAT_LOCK_HELD=$LOCKDIR
+    export WEBOS_SAT_LOCK_HELD
+}
+
+lock_release() {
+    if [ "${LOCK_OWNED:-0}" = 1 ]; then
+        rm -rf "$LOCKDIR"
+        LOCK_OWNED=0
+    fi
+}
+
+# Copies $1 to $2 with mode $3 through a temporary file and a rename, so a
+# shell that is running the old $2 keeps reading the old file.
+install_file() {
+    cp "$1" "$2.new.$$" && chmod "$3" "$2.new.$$" && mv -f "$2.new.$$" "$2"
+}
+
+# Runs "$@" in a new session when setsid exists, so the job does not share
+# the caller's session or process group (a Homebrew Channel exec, a hook).
+# In a non-interactive shell a background job is not a group leader, so
+# setsid does not fork and $! stays the job's pid.
+detached() {
+    if command -v setsid >/dev/null 2>&1; then
+        setsid "$@"
+    else
+        "$@"
+    fi
+}
 
 # Picks the prefix: --prefix DIR, or the parent of the directory holding the
 # installed script. Call as: resolve_prefix "$0" "$prefix_arg"
@@ -184,7 +249,12 @@ arch_for_machine() {
 }
 
 # Rust target triple that `--version` of the build for arch $1 reports.
+# Host tests set WEBOS_SAT_TEST_ANY_TRIPLE=1 to accept a host build.
 triple_of_arch() {
+    if [ "${WEBOS_SAT_TEST_ANY_TRIPLE:-}" = 1 ]; then
+        echo ""
+        return
+    fi
     case $1 in
     aarch64) echo aarch64-unknown-linux-musl ;;
     armv7) echo armv7-unknown-linux-musleabi ;;

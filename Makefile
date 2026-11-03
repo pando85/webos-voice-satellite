@@ -21,7 +21,17 @@ TARGET_A64    := aarch64-unknown-linux-musl
 OUT_ARM       := target/$(TARGET_ARM)/release/$(BIN)
 OUT_A64       := target/$(TARGET_A64)/release/$(BIN)
 
+# webOS app package (.ipk); docs/design/packaging.md. The version is the
+# workspace version in Cargo.toml.
+APP_ID        ?= io.github.pando85.voicesatellite
+VERSION       := $(shell sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
+IPK_DIR       := target/ipk
+IPK           := $(IPK_DIR)/$(APP_ID)_$(VERSION)_all.ipk
+IPK_BUILD     := python3 $(PKG)/ipk/build_ipk.py
+TV_APP_DIR    ?= /media/developer/apps/usr/palm/applications/$(APP_ID)
+
 .PHONY: build-tv build-tv64 build-tv-all package-tv test lint fmt deploy-tv run-tv-selftest clean-tv tv-install-tmp tv-uninstall-tmp
+.PHONY: ipk ipk-check test-packaging tv-install-ipk tv-remove-ipk
 
 # Static 32-bit ARM EABI5 binary (flags come from .cargo/config.toml). Runs on
 # every supported TV; the build verified on c3-a.
@@ -54,6 +64,22 @@ package-tv: build-tv-all
 	tar -C $(dir $(PKG_OUT)) -czf $(PKG_TAR) $(notdir $(PKG_OUT))
 	@cat $(PKG_OUT)/SHA256SUMS
 	@echo "package: $(PKG_OUT) and $(PKG_TAR)"
+
+# Both TV builds plus the scripts and the status app in one reproducible
+# ipk (target/ipk/<id>_<version>_all.ipk), its sha256 and an HBC manifest.
+ipk: build-tv-all
+	$(IPK_BUILD) build --app-id $(APP_ID) --version $(VERSION) --armv7 $(OUT_ARM) --aarch64 $(OUT_A64) --out $(IPK_DIR)
+	$(IPK_BUILD) check --app-id $(APP_ID) --version $(VERSION) $(IPK)
+
+# Structure check of an existing ipk (ar/tar layout, control, appinfo, payload).
+ipk-check:
+	$(IPK_BUILD) check --app-id $(APP_ID) --version $(VERSION) $(IPK)
+
+# Host tests of the scripts, the package lifecycle and the status app.
+test-packaging:
+	sh $(PKG)/tests/run.sh
+	sh $(PKG)/tests/ipk.sh
+	node $(PKG)/tests/app_smoke.js
 
 test:
 	cargo test --workspace
@@ -96,3 +122,18 @@ tv-install-tmp: package-tv
 # Stops the daemon and removes TV_PREFIX (and the staging directory) from the TV.
 tv-uninstall-tmp:
 	timeout $(TIMEOUT) ssh $(SSH_OPTS) $(TV) 'sh $(TV_PREFIX)/bin/uninstall.sh; rm -rf $(TV_STAGE)'
+
+# Installs (or updates) the ipk on the TV through appinstalld, as the Homebrew
+# Channel does, then prints the package status. Starts nothing and writes
+# nothing outside the app directory: set up and start from the app, or with
+#   ssh $(TV) 'sh $(TV_APP_DIR)/payload/ctl.sh install'
+# Persistent change on the TV: needs the owner's authorization.
+tv-install-ipk: ipk
+	timeout $(TIMEOUT) scp $(SSH_OPTS) $(IPK) $(TV):/tmp/$(notdir $(IPK))
+	timeout 90 ssh $(SSH_OPTS) $(TV) sh -s -- install /tmp/$(notdir $(IPK)) <$(PKG)/tv/appinstall.sh; rc=$$?; \
+	  timeout $(TIMEOUT) ssh $(SSH_OPTS) $(TV) 'rm -f /tmp/$(notdir $(IPK))'; exit $$rc
+	timeout $(TIMEOUT) ssh $(SSH_OPTS) $(TV) 'sh $(TV_APP_DIR)/payload/ctl.sh status'
+
+# Removes the app (after `ctl.sh uninstall` or `purge`, which this does not run).
+tv-remove-ipk:
+	timeout 90 ssh $(SSH_OPTS) $(TV) sh -s -- remove $(APP_ID) <$(PKG)/tv/appinstall.sh

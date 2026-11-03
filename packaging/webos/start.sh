@@ -59,17 +59,19 @@ if [ -f "$LOG" ] && [ "$(wc -c <"$LOG")" -gt "$max" ]; then
 fi
 
 cd "$PREFIX"
+# New session (setsid when present): the daemon must not depend on the
+# caller's session, for example a Homebrew Channel exec from the app.
 if [ "$supervise" -eq 1 ]; then
-    nohup sh "$PREFIX/bin/supervise.sh" -- "$@" </dev/null >/dev/null 2>&1 &
+    detached nohup sh "$PREFIX/bin/supervise.sh" -- "$@" </dev/null >/dev/null 2>&1 &
     watch=$!
     echo "$watch" >"$SUPPID"
 else
-    nohup "$BIN" --config "$CFG" "$@" </dev/null >>"$LOG" 2>&1 &
+    detached nohup "$BIN" --config "$CFG" "$@" </dev/null >>"$LOG" 2>&1 &
     watch=$!
     echo "$watch" >"$PIDFILE"
 fi
 # The rotator exits with the process it watches (the supervisor or the daemon).
-nohup sh "$PREFIX/bin/rotate.sh" "$watch" "$LOG" "$max" </dev/null >/dev/null 2>&1 &
+detached nohup sh "$PREFIX/bin/rotate.sh" "$watch" "$LOG" "$max" </dev/null >/dev/null 2>&1 &
 echo $! >"$ROTPID"
 
 sleep 1

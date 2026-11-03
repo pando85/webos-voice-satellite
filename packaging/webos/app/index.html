@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Voice Satellite</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<main>
+  <header>
+    <h1>Voice Satellite</h1>
+    <p class="sub">Home Assistant voice satellite for this TV. Everything stays on your network.</p>
+  </header>
+
+  <section id="summary" aria-live="polite">
+    <p id="headline" class="headline">Checking&hellip;</p>
+    <p id="detail" class="detail"></p>
+  </section>
+
+  <section class="grid">
+    <div class="panel">
+      <h2>Status</h2>
+      <dl id="facts"></dl>
+    </div>
+    <div class="panel">
+      <h2>Actions</h2>
+      <div id="actions" class="actions">
+        <button id="b-install" data-cmd="install" data-then="start">Set up</button>
+        <button id="b-update" data-cmd="install">Apply update</button>
+        <button id="b-start" data-cmd="start">Start</button>
+        <button id="b-stop" data-cmd="stop">Stop</button>
+        <button id="b-boot-on" data-cmd="autostart on">Start at boot: turn on</button>
+        <button id="b-boot-off" data-cmd="autostart off">Start at boot: turn off</button>
+        <button id="b-mic-off" data-cmd="mic off">Microphone off</button>
+        <button id="b-mic-on" data-cmd="mic on">Microphone on</button>
+        <button id="b-pair" data-cmd="pair">Open pairing window</button>
+        <button id="b-reset" data-cmd="reset-pairing" data-confirm="1">Reset pairing</button>
+        <button id="b-crash" data-cmd="clear-crashloop">Clear crash-loop marker</button>
+        <button id="b-uninstall" data-cmd="uninstall" data-confirm="1">Remove service (keep settings)</button>
+        <button id="b-purge" data-cmd="purge" data-confirm="1">Remove service and all data</button>
+        <button id="b-refresh" data-cmd="">Refresh</button>
+      </div>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>Adding it to Home Assistant</h2>
+    <p id="ha-hint">In Home Assistant: Settings, Devices &amp; services, Add integration, ESPHome. Host: this TV's address, port 6053. With Home Assistant 2026.9 or newer no key is needed while the pairing window is open (10 minutes after the first start, or after "Open pairing window").</p>
+    <h2>Not available yet</h2>
+    <p class="muted">Pairing window countdown, power options (screen off, Always Ready) and settings such as microphone gain are not shown here yet. Settings are edited in <code>/var/lib/webos-satellite/etc/config.toml</code> over SSH.</p>
+  </section>
+
+  <section class="panel">
+    <h2>Recent log</h2>
+    <pre id="log"></pre>
+  </section>
+  <p id="message" class="message" aria-live="polite"></p>
+</main>
+<script src="app.js"></script>
+</body>
+</html>

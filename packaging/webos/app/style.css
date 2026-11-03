@@ -1,0 +1,49 @@
+/* TV app at 1920x1080 (or 1280x720, scaled by the web runtime). */
+:root {
+  --bg: #10151c;
+  --panel: #1a222d;
+  --text: #e8edf3;
+  --muted: #9aa7b6;
+  --accent: #3fa7ff;
+  --ok: #4cc38a;
+  --warn: #f2b84b;
+  --bad: #ff6b6b;
+}
+html, body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: "LG Smart UI", "Museo Sans", sans-serif;
+  font-size: 26px;
+}
+main { padding: 48px 72px; }
+h1 { font-size: 52px; margin: 0; }
+h2 { font-size: 30px; margin: 0 0 16px; color: var(--muted); font-weight: normal; }
+.sub { color: var(--muted); margin: 8px 0 24px; }
+.headline { font-size: 36px; margin: 0; }
+.detail { color: var(--muted); margin: 8px 0 0; }
+.grid { display: flex; gap: 32px; margin: 24px 0; }
+.grid .panel { flex: 1; }
+.panel { background: var(--panel); border-radius: 12px; padding: 24px 32px; margin-bottom: 24px; }
+dl { display: grid; grid-template-columns: max-content 1fr; gap: 8px 24px; margin: 0; }
+dt { color: var(--muted); }
+dd { margin: 0; }
+.ok { color: var(--ok); }
+.warn { color: var(--warn); }
+.bad { color: var(--bad); }
+.muted { color: var(--muted); }
+.actions { display: flex; flex-wrap: wrap; gap: 12px; }
+button {
+  font: inherit;
+  color: var(--text);
+  background: #253041;
+  border: 3px solid transparent;
+  border-radius: 8px;
+  padding: 10px 20px;
+}
+button:focus, button:hover { border-color: var(--accent); outline: none; }
+button[hidden] { display: none; }
+button.armed { background: #5a2a2a; }
+pre { font-size: 20px; white-space: pre-wrap; word-break: break-all; margin: 0; color: var(--muted); }
+code { font-size: 22px; }
+.message { min-height: 32px; color: var(--warn); }

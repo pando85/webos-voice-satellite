@@ -1,21 +1,26 @@
 #!/bin/sh
-# DRAFT boot hook for /var/lib/webosbrew/init.d/ (run by `run-parts` from the
-# Homebrew Channel's startup.sh at early boot, while its failsafe flag is set).
+# Boot hook template for /var/lib/webosbrew/init.d/webos-satellite (run by
+# `run-parts` from the Homebrew Channel's startup.sh at early boot, while its
+# failsafe flag is set). Review and rollback: docs/design/autostart.md.
 #
-# NOT INSTALLED. Copying this file to the TV is a persistent change that needs
-# the owner's explicit approval; see docs/design/autostart.md for the review,
-# the install step and the rollback (delete this one file).
+# Not installed by the package itself: `ctl.sh autostart on` (the app's
+# "Start at boot" button) writes a copy with @PREFIX@ replaced by the install
+# directory, and `ctl.sh autostart off` deletes it. Opt-in; off by default.
 #
 # Contract with run-parts: returns at once with status 0, prints nothing,
 # reads nothing from stdin, never fails. Everything else happens in a
 # detached session after a delay (autostart.sh), so a slow, hanging or
 # crashing satellite can neither block the hook chain nor trip failsafe mode.
 #
-# Edit PREFIX to the persistent install directory chosen at install time.
-PREFIX=/media/developer/webos-satellite
+# Does nothing when the install is missing, DIR/disable exists, or the app
+# recorded in DIR/app-dir has been removed (an app removed through the
+# Homebrew Channel or the launcher runs no uninstall script).
+PREFIX=@PREFIX@
 
+app=
+[ ! -f "$PREFIX/app-dir" ] || read -r app <"$PREFIX/app-dir" || true
 if [ -f "$PREFIX/.webos-satellite-install" ] && [ -f "$PREFIX/bin/autostart.sh" ] &&
-    [ ! -e "$PREFIX/disable" ]; then
+    [ ! -e "$PREFIX/disable" ] && { [ -z "$app" ] || [ -f "$app/appinfo.json" ]; }; then
     if command -v setsid >/dev/null 2>&1; then
         setsid sh "$PREFIX/bin/autostart.sh" </dev/null >/dev/null 2>&1 &
     else
