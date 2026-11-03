@@ -220,6 +220,10 @@ check "update: restarted with the new build (new pid, one daemon, one supervisor
 check "update: installed binary is the new one" 'cmp -s "$S/bin/webos-satellite" "$T/a64-two" && [ "$(cat "$S/VERSION")" = 0.0.2 ] && ! json "s[\"update_pending\"]"'
 check "update: config and key unchanged" '[ "$(sha256sum <"$S/etc/config.toml")" = "$cfg_sum" ] && [ "$(sha256sum <"$S/etc/noise_psk")" = "$psk_sum" ]'
 check "update: boot hook refreshed and still on" 'grep -q "^PREFIX=$S\$" "$H"'
+out=$($CTL install 2>&1)
+check "a second install of the same payload does nothing (no restart)" 'echo "$out" | grep -q "already up to date" && [ "$(running_pid)" = "$pid_v2" ]'
+$CTL install --force >/dev/null
+check "install --force reinstalls and restarts" '[ -n "$(running_pid)" ] && [ "$(running_pid)" != "$pid_v2" ] && [ "$(daemons)" = 1 ]'
 
 echo "== update at boot (autostart.sh) =="
 $CTL stop >/dev/null

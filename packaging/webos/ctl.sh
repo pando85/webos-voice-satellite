@@ -8,12 +8,15 @@
 #   status [--json]   state of the package, the install and the daemon
 #                     (never prints the key or other secrets)
 #   install [--config FILE] [--psk-file FILE] [--arch auto|armv7|aarch64]
+#           [--force]
 #                     first install or update from the app's payload into DIR:
 #                     stops a running daemon, installs, starts it again if it
 #                     was running. Keeps etc/ (config, key, pairing state)
 #                     and log/. A first install writes a config from
 #                     config.default.toml with a random name and MAC seed;
-#                     --config replaces the config, --psk-file the key
+#                     --config replaces the config, --psk-file the key.
+#                     Does nothing when DIR already holds this payload (two
+#                     triggers applying one update), unless --force
 #   start | stop | restart
 #                     the supervised daemon (start refuses while DIR/disable
 #                     or DIR/crashloop exists)
@@ -38,7 +41,7 @@ here=$(cd "$(dirname "$0")" && pwd)
 . "$here/lib.sh"
 
 usage() {
-    sed -n '2,36p' "$0" >&2
+    sed -n '2,39p' "$0" >&2
     exit 2
 }
 
@@ -103,17 +106,24 @@ cmd_install() {
     cfg=
     psk=
     arch=auto
+    force=0
     while [ $# -gt 0 ]; do
         case $1 in
         --config) [ $# -ge 2 ] || usage; cfg=$2; shift 2 ;;
         --psk-file) [ $# -ge 2 ] || usage; psk=$2; shift 2 ;;
         --arch) [ $# -ge 2 ] || usage; arch=$2; shift 2 ;;
+        --force) force=1; shift ;;
         *) usage ;;
         esac
     done
     need_root
     [ -n "$PAYLOAD" ] || die "no package payload found (run the ctl.sh inside the app's payload directory)"
     locked
+    if [ "$force" -eq 0 ] && [ -z "$cfg" ] && [ -z "$psk" ] && installed &&
+        cmp -s "$PAYLOAD/SHA256SUMS" "$P/package.sums"; then
+        note "already up to date ($(cat "$P/VERSION" 2>/dev/null || echo unknown)); nothing to do (--force reinstalls)"
+        return 0
+    fi
     was_running=0
     if [ -f "$P/$MARKER" ] && running; then
         was_running=1
