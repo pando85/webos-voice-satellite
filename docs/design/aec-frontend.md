@@ -277,3 +277,50 @@ From the [P2 offline A/B](../experiments/P2-aec-offline-ab.md) (2026-11-02): cor
 - **False wakes:** 0 in 10 minutes of content per volume for every variant but `linear+ns` (1 at volume 10); the linear output gives the detector much higher scores on content (up to 0.62 against 0.11 without AEC).
 - **New, experimental keys** (defaults unchanged): `render_channels = 1 | 2` (stereo render to AEC3) and `output = "full" | "linear" | "nearend"` (AEC3 driven directly through sonora-aec3; the direct path with AEC3's defaults is sample-for-sample identical to sonora's `AudioProcessing`, unit-tested). See [configuration](#6-configuration) and [config/example.toml](../../config/example.toml).
 - **Proposal for the live A/B (step 3):** `enabled = true`, `ns = true`, `render_channels = 1`, gain +24 dB; arm A `output = "linear"`, arm B `output = "full"`, plus a no-AEC control. Keep the shipped default off until the A/B passes; measure false wakes per hour with the linear output over the full content set.
+
+## 12. Tuning results and parked state
+
+**Status (2026-11-03): PARKED** by the owner. The echo-cancellation work and TV session 3 stop here. The shipped default stays **`[aec] enabled = false`**, and every key below is experimental with unchanged defaults.
+
+From the [P2 AEC tuning](../experiments/P2-aec-tuning.md) (offline, semi-synthetic, c3-a recordings; **observed-on-other-device**): parameters were chosen on four corpus voices and reported on three other voices plus the two MLS voices.
+
+- **AEC3's own suppressor parameters do not rescue a quiet talker.** That covers the masks, near-end detection, echo-path strength, audibility, ERLE bounds, comfort noise and filter lengths. **Bounding the suppression does.** The new `linear_mix` blends the aligned linear output back into the final output.
+- **Best-known configuration ("B"):**
+  - `[aec]`: `enabled = true`, `render_channels = 2`, optionally `ns = true`;
+  - `[aec.aec3]`: `"linear_mix" = 0.4`, `"ep_strength.default_len" = 0.0`.
+- **What B gives offline:**
+  - On the tuning voices, 42 % on content against 38 % for the linear output and 26 % for the default. Its ERLE is at the default's level (14.9/20.4 against 13.3/20.2 dB at volume 10/15), and its detector scores on content are back near the default's.
+  - Held-out, quiet / volume 10 / volume 15 at the reference level, then 10 dB louder:
+
+    | Variant | Reference level | +10 dB |
+    | --- | --- | --- |
+    | B | 25 / 13 / 0 % | 42 / 45 / 25 % |
+    | B + NS | 35 / 16 / 7 % | 44 / 44 / 25 % |
+    | default | 25 / 7 / 2 % | 42 / 31 / 11 % |
+
+  - B is better than the default with a louder talker (p 0.008 to 0.06). It is not significantly better than the plain linear output on the held-out voices. Nothing works at volume 15 for a reference-level talker.
+- **Rejected or null:**
+  - RNNoise (nnnoiseless) removes the talker and costs about 4× the canceller.
+  - AGC2 as a limiter or adaptive gain had no effect.
+  - Longer filters did not help.
+- **Wake threshold:** keep HA's 0.5 and trigger level 1 (the owner's GitOps values).
+  - Level 2 costs 14 to 17 points in quiet, and its count never resets within a long stream.
+  - 0.4 gains 0 to 7 points at about 1 % more stray wakes on negatives.
+  - The content false wakes for B were 0 at every threshold from 0.2 to 0.6, but 22.5 minutes bounds the rate only at ≤ 8 per hour.
+- **CPU (host):** B costs about 1.2× the default (1.4× with NS). Scaled to the TV's measured 1.0 ms per frame (armv7) and 0.21 ms (aarch64), that is about 1.2 ms and 0.25 ms per frame (**hypothesis**, not measured on the TV).
+- **Code:**
+  - `[aec.aec3]` (39 named AEC3 overrides plus `linear_mix`);
+  - the direct engine now takes a stereo render (sample-identical to sonora's `AudioProcessing` for the defaults, mono and stereo);
+  - an AGC2 stage in the dsp crate only, not in the daemon config;
+  - `aec_offline --aec3/--agc2-*/--rnnoise`;
+  - `tune_eval.py` and `tune_report.py`.
+
+**Open items when the work resumes:**
+
+1. On the TV: the delay lock and ERLE with a playing stimulus (step 2 left them `n/a`), and the CPU of B on armv7 and aarch64.
+2. A false-wake soak of several hours with B (and with NS) over TV content, which offline can only bound at ≤ 8 per hour.
+3. A JBL talker A/B (the rig loudspeaker at a measured distance, through the room) of no AEC, the default and B.
+4. A live-person test with consenting speakers.
+5. STT on the kept tuning WAVs, which was not run.
+
+**Session 3** was started and stopped with the parking: partial raw data from c3-a (`armL-v10-part1/2`, `t1-default` and logs) is in the gitignored `devices/private/c3-a/P2/session3/`. It has not been analysed or documented.
