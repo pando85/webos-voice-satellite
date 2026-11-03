@@ -42,6 +42,7 @@ DEFAULT_APP_ID = "io.github.pando85.voicesatellite"
 TITLE = "Voice Satellite"
 DESCRIPTION = "Home Assistant voice satellite for rooted LG webOS TVs (ESPHome native API)"
 SOURCE_URL = "https://github.com/pando85/webos-voice-satellite"
+LICENSE_ID = "GPL-3.0-or-later"  # SPDX; keep equal to workspace.package.license in Cargo.toml
 
 # Files of packaging/webos/ shipped in payload/ (scripts run with `sh`).
 PAYLOAD_SCRIPTS = [
@@ -223,6 +224,7 @@ def build(args: argparse.Namespace) -> Path:
     }
     for name in APP_FILES:
         app[name] = ((PKG / "app" / name).read_bytes(), 0o644)
+    app["LICENSE"] = ((ROOT / "LICENSE").read_bytes(), 0o644)  # the GPL text travels with the binaries
     for name, entry in payload.items():
         app[f"payload/{name}"] = entry
 
@@ -244,7 +246,7 @@ def build(args: argparse.Namespace) -> Path:
     installed_size = sum(len(d) for _, d, _ in entries if d is not None)
     control = (f"Package: {app_id}\nVersion: {version}\nSection: misc\nPriority: optional\n"
                f"Architecture: all\nInstalled-Size: {installed_size}\n"
-               f"Maintainer: N/A <nobody@example.com>\nDescription: {DESCRIPTION}\n"
+               f"Maintainer: N/A <nobody@example.com>\nLicense: {LICENSE_ID}\nDescription: {DESCRIPTION}\n"
                f"webOS-Package-Format-Version: 2\nwebOS-Packager-Version: x.y.x\n")
     blob = ar([("debian-binary", b"2.0\n"),
                ("control.tar.gz", tar_gz([("control", control.encode(), 0o644)], mtime)),
@@ -306,13 +308,14 @@ def check(args: argparse.Namespace) -> None:
     need(list(ctrl) == ["control"], f"control.tar.gz holds {list(ctrl)}")
     fields = dict(line.split(": ", 1) for line in ctrl["control"][1].decode().splitlines() if line)
     for key in ["Package", "Version", "Section", "Priority", "Architecture", "Installed-Size",
-                "Maintainer", "Description", "webOS-Package-Format-Version"]:
+                "Maintainer", "License", "Description", "webOS-Package-Format-Version"]:
         need(key in fields, f"control lacks {key}")
     app_id, version = fields.get("Package", ""), fields.get("Version", "")
     check_id_version(app_id, version)
     need(not args.app_id or app_id == args.app_id, f"Package {app_id} != {args.app_id}")
     need(not args.version or version == args.version, f"Version {version} != {args.version}")
     need(fields.get("Architecture") == "all", "Architecture is not all")
+    need(fields.get("License") == LICENSE_ID, f"License {fields.get('License')} != {LICENSE_ID}")
     need(path.name == f"{app_id}_{version}_all.ipk", f"file name {path.name}")
 
     data = untar(m["data.tar.gz"])
@@ -342,6 +345,8 @@ def check(args: argparse.Namespace) -> None:
         png_data = data.get(f"{appdir}/{appinfo.get(key)}", (None, b""))[1] or b""
         need(png_data[:8] == b"\x89PNG\r\n\x1a\n" and struct.unpack(">II", png_data[16:24]) == (size, size),
              f"{key} is not a {size}x{size} PNG")
+    need(f"{appdir}/LICENSE" in data and b"GNU GENERAL PUBLIC LICENSE" in (data[f"{appdir}/LICENSE"][1] or b""),
+         "the app directory lacks the GPL LICENSE text")
     pkginfo = json.loads(data[f"{pkgdir}/packageinfo.json"][1])
     need(pkginfo == {"app": app_id, "id": app_id, "version": version}, f"packageinfo.json {pkginfo}")
 
