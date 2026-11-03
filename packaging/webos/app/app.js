@@ -128,6 +128,12 @@
       var k = KEY_TEXT[s.key] || [s.key, ''];
       addFact(facts, 'Home Assistant', k[0], k[1]);
       addFact(facts, 'Device name', s.name || '?');
+      addFact(facts, 'Reply volume', s.reply_volume ? s.reply_volume + ' %' : 'default (set it in Home Assistant)');
+      // Short form of the risks in docs/design/always-on.md section 12.
+      addFact(facts, 'Remote power key',
+        s.remote_off === 'keep_listening'
+          ? 'keeps listening: the TV stays on with the screen dark (uses more power than standby; OLED care at power-off may not run). Change it in Home Assistant.'
+          : 'turns the TV off normally', s.remote_off === 'keep_listening' ? 'warn' : '');
     }
     addFact(facts, 'Address', (tvAddress || 'unknown') + ', port ' + (s.port || '6053'));
     addFact(facts, 'Kernel', s.machine || '?');

@@ -93,11 +93,15 @@ const ALLOWED = /^sh '\/media\/developer\/apps\/usr\/palm\/applications\/io\.git
     && ex.findIndex((c) => / install /.test(c)) < ex.findIndex((c) => / start /.test(c)));
 
   status = Object.assign({}, status, { installed: true, installed_version: '0.0.1', update_pending: true, running: true,
-    pid: 42, supervised: true, key: 'unpaired', firmware_ok: true, name: 'webos-satellite-abc123' });
+    pid: 42, supervised: true, key: 'unpaired', firmware_ok: true, name: 'webos-satellite-abc123',
+    remote_off: 'keep_listening', reply_volume: '40' });
   calls.length = 0;
   byId['b-refresh'].listeners.click();
   for (let i = 0; i < 6; i++) await tick();
   check('pending update applied once on open', execs().filter((c) => / install /.test(c)).length === 1);
+  const facts = byId.facts.children.map((c) => c.textContent).join('|');
+  check('reply volume and remote power key shown', facts.includes('Reply volume|40 %')
+    && /Remote power key\|keeps listening: the TV stays on/.test(facts));
   check('running and unpaired: pairing, stop, boot, uninstall buttons', ['b-pair', 'b-stop', 'b-boot-on', 'b-uninstall', 'b-purge']
     .every((id) => !byId[id].hidden) && byId['b-start'].hidden && byId['b-reset'].hidden);
 
