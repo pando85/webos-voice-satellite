@@ -46,6 +46,8 @@ pub(crate) struct Settings {
     pub(crate) aec: AecSection,
     /// TV power state watch and the remote power-off behaviour.
     pub(crate) power: PowerSection,
+    /// TV control from Home Assistant (screen, power, volume, input, apps).
+    pub(crate) tv_control: TvControlSection,
 }
 
 /// How pipeline runs start.
@@ -356,6 +358,83 @@ impl Default for PowerSection {
             max_actions_per_hour: 10,
             cooldown_s: 20,
         }
+    }
+}
+
+/// `[tv_control]`: TV control from Home Assistant
+/// ([design](../../../docs/design/tv-control.md)). Needs `luna-send` and
+/// `power.watch`; on a PC every control is off by itself.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // one bool per TOML switch
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct TvControlSection {
+    /// Master switch.
+    pub(crate) enabled: bool,
+    /// `tv_screen` switch (screen off and on).
+    pub(crate) screen: bool,
+    /// `tv_turn_on` button.
+    pub(crate) power_on: bool,
+    /// `tv_power` switch: Home Assistant can turn the TV off in the "Keep
+    /// listening (screen off)" mode only. Opt-in.
+    pub(crate) power_off: bool,
+    /// `tv_volume` and the volume step buttons.
+    pub(crate) volume: bool,
+    /// The highest TV volume Home Assistant may set (the TV's own maximum
+    /// also applies).
+    pub(crate) volume_limit: u32,
+    /// `tv_mute` switch.
+    pub(crate) mute: bool,
+    /// `tv_input` select.
+    pub(crate) input: bool,
+    /// `tv_app` select.
+    pub(crate) apps: bool,
+    /// Most apps in the `tv_app` select.
+    pub(crate) app_limit: u32,
+    /// `tv_play_state` sensor.
+    pub(crate) play_state: bool,
+    /// Refuse the TV control setters on firmware that is not in
+    /// `safety.validated_firmware` (sensors and states still report). Default
+    /// false: **owner decision 2026-11-04, TV control is not gated by the
+    /// firmware guard**; on unvalidated firmware it runs and a warning is
+    /// logged. The key stays for owners who want the stricter behaviour.
+    pub(crate) follow_firmware_guard: bool,
+}
+
+impl Default for TvControlSection {
+    /// Screen and power-on on, power-off off (opt-in), volume, mute, input and
+    /// apps on (EXP-010 Part A passed on c3-b, 2026-11-04; each control is
+    /// still checked per TV at startup), play state off, firmware guard not
+    /// followed (owner decision 2026-11-04).
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            screen: true,
+            power_on: true,
+            power_off: false,
+            volume: true,
+            volume_limit: 40,
+            mute: true,
+            input: true,
+            apps: true,
+            app_limit: 30,
+            play_state: false,
+            follow_firmware_guard: false,
+        }
+    }
+}
+
+impl TvControlSection {
+    /// Any control is on.
+    pub(crate) fn any(&self) -> bool {
+        self.enabled
+            && (self.screen
+                || self.power_on
+                || self.power_off
+                || self.volume
+                || self.mute
+                || self.input
+                || self.apps
+                || self.play_state)
     }
 }
 
@@ -823,6 +902,12 @@ impl Settings {
         if self.power.cooldown_s > 3600 {
             return Err(err("power.cooldown_s must be between 0 and 3600"));
         }
+        if !(1..=100).contains(&self.tv_control.volume_limit) {
+            return Err(err("tv_control.volume_limit must be between 1 and 100"));
+        }
+        if !(1..=100).contains(&self.tv_control.app_limit) {
+            return Err(err("tv_control.app_limit must be between 1 and 100"));
+        }
         Ok(())
     }
 
@@ -932,6 +1017,29 @@ impl Settings {
         if self.aec.enabled && self.aec.ns {
             w.push(
                 "aec.ns is on: noise suppression has been evaluated offline only, not on a TV"
+                    .to_owned(),
+            );
+        }
+        w.extend(self.tv_control_warnings());
+        w
+    }
+
+    /// Findings about `[tv_control]`.
+    fn tv_control_warnings(&self) -> Vec<String> {
+        let t = &self.tv_control;
+        let mut w = Vec::new();
+        if !t.enabled {
+            return w;
+        }
+        if t.any() && !self.power.watch {
+            w.push(
+                "tv_control needs power.watch = true (it reads the TV power state): no TV control entities are listed"
+                    .to_owned(),
+            );
+        }
+        if t.power_off {
+            w.push(
+                "tv_control.power_off = true: Home Assistant can turn the TV off, which leaves it running with a dark screen (more power than standby, LG's OLED care may not run); it works only while \"When the TV is turned off with the remote\" is on \"Keep listening\""
                     .to_owned(),
             );
         }
@@ -1190,7 +1298,7 @@ impl Settings {
             "off".to_owned()
         };
         format!(
-            "name={} port={} voice_features={} mode={:?} encryption={encryption} mic=[{mic}] dsp=[{:?} gain_db={} hpf_hz={}] aec=[{aec}] sink=[{sink}] safety=[kill_switch={} mute_file={} firmware={fw}] limits=[nice={} nofile={} rss_mb={} capture_stall_s={} loop_stall_s={}] power=[watch={} remote_off={:?}(default) max_per_hour={} cooldown_s={}]",
+            "name={} port={} voice_features={} mode={:?} encryption={encryption} mic=[{mic}] dsp=[{:?} gain_db={} hpf_hz={}] aec=[{aec}] sink=[{sink}] safety=[kill_switch={} mute_file={} firmware={fw}] limits=[nice={} nofile={} rss_mb={} capture_stall_s={} loop_stall_s={}] power=[watch={} remote_off={:?}(default) max_per_hour={} cooldown_s={}] tv_control=[{tv}]",
             self.device.name,
             self.device.port,
             self.voice_features(),
@@ -1209,6 +1317,41 @@ impl Settings {
             self.power.remote_off,
             self.power.max_actions_per_hour,
             self.power.cooldown_s,
+            tv = self.tv_control_summary(),
+        )
+    }
+
+    /// The `[tv_control]` part of the summary line.
+    fn tv_control_summary(&self) -> String {
+        let t = &self.tv_control;
+        if !t.enabled {
+            return "off".to_owned();
+        }
+        let mut on: Vec<&str> = Vec::new();
+        for (flag, name) in [
+            (t.screen, "screen"),
+            (t.power_on, "power_on"),
+            (t.power_off, "power_off"),
+            (t.volume, "volume"),
+            (t.mute, "mute"),
+            (t.input, "input"),
+            (t.apps, "apps"),
+            (t.play_state, "play_state"),
+        ] {
+            if flag {
+                on.push(name);
+            }
+        }
+        format!(
+            "on={} volume_limit={} app_limit={} firmware_guard={}",
+            if on.is_empty() {
+                "-".to_owned()
+            } else {
+                on.join(",")
+            },
+            t.volume_limit,
+            t.app_limit,
+            t.follow_firmware_guard
         )
     }
 }
@@ -1684,6 +1827,85 @@ level = "debug"
         assert_eq!(s.power.remote_off_file, base.join("ro"));
         assert!(Settings::from_toml("[power]\nremote_off = \"darken\"\n", base).is_err());
         assert!(Settings::from_toml("[sink]\nvolume = 0.5\n", base).is_err());
+    }
+
+    #[test]
+    fn tv_control_defaults_keys_and_validation() {
+        let base = Path::new("/etc/sat");
+        let def = TvControlSection::default();
+        assert!(def.enabled && def.screen && def.power_on && !def.follow_firmware_guard);
+        assert!(def.volume && def.mute && def.input && def.apps);
+        assert!(!def.power_off && !def.play_state);
+        assert_eq!((def.volume_limit, def.app_limit), (40, 30));
+        let s = Settings::from_toml(
+            "[tv_control]\nenabled = true\nscreen = false\npower_off = true\nvolume = true\nvolume_limit = 25\nmute = true\ninput = true\napps = true\napp_limit = 12\nplay_state = true\nfollow_firmware_guard = false\n",
+            base,
+        )
+        .unwrap();
+        let tvc = &s.tv_control;
+        assert!(
+            !tvc.screen
+                && tvc.power_off
+                && tvc.volume
+                && tvc.mute
+                && tvc.input
+                && tvc.apps
+                && tvc.play_state
+        );
+        assert_eq!(
+            (tvc.volume_limit, tvc.app_limit, tvc.follow_firmware_guard),
+            (25, 12, false)
+        );
+        // Strict: unknown keys and wrong types are rejected with the key.
+        let err_unknown = Settings::from_toml("[tv_control]\nvolum = true\n", base).unwrap_err();
+        assert!(err_unknown.0.contains("volum"), "{err_unknown}");
+        assert!(Settings::from_toml("[tv_control]\nvolume = \"yes\"\n", base).is_err());
+        assert!(Settings::from_toml("[tv_control]\nvolume_limit = -1\n", base).is_err());
+        // Ranges.
+        let mut s = Settings::default();
+        s.device.allow_plaintext = true;
+        s.validate().unwrap();
+        for (limit, apps, ok) in [
+            (0, 30, false),
+            (101, 30, false),
+            (1, 1, true),
+            (100, 100, true),
+            (40, 0, false),
+            (40, 101, false),
+        ] {
+            let mut s = s.clone();
+            s.tv_control.volume_limit = limit;
+            s.tv_control.app_limit = apps;
+            let r = s.validate();
+            assert_eq!(r.is_ok(), ok, "limit {limit} apps {apps}: {r:?}");
+            if let Err(err) = r {
+                assert!(err.0.contains("tv_control."), "{err}");
+            }
+        }
+    }
+
+    #[test]
+    fn tv_control_warnings_and_summary() {
+        let mut s = Settings::default();
+        s.device.allow_plaintext = true;
+        let has = |s: &Settings, needle: &str| s.warnings().iter().any(|w| w.contains(needle));
+        // The defaults warn about nothing from [tv_control].
+        assert!(!has(&s, "tv_control"));
+        s.tv_control.power_off = true;
+        assert!(has(&s, "tv_control.power_off = true"));
+        s.power.watch = false;
+        assert!(has(&s, "needs power.watch = true"));
+        // Disabled: nothing.
+        s.tv_control.enabled = false;
+        assert!(!has(&s, "tv_control"));
+        assert!(s.summary().contains("tv_control=[off]"));
+        let s = Settings::default();
+        assert!(
+            s.summary()
+                .contains("tv_control=[on=screen,power_on,volume,mute,input,apps volume_limit=40 app_limit=30 firmware_guard=false]"),
+            "{}",
+            s.summary()
+        );
     }
 
     #[test]

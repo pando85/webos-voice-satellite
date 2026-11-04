@@ -14,8 +14,9 @@
 //! starts unpaired (or with the key stored in FILE) and HA can set a key while
 //! the window is open (`--pair-closed`: closed at start). Stdin commands:
 //! `ptt`, `wake`, `stop`, `mute`, `unmute`, `pair` (open the window),
-//! `reset-pairing`, `number VALUE|unknown` and `binary on|off|unknown` (states of
-//! the `--demo-entities`), `quit`. Log level: `FAKE_DEVICE_LOG=info|debug|trace`.
+//! `reset-pairing`, `number VALUE|unknown`, `binary on|off|unknown`,
+//! `switch on|off|unknown`, `text VALUE|unknown`, `select OPTION|unknown` and
+//! `options A,B,C` (states and options of the `--demo-entities`), `quit`. Log level: `FAKE_DEVICE_LOG=info|debug|trace`.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -27,7 +28,7 @@ use tokio::sync::mpsc;
 use webos_esphome_api::proto::{EntityCategory, NumberMode};
 use webos_esphome_api::{
     AppCommand, AppEvent, BinarySensorEntity, ButtonEntity, Config, NumberEntity, PipelineMode,
-    Provisioning, Server,
+    Provisioning, SelectEntity, Server, SwitchEntity, TextSensorEntity,
 };
 
 /// A number, two buttons and two binary sensors, to exercise the generic
@@ -58,6 +59,28 @@ fn add_demo_entities(cfg: &mut Config) {
         icon: String::new(),
         device_class: "restart".to_owned(),
         entity_category: EntityCategory::Config,
+    });
+    cfg.switches.push(SwitchEntity {
+        object_id: "demo_switch".to_owned(),
+        name: "Demo switch".to_owned(),
+        icon: "mdi:television".to_owned(),
+        device_class: "switch".to_owned(),
+        entity_category: EntityCategory::None,
+    });
+    cfg.text_sensors.push(TextSensorEntity {
+        object_id: "demo_text".to_owned(),
+        name: "Demo text".to_owned(),
+        icon: String::new(),
+        device_class: String::new(),
+        entity_category: EntityCategory::Diagnostic,
+    });
+    cfg.selects.push(SelectEntity {
+        object_id: "demo_select".to_owned(),
+        name: "Demo select".to_owned(),
+        icon: "mdi:apps".to_owned(),
+        options: vec!["App A".to_owned(), "App B".to_owned(), "Other".to_owned()],
+        entity_category: EntityCategory::None,
+        command_echo: false,
     });
     cfg.binary_sensors.push(BinarySensorEntity {
         object_id: "demo_state".to_owned(),
@@ -198,6 +221,7 @@ fn parse_args() -> (Config, Option<PipelineMode>) {
 }
 
 #[tokio::main(flavor = "current_thread")]
+#[allow(clippy::too_many_lines)] // one flat command table
 async fn main() {
     let level = match std::env::var("FAKE_DEVICE_LOG").as_deref() {
         Ok("trace") => log::LevelFilter::Trace,
@@ -247,6 +271,37 @@ async fn main() {
                 other if other.starts_with("number ") => AppCommand::SetNumber {
                     object_id: "demo_volume".to_owned(),
                     value: other["number ".len()..].trim().parse().ok(),
+                },
+                other if other.starts_with("switch ") => AppCommand::SetSwitch {
+                    object_id: "demo_switch".to_owned(),
+                    state: match other["switch ".len()..].trim() {
+                        "on" => Some(true),
+                        "off" => Some(false),
+                        _ => None,
+                    },
+                },
+                other if other.starts_with("text ") => AppCommand::SetTextSensor {
+                    object_id: "demo_text".to_owned(),
+                    state: match other["text ".len()..].trim() {
+                        "unknown" => None,
+                        v => Some(v.to_owned()),
+                    },
+                },
+                other if other.starts_with("select ") => match other["select ".len()..].trim() {
+                    "unknown" => AppCommand::ClearSelect {
+                        object_id: "demo_select".to_owned(),
+                    },
+                    v => AppCommand::SetSelect {
+                        object_id: "demo_select".to_owned(),
+                        option: v.to_owned(),
+                    },
+                },
+                other if other.starts_with("options ") => AppCommand::SetSelectOptions {
+                    object_id: "demo_select".to_owned(),
+                    options: other["options ".len()..]
+                        .split(',')
+                        .map(|o| o.trim().to_owned())
+                        .collect(),
                 },
                 other if other.starts_with("binary ") => AppCommand::SetBinarySensor {
                     object_id: "demo_state".to_owned(),

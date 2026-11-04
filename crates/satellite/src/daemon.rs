@@ -34,6 +34,7 @@ use crate::darken::{self, Action, Darkener};
 use crate::firmware::{self, Verdict};
 use crate::player::{Done, Kind, Player, redact_url};
 use crate::power::{self, PowerUpdate};
+use crate::tv_control::{self, Tv, TvMsg};
 use crate::volume::{self, SharedGain};
 use crate::watchdog::{self, Beats};
 use crate::{resume, volume::Origin};
@@ -232,6 +233,70 @@ pub(crate) async fn sleep_opt(at: Option<Instant>) {
         Some(t) => tokio::time::sleep_until(t).await,
         None => std::future::pending().await,
     }
+}
+
+/// Receives from an optional channel; never completes without one.
+async fn recv_opt<T>(rx: Option<&mut mpsc::UnboundedReceiver<T>>) -> Option<T> {
+    match rx {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Starts TV control when `[tv_control]` has anything on and `luna-send` is
+/// there (the power watch runs): the read-only capability check, then the
+/// entities are added to the server configuration. TV control is not gated by
+/// the firmware guard (owner decision 2026-11-04): on an unvalidated firmware it
+/// runs with a warning, unless `tv_control.follow_firmware_guard` is set.
+async fn start_tv_control(
+    settings: &Settings,
+    luna: Option<&PathBuf>,
+    verdict: &Verdict,
+    esp: &mut webos_esphome_api::Config,
+) -> Option<tv_control::Started> {
+    if !settings.tv_control.any() {
+        log::info!("tv_control: off ([tv_control] enabled = false or nothing switched on)");
+        return None;
+    }
+    let Some(luna) = luna else {
+        log::info!(
+            "tv_control: not started: luna-send was not found or power.watch is off (normal off the TV)"
+        );
+        return None;
+    };
+    let blocked = if settings.tv_control.follow_firmware_guard && !verdict.allows_capture() {
+        let why = match verdict {
+            Verdict::NotValidated(i) => {
+                format!("firmware {} is not in safety.validated_firmware", i.version)
+            }
+            _ => "the firmware version cannot be read".to_owned(),
+        };
+        log::warn!(
+            "tv_control: TV control SETTERS ARE OFF ({why}; tv_control.follow_firmware_guard = true); sensors and states still report"
+        );
+        Some(why)
+    } else {
+        match verdict {
+            Verdict::NotValidated(i) => log::warn!(
+                "tv_control: firmware {} is not in safety.validated_firmware; TV control runs anyway (owner decision 2026-11-04: not gated by the firmware guard; each control is checked at startup and a failing one is switched off)",
+                i.version
+            ),
+            Verdict::Unreadable(_) => log::warn!(
+                "tv_control: the firmware version cannot be read; TV control runs anyway (not gated by the firmware guard)"
+            ),
+            _ => {}
+        }
+        None
+    };
+    let mut started = tv_control::start(
+        settings,
+        luna.clone(),
+        blocked,
+        Path::new(tv_control::DECLARATION_DIR),
+    )
+    .await;
+    std::mem::take(&mut started.entities).add_to(esp);
+    Some(started)
 }
 
 async fn tick_opt(iv: Option<&mut tokio::time::Interval>) {
@@ -445,6 +510,12 @@ struct Daemon {
     remote_off_file: PathBuf,
     resume: resume::Detector,
     last_resume: Option<Instant>,
+    /// TV control (screen, power, volume, input, apps), when `luna-send` is
+    /// there and `[tv_control]` is on.
+    tv: Option<Tv>,
+    /// A conversation is in progress (wake word heard or push-to-talk until
+    /// the run ends): list changes of TV control wait.
+    in_run: bool,
 }
 
 impl Daemon {
@@ -640,8 +711,70 @@ impl Daemon {
         }
         let inhibit = self.gate.kill.then_some("the kill switch is on");
         let action = self.darkener.on_update(now, &shown, inhibit);
+        let tv_out = self
+            .tv
+            .as_mut()
+            .map(|tv| tv.on_power(&shown.state_key(), !shown.processing_key().is_empty()));
         self.last_power = Some(shown);
         self.run_action(action);
+        if let Some(out) = tv_out {
+            self.apply_tv(out).await;
+        }
+    }
+
+    /// Sends what TV control produced: states and options for HA, and the
+    /// darkener's note that the satellite woke the TV itself.
+    async fn apply_tv(&mut self, out: tv_control::Outcome) {
+        if out.own_wake {
+            self.darkener.note_own_wake();
+        }
+        for cmd in out.commands {
+            self.send(cmd).await;
+        }
+    }
+
+    async fn on_tv_msg(&mut self, msg: TvMsg) {
+        let out = self.tv.as_mut().map(|tv| tv.on_msg(msg));
+        if let Some(out) = out {
+            self.apply_tv(out).await;
+        }
+    }
+
+    /// What the power-off of `tv_power` needs from the daemon (design
+    /// section 4.2): the select, the kill switch and the darkener's verdict.
+    fn tv_env(&self) -> webos_tv_control::PowerOffEnv {
+        webos_tv_control::PowerOffEnv {
+            keep_listening: self.darkener.mode() == RemoteOff::KeepListening,
+            kill_switch: self.gate.kill,
+            darkener: self.darkener.would_act(Instant::now(), None),
+        }
+    }
+
+    /// Drives TV control's clock and applies new select options when no
+    /// conversation or reply is running (HA reconnects to list them).
+    async fn poll_tv(&mut self) {
+        let env = self.tv_env();
+        let Some(tv) = self.tv.as_mut() else {
+            return;
+        };
+        let out = tv.tick(env);
+        let pending = tv.pending_options();
+        self.apply_tv(out).await;
+        if pending.is_empty() || self.in_run || self.player.is_active() {
+            return;
+        }
+        for (id, options) in pending {
+            log::info!("tv_control: new options for {id}; Home Assistant lists the entities again");
+            self.send(AppCommand::SetSelectOptions {
+                object_id: id.to_owned(),
+                options,
+            })
+            .await;
+            let out = self.tv.as_mut().map(|tv| tv.options_applied(id));
+            if let Some(out) = out {
+                self.apply_tv(out).await;
+            }
+        }
     }
 
     /// Runs a wake-and-darken call in the background (logged).
@@ -692,6 +825,10 @@ impl Daemon {
             self.shared.xruns.load(Ordering::Relaxed)
         );
         self.send(AppCommand::Resumed).await;
+        let out = self.tv.as_mut().map(Tv::on_resume);
+        if let Some(out) = out {
+            self.apply_tv(out).await;
+        }
     }
 
     /// Called every kill-switch poll: resume detection and the darkener's
@@ -731,6 +868,12 @@ impl Daemon {
             self.on_timer(&ev);
             return;
         }
+        // A command for a TV control entity.
+        let tv_out = self.tv.as_mut().and_then(|tv| tv.on_event(&ev));
+        if let Some(out) = tv_out {
+            self.apply_tv(out).await;
+            return;
+        }
         match ev {
             AppEvent::HaConnected { client_info, peer } => {
                 self.connected = true;
@@ -738,6 +881,7 @@ impl Daemon {
             }
             AppEvent::HaDisconnected => {
                 self.connected = false;
+                self.in_run = false;
                 self.set_streaming(false);
                 log::warn!("HA disconnected");
                 // Playback was already stopped through StopPlayback if it
@@ -747,6 +891,7 @@ impl Daemon {
                 }
             }
             AppEvent::StartStreaming { wake_word, .. } => {
+                self.in_run |= !wake_word;
                 self.set_streaming(true);
                 log::info!(
                     "streaming mic audio to HA ({})",
@@ -763,6 +908,7 @@ impl Daemon {
                 log::info!("stopped streaming mic audio");
             }
             AppEvent::WakeWordDetected => {
+                self.in_run = true;
                 log::info!("wake word detected by HA");
                 self.runs.wake(now);
             }
@@ -827,6 +973,7 @@ impl Daemon {
                 }
             }
             AppEvent::RunEnd => {
+                self.in_run = false;
                 log::info!("pipeline run end");
                 Self::log_line(self.runs.run_end());
             }
@@ -948,6 +1095,10 @@ pub(crate) async fn run(mut settings: Settings, triggers: TestTriggers) -> Resul
     } else if remote_off == RemoteOff::KeepListening {
         log::warn!("power: remote_off = keep_listening needs the power watch; ignored");
     }
+    // TV control: the capability check (read-only calls) before the entities
+    // are listed. The firmware guard decides whether setters may run.
+    let verdict = firmware::check(&settings);
+    let mut tv_started = start_tv_control(&settings, luna.as_ref(), &verdict, &mut esp).await;
     // Reply volume.
     let (reply_volume, origin) = volume::load(&settings.sink.volume_file, settings.sink.volume);
     match origin {
@@ -986,7 +1137,6 @@ pub(crate) async fn run(mut settings: Settings, triggers: TestTriggers) -> Resul
     let mut sigusr1 = signal(SignalKind::user_defined1()).map_err(|e| e.to_string())?;
 
     // Microphone gate: firmware guard, kill switch and the remembered mute.
-    let verdict = firmware::check(&settings);
     let gated = settings.mic.source == MicSource::Alsa;
     match &verdict {
         Verdict::Validated(_) => log::info!("firmware guard: {verdict}"),
@@ -1092,7 +1242,30 @@ pub(crate) async fn run(mut settings: Settings, triggers: TestTriggers) -> Resul
         remote_off_file: settings.power.remote_off_file.clone(),
         resume: resume::Detector::default(),
         last_resume: None,
+        tv: None,
+        in_run: false,
     };
+    let mut tv_rx = None;
+    if let Some(started) = tv_started.take() {
+        let tv_control::Started {
+            tv,
+            effects,
+            rx,
+            entities: _,
+        } = started;
+        d.tv = Some(tv);
+        tv_rx = Some(rx);
+        // The first states and the subscriptions, now that the server runs.
+        let out = d.tv.as_mut().map(|tv| tv.exec(effects));
+        if let Some(out) = out {
+            d.apply_tv(out).await;
+        }
+    }
+    let mut tv_tick = d.tv.as_ref().map(|_| {
+        let mut iv = tokio::time::interval(tv_control::TICK);
+        iv.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        iv
+    });
     // The first reading is the baseline.
     d.resume.observe(resume::suspended_total());
     let mut pairing_poll = settings.pairing_active().then(|| {
@@ -1126,6 +1299,8 @@ pub(crate) async fn run(mut settings: Settings, triggers: TestTriggers) -> Resul
             }
             Some(done) = done_rx.recv() => d.on_done(done).await,
             Some(u) = power_rx.recv() => d.on_power(u).await,
+            Some(m) = recv_opt(tv_rx.as_mut()) => d.on_tv_msg(m).await,
+            () = tick_opt(tv_tick.as_mut()) => d.poll_tv().await,
             _ = sigterm.recv() => {
                 log::info!("SIGTERM: shutting down");
                 break;
@@ -1171,6 +1346,9 @@ pub(crate) async fn run(mut settings: Settings, triggers: TestTriggers) -> Resul
     beats.disarmed.store(true, Ordering::Relaxed);
     if let Some(w) = power_watch {
         w.shutdown().await;
+    }
+    if let Some(tv) = d.tv.take() {
+        tv.shutdown().await;
     }
     d.set_streaming(false);
     d.player.shutdown().await;

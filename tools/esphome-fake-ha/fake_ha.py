@@ -37,6 +37,12 @@ from aioesphomeapi import (
     NumberInfo,
     NumberMode,
     NumberState,
+    SelectInfo,
+    SelectState,
+    SwitchInfo,
+    SwitchState,
+    TextSensorInfo,
+    TextSensorState,
     ConnectionClosedEvent,
     DisconnectReason,
     InvalidEncryptionKeyAPIError,
@@ -586,6 +592,88 @@ async def scenario_entities(binary: str) -> None:
         await dev.stop()
 
 
+async def scenario_generic_entities(binary: str) -> None:
+    """switch, text_sensor and an application-owned select: listing, states, commands, options."""
+    print("\n== scenario I: switch / text_sensor / app-owned select entities ==")
+    dev = Device(binary, ["--mode", "none", "--demo-entities", "--mac", "02:00:00:00:00:0e"], None)
+    await dev.start()
+    ha = FakeHA(dev.port)
+    try:
+        cli = await ha.connect()
+        _info, entities, _ = await cli.device_info_and_list_entities()
+        sws = {e.object_id: e for e in entities if isinstance(e, SwitchInfo)}
+        txt = [e for e in entities if isinstance(e, TextSensorInfo) and e.object_id == "demo_text"]
+        sels = [e for e in entities if isinstance(e, SelectInfo) and e.object_id == "demo_select"]
+        sw = sws.get("demo_switch")
+        check("I1 generic switch listed next to the mute switch (no category, class switch)",
+              sw is not None and "mute_microphone" in sws and sw.entity_category == EntityCategory.NONE
+              and sw.device_class == "switch" and sws["mute_microphone"].entity_category == EntityCategory.CONFIG,
+              str(sws))
+        check("I2 text sensor listed as a diagnostic",
+              len(txt) == 1 and txt[0].entity_category == EntityCategory.DIAGNOSTIC, str(txt))
+        check("I3 select listed with its options, no category",
+              len(sels) == 1 and list(sels[0].options) == ["App A", "App B", "Other"]
+              and sels[0].entity_category == EntityCategory.NONE, str(sels))
+        sel = sels[0]
+        states: dict[int, object] = {}
+        cli.subscribe_states(lambda st: states.__setitem__(st.key, st))
+        ok = await until_true(lambda: sw.key in states and txt[0].key in states and sel.key in states)
+        check("I4 initial states are missing_state (unknown) for all three",
+              ok and states[sw.key].missing_state and states[txt[0].key].missing_state
+              and states[sel.key].missing_state, f"{states}")
+
+        await dev.command("switch on")
+        await dev.command("text external_arc")
+        await dev.command("select App B")
+        ok = await until_true(lambda: isinstance(states[sw.key], SwitchState) and states[sw.key].state is True
+                              and not states[sw.key].missing_state
+                              and isinstance(states[txt[0].key], TextSensorState)
+                              and states[txt[0].key].state == "external_arc"
+                              and isinstance(states[sel.key], SelectState) and states[sel.key].state == "App B")
+        check("I5 states pushed on change (switch on, text, select)", ok, f"{states}")
+
+        cli.switch_command(sw.key, False)
+        ev = await dev.wait_event("SwitchChanged")
+        check("I6 switch command reaches the app", ev == 'SwitchChanged { object_id: "demo_switch", state: false }', ev)
+        await asyncio.sleep(0.2)
+        check("I7 the command is not echoed as a state (the app owns the truth)",
+              states[sw.key].state is True, str(states[sw.key]))
+        cli.select_command(sel.key, "App A")
+        ev = await dev.wait_event("SelectChanged")
+        check("I8 select command reaches the app", 'object_id: "demo_select"' in ev and "App A" in ev, ev)
+        await asyncio.sleep(0.2)
+        check("I9 the select command is not echoed either", states[sel.key].state == "App B", str(states[sel.key]))
+        cli.select_command(sel.key, "No such app")
+        await asyncio.sleep(0.3)
+        check("I10 an invalid option is rejected (no event) and the state is re-sent",
+              dev.count_since("SelectChanged", 0) == 1 and states[sel.key].state == "App B", str(dev.events))
+        await dev.command("switch unknown")
+        await dev.command("select unknown")
+        await dev.command("text unknown")
+        ok = await until_true(lambda: states[sw.key].missing_state and states[sel.key].missing_state
+                              and states[txt[0].key].missing_state)
+        check("I11 all three can go back to unknown", ok, f"{states}")
+
+        # New options: HA is disconnected so it lists again.
+        await dev.command("switch on")
+        await dev.command("options App A, App B, App C, Other")
+        await dev.wait_event("HaDisconnected")
+        ha2 = FakeHA(dev.port)
+        cli2 = await ha2.connect()
+        _i, entities2, _ = await cli2.device_info_and_list_entities()
+        sel2 = [e for e in entities2 if isinstance(e, SelectInfo) and e.object_id == "demo_select"][0]
+        check("I12 a changed option list closes the connection; the next listing has the new options and the same key",
+              list(sel2.options) == ["App A", "App B", "App C", "Other"] and sel2.key == sel.key, str(sel2))
+        states2: dict[int, object] = {}
+        cli2.subscribe_states(lambda st: states2.__setitem__(st.key, st))
+        ok = await until_true(lambda: sel2.key in states2 and sw.key in states2)
+        check("I13 after the change the select has no state until the app sets one; the switch state is kept",
+              ok and states2[sel2.key].missing_state and states2[sw.key].state is True, f"{states2}")
+        await cli2.disconnect()
+    finally:
+        await dev.stop()
+
+
 async def provision_over_zero_psk(port: int, key: bytes) -> bool:
     """What HA 2026.10.4's _async_provision_key_over_noise does."""
     cli = APIClient("127.0.0.1", port, "", client_info="fake-ha-provision", noise_psk=ZERO_NOISE_PSK)
@@ -910,7 +998,7 @@ async def main() -> int:
     failed = False
     for scenario in (scenario_plaintext_speaker, scenario_noise_url, scenario_timers,
                      scenario_pairing, scenario_pairing_window, scenario_window_behind_router,
-                     scenario_key_clear, scenario_entities):
+                     scenario_key_clear, scenario_entities, scenario_generic_entities):
         try:
             await scenario(args.device)
         except Exception as err:  # noqa: BLE001

@@ -168,6 +168,15 @@ pub enum AppEvent {
         /// The button's object id.
         object_id: String,
     },
+    /// HA switched a generic switch entity ([`crate::Config::switches`]). The
+    /// server does not echo the value: the application acts on it and reports
+    /// the resulting state with [`AppCommand::SetSwitch`].
+    SwitchChanged {
+        /// The switch's object id.
+        object_id: String,
+        /// The state HA asked for.
+        state: bool,
+    },
     /// A timer event from HA. Only sent when the `TIMERS` feature
     /// ([`crate::features::TIMERS`]) is enabled. HA owns and counts the timers;
     /// the device shows or sounds them (see [`crate::TimerTable`]).
@@ -256,6 +265,44 @@ pub enum AppCommand {
         object_id: String,
         /// The value, or `None` for unknown.
         value: Option<f32>,
+    },
+    /// The state of a generic switch entity ([`crate::Config::switches`]).
+    /// `None` means no valid state (HA shows "unknown"). Sent to HA on every
+    /// change and again when HA connects or resubscribes; an unchanged state
+    /// is not repeated.
+    SetSwitch {
+        /// The switch's object id.
+        object_id: String,
+        /// The state, or `None` for unknown.
+        state: Option<bool>,
+    },
+    /// The state of a text sensor entity ([`crate::Config::text_sensors`]).
+    /// `None` means no valid state (HA shows "unknown"). An unchanged state is
+    /// not repeated.
+    SetTextSensor {
+        /// The sensor's object id.
+        object_id: String,
+        /// The text, or `None` for unknown.
+        state: Option<String>,
+    },
+    /// Puts a select entity ([`crate::Config::selects`]) back to "no valid
+    /// state" (HA shows "unknown").
+    ClearSelect {
+        /// The select's object id.
+        object_id: String,
+    },
+    /// Replaces the options of a select entity (an app list that changed).
+    /// HA reads the options when it lists the entities, so when the list
+    /// differs the server **closes the HA connection** (HA reconnects at once
+    /// and lists the entities again) and the select has no state until the
+    /// application sends [`AppCommand::SetSelect`] again. The application
+    /// decides when it is safe to interrupt (no conversation in progress).
+    /// An empty list or an unknown id is ignored with a log line.
+    SetSelectOptions {
+        /// The select's object id.
+        object_id: String,
+        /// The new options, in display order.
+        options: Vec<String>,
     },
     /// The state of a binary sensor entity ([`crate::Config::binary_sensors`]).
     /// `None` means no valid state (HA shows "unknown"). Sent to HA on every
@@ -348,6 +395,11 @@ impl fmt::Debug for AppEvent {
                 .debug_struct("ButtonPressed")
                 .field("object_id", object_id)
                 .finish(),
+            Self::SwitchChanged { object_id, state } => f
+                .debug_struct("SwitchChanged")
+                .field("object_id", object_id)
+                .field("state", state)
+                .finish(),
             // The timer name is user speech: id, event and seconds only.
             Self::Timer {
                 event,
@@ -404,6 +456,27 @@ impl fmt::Debug for AppCommand {
                 .debug_struct("SetBinarySensor")
                 .field("object_id", object_id)
                 .field("state", state)
+                .finish(),
+            Self::SetSwitch { object_id, state } => f
+                .debug_struct("SetSwitch")
+                .field("object_id", object_id)
+                .field("state", state)
+                .finish(),
+            // A text sensor or an option may hold an app title or an input
+            // label: sizes only.
+            Self::SetTextSensor { object_id, state } => f
+                .debug_struct("SetTextSensor")
+                .field("object_id", object_id)
+                .field("state_bytes", &state.as_ref().map(String::len))
+                .finish(),
+            Self::ClearSelect { object_id } => f
+                .debug_struct("ClearSelect")
+                .field("object_id", object_id)
+                .finish(),
+            Self::SetSelectOptions { object_id, options } => f
+                .debug_struct("SetSelectOptions")
+                .field("object_id", object_id)
+                .field("options", &options.len())
                 .finish(),
         }
     }

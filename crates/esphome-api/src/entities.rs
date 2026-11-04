@@ -9,7 +9,10 @@
 //! binary sensor with no valid state is sent with `missing_state` (HA shows
 //! "unknown").
 
-use crate::config::{BinarySensorEntity, ButtonEntity, NumberEntity, Resolved, SelectEntity};
+use crate::config::{
+    BinarySensorEntity, ButtonEntity, NumberEntity, Resolved, SelectEntity, SwitchEntity,
+    TextSensorEntity,
+};
 use crate::proto::{
     BinarySensorStateResponse, EntityCategory, ListEntitiesBinarySensorResponse,
     ListEntitiesButtonResponse, ListEntitiesMediaPlayerResponse, ListEntitiesNumberResponse,
@@ -208,7 +211,54 @@ pub(crate) fn list_select(sel: &SelectEntity) -> ListEntitiesSelectResponse {
         name: sel.name.clone(),
         icon: sel.icon.clone(),
         options: sel.options.clone(),
-        entity_category: EntityCategory::Config as i32,
+        entity_category: sel.entity_category as i32,
+        ..Default::default()
+    }
+}
+
+pub(crate) fn list_switch(sw: &SwitchEntity) -> ListEntitiesSwitchResponse {
+    ListEntitiesSwitchResponse {
+        object_id: sw.object_id.clone(),
+        key: entity_key(&sw.object_id),
+        name: sw.name.clone(),
+        icon: sw.icon.clone(),
+        device_class: sw.device_class.clone(),
+        entity_category: sw.entity_category as i32,
+        ..Default::default()
+    }
+}
+
+/// `None`: no valid state (HA shows "unknown").
+pub(crate) fn switch_state(sw: &SwitchEntity, state: Option<bool>) -> SwitchStateResponse {
+    SwitchStateResponse {
+        key: entity_key(&sw.object_id),
+        state: state.unwrap_or_default(),
+        missing_state: state.is_none(),
+        ..Default::default()
+    }
+}
+
+pub(crate) fn list_text_sensor(t: &TextSensorEntity) -> ListEntitiesTextSensorResponse {
+    ListEntitiesTextSensorResponse {
+        object_id: t.object_id.clone(),
+        key: entity_key(&t.object_id),
+        name: t.name.clone(),
+        icon: t.icon.clone(),
+        device_class: t.device_class.clone(),
+        entity_category: t.entity_category as i32,
+        ..Default::default()
+    }
+}
+
+/// `None`: no valid state (HA shows "unknown").
+pub(crate) fn text_sensor_state(
+    t: &TextSensorEntity,
+    state: Option<&str>,
+) -> TextSensorStateResponse {
+    TextSensorStateResponse {
+        key: entity_key(&t.object_id),
+        state: state.unwrap_or_default().to_owned(),
+        missing_state: state.is_none(),
         ..Default::default()
     }
 }
@@ -385,6 +435,70 @@ mod tests {
         assert!(on.state && !on.missing_state);
         let off = binary_sensor_state(&s, Some(false));
         assert!(!off.state && !off.missing_state);
+    }
+
+    #[test]
+    fn switch_and_text_sensor_listing_and_state() {
+        let sw = SwitchEntity {
+            object_id: "tv_mute".to_owned(),
+            name: "TV mute".to_owned(),
+            icon: "mdi:volume-off".to_owned(),
+            device_class: "switch".to_owned(),
+            entity_category: EntityCategory::None,
+        };
+        let l = list_switch(&sw);
+        assert_eq!(
+            (l.key, l.object_id.as_str(), l.device_class.as_str()),
+            (entity_key("tv_mute"), "tv_mute", "switch")
+        );
+        assert_eq!(l.entity_category, EntityCategory::None as i32);
+        assert!(switch_state(&sw, None).missing_state);
+        let on = switch_state(&sw, Some(true));
+        assert!(on.state && !on.missing_state);
+        let off = switch_state(&sw, Some(false));
+        assert!(!off.state && !off.missing_state);
+        let t = TextSensorEntity {
+            object_id: "tv_sound_output".to_owned(),
+            name: "TV sound output".to_owned(),
+            icon: String::new(),
+            device_class: String::new(),
+            entity_category: EntityCategory::Diagnostic,
+        };
+        let l = list_text_sensor(&t);
+        assert_eq!(
+            (l.key, l.entity_category),
+            (
+                entity_key("tv_sound_output"),
+                EntityCategory::Diagnostic as i32
+            )
+        );
+        assert!(text_sensor_state(&t, None).missing_state);
+        let st = text_sensor_state(&t, Some("external_arc"));
+        assert!(!st.missing_state);
+        assert_eq!(st.state, "external_arc");
+    }
+
+    #[test]
+    fn select_listing_carries_the_category() {
+        let mut sel = SelectEntity {
+            object_id: "tv_input".to_owned(),
+            name: "TV input".to_owned(),
+            icon: String::new(),
+            options: vec!["A".to_owned(), "Other".to_owned()],
+            entity_category: EntityCategory::None,
+            command_echo: false,
+        };
+        assert_eq!(
+            list_select(&sel).entity_category,
+            EntityCategory::None as i32
+        );
+        sel.entity_category = EntityCategory::Config;
+        assert_eq!(
+            list_select(&sel).entity_category,
+            EntityCategory::Config as i32
+        );
+        assert!(select_state(&sel, None).missing_state);
+        assert!(!select_state(&sel, Some("A")).missing_state);
     }
 
     #[test]

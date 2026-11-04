@@ -122,6 +122,8 @@ On HBC 0.6.3 (c3-a) install, `ctl.sh` set up with the existing HA identity, star
 | `Apache-2.0 AND ISC` | 1 (`ring` 0.17.14) | yes, **check on release** | Both terms apply. Its `LICENSE` files list ISC, Apache-2.0 (BoringSSL parts) and once_cell (MIT/Apache-2.0); none of them is the OpenSSL advertising-clause license that GPLv3 rejects. Pulled in by `rustls` through `ureq` (`webos-playback`), so it is in the TV binary. Confirm the file-by-file notices when the release notice file is generated |
 | `CDLA-Permissive-2.0` | 1 (`webpki-roots` 1.0.11, the Mozilla CA bundle as data) | yes (permissive, attribution) | **Not on the FSF list, and `cargo deny` rejects it unless allowed explicitly.** It is a permissive data license with no copyleft; judged compatible, but unclear to a strict reviewer. In the TV binary through `ureq`. Flag for the owner: either accept it, or build `ureq` against the TV's own CA store instead |
 
+Added 2026-11-04 with the TV control crate (`webos-tv-control`): `serde_json` 1.0.154 (`MIT OR Apache-2.0`) and `zmij` 1.0.23 (`MIT`), both pure Rust; the other counts above are unchanged (182 external packages).
+
 No GPL-2.0-only, proprietary, missing or unknown licenses. Nothing is incompatible. Flags for the owner:
 
 1. `webpki-roots` (`CDLA-Permissive-2.0`): unusual license, judged fine.

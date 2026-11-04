@@ -342,6 +342,58 @@ impl Darkener {
     pub(crate) fn busy(&self) -> bool {
         self.phase != Phase::Idle
     }
+
+    /// The current mode.
+    pub(crate) fn mode(&self) -> RemoteOff {
+        self.mode
+    }
+
+    /// Whether this machine would act on a remote power-off now: the mode is
+    /// keep-listening, nothing inhibits it, no wake or darken is in
+    /// progress, the hourly budget has room and the cooldown has passed. TV
+    /// control asks before it sends the power key for Home Assistant, so a
+    /// refusal here becomes a refusal of the key (design section 4.2): the
+    /// key would otherwise end in LG standby or Suspend. Does not change
+    /// anything; the budget is spent when the machine acts.
+    pub(crate) fn would_act(&self, now: Instant, inhibit: Option<&str>) -> Result<(), String> {
+        if self.mode != RemoteOff::KeepListening {
+            return Err("the remote power-off mode is not keep listening".to_owned());
+        }
+        if let Some(why) = inhibit {
+            return Err(why.to_owned());
+        }
+        if self.phase != Phase::Idle {
+            return Err("a wake or darken is in progress".to_owned());
+        }
+        let hour = Duration::from_secs(3600);
+        let recent = self
+            .actions
+            .iter()
+            .filter(|t| now.saturating_duration_since(**t) < hour)
+            .count();
+        if recent >= self.max_per_hour {
+            return Err(format!("{recent} actions in the last hour (limit)"));
+        }
+        if let Some(last) = self.actions.back() {
+            let since = now.saturating_duration_since(*last);
+            if since < self.cooldown {
+                return Err(format!(
+                    "cooldown ({} s since the last action)",
+                    since.as_secs()
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The satellite itself woke the TV (TV control's turn-on): the screen
+    /// is no longer dark by the darkener's doing. Not while a wake or darken
+    /// of its own is running.
+    pub(crate) fn note_own_wake(&mut self) {
+        if self.phase == Phase::Idle {
+            self.dark = false;
+        }
+    }
 }
 
 /// Object id of the HA select.
@@ -360,6 +412,8 @@ pub(crate) fn select_entity() -> webos_esphome_api::SelectEntity {
         name: SELECT_NAME.to_owned(),
         icon: "mdi:power-standby".to_owned(),
         options: vec![OPTION_NORMAL.to_owned(), OPTION_KEEP_LISTENING.to_owned()],
+        entity_category: webos_esphome_api::proto::EntityCategory::Config,
+        command_echo: true,
     }
 }
 
@@ -404,6 +458,8 @@ pub(crate) fn load_mode(path: &std::path::Path) -> Result<Option<RemoteOff>, Str
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)]
+
     use super::*;
 
     fn st(state: &str) -> PowerUpdate {
@@ -655,5 +711,84 @@ mod tests {
         t.d.set_mode(RemoteOff::Normal);
         assert!(!t.d.busy());
         assert_eq!(t.up(7000, &st("Active")), None);
+    }
+
+    #[test]
+    fn would_act_mirrors_the_conditions_of_acting() {
+        let mut t = T::new(RemoteOff::Normal);
+        assert!(
+            t.d.would_act(t.at(0), None)
+                .unwrap_err()
+                .contains("not keep listening")
+        );
+        t.d.set_mode(RemoteOff::KeepListening);
+        assert_eq!(t.d.mode(), RemoteOff::KeepListening);
+        assert_eq!(t.d.would_act(t.at(0), None), Ok(()));
+        assert_eq!(
+            t.d.would_act(t.at(0), Some("kill switch")),
+            Err("kill switch".to_owned())
+        );
+        // Acting spends the budget and starts the cooldown; would_act itself
+        // changes nothing.
+        t.up(0, &st("Active"));
+        for _ in 0..5 {
+            assert_eq!(t.d.would_act(t.at(500), None), Ok(()));
+        }
+        assert_eq!(t.power_off(1000, "Active", "remoteKey"), Some(Action::Wake));
+        // A wake is in progress.
+        assert!(
+            t.d.would_act(t.at(5000), None)
+                .unwrap_err()
+                .contains("in progress")
+        );
+        t.up(5000, &st("Active"));
+        t.up(5500, &st("Screen Off"));
+        assert!(!t.d.busy());
+        // Cooldown: 20 s from the action at 4100 ms.
+        assert!(
+            t.d.would_act(t.at(10_000), None)
+                .unwrap_err()
+                .contains("cooldown")
+        );
+        assert_eq!(t.d.would_act(t.at(25_000), None), Ok(()));
+        // The hourly limit: nine more actions fill it.
+        let mut ms = 40_000;
+        for _ in 0..9 {
+            t.up(ms, &st("Active"));
+            t.d.set_mode(RemoteOff::KeepListening);
+            assert_eq!(
+                t.power_off(ms + 100, "Active", "remoteKey"),
+                Some(Action::Wake)
+            );
+            t.up(ms + 5000, &st("Active"));
+            t.up(ms + 5200, &st("Screen Off"));
+            ms += 30_000;
+        }
+        t.d.set_mode(RemoteOff::KeepListening);
+        let err = t.d.would_act(t.at(ms), None).unwrap_err();
+        assert!(err.contains("10 actions in the last hour"), "{err}");
+        // An hour after the first action there is room again.
+        assert_eq!(t.d.would_act(t.at(3_700_000), None), Ok(()));
+    }
+
+    #[test]
+    fn an_own_wake_clears_the_dark_by_us_bookkeeping_but_not_mid_action() {
+        let mut t = T::new(RemoteOff::KeepListening);
+        t.up(0, &st("Active"));
+        assert_eq!(t.power_off(1000, "Active", "remoteKey"), Some(Action::Wake));
+        t.d.on_update(t.at(5000), &st("Active"), None);
+        t.d.on_update(t.at(5100), &st("Screen Off"), None);
+        assert!(t.d.screen_dark_by_us());
+        t.d.note_own_wake();
+        assert!(!t.d.screen_dark_by_us());
+        // In the middle of a wake the flag is left alone.
+        t.up(10_000, &st("Active"));
+        assert_eq!(
+            t.power_off(40_000, "Active", "remoteKey"),
+            Some(Action::Wake)
+        );
+        assert!(t.d.busy());
+        t.d.note_own_wake();
+        assert!(t.d.busy());
     }
 }

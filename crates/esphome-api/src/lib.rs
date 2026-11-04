@@ -32,13 +32,20 @@
 //! - Entities: a media player whose single ANNOUNCEMENT format (default
 //!   flac/22050/mono/16-bit) is HA's TTS format in URL mode and the format of
 //!   proxied announcement media, and a "Mute microphone" switch. The
-//!   application can add `select`, `number`, `button` and `binary_sensor`
-//!   entities ([`Config::selects`], [`Config::numbers`], [`Config::buttons`],
-//!   [`Config::binary_sensors`]) with stable object ids and keys; states go
-//!   out with [`AppCommand::SetSelect`], [`AppCommand::SetNumber`] and
-//!   [`AppCommand::SetBinarySensor`], HA's commands arrive as
-//!   [`AppEvent::SelectChanged`], [`AppEvent::NumberChanged`] and
-//!   [`AppEvent::ButtonPressed`].
+//!   application can add `select`, `number`, `button`, `binary_sensor`,
+//!   `switch` and `text_sensor` entities ([`Config::selects`],
+//!   [`Config::numbers`], [`Config::buttons`], [`Config::binary_sensors`],
+//!   [`Config::switches`], [`Config::text_sensors`]) with stable object ids
+//!   and keys; states go out with [`AppCommand::SetSelect`] (or
+//!   [`AppCommand::ClearSelect`]), [`AppCommand::SetNumber`],
+//!   [`AppCommand::SetBinarySensor`], [`AppCommand::SetSwitch`] and
+//!   [`AppCommand::SetTextSensor`], HA's commands arrive as
+//!   [`AppEvent::SelectChanged`], [`AppEvent::NumberChanged`],
+//!   [`AppEvent::ButtonPressed`] and [`AppEvent::SwitchChanged`]. A select
+//!   whose [`SelectEntity::command_echo`] is false, a number and a generic
+//!   switch are not echoed: HA shows what the application reports.
+//!   [`AppCommand::SetSelectOptions`] changes a select's options at run time
+//!   (the HA connection is closed so HA lists the entities again).
 //!
 //! # Usage
 //!
@@ -129,7 +136,7 @@ mod voice;
 pub use app::{AppCommand, AppEvent, PairingEvent, PipelineMode};
 pub use config::{
     AudioFormat, BinarySensorEntity, ButtonEntity, Config, ConfigError, Mac, NumberEntity,
-    SelectEntity, features,
+    SelectEntity, SwitchEntity, TextSensorEntity, features,
 };
 pub use frame::{NOISE_PREAMBLE, PLAINTEXT_PREAMBLE};
 pub use pairing::Provisioning;

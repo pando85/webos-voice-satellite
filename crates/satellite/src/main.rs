@@ -24,6 +24,9 @@ mod player;
 mod power;
 mod resume;
 mod selftest;
+#[cfg(test)]
+mod testutil;
+mod tv_control;
 mod volume;
 mod watchdog;
 

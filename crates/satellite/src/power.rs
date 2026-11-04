@@ -234,16 +234,18 @@ fn open_pty() -> std::io::Result<(std::fs::File, std::os::fd::OwnedFd)> {
     Ok((std::fs::File::from(master), slave))
 }
 
-/// Starts `luna-send -i` on a pty; lines arrive on the receiver, which
-/// closes when the child's terminal is gone.
+/// Starts `luna-send -i <uri> <payload>` on a pty; lines arrive on the
+/// receiver, which closes when the child's terminal is gone.
 fn start_child(
     luna: &Path,
+    uri: &str,
+    payload: &str,
 ) -> std::io::Result<(tokio::process::Child, mpsc::UnboundedReceiver<String>)> {
     let (master, slave) = open_pty()?;
     let mut cmd = Command::new(luna);
     cmd.arg("-i")
-        .arg(POWER_STATE_URI)
-        .arg(r#"{"subscribe":true}"#)
+        .arg(uri)
+        .arg(payload)
         .stdin(Stdio::from(slave.try_clone()?))
         .stdout(Stdio::from(slave.try_clone()?))
         .stderr(Stdio::from(slave))
@@ -296,26 +298,93 @@ impl Watch {
     }
 }
 
-/// Starts the supervised subscription; updates go to `tx`.
+/// What a line of a subscription child was.
+enum LineOutcome {
+    /// Handled; counts as the first answer.
+    Answer,
+    /// Handled; not an answer (noise).
+    Noise,
+    /// The receiver is gone: stop the child and the task.
+    Closed,
+}
+
+/// Starts the supervised power state subscription; updates go to `tx`.
 pub(crate) fn spawn(luna: PathBuf, tx: mpsc::UnboundedSender<PowerUpdate>) -> Watch {
+    spawn_with(
+        luna,
+        POWER_STATE_URI,
+        "power",
+        "TV power state",
+        move |line| match parse_line(line) {
+            Line::Update(u) => {
+                if tx.send(u).is_err() {
+                    return LineOutcome::Closed;
+                }
+                LineOutcome::Answer
+            }
+            Line::Error(e) => {
+                log::warn!("power: getPowerState answered an error: {e}");
+                LineOutcome::Answer
+            }
+            Line::Other => {
+                log::debug!("power: luna-send line ignored ({} bytes)", line.len());
+                LineOutcome::Noise
+            }
+        },
+    )
+}
+
+/// Starts a supervised `luna-send -i <uri> {"subscribe":true}` child (same
+/// terminal, backoff and shutdown as the power watch); every output line that
+/// starts with `{` is passed to `on_line`, which returns false to stop. TV
+/// control uses it for the volume and the foreground app.
+pub(crate) fn spawn_lines(
+    luna: PathBuf,
+    uri: &'static str,
+    label: &'static str,
+    what: &'static str,
+    mut on_line: impl FnMut(String) -> bool + Send + 'static,
+) -> Watch {
+    spawn_with(luna, uri, label, what, move |line| {
+        if !line.trim_start().starts_with('{') {
+            return LineOutcome::Noise;
+        }
+        if on_line(line.to_owned()) {
+            LineOutcome::Answer
+        } else {
+            LineOutcome::Closed
+        }
+    })
+}
+
+fn spawn_with(
+    luna: PathBuf,
+    uri: &'static str,
+    label: &'static str,
+    what: &'static str,
+    on_line: impl FnMut(&str) -> LineOutcome + Send + 'static,
+) -> Watch {
     let (stop, stop_rx) = watch::channel(false);
-    let task = tokio::spawn(run(luna, tx, stop_rx));
+    let task = tokio::spawn(run(luna, uri, label, what, on_line, stop_rx));
     Watch { stop, task }
 }
 
 async fn run(
     luna: PathBuf,
-    tx: mpsc::UnboundedSender<PowerUpdate>,
+    uri: &'static str,
+    label: &'static str,
+    what: &'static str,
+    mut on_line: impl FnMut(&str) -> LineOutcome,
     mut stop: watch::Receiver<bool>,
 ) {
     let mut backoff = Backoff::default();
     let mut start_warned = false;
     loop {
         let started = Instant::now();
-        match start_child(&luna) {
+        match start_child(&luna, uri, r#"{"subscribe":true}"#) {
             Ok((mut child, mut lines)) => {
                 log::info!(
-                    "power: subscribed to the TV power state ({} pid {})",
+                    "{label}: subscribed to the {what} ({} pid {})",
                     luna.display(),
                     child.id().unwrap_or(0)
                 );
@@ -330,24 +399,18 @@ async fn run(
                         }
                         line = lines.recv() => {
                             let Some(line) = line else { break };
-                            match parse_line(&line) {
-                                Line::Update(u) => {
-                                    first_by = None;
-                                    if tx.send(u).is_err() {
-                                        let _ = child.kill().await;
-                                        return;
-                                    }
+                            match on_line(&line) {
+                                LineOutcome::Answer => first_by = None,
+                                LineOutcome::Noise => {}
+                                LineOutcome::Closed => {
+                                    let _ = child.kill().await;
+                                    return;
                                 }
-                                Line::Error(e) => {
-                                    first_by = None;
-                                    log::warn!("power: getPowerState answered an error: {e}");
-                                }
-                                Line::Other => log::debug!("power: luna-send line ignored ({} bytes)", line.len()),
                             }
                         }
                         () = crate::daemon::sleep_opt(first_by) => {
                             first_by = None;
-                            log::warn!("power: no answer from luna-send within {} s; still waiting", FIRST_LINE_WAIT.as_secs());
+                            log::warn!("{label}: no answer from luna-send within {} s; still waiting", FIRST_LINE_WAIT.as_secs());
                         }
                     }
                 }
@@ -361,22 +424,22 @@ async fn run(
                     }
                 };
                 log::warn!(
-                    "power: the subscription ended after {} s ({status})",
+                    "{label}: the subscription ended after {} s ({status})",
                     started.elapsed().as_secs()
                 );
             }
             Err(e) => {
                 if start_warned {
-                    log::debug!("power: cannot start {}: {e}", luna.display());
+                    log::debug!("{label}: cannot start {}: {e}", luna.display());
                 } else {
                     start_warned = true;
-                    log::warn!("power: cannot start {}: {e}", luna.display());
+                    log::warn!("{label}: cannot start {}: {e}", luna.display());
                 }
             }
         }
         let delay = backoff.after_exit(started.elapsed());
         log::info!(
-            "power: restarting the subscription in {} s",
+            "{label}: restarting the subscription in {} s",
             delay.as_secs()
         );
         tokio::select! {
@@ -404,6 +467,73 @@ pub(crate) async fn call(luna: &Path, uri: &str, payload: &str) -> Result<String
     let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
     text.push_str(&String::from_utf8_lossy(&out.stderr));
     Ok(compact(&text))
+}
+
+/// One `luna-send -n 1` call on a pseudo-terminal, for TV control: over a
+/// plain pipe the audio methods print nothing on the TV (EXP-010 Part A,
+/// c3-b). Returns the raw output (whitespace kept: titles and labels have
+/// spaces), at most `max` bytes; more is an error that says so without the
+/// text.
+pub(crate) async fn call_pty(
+    luna: &Path,
+    uri: &str,
+    payload: &str,
+    max: usize,
+) -> Result<String, String> {
+    let (master, slave) = open_pty().map_err(|e| format!("cannot open a terminal: {e}"))?;
+    let mut cmd = Command::new(luna);
+    cmd.args(["-n", "1", "-w", "3000", uri, payload])
+        .stdin(Stdio::from(
+            slave.try_clone().map_err(|e| format!("terminal: {e}"))?,
+        ))
+        .stdout(Stdio::from(
+            slave.try_clone().map_err(|e| format!("terminal: {e}"))?,
+        ))
+        .stderr(Stdio::from(slave))
+        .kill_on_drop(true);
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("cannot start {}: {e}", luna.display()))?;
+    // Drop the slave descriptors the Command holds, so the master read ends
+    // (EIO) when the child is gone.
+    drop(cmd);
+    let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    std::thread::Builder::new()
+        .name("luna-call".into())
+        .spawn(move || {
+            use std::io::Read as _;
+            let mut master = master;
+            let mut total = 0_usize;
+            let mut buf = [0_u8; 4096];
+            loop {
+                match master.read(&mut buf) {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => {
+                        total += n;
+                        if tx.send(buf[..n].to_vec()).is_err() || total > max {
+                            return;
+                        }
+                    }
+                }
+            }
+        })
+        .map_err(|e| format!("cannot start a reader thread: {e}"))?;
+    let collect = async {
+        let mut out: Vec<u8> = Vec::new();
+        while let Some(chunk) = rx.recv().await {
+            out.extend_from_slice(&chunk);
+            if out.len() > max {
+                return Err(format!("reply of more than {max} bytes"));
+            }
+        }
+        Ok(out)
+    };
+    let out = tokio::time::timeout(CALL_TIMEOUT, collect)
+        .await
+        .map_err(|_| format!("no answer within {} s", CALL_TIMEOUT.as_secs()))??;
+    // The terminal's end of input came with the child's exit; reap it.
+    let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+    Ok(String::from_utf8_lossy(&out).into_owned())
 }
 
 #[cfg(test)]
@@ -495,11 +625,8 @@ mod tests {
     }
 
     fn fake_luna(dir: &Path, body: &str) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::create_dir_all(dir).unwrap();
         let p = dir.join("luna-send");
-        std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::testutil::write_script(&p, body);
         p
     }
 
@@ -583,6 +710,66 @@ printf '{"returnValue":true,"state":"Active Standby","processing":"Request Power
             .unwrap();
         assert!(r.contains("Keyblock1.5second"), "{r}");
         assert!(r.contains("-n1-w3000luna://x/y"), "{r}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn call_pty_runs_on_a_terminal_and_keeps_whitespace() {
+        let dir = std::env::temp_dir().join(format!("webos-sat-power-t-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let luna = fake_luna(
+            &dir,
+            r#"[ -t 1 ] && t=tty || t=pipe
+echo "{ \"returnValue\": true, \"title\": \"App  A\", \"tty\": \"$t\", \"args\": \"$5 $6\" }""#,
+        );
+        let r = call_pty(&luna, "luna://x/y", r#"{"a":1}"#, 1 << 20)
+            .await
+            .unwrap();
+        assert!(r.contains("\"App  A\""), "spaces are kept: {r}");
+        assert!(r.contains("\"tty\": \"tty\""), "{r}");
+        assert!(r.contains(r#"luna://x/y {"a":1}"#), "{r}");
+        // A big reply over the limit is an error that names no content.
+        let big = fake_luna(&dir, "head -c 5000 /dev/zero | tr '\\0' 'x'; echo");
+        let e = call_pty(&big, "luna://x/y", "{}", 1000).await.unwrap_err();
+        assert!(
+            e.contains("more than 1000 bytes") && !e.contains("xxx"),
+            "{e}"
+        );
+        // A binary that cannot start.
+        let e = call_pty(Path::new("/nonexistent/luna-send"), "u", "{}", 1000)
+            .await
+            .unwrap_err();
+        assert!(e.contains("cannot start"), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn generic_subscription_forwards_json_lines_and_stops() {
+        let dir = std::env::temp_dir().join(format!("webos-sat-power-s-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let luna = fake_luna(
+            &dir,
+            r#"echo "** Message: noise"
+echo "{\"returnValue\":true,\"subscribed\":true,\"uri\":\"$2\",\"payload\":\"$3\"}"
+exec sleep 30"#,
+        );
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let w = spawn_lines(luna, "luna://svc/get", "test", "thing", move |l| {
+            tx.send(l).is_ok()
+        });
+        let line = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            line.contains(r#""subscribed":true"#) && line.contains("luna://svc/get"),
+            "{line}"
+        );
+        assert!(
+            line.contains(r#"{\"subscribe\":true}"#) || line.contains("subscribe"),
+            "{line}"
+        );
+        w.shutdown().await;
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -1,0 +1,16 @@
+[package]
+name = "webos-tv-control"
+description = "webos-voice-satellite: TV control (screen, power, volume, input, apps) as a sans-IO state machine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+# Pure Rust (MIT or Apache-2.0). Replies of luna-send are real JSON (the app
+# list is nested and about 35 KB), unlike the flat power state lines.
+serde_json = "1"
+
+[lints]
+workspace = true

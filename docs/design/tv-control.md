@@ -1,6 +1,6 @@
 # TV control from Home Assistant via the satellite
 
-- **Status:** design, accepted direction ([ADR 0005](../decisions/0005-tv-control-entities.md)); **nothing implemented**. Backlog item [#11](../project/backlog.md#11-tv-control-from-home-assistant-via-the-satellite). Setters were run on **c3-b only** (firmware `03.30.73`) on 2026-11-04 in [EXP-010](../experiments/EXP-010-tv-control-setters.md) Part A: screen, mute, volume set and step, input switch and app launch all passed and restored (section 5). Everything there is **c3-b-only**: c3-a (`03.30.74`) is untested. Part B (through HA) is not run.
+- **Status:** design, accepted direction ([ADR 0005](../decisions/0005-tv-control-entities.md)); **implemented on the PC (2026-11-04), not yet run on a TV**: crate `webos-tv-control`, daemon adapter `crates/satellite/src/tv_control.rs`, generic `switch` and `text_sensor` entities in the ESPHome API crate, unit tests with synthetic fixtures, fake-HA and satellite end-to-end scenarios with a fake `luna-send` (see [section 15](#15-implementation-status-2026-11-04)). EXP-010 Part B (through HA on c3-b) needs a separate go. Backlog item [#11](../project/backlog.md#11-tv-control-from-home-assistant-via-the-satellite). Setters were run on **c3-b only** (firmware `03.30.73`) on 2026-11-04 in [EXP-010](../experiments/EXP-010-tv-control-setters.md) Part A: screen, mute, volume set and step, input switch and app launch all passed and restored (section 5). Everything there is **c3-b-only**: c3-a (`03.30.74`) is untested. Part B (through HA) is not run.
 - **Date:** 2026-11-04. Owner decisions of 2026-11-04 are recorded in ADR 0005.
 - **Devices in scope for TV facts:** c3-b (LG C3, webOS TV 8.3.0, firmware `03.30.73`) for the getters and the power path; c3-a (firmware `03.30.74`) is **untested** for every method in this document except the power-state subscription and the wake-and-darken path that run there in 0.1.0. A finding on one unit or firmware is not confirmation on another.
 - **Related:** [always-on design](always-on.md) (sections 10 to 13), [D5 results](../discovery/c3-b/D5-results.md), [D6 results](../discovery/c3-b/D6-poweroff-screenoff.md), [ESPHome API crate](../development/esphome-api.md), [install and configuration UX](install-and-config-ux.md), [compatibility](../compatibility/README.md).
@@ -220,13 +220,14 @@ enabled = true        # master switch; off by itself without luna-send (PC)
 screen = true         # tv_screen switch
 power_on = true       # tv_turn_on button
 power_off = false     # tv_power switch: opt-in, needs the "Keep listening" mode
-volume = false        # tv_volume, tv_volume_up/down (EXP-010 Part A passed on c3-b: may become true)
+volume = true         # tv_volume, tv_volume_up/down (EXP-010 Part A passed on c3-b)
 volume_limit = 40     # highest TV volume HA may set
-mute = false          # tv_mute (passed on c3-b: may become true)
-input = false         # tv_input (passed on c3-b: may become true)
-apps = false          # tv_app (passed on c3-b: may become true)
+mute = true           # tv_mute (passed on c3-b)
+input = true          # tv_input (passed on c3-b)
+apps = true           # tv_app (passed on c3-b)
 app_limit = 30        # maximum apps in the tv_app select
 play_state = false    # tv_play_state sensor
+follow_firmware_guard = false  # owner decision 2026-11-04: TV control is not gated by the firmware guard
 ```
 
 | Key | Default | Why |
@@ -234,12 +235,12 @@ play_state = false    # tv_play_state sensor
 | `enabled` | true | Read-only state is harmless and makes the controls discoverable; the per-control flags gate every write |
 | `screen`, `power_on` | true | Their calls are verified on c3-b (D5, D6, section 13), they keep the satellite running, and any remote key undoes them |
 | `power_off` | **false** | Owner decision: opt-in, and only in the always-on mode. Costs: TV stays running dark (power draw not measured), LG's OLED care at power-off may not run, a brief panel flash, a second remote press takes about 5 s ([always-on 12.2](always-on.md#122-the-setting-to-expose-app-and-ha-ui)) |
-| `volume`, `mute`, `input`, `apps` | false in the code until the owner flips it; **EXP-010 Part A passed for all four on c3-b `03.30.73` (2026-11-04), so the recommended default is true** | The setters worked, read back and restored. The evidence is c3-b only; c3-a (`03.30.74`) is untested and a failed setter is detected at run time (section 6) and disabled. The `volume_limit` clamp stays. Two caveats: volume and mute were tested on `external_arc` only, and input only on a disconnected HDMI input |
+| `volume`, `mute`, `input`, `apps` | **true** (owner, 2026-11-04, after EXP-010 Part A passed for all four on c3-b `03.30.73`) | The setters worked, read back and restored. The evidence is c3-b only; c3-a (`03.30.74`) is untested and each control is still checked per TV at startup and switched off when its getter, its declaration or a write fails (section 6). The `volume_limit` clamp stays. Two caveats: volume and mute were tested on `external_arc` only, and input only on a disconnected HDMI input |
 | `volume_limit` | 40 | Section 7 |
 | `app_limit` | 30 | Keeps the select usable in HA and in voice |
 | `play_state` | false | Extra polling for a sensor no v1 feature needs |
 
-Every control is also gated at run time by section 6. The firmware guard (`safety.validated_firmware`) blocks the microphone only; it does not gate TV control, because the getters run on any firmware and a failed method is detected (section 6). Whether TV control should also follow the guard on an unverified firmware is an open question (section 14).
+Every control is also gated at run time by section 6. **Firmware guard (owner decision 2026-11-04): TV control is not gated by it.** On a firmware that is not in `safety.validated_firmware` (or whose version cannot be read) TV control keeps working and the daemon logs a warning at startup; the microphone guard itself is unchanged. The key `follow_firmware_guard` (default `false`) exists for an owner who wants the stricter behaviour: with `true` every setter is refused on an unvalidated firmware, while getters, sensors and states still report.
 
 ## 10. Safety
 
@@ -300,5 +301,23 @@ Following [AGENTS.md](../../AGENTS.md) (keep capture, playback, power lifecycle 
 2. Whether an HA power-off with an app playing stops its sound (EXP-010 Part B).
 3. How HA 2026.10.4 renders a missing state for switch, number and select, and whether it lists entities on every reconnect (fake-HA test).
 4. Which Assist intents act on buttons, numbers and selects on the owner's HA (section 11).
-5. Whether TV control should follow the firmware guard on firmware not in `validated_firmware` (owner).
+5. ~~Whether TV control should follow the firmware guard~~ Decided 2026-11-04 (owner): it does not; a warning is logged (section 9).
 6. c3-a (`03.30.74`): all getters and setters untested.
+
+## 15. Implementation status (2026-11-04)
+
+PC only: nothing here was run on a TV. Layout as in section 12.1: crate `crates/tv-control` (`webos-tv-control`: `luna` parsers, `lists`, `limits`, `setters`, `entities`, `controller`), adapter `crates/satellite/src/tv_control.rs` (startup check, `luna-send` calls, subscriptions, entity mapping) and a few hooks in `daemon.rs`; `darken.rs` gained `would_act` and `note_own_wake`; the ESPHome API crate gained generic `switch` and `text_sensor` entities, application-owned selects (no echo, `ClearSelect`, `SetSelectOptions`).
+
+Deviations from the text above, and why:
+
+- **Calls run on a pseudo-terminal**, not the pipe of `power::call`: EXP-010 Part A found that the audio methods print nothing over a pipe. The power-path calls of the existing daemon are unchanged.
+- **Mute** uses `apiadapter/audio/setMute {"mute":bool}` (EXP-010), not `setMuted`. The `tv_sound_output` sensor comes from `getVolume`'s `soundOutput`; `apiadapter/audio/getSoundOutput` is not called.
+- **A failed write disables a control** (until a restart or a list refresh) only for volume, mute, input and apps. Screen, power-on and power-off are never disabled: tvpowerd's refusals (`busy`, `Keyblock1.5second`, "substate must be active") are transient and known.
+- **Declaration check:** the TV's `api-permissions.d` files are read for the services involved. The file format is not verified on a TV: when no file of a service can be read the result is `Unchecked` (allowed, with a warning; the read-back after every write is the guard), and only a readable file that lacks the method makes the control read-only.
+- **Read-back timing:** 0.5 s after the setter's reply, then once more 2.5 s later (input and app changes took 1.5 to 2 s in EXP-010) before a mismatch disables the control; never a second write.
+- **`tv_power` reads unknown** whenever any precondition of section 4.2 fails, including the darkener's 20 s cooldown after a power-off. The way back is `tv_turn_on`.
+- **`launch` payload and app list:** launch points have no hidden marker on c3-b, so every entry with an id and a title is kept, minus the satellite's own app (`io.github.pando85.voicesatellite`), the input apps and duplicate ids, capped at `app_limit`. The parser also honours `visible: false` or `hidden: true` if a firmware sends them (not verified anywhere).
+- **Select options change:** the controller queues new options; the daemon applies them (the server closes the HA connection, HA lists again) only when no conversation or reply is running. Whether HA lists entities on every reconnect is checked in the fake-HA scenario only, not against HA 2026.10.4.
+- **Volume and foreground subscriptions** start only for getters that answered, fall back to polling when the first reply lacks `subscribed: true`, and the play state is always polled (every 10 s in `Active` and `Screen Saver`).
+
+Left for the TV run (EXP-010 Part B): the pty one-shot calls on the real `luna-send`, the declaration file format, the subscription children's CPU cost, how HA 2026.10.4 shows a missing state for switch, number and select, the list refresh against HA, and every control on c3-a.

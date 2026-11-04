@@ -45,7 +45,19 @@ from fake_ha import (  # noqa: E402
     until_true,
 )
 
-from aioesphomeapi import BinarySensorInfo, BinarySensorState, SwitchInfo  # noqa: E402
+from aioesphomeapi import (  # noqa: E402
+    BinarySensorInfo,
+    BinarySensorState,
+    ButtonInfo,
+    NumberInfo,
+    NumberState,
+    SelectInfo,
+    SelectState,
+    SwitchInfo,
+    SwitchState,
+    TextSensorInfo,
+    TextSensorState,
+)
 from aioesphomeapi import VoiceAssistantEventType as Ev  # noqa: E402
 from aioesphomeapi import VoiceAssistantTimerEventType as TimerEv  # noqa: E402
 
@@ -541,6 +553,246 @@ level = "debug"
         sat.log.close()
 
 
+FAKE_LUNA = r"""#!/bin/sh
+# A fake luna-send for the TV control e2e: synthetic replies from state files in
+# $D, every call appended to $D/calls. Needs a terminal on stdout, like the TV.
+D="@D@"
+[ -t 1 ] || echo "NOT-A-TTY" >> "$D/calls"
+snap() { cat "$D/vol" "$D/mute" "$D/fg" "$D/power" "$D/points" 2>/dev/null | tr -d '\n'; }
+vol_json() { printf '{"returnValue":true,"volumeStatus":{"volume":%s,"maxVolume":60,"muteStatus":%s,"soundOutput":"external_arc"}}' "$(cat "$D/vol")" "$(cat "$D/mute")"; }
+fg_json() { printf '{"returnValue":true,"appId":"%s"}' "$(cat "$D/fg")"; }
+if [ "$1" = "-i" ]; then
+  echo "SUB $2" >> "$D/calls"
+  last=""
+  while :; do
+    cur=$(snap)
+    if [ "$cur" != "$last" ]; then
+      last="$cur"
+      case "$2" in
+        */getPowerState) printf '{"returnValue":true,"state":"%s","subscribed":true}\n' "$(cat "$D/power")" ;;
+        */getVolume) vol_json | sed 's/{"returnValue":true,/{"returnValue":true,"subscribed":true,/'; echo ;;
+        */getForegroundAppInfo) fg_json | sed 's/{"returnValue":true,/{"returnValue":true,"subscribed":true,/'; echo ;;
+        *) printf '{"returnValue":true,"subscribed":false}\n' ;;
+      esac
+    fi
+    sleep 0.2
+  done
+fi
+uri="$5"; payload="$6"
+echo "$uri $payload" >> "$D/calls"
+case "$uri" in
+  */getPowerState) printf '{"returnValue":true,"state":"%s"}\n' "$(cat "$D/power")" ;;
+  */getVolume) vol_json; echo ;;
+  */getForegroundAppInfo) case "$uri" in *media*) echo '{"returnValue":true,"playState":"playing"}' ;; *) fg_json; echo ;; esac ;;
+  */getExternalInputList) echo '{"returnValue":true,"devices":[{"id":"HDMI_1","label":"CanaryInput 1","connected":true,"appId":"app.hdmi1"},{"id":"HDMI_2","label":"CanaryInput 2","connected":false,"appId":"app.hdmi2"}]}' ;;
+  */listLaunchPoints) cat "$D/points"; echo ;;
+  */setVolume) sed 's/.*"volume":\([0-9]*\).*/\1/' <<EOF2 > "$D/vol"
+$payload
+EOF2
+    echo '{"returnValue":true,"volume":1,"soundOutput":""}' ;;
+  */volumeUp) echo $(( $(cat "$D/vol") + 1 )) > "$D/vol"; echo '{"returnValue":true}' ;;
+  */volumeDown) echo $(( $(cat "$D/vol") - 1 )) > "$D/vol"; echo '{"returnValue":true}' ;;
+  */setMute) case "$payload" in *true*) echo true > "$D/mute" ;; *) echo false > "$D/mute" ;; esac
+    echo '{"returnValue":true}' ;;
+  */switchInput) n=$(echo "$payload" | sed 's/.*HDMI_\([0-9]\).*/\1/'); echo "app.hdmi$n" > "$D/fg"; echo '{"returnValue":true}' ;;
+  *applicationManager/launch) sed 's/.*"id":"\([^"]*\)".*/\1/' <<EOF3 > "$D/fg"
+$payload
+EOF3
+    echo '{"returnValue":true}' ;;
+  */turnOffScreen) echo "Screen Off" > "$D/power"; echo '{"returnValue":true,"state":"Screen Off"}' ;;
+  */turnOnScreen|*/powerOn) echo "Active" > "$D/power"; echo '{"returnValue":true,"state":"Active"}' ;;
+  *) echo '{"returnValue":true}' ;;
+esac
+"""
+
+POINTS = (
+    '{"returnValue":true,"launchPoints":[{"id":"app.a","title":"CanaryApp A","icon":"/secret.png"},'
+    '{"id":"io.github.pando85.voicesatellite","title":"Voice Satellite"},'
+    '{"id":"app.hdmi1","title":"CanaryInput 1"},{"id":"app.b","title":"CanaryApp B"}]}'
+)
+
+
+async def scenario_tv_control(binary: str, tmp: str) -> None:
+    print("\n== satellite e2e: TV control through a fake luna-send ==")
+    psk = base64.b64encode(os.urandom(32)).decode()
+    with open(os.path.join(tmp, "psk-tv"), "w") as f:
+        f.write(psk + "\n")
+    os.chmod(os.path.join(tmp, "psk-tv"), 0o600)
+    write_mic(os.path.join(tmp, "mic-tv.raw"), 30.0)
+    tv = os.path.join(tmp, "tv")
+    os.mkdir(tv)
+    for name, text in (("vol", "12"), ("mute", "false"), ("fg", "app.a"), ("power", "Active"), ("points", POINTS)):
+        with open(os.path.join(tv, name), "w") as f:
+            f.write(text + "\n")
+    luna = os.path.join(tmp, "luna-send")
+    with open(luna, "w") as f:
+        f.write(FAKE_LUNA.replace("@D@", tv))
+    os.chmod(luna, 0o755)
+    os_info = os.path.join(tmp, "os_info.json")
+    with open(os_info, "w") as f:
+        f.write('{"webos_manufacturing_version": "99.99.99"}')
+    port = free_port()
+    config = os.path.join(tmp, "sat-tv.toml")
+    with open(config, "w") as f:
+        f.write(f"""
+mode = "wake"
+[device]
+name = "e2e-tv"
+mac = "02:00:00:00:00:e4"
+bind = "127.0.0.1"
+port = {port}
+noise_psk_file = "psk-tv"
+[mic]
+source = "file"
+path = "mic-tv.raw"
+[sink]
+type = "null"
+[log]
+level = "info"
+[power]
+luna_send = "{luna}"
+[tv_control]
+power_off = true
+play_state = true
+[safety]
+validated_firmware = ["03.30.74"]
+firmware_info = "{os_info}"
+""")
+    calls_path = os.path.join(tv, "calls")
+
+    def calls() -> str:
+        return open(calls_path).read() if os.path.exists(calls_path) else ""
+
+    async def called(needle: str, timeout: float = TIMEOUT) -> bool:
+        return await until_true(lambda: needle in calls(), timeout)
+
+    sat = Satellite(binary, config, os.path.join(tmp, "satellite-tv.log"))
+    await sat.start()
+    ha = FakeHA(port, psk)
+    try:
+        cli = await ha.connect()
+        _info, ents, _ = await cli.device_info_and_list_entities()
+        by = {e.object_id: e for e in ents}
+        want = {"tv_screen", "tv_power", "tv_mute", "tv_volume", "tv_volume_up", "tv_volume_down", "tv_turn_on",
+                "tv_input", "tv_app", "tv_refresh_lists", "tv_sound_output", "tv_play_state", "tv_power_state",
+                "remote_power_off", "listening", "microphone_muted", "mute_microphone"}
+        check("V1 entity list: every TV control entity, once", want <= set(by) and len(by) == len(ents),
+              f"missing {want - set(by)}")
+        check("V2 volume range comes from the TV (60), no unit; selects have no category",
+              isinstance(by["tv_volume"], NumberInfo) and by["tv_volume"].max_value == 60.0
+              and by["tv_volume"].unit_of_measurement == ""
+              and list(by["tv_input"].options) == ["CanaryInput 1", "CanaryInput 2", "Other"]
+              and list(by["tv_app"].options) == ["CanaryApp A", "CanaryApp B", "Other"]
+              and by["tv_refresh_lists"].entity_category.name == "CONFIG"
+              and by["tv_sound_output"].entity_category.name == "DIAGNOSTIC", "")
+        states: dict[int, object] = {}
+        cli.subscribe_states(lambda st: states.__setitem__(st.key, st))
+        ha.subscribe_voice()
+
+        def st(obj: str):
+            v = states.get(by[obj].key)
+            return None if v is None or getattr(v, "missing_state", False) else v.state
+
+        ok = await until_true(lambda: st("tv_volume") == 12.0 and st("tv_mute") is False and st("tv_screen") is True
+                              and st("tv_app") == "CanaryApp A" and st("tv_input") == "Other"
+                              and st("tv_sound_output") == "external_arc" and st("tv_play_state") == "playing")
+        check("V3 initial states from the TV", ok,
+              " ".join(f"{o}={st(o)}" for o in ("tv_volume", "tv_mute", "tv_screen", "tv_app", "tv_input")))
+        check("V4 tv_power reads unknown while the remote power-off select is on \"Turn off normally\"",
+              st("tv_power") is None)
+        check("V5 getters ran on a terminal, startup wrote nothing, getSystemInfo never called",
+              "NOT-A-TTY" not in calls() and "getSystemInfo" not in calls()
+              and not any(w in calls().split("SUB")[0] for w in ("setVolume", "setMute", "switchInput", "turnOff")),
+              calls()[:300])
+        log = sat.text()
+        check("V6 firmware not validated: warning logged, TV control still on",
+              "tv_control: firmware 99.99.99 is not in safety.validated_firmware; TV control runs anyway" in log
+              and "SETTERS ARE OFF" not in log, "")
+
+        # tv_power off while not in keep-listening: refused, no key.
+        cli.switch_command(by["tv_power"].key, False)
+        await asyncio.sleep(0.6)
+        check("V7 power-off refused without the always-on mode: no key sent",
+              "controls/power" not in calls() and await sat.wait_log("tv_power: refused"), calls())
+        cli.select_command(by["remote_power_off"].key, "Keep listening (screen off)")
+        ok = await until_true(lambda: st("tv_power") is True)
+        check("V8 select on Keep listening: tv_power shows on", ok, str(st("tv_power")))
+        cli.switch_command(by["tv_power"].key, False)
+        check("V9 power-off sends the remote's power key", await called("luna://com.webos.service.networkinput/controls/power {}"),
+              calls())
+
+        # Volume: coalesced set, clamp, read back.
+        cli.number_command(by["tv_volume"].key, 20.0)
+        check("V10 volume set calls setVolume with the value", await called('master/setVolume {"volume":20}'), calls())
+        ok = await until_true(lambda: st("tv_volume") == 20.0)
+        check("V11 the state follows the TV's own value", ok, str(st("tv_volume")))
+        await asyncio.sleep(1.2)
+        cli.number_command(by["tv_volume"].key, 55.0)
+        check("V12 volume above volume_limit is clamped to 40", await called('master/setVolume {"volume":40}'), calls())
+        await asyncio.sleep(1.2)
+        cli.button_command(by["tv_volume_up"].key)
+        await asyncio.sleep(0.6)
+        check("V13 volume up at the limit is refused (no call)", "master/volumeUp" not in calls(), calls())
+        cli.button_command(by["tv_volume_down"].key)
+        ok = await called("master/volumeDown") and await until_true(lambda: st("tv_volume") == 39.0)
+        check("V14 volume down works", ok, str(st("tv_volume")))
+
+        cli.switch_command(by["tv_mute"].key, True)
+        ok = await called('apiadapter/audio/setMute {"mute":true}') and await until_true(lambda: st("tv_mute") is True)
+        check("V15 mute", ok, calls())
+
+        # Input and app.
+        cli.select_command(by["tv_input"].key, "Other")
+        await asyncio.sleep(0.5)
+        check("V16 choosing Other is refused", "switchInput" not in calls(), calls())
+        cli.select_command(by["tv_input"].key, "CanaryInput 2")
+        ok = await called('apiadapter/tv/switchInput {"inputId":"HDMI_2"}') and await until_true(
+            lambda: st("tv_input") == "CanaryInput 2")
+        check("V17 input switch, state follows the foreground app", ok, str(st("tv_input")))
+        await asyncio.sleep(2.2)
+        cli.select_command(by["tv_app"].key, "CanaryApp B")
+        ok = await called('applicationManager/launch {"id":"app.b"}') and await until_true(
+            lambda: st("tv_app") == "CanaryApp B")
+        check("V18 app launch, state follows", ok, str(st("tv_app")))
+
+        # Screen and turn on.
+        cli.switch_command(by["tv_screen"].key, False)
+        ok = await called("turnOffScreen") and await until_true(lambda: st("tv_screen") is False)
+        check("V19 screen off, state follows the power state", ok, str(st("tv_screen")))
+        check("V20 volume still readable and settable in Screen Off", st("tv_volume") == 39.0, str(st("tv_volume")))
+        cli.button_command(by["tv_turn_on"].key)
+        ok = await called("turnOnScreen") and await until_true(lambda: st("tv_screen") is True)
+        check("V21 turn on from Screen Off", ok, str(st("tv_screen")))
+
+        # Refresh: a new app is installed, HA lists again.
+        with open(os.path.join(tv, "points"), "w") as f:
+            f.write(POINTS.replace('{"id":"app.b"', '{"id":"app.c","title":"CanaryApp C"},{"id":"app.b"') + "\n")
+        n_before = sat.text().count("HA connected")
+        cli.button_command(by["tv_refresh_lists"].key)
+        ok = await until_true(lambda: sat.text().count("HA connected") > n_before or "HA disconnected" in sat.text()[-3000:], 15)
+        await asyncio.sleep(0.5)
+        ha2 = FakeHA(port, psk)
+        cli2 = await ha2.connect()
+        _i, ents2, _ = await cli2.device_info_and_list_entities()
+        app2 = [e for e in ents2 if e.object_id == "tv_app"][0]
+        check("V22 list refresh: HA reconnects and lists the new app", ok and "CanaryApp C" in list(app2.options),
+              str(list(app2.options)))
+        await cli2.disconnect()
+
+        log = sat.text()
+        leaks = [w for w in ("CanaryApp", "CanaryInput", "app.hdmi", "app.a", "app.b", "app.c", "/secret.png") if w in log]
+        check("V23 no app title, input label or app id in the log at info", not leaks, f"{leaks}")
+        sat.proc.send_signal(signal.SIGTERM)
+        rc = await asyncio.wait_for(sat.proc.wait(), 8)
+        left = await until_true(lambda: True)
+        check("V24 clean exit", rc == 0 and left, f"rc={rc}")
+    finally:
+        if sat.proc.returncode is None:
+            sat.proc.kill()
+            await sat.proc.wait()
+        sat.log.close()
+
+
 async def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary", required=True, help="path to the webos-satellite binary")
@@ -553,11 +805,12 @@ async def main() -> int:
             await scenario_pairing(args.binary, tmp)
             await scenario_pairing_window(args.binary, tmp)
             await scenario_aec(args.binary, tmp)
+            await scenario_tv_control(args.binary, tmp)
         except Exception as err:  # noqa: BLE001
             failed = True
             print(f"FAIL  {type(err).__name__}: {err}", flush=True)
             for name in ("satellite.log", "satellite-timers.log", "satellite-pairing.log",
-                         "satellite-pairing.log.2", "satellite-window.log", "satellite-aec.log"):
+                         "satellite-pairing.log.2", "satellite-window.log", "satellite-aec.log", "satellite-tv.log"):
                 log = os.path.join(tmp, name)
                 if os.path.exists(log):
                     print(f"---- {name} ----")

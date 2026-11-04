@@ -677,12 +677,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("webos-sat-stall-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let script = dir.join("fake-pacat");
-        std::fs::write(&script, "#!/bin/sh\nsleep 30\n").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        crate::testutil::write_script(&script, "sleep 30");
         let mut cfg = SinkSection::default();
         cfg.binary.clone_from(&script);
         let (tx, _rx) = mpsc::unbounded_channel();
@@ -771,12 +766,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let out = dir.join("written.raw");
         let script = dir.join("fake-pacat");
-        std::fs::write(&script, format!("#!/bin/sh\ncat > '{}'\n", out.display())).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        crate::testutil::write_script(&script, &format!("cat > '{}'", out.display()));
         let mut cfg = SinkSection::default();
         cfg.binary.clone_from(&script);
         cfg.gain = 0.5;
@@ -820,12 +810,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let out = dir.join("written.raw");
         let script = dir.join("fake-pacat");
-        std::fs::write(&script, format!("#!/bin/sh\ncat > '{}'\n", out.display())).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        crate::testutil::write_script(&script, &format!("cat > '{}'", out.display()));
         let mut cfg = SinkSection::default();
         cfg.binary.clone_from(&script);
         cfg.gain = 0.0;

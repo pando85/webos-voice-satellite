@@ -159,6 +159,41 @@ remote_off_file = "remote_off"
 max_actions_per_hour = 10  # wake-and-darken actions allowed per hour
 cooldown_s = 20            # minimum time between two of them
 
+[tv_control]
+# TV control from Home Assistant: extra entities on the satellite device that
+# act on the TV itself (screen, power, volume, mute, input, apps). Design and
+# evidence: docs/design/tv-control.md and docs/experiments/EXP-010-tv-control-setters.md.
+# Needs luna-send and power.watch = true (on a PC every control is off by
+# itself). Evidence is c3-b (firmware 03.30.73) only; c3-a is untested. A
+# control whose TV call fails, or whose write does not read back, is switched
+# off until a restart or a list refresh and shows no state: nothing is guessed.
+enabled = true            # master switch
+screen = true             # switch "TV screen": off = Screen Off (the satellite keeps listening)
+power_on = true           # button "Turn on TV": Screen Off or Active Standby to on
+# Switch "TV power (keep listening)": Home Assistant can turn the TV off, but
+# only while the select "When the TV is turned off with the remote" is on
+# "Keep listening (screen off)" and the wake-and-darken machine would act (no
+# kill switch, cooldown and hourly budget of [power] apply). The TV then stays
+# on with a dark screen: more power than standby, LG's OLED care at power-off
+# may not run, a brief panel flash. Opt-in; not listed when false.
+power_off = false
+# On by default: the setters passed EXP-010 Part A on c3-b (firmware
+# 03.30.73, 2026-11-04) and each control is checked per TV at startup (c3-a is
+# untested). Set any of them to false to remove the entities.
+volume = true             # number "TV volume" and the up/down buttons
+volume_limit = 40         # highest TV volume Home Assistant may set (LG steps, not percent; the TV's own maximum also applies)
+mute = true               # switch "TV mute"
+input = true              # select "TV input" (the TV's external inputs)
+apps = true               # select "TV app" (launcher apps)
+app_limit = 30            # most apps in the "TV app" select
+play_state = false        # sensor "TV play state"
+# Owner decision 2026-11-04: TV control is NOT gated by the firmware guard. On
+# a firmware that is not in safety.validated_firmware it keeps working and the
+# daemon logs a warning at startup (the microphone guard is separate). true
+# refuses the TV control setters there instead (sensors still report). A
+# failed setter is detected in either case and its control switched off.
+follow_firmware_guard = false
+
 [pairing]
 # Pairing without typing a key: Home Assistant 2026.9 or newer generates the
 # Noise key and sets it on the device (ESPHome "dynamic encryption key"). Only

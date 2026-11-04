@@ -22,6 +22,7 @@ webos-capture = { workspace = true }
 webos-dsp = { workspace = true }
 webos-esphome-api = { workspace = true }
 webos-playback = { workspace = true }
+webos-tv-control = { workspace = true }
 
 # musl's malloc does not give memory back after TTS replies (RSS grew about 1.7
 # bytes per reply byte on a PC musl build while Rust's live bytes stayed flat),

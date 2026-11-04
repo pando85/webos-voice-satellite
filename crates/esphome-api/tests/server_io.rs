@@ -434,6 +434,8 @@ async fn power_sensor_and_select_entities() {
             "Turn off normally".into(),
             "Keep listening (screen off)".into(),
         ],
+        entity_category: pb::EntityCategory::Config,
+        command_echo: true,
     });
     let (port, mut events, cmds) = start_cfg(cfg).await;
     cmds.send(AppCommand::SetSelect {
@@ -680,6 +682,217 @@ async fn number_button_and_binary_sensor_entities() {
     .unwrap();
     let b: pb::BinarySensorStateResponse = c2.recv_as().await;
     assert!(b.missing_state);
+}
+
+fn tv_switch_cfg() -> Config {
+    use webos_esphome_api::config::{SwitchEntity, TextSensorEntity};
+    let mut cfg = plain_cfg();
+    cfg.switches.push(SwitchEntity {
+        object_id: "tv_screen".into(),
+        name: "TV screen".into(),
+        icon: "mdi:television".into(),
+        device_class: "switch".into(),
+        entity_category: pb::EntityCategory::None,
+    });
+    cfg.text_sensors.push(TextSensorEntity {
+        object_id: "tv_sound_output".into(),
+        name: "TV sound output".into(),
+        icon: String::new(),
+        device_class: String::new(),
+        entity_category: pb::EntityCategory::Diagnostic,
+    });
+    cfg.selects.push(webos_esphome_api::SelectEntity {
+        object_id: "tv_input".into(),
+        name: "TV input".into(),
+        icon: "mdi:video-input-hdmi".into(),
+        options: vec!["HDMI 1".into(), "Other".into()],
+        entity_category: pb::EntityCategory::None,
+        command_echo: false,
+    });
+    cfg
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn switch_text_sensor_and_app_owned_select_entities() {
+    let (port, mut events, cmds) = start_cfg(tv_switch_cfg()).await;
+    let mut c = connect_plain(port).await;
+    c.send(&pb::ListEntitiesRequest {}).await;
+    // Order: media player, the mute switch, generic switches, text sensors, selects.
+    let mute: pb::ListEntitiesSwitchResponse = c.recv_as().await;
+    assert_eq!(mute.object_id, "mute_microphone");
+    let sw: pb::ListEntitiesSwitchResponse = c.recv_as().await;
+    assert_eq!(sw.object_id, "tv_screen");
+    assert_eq!(sw.device_class, "switch");
+    assert_eq!(sw.entity_category, pb::EntityCategory::None as i32);
+    assert_eq!(sw.key, webos_esphome_api::entities::entity_key("tv_screen"));
+    let ts: pb::ListEntitiesTextSensorResponse = c.recv_as().await;
+    assert_eq!(ts.object_id, "tv_sound_output");
+    assert_eq!(ts.entity_category, pb::EntityCategory::Diagnostic as i32);
+    let sel: pb::ListEntitiesSelectResponse = c.recv_as().await;
+    assert_eq!(sel.options, ["HDMI 1", "Other"]);
+    assert_eq!(sel.entity_category, pb::EntityCategory::None as i32);
+    let _: pb::ListEntitiesDoneResponse = c.recv_as().await;
+
+    // Missing states first.
+    c.send(&pb::SubscribeStatesRequest {}).await;
+    let _: pb::SwitchStateResponse = c.recv_as().await; // the mute switch
+    let st: pb::SelectStateResponse = c.recv_as().await;
+    assert!(st.missing_state);
+    let s: pb::SwitchStateResponse = c.recv_as().await;
+    assert!(s.missing_state && s.key == sw.key);
+    let t: pb::TextSensorStateResponse = c.recv_as().await;
+    assert!(t.missing_state);
+
+    // Pushed states; an unchanged one is not repeated.
+    for state in [Some(true), Some(true), Some(false)] {
+        cmds.send(AppCommand::SetSwitch {
+            object_id: "tv_screen".into(),
+            state,
+        })
+        .await
+        .unwrap();
+    }
+    let s: pb::SwitchStateResponse = c.recv_as().await;
+    assert_eq!((s.state, s.missing_state), (true, false));
+    let s: pb::SwitchStateResponse = c.recv_as().await;
+    assert_eq!((s.state, s.missing_state), (false, false), "no duplicate");
+    cmds.send(AppCommand::SetTextSensor {
+        object_id: "tv_sound_output".into(),
+        state: Some("external_arc".into()),
+    })
+    .await
+    .unwrap();
+    let t: pb::TextSensorStateResponse = c.recv_as().await;
+    assert_eq!((t.state.as_str(), t.missing_state), ("external_arc", false));
+    cmds.send(AppCommand::SetTextSensor {
+        object_id: "tv_sound_output".into(),
+        state: None,
+    })
+    .await
+    .unwrap();
+    let t: pb::TextSensorStateResponse = c.recv_as().await;
+    assert!(t.missing_state);
+    // Unknown ids are ignored.
+    cmds.send(AppCommand::SetSwitch {
+        object_id: "nope".into(),
+        state: Some(true),
+    })
+    .await
+    .unwrap();
+
+    // A switch command is an event and no echo; the mute switch still works
+    // as before (no SwitchChanged for it); an unknown key does nothing.
+    c.send(&pb::SwitchCommandRequest {
+        key: sw.key,
+        state: true,
+        ..Default::default()
+    })
+    .await;
+    assert_eq!(
+        next_event(&mut events).await,
+        AppEvent::SwitchChanged {
+            object_id: "tv_screen".into(),
+            state: true
+        }
+    );
+    c.send(&pb::SwitchCommandRequest {
+        key: 777,
+        state: true,
+        ..Default::default()
+    })
+    .await;
+
+    // An app-owned select: a valid option is an event and no state frame
+    // follows; the state is what the application reports; an invalid option
+    // is answered with the current state.
+    cmds.send(AppCommand::SetSelect {
+        object_id: "tv_input".into(),
+        option: "Other".into(),
+    })
+    .await
+    .unwrap();
+    let st: pb::SelectStateResponse = c.recv_as().await;
+    assert_eq!(st.state, "Other");
+    c.send(&pb::SelectCommandRequest {
+        key: sel.key,
+        state: "HDMI 1".into(),
+        ..Default::default()
+    })
+    .await;
+    assert_eq!(
+        next_event(&mut events).await,
+        AppEvent::SelectChanged {
+            object_id: "tv_input".into(),
+            option: "HDMI 1".into()
+        }
+    );
+    c.send(&pb::SelectCommandRequest {
+        key: sel.key,
+        state: "HDMI 9".into(),
+        ..Default::default()
+    })
+    .await;
+    let st: pb::SelectStateResponse = c.recv_as().await;
+    assert_eq!(
+        st.state, "Other",
+        "the application's state, not the command"
+    );
+    cmds.send(AppCommand::SetSelect {
+        object_id: "tv_input".into(),
+        option: "HDMI 1".into(),
+    })
+    .await
+    .unwrap();
+    let st: pb::SelectStateResponse = c.recv_as().await;
+    assert_eq!(st.state, "HDMI 1");
+    cmds.send(AppCommand::ClearSelect {
+        object_id: "tv_input".into(),
+    })
+    .await
+    .unwrap();
+    let st: pb::SelectStateResponse = c.recv_as().await;
+    assert!(st.missing_state);
+
+    // New options: the HA connection is closed so HA lists again; the new
+    // list is what the next connection sees, with no state until reported.
+    cmds.send(AppCommand::SetSelectOptions {
+        object_id: "tv_input".into(),
+        options: vec!["HDMI 1".into(), "HDMI 2".into(), "Other".into()],
+    })
+    .await
+    .unwrap();
+    assert_eq!(next_event(&mut events).await, AppEvent::HaDisconnected);
+    let mut c2 = connect_plain(port).await;
+    c2.send(&pb::ListEntitiesRequest {}).await;
+    let sel2: pb::ListEntitiesSelectResponse = c2.recv_as().await;
+    assert_eq!(sel2.options, ["HDMI 1", "HDMI 2", "Other"]);
+    assert_eq!(sel2.key, sel.key, "the key is stable");
+    c2.send(&pb::SubscribeStatesRequest {}).await;
+    let _: pb::SwitchStateResponse = c2.recv_as().await;
+    let st: pb::SelectStateResponse = c2.recv_as().await;
+    assert!(st.missing_state);
+    let s: pb::SwitchStateResponse = c2.recv_as().await;
+    assert_eq!(
+        (s.state, s.missing_state),
+        (false, false),
+        "kept across reconnects"
+    );
+    // The same list again does not close the connection.
+    cmds.send(AppCommand::SetSelectOptions {
+        object_id: "tv_input".into(),
+        options: vec!["HDMI 1".into(), "HDMI 2".into(), "Other".into()],
+    })
+    .await
+    .unwrap();
+    cmds.send(AppCommand::SetSelect {
+        object_id: "tv_input".into(),
+        option: "HDMI 2".into(),
+    })
+    .await
+    .unwrap();
+    let st: pb::SelectStateResponse = c2.recv_as().await;
+    assert_eq!(st.state, "HDMI 2");
 }
 
 #[tokio::test]

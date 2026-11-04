@@ -6,6 +6,7 @@ members = [
     "crates/dsp",
     "crates/esphome-api",
     "crates/playback",
+    "crates/tv-control",
 ]
 
 [workspace.package]
@@ -21,6 +22,7 @@ webos-capture = { path = "crates/capture" }
 webos-dsp = { path = "crates/dsp" }
 webos-esphome-api = { path = "crates/esphome-api" }
 webos-playback = { path = "crates/playback" }
+webos-tv-control = { path = "crates/tv-control" }
 # External crates (pure Rust: the TV build is static musl, no system libs)
 rustix = { version = "1", default-features = false, features = ["std", "system", "param", "process", "time", "pty", "fs"] }
 # Echo canceller: pure Rust port of WebRTC audio processing (AEC3, NS), BSD-3-Clause.

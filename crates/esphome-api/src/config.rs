@@ -82,6 +82,17 @@ pub struct SelectEntity {
     pub icon: String,
     /// The options, in display order. HA can only choose one of these.
     pub options: Vec<String>,
+    /// None (primary), configuration or diagnostic. The behaviour selects
+    /// use [`crate::proto::EntityCategory::Config`].
+    pub entity_category: crate::proto::EntityCategory,
+    /// `true`: a valid command is stored and confirmed to HA at once (a
+    /// setting). `false`: the application owns the state, as for a
+    /// [`NumberEntity`]: a valid command is reported as
+    /// [`crate::AppEvent::SelectChanged`] and **not** echoed, HA shows the
+    /// state the application reports ([`crate::AppCommand::SetSelect`],
+    /// [`crate::AppCommand::ClearSelect`]), and the option is not written to
+    /// the log at info (it may be an app title or an input label).
+    pub command_echo: bool,
 }
 
 /// A `number` entity: a bounded float setting or control, such as a TV volume.
@@ -155,6 +166,46 @@ pub struct BinarySensorEntity {
     pub entity_category: crate::proto::EntityCategory,
 }
 
+/// A generic `switch` entity: an on/off control whose state the application
+/// owns (the built-in "Mute microphone" switch is separate).
+///
+/// A command from HA arrives as [`crate::AppEvent::SwitchChanged`] and is
+/// **not** echoed: HA shows the state the application reports
+/// ([`crate::AppCommand::SetSwitch`], `None` meaning "no valid state", shown
+/// as unknown).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SwitchEntity {
+    /// Object id (see [`NumberEntity::object_id`]).
+    pub object_id: String,
+    /// Name shown in HA.
+    pub name: String,
+    /// Material Design icon.
+    pub icon: String,
+    /// HA switch device class (`switch`, `outlet`) or empty.
+    pub device_class: String,
+    /// None (primary), configuration or diagnostic.
+    pub entity_category: crate::proto::EntityCategory,
+}
+
+/// A generic `text_sensor` entity: a read-only string state (the built-in
+/// "TV power state" sensor is separate).
+///
+/// The application sets its state ([`crate::AppCommand::SetTextSensor`]),
+/// `None` meaning "no valid state" (HA shows unknown).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextSensorEntity {
+    /// Object id (see [`NumberEntity::object_id`]).
+    pub object_id: String,
+    /// Name shown in HA.
+    pub name: String,
+    /// Material Design icon.
+    pub icon: String,
+    /// HA sensor device class or empty.
+    pub device_class: String,
+    /// None (primary), configuration or diagnostic.
+    pub entity_category: crate::proto::EntityCategory,
+}
+
 /// Configuration of the ESPHome API server.
 #[derive(Clone)]
 pub struct Config {
@@ -202,6 +253,10 @@ pub struct Config {
     pub buttons: Vec<ButtonEntity>,
     /// `binary_sensor` entities.
     pub binary_sensors: Vec<BinarySensorEntity>,
+    /// Generic `switch` entities (besides the built-in mute switch).
+    pub switches: Vec<SwitchEntity>,
+    /// Generic `text_sensor` entities (besides the built-in power state).
+    pub text_sensors: Vec<TextSensorEntity>,
 }
 
 impl Default for Config {
@@ -224,6 +279,8 @@ impl Default for Config {
             numbers: Vec::new(),
             buttons: Vec::new(),
             binary_sensors: Vec::new(),
+            switches: Vec::new(),
+            text_sensors: Vec::new(),
         }
     }
 }
@@ -247,6 +304,8 @@ impl fmt::Debug for Config {
             .field("numbers", &self.numbers)
             .field("buttons", &self.buttons)
             .field("binary_sensors", &self.binary_sensors)
+            .field("switches", &self.switches)
+            .field("text_sensors", &self.text_sensors)
             .finish_non_exhaustive()
     }
 }
@@ -365,6 +424,8 @@ pub(crate) struct Resolved {
     pub(crate) numbers: Vec<NumberEntity>,
     pub(crate) buttons: Vec<ButtonEntity>,
     pub(crate) binary_sensors: Vec<BinarySensorEntity>,
+    pub(crate) switches: Vec<SwitchEntity>,
+    pub(crate) text_sensors: Vec<TextSensorEntity>,
 }
 
 /// An ESPHome object id: `[a-z0-9_]`, 1 to 120 characters.
@@ -390,7 +451,9 @@ impl Config {
             .map(|e| e.object_id.as_str())
             .chain(self.numbers.iter().map(|e| e.object_id.as_str()))
             .chain(self.buttons.iter().map(|e| e.object_id.as_str()))
-            .chain(self.binary_sensors.iter().map(|e| e.object_id.as_str()));
+            .chain(self.binary_sensors.iter().map(|e| e.object_id.as_str()))
+            .chain(self.switches.iter().map(|e| e.object_id.as_str()))
+            .chain(self.text_sensors.iter().map(|e| e.object_id.as_str()));
         let mut seen: Vec<(&str, u32)> = vec![
             (MEDIA_PLAYER_OBJECT_ID, entity_key(MEDIA_PLAYER_OBJECT_ID)),
             (MUTE_OBJECT_ID, entity_key(MUTE_OBJECT_ID)),
@@ -409,6 +472,14 @@ impl Config {
                 ));
             }
             seen.push((id, key));
+        }
+        for sel in &self.selects {
+            if sel.options.is_empty() {
+                return err(format!(
+                    "select {:?}: needs at least one option",
+                    sel.object_id
+                ));
+            }
         }
         for n in &self.numbers {
             if !(n.min_value.is_finite() && n.max_value.is_finite() && n.min_value <= n.max_value) {
@@ -515,6 +586,8 @@ impl Config {
             numbers: self.numbers.clone(),
             buttons: self.buttons.clone(),
             binary_sensors: self.binary_sensors.clone(),
+            switches: self.switches.clone(),
+            text_sensors: self.text_sensors.clone(),
         })
     }
 }
@@ -675,6 +748,56 @@ mod tests {
         n.max_value = f32::NAN;
         c.numbers.push(n);
         assert!(bad(&c));
+    }
+
+    #[test]
+    fn switch_text_sensor_and_select_definitions_are_validated() {
+        use crate::proto::EntityCategory;
+        let switch = |id: &str| SwitchEntity {
+            object_id: id.to_owned(),
+            name: "S".to_owned(),
+            icon: String::new(),
+            device_class: String::new(),
+            entity_category: EntityCategory::None,
+        };
+        let text = |id: &str| TextSensorEntity {
+            object_id: id.to_owned(),
+            name: "T".to_owned(),
+            icon: String::new(),
+            device_class: String::new(),
+            entity_category: EntityCategory::Diagnostic,
+        };
+        let mut cfg = Config::default();
+        cfg.switches.push(switch("tv_screen"));
+        cfg.text_sensors.push(text("tv_sound_output"));
+        cfg.validate().unwrap();
+        let bad = |c: &Config| matches!(c.validate(), Err(ConfigError::InvalidEntity(_)));
+        let mut c = cfg.clone();
+        c.text_sensors.push(text("tv_screen"));
+        assert!(bad(&c), "duplicate across types");
+        let mut c = cfg.clone();
+        c.switches.push(switch("mute_microphone"));
+        assert!(bad(&c), "the built-in mute switch id");
+        let mut c = cfg.clone();
+        c.switches.push(switch("Bad Id"));
+        assert!(bad(&c));
+        let mut c = cfg.clone();
+        c.text_sensors.push(text("tv_power_state"));
+        c.validate().unwrap();
+        c.power_sensor = true;
+        assert!(bad(&c), "the built-in power state id");
+        let mut c = cfg.clone();
+        c.selects.push(SelectEntity {
+            object_id: "tv_input".to_owned(),
+            name: "I".to_owned(),
+            icon: String::new(),
+            options: Vec::new(),
+            entity_category: EntityCategory::None,
+            command_echo: false,
+        });
+        assert!(bad(&c), "a select needs options");
+        c.selects[0].options.push("Other".to_owned());
+        c.validate().unwrap();
     }
 
     #[test]

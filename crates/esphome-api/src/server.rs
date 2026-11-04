@@ -195,6 +195,8 @@ impl Server {
             selects: vec![None; self.cfg.selects.len()],
             numbers: vec![None; self.cfg.numbers.len()],
             binary_sensors: vec![None; self.cfg.binary_sensors.len()],
+            switches: vec![None; self.cfg.switches.len()],
+            text_sensors: vec![None; self.cfg.text_sensors.len()],
         };
         let mut pending: JoinSet<Result<Session, (SocketAddr, FrameError)>> = JoinSet::new();
         let mut keyless: JoinSet<()> = JoinSet::new();
@@ -613,6 +615,10 @@ struct Ctx {
     numbers: Vec<Option<f32>>,
     /// State of each binary sensor in `cfg.binary_sensors` (same order).
     binary_sensors: Vec<Option<bool>>,
+    /// State of each generic switch in `cfg.switches` (same order).
+    switches: Vec<Option<bool>>,
+    /// State of each text sensor in `cfg.text_sensors` (same order).
+    text_sensors: Vec<Option<String>>,
 }
 
 enum Flow {
@@ -1046,8 +1052,14 @@ impl Ctx {
             pb::ListEntitiesRequest::ID => {
                 s.send(&entities::list_media_player(&self.cfg)).await?;
                 s.send(&entities::list_mute_switch()).await?;
+                for sw in &self.cfg.switches {
+                    s.send(&entities::list_switch(sw)).await?;
+                }
                 if self.cfg.power_sensor {
                     s.send(&entities::list_power_sensor()).await?;
+                }
+                for t in &self.cfg.text_sensors {
+                    s.send(&entities::list_text_sensor(t)).await?;
                 }
                 for sel in &self.cfg.selects {
                     s.send(&entities::list_select(sel)).await?;
@@ -1084,6 +1096,13 @@ impl Ctx {
                 }
                 for (b, state) in self.cfg.binary_sensors.iter().zip(&self.binary_sensors) {
                     s.send(&entities::binary_sensor_state(b, *state)).await?;
+                }
+                for (sw, state) in self.cfg.switches.iter().zip(&self.switches) {
+                    s.send(&entities::switch_state(sw, *state)).await?;
+                }
+                for (t, state) in self.cfg.text_sensors.iter().zip(&self.text_sensors) {
+                    s.send(&entities::text_sensor_state(t, state.as_deref()))
+                        .await?;
                 }
             }
             pb::SubscribeVoiceAssistantRequest::ID => {
@@ -1152,6 +1171,8 @@ impl Ctx {
                 if let Some(c) = decode::<pb::SwitchCommandRequest>(msg) {
                     if c.key == entities::mute_key() {
                         self.voice.on_mute(now, c.state);
+                    } else {
+                        self.switch_command(c.key, c.state);
                     }
                 }
             }
@@ -1286,6 +1307,16 @@ impl Ctx {
             AppCommand::SetBinarySensor { object_id, state } => {
                 self.set_binary_sensor(&object_id, state).await;
             }
+            AppCommand::SetSwitch { object_id, state } => {
+                self.set_switch(&object_id, state).await;
+            }
+            AppCommand::SetTextSensor { object_id, state } => {
+                self.set_text_sensor(&object_id, state).await;
+            }
+            AppCommand::ClearSelect { object_id } => self.clear_select(&object_id).await,
+            AppCommand::SetSelectOptions { object_id, options } => {
+                self.set_select_options(&object_id, options);
+            }
             AppCommand::SetSelect { object_id, option } => {
                 let Some(i) = self
                     .cfg
@@ -1297,8 +1328,9 @@ impl Ctx {
                     return;
                 };
                 if !self.cfg.selects[i].options.contains(&option) {
-                    log::warn!(
-                        "esphome-api: SetSelect {object_id:?}: {option:?} is not an option; ignored"
+                    log::warn!("esphome-api: SetSelect {object_id:?}: not an option; ignored");
+                    log::debug!(
+                        "esphome-api: SetSelect {object_id:?}: {option:?} is not an option"
                     );
                     return;
                 }
@@ -1350,6 +1382,128 @@ impl Ctx {
         if let Err(err) = self.send_binary_sensor_state(i).await {
             self.close(&err.to_string());
         }
+    }
+
+    async fn set_switch(&mut self, object_id: &str, state: Option<bool>) {
+        let Some(i) = self
+            .cfg
+            .switches
+            .iter()
+            .position(|sw| sw.object_id == object_id)
+        else {
+            log::warn!("esphome-api: SetSwitch for unknown switch {object_id:?} ignored");
+            return;
+        };
+        if self.switches[i] == state {
+            return;
+        }
+        self.switches[i] = state;
+        if let Err(err) = self.send_switch_state(i).await {
+            self.close(&err.to_string());
+        }
+    }
+
+    async fn set_text_sensor(&mut self, object_id: &str, state: Option<String>) {
+        let Some(i) = self
+            .cfg
+            .text_sensors
+            .iter()
+            .position(|t| t.object_id == object_id)
+        else {
+            log::warn!("esphome-api: SetTextSensor for unknown sensor {object_id:?} ignored");
+            return;
+        };
+        if self.text_sensors[i] == state {
+            return;
+        }
+        self.text_sensors[i] = state;
+        if let Err(err) = self.send_text_sensor_state(i).await {
+            self.close(&err.to_string());
+        }
+    }
+
+    async fn clear_select(&mut self, object_id: &str) {
+        let Some(i) = self
+            .cfg
+            .selects
+            .iter()
+            .position(|s| s.object_id == object_id)
+        else {
+            log::warn!("esphome-api: ClearSelect for unknown select {object_id:?} ignored");
+            return;
+        };
+        self.selects[i] = None;
+        if let Err(err) = self.send_select_state(i).await {
+            self.close(&err.to_string());
+        }
+    }
+
+    /// Replaces a select's options. HA only reads them when it lists the
+    /// entities, so a changed list closes the connection: HA reconnects at
+    /// once and lists again.
+    fn set_select_options(&mut self, object_id: &str, options: Vec<String>) {
+        let Some(i) = self
+            .cfg
+            .selects
+            .iter()
+            .position(|s| s.object_id == object_id)
+        else {
+            log::warn!("esphome-api: SetSelectOptions for unknown select {object_id:?} ignored");
+            return;
+        };
+        if options.is_empty() {
+            log::warn!("esphome-api: SetSelectOptions {object_id:?}: no options; ignored");
+            return;
+        }
+        if self.cfg.selects[i].options == options {
+            return;
+        }
+        Arc::make_mut(&mut self.cfg).selects[i].options = options;
+        self.selects[i] = None;
+        log::info!(
+            "esphome-api: the options of {object_id} changed; closing the HA connection so HA lists the entities again"
+        );
+        self.close("the options of a select changed");
+    }
+
+    async fn send_switch_state(&mut self, i: usize) -> Result<(), FrameError> {
+        let msg = entities::switch_state(&self.cfg.switches[i], self.switches[i]);
+        match self.session.as_mut() {
+            Some(s) if s.states_subscribed => s.send(&msg).await,
+            _ => Ok(()),
+        }
+    }
+
+    async fn send_text_sensor_state(&mut self, i: usize) -> Result<(), FrameError> {
+        let msg =
+            entities::text_sensor_state(&self.cfg.text_sensors[i], self.text_sensors[i].as_deref());
+        match self.session.as_mut() {
+            Some(s) if s.states_subscribed => s.send(&msg).await,
+            _ => Ok(()),
+        }
+    }
+
+    /// `SwitchCommandRequest` for a generic switch: reported to the
+    /// application, which answers with the actual state
+    /// ([`AppCommand::SetSwitch`]); the server does not echo it. A key that
+    /// is no switch is ignored.
+    fn switch_command(&mut self, key: u32, state: bool) {
+        let Some(sw) = self
+            .cfg
+            .switches
+            .iter()
+            .find(|sw| entities::entity_key(&sw.object_id) == key)
+        else {
+            log::debug!("esphome-api: switch command for an unknown entity ignored");
+            return;
+        };
+        log::info!(
+            "esphome-api: {} set to {} by HA",
+            sw.object_id,
+            if state { "on" } else { "off" }
+        );
+        let object_id = sw.object_id.clone();
+        self.emit(AppEvent::SwitchChanged { object_id, state });
     }
 
     async fn send_number_state(&mut self, i: usize) -> Result<(), FrameError> {
@@ -1440,9 +1594,21 @@ impl Ctx {
         let sel = &self.cfg.selects[i];
         if !sel.options.contains(&option) {
             log::warn!(
-                "esphome-api: {}: {option:?} is not an option; ignored",
+                "esphome-api: {}: a value that is not an option; ignored",
                 sel.object_id
             );
+            log::debug!(
+                "esphome-api: {}: {option:?} is not an option",
+                sel.object_id
+            );
+        } else if !sel.command_echo {
+            // The application owns the state; the option may be an app title
+            // or an input label, so it is not logged at info.
+            log::info!("esphome-api: {} chosen by HA", sel.object_id);
+            log::debug!("esphome-api: {} chosen: {option:?}", sel.object_id);
+            let object_id = sel.object_id.clone();
+            self.emit(AppEvent::SelectChanged { object_id, option });
+            return Ok(());
         } else if self.selects[i].as_deref() != Some(option.as_str()) {
             log::info!("esphome-api: {} set to {option:?} by HA", sel.object_id);
             let object_id = sel.object_id.clone();

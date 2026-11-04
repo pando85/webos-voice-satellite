@@ -25,7 +25,7 @@ Also decided by the owner on 2026-11-04: the audible timer and announcement chec
 ## Consequences
 
 - New entities on the satellite device; a new sans-IO crate for TV control, separate from capture, voice and playback; the ESPHome API crate needs generic `switch` and `text_sensor` entities.
-- Volume, mute, input and app stay off by default until EXP-010 passes on c3-b; a control whose setter fails there stays off. (Update 2026-11-04: Part A passed for all four on c3-b `03.30.73`; flipping the code defaults is the owner's call, see the [design section 9](../design/tv-control.md#9-configuration).)
+- Volume, mute, input and app stay off by default until EXP-010 passes on c3-b; a control whose setter fails there stays off. (Update 2026-11-04: Part A passed for all four on c3-b `03.30.73`; the owner then made them **on by default**, and decided that TV control is **not gated by the firmware guard** (a warning is logged on an unvalidated firmware; see the [design section 9](../design/tv-control.md#9-configuration)).)
 - Every control is gated by a startup capability check; a failed method gives an entity with a missing state, never a guessed value.
 - An HA "turn off the TV" leaves the TV running with a dark screen: more power than standby (not measured), LG's power-off OLED care may not run, a brief panel flash, and a 5 s second press. These costs are the always-on mode's, shown next to the setting.
 - Waking a TV from Suspend stays outside the satellite (HA's Wake-on-LAN or the remote).
