@@ -7,6 +7,8 @@ Research tasks and implementation work are tracked in GitHub Issues. This roadma
 ## Current focus (owner, 2026-11-03)
 
 - **Always-on operation is the current focus:** listening and playback when the remote powers the TV off or the screen is off, plus autostart. Design: [always-on](../design/always-on.md). Procedure: [D5 plan](../discovery/c3-a/D5-plan.md). Autostart: [autostart design](../design/autostart.md).
+- **TV control from HA (backlog #11), 2026-11-04:** design done and owner decisions recorded ([TV control](../design/tv-control.md), [ADR 0005](../decisions/0005-tv-control-entities.md)); implementation next. Setters are tested on c3-b with [EXP-010](../experiments/EXP-010-tv-control-setters.md) only on the owner's go.
+- **Conversation agent for the Kiwi pipeline: decision pending (owner)**, deferred to a future plan discussion. Facts and options A (reload `qwen2.5:3b` on the in-cluster Ollama), B (`prefer_local_intents`) and C (B plus the Kiais gateway fallback) are in [backlog #12](backlog.md#12-conversation-agent-for-the-kiwi-pipeline). No HA change made.
 - **Audio front-end (echo cancellation) is PARKED** (owner decision, 2026-11-03). Defaults stay off (`[aec] enabled = false`). The status and the best-known config are in [AEC front-end §12](../design/aec-frontend.md#12-tuning-results-and-parked-state) and [P2 AEC tuning](../experiments/P2-aec-tuning.md). Open items when it resumes: TV delay lock and ERLE with a playing stimulus, a false-wake soak over TV content, a JBL talker A/B, a live-person test, STT on the tuned variants, and TV CPU. P2 session 3 is on hold with partial data.
 
 ## Ground rules
@@ -163,4 +165,4 @@ Research tasks and implementation work are tracked in GitHub Issues. This roadma
 
 ## After Phase 5
 
-Remaining improvements are in the [backlog](backlog.md); the owner priorities of 2026-11-02 are interleaved into the phases above. Idea added 2026-11-03: [backlog #11, TV control from Home Assistant via the satellite](backlog.md#11-tv-control-from-home-assistant-via-the-satellite) (not started, priority open).
+Remaining improvements are in the [backlog](backlog.md); the owner priorities of 2026-11-02 are interleaved into the phases above. [Backlog #11, TV control from Home Assistant via the satellite](backlog.md#11-tv-control-from-home-assistant-via-the-satellite): design done 2026-11-04 ([design](../design/tv-control.md), [ADR 0005](../decisions/0005-tv-control-entities.md)), implementation next. [Backlog #12, conversation agent for the Kiwi pipeline](backlog.md#12-conversation-agent-for-the-kiwi-pipeline): decision pending (owner).

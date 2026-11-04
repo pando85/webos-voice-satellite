@@ -10,8 +10,9 @@ Record decisions once supported by evidence or by an explicit owner decision. Us
 | [0002](0002-rust-implementation.md) | Implement the satellite in Rust | Accepted (2026-11-01, owner) |
 | [0003](0003-server-side-wake-word-for-mvp.md) | Server-side wake word for the MVP | Accepted (2026-11-01, owner) |
 | [0004](0004-mvp-capture-device-and-lg-handsfree-off.md) | MVP capture from hw:LGSIC,0 with LG hands-free off | Accepted (2026-11-01, owner) |
+| [0005](0005-tv-control-entities.md) | TV control from Home Assistant through separate satellite entities | Accepted (2026-11-04, owner) |
 
-These ADRs record **owner decisions** supported by discovery on c3-a. They do not claim that the chosen route has been verified end to end; open verification work is in the [roadmap](../project/roadmap.md).
+These ADRs record **owner decisions** supported by discovery on c3-a (ADR 0005 also by checks on c3-b). They do not claim that the chosen route has been verified end to end; open verification work is in the [roadmap](../project/roadmap.md).
 
 ## Related documents
 

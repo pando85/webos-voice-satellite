@@ -19,7 +19,7 @@ Ranked priorities and where each lands:
 | 2 | [#3 Install and configuration UX](#3-install-and-configuration-ux) (Homebrew Channel package, phone configuration through a QR code, pairing without typing the key) | **Phase 3** (with autostart): Homebrew Channel package and first-run configuration pulled forward. **Phase 5** (packaging): the `ipk` and its install flow. The QR and phone configuration needs a **security design first** (authentication, TLS, secrets handling) before any implementation |
 | 3 | [#8 Share findings with the webOS homebrew community](#8-share-findings-with-the-webos-homebrew-community) | **After Phase 2**, because the project is public. Needs a redaction review first |
 
-Items not in the ranked list stay in the backlog without a priority or a phase: #2, #4, #5, #6, #7 and #9, each marked "not prioritized (2026-11-02)" below.
+Items not in the ranked list stay in the backlog without a priority or a phase: #2, #4, #5, #6, #7 and #9, each marked "not prioritized (2026-11-02)" below. Later items: #10 (follow-up), #11 (design done 2026-11-04, implementation next) and #12 (decision pending, owner).
 
 ## 1. Professional audio front-end
 
@@ -117,7 +117,7 @@ Items not in the ranked list stay in the backlog without a priority or a phase: 
 
 ## 11. TV control from Home Assistant via the satellite
 
-- **Status:** idea, not started (2026-11-03). Requested by the owner. Priority to be decided with the owner.
+- **Status:** **design done, implementation next** (2026-11-04). Owner decisions in [ADR 0005](../decisions/0005-tv-control-entities.md): complement HA's `webostv`; v1 = power and screen, volume and mute, input, app launch (no toasts); separate entities, not a TV media player; power-off only into the keep-listening `Screen Off` state and only when that mode is enabled (opt-in); listening indicator as HA binary sensors only. Design: [TV control](../design/tv-control.md). Setter test procedure: [EXP-010](../experiments/EXP-010-tv-control-setters.md) on c3-b, **run only on the owner's go**. Getters verified on c3-b (`03.30.73`) on 2026-11-04; setters untested; c3-a untested. The text below is the original idea (2026-11-03), kept for context; its open questions on overlap and entity design are settled by ADR 0005.
 - **Idea:** the satellite already runs as root on the TV and holds an ESPHome API connection to Home Assistant. It could expose TV controls as HA entities:
   - power and screen on and off (the daemon already calls `tvpower` and `turnOffScreen` for the remote power-off feature, [always-on section 13](../design/always-on.md#13-implemented-in-the-daemon-010-and-checked-on-c3-b));
   - TV volume and mute;
@@ -138,3 +138,20 @@ Items not in the ranked list stay in the backlog without a priority or a phase: 
   - Entity design: a TV `media_player` versus separate entities, given that the satellite's media player already means reply volume (see approach options).
 - **Dependencies:** the power-state subscription and remote power-off feature ([always-on](../design/always-on.md)); the ESPHome entity work in [ADR 0001](../decisions/0001-esphome-native-api.md); a verified list of public interfaces per firmware; item 4 (TV integration) for any overlap with ducking or toasts.
 - **Evidence needed:** for each control, a read-only check first, then a single user-initiated test on the target with the state restored afterwards; the luna methods and results recorded per model and firmware; the built-in HA integration's standby behaviour checked on the owner's HA before the comparison is written up.
+
+## 12. Conversation agent for the Kiwi pipeline
+
+- **Status:** **decision pending (owner)**, deferred to a future plan discussion (owner, 2026-11-04). No HA change made.
+- **Why:** the satellite works end to end with HA's built-in agent, but the owner's Kiwi pipeline has no working conversation agent, so free-form requests fail. The choice also decides how voice reaches TV-control numbers and selects ([TV control section 11](../design/tv-control.md#11-voice)).
+- **Facts (2026-11-04, owner's homelab, read by an agent):**
+  - Kiwi's Ollama agent fails: the in-cluster Ollama has no models loaded and answers 404 for `qwen2.5:3b`.
+  - The pipeline option `prefer_local_intents` exists on HA 2026.10.4 and is currently `false`.
+  - The homelab "Kiais" OpenAI-compatible gateway has a fast tier with a TTFT p50 of about 1.5 s, measured on **only 2 requests**; it is cloud-routed. HA's core `openai_conversation` integration has no base URL setting, so using it needs a custom or HACS integration.
+  - Separate homelab issue: the HA pod was recreated 8 times in one day, and each recreation disconnected the satellite. This is not a satellite fault; it is tracked on the homelab side.
+- **Options:**
+  - **A.** Reload `qwen2.5:3b` on the in-cluster Ollama (GTX 1060, 3 GB). Local; quality and latency on that GPU not measured.
+  - **B.** Set `prefer_local_intents = true` on the pipeline, so HA's built-in intents (TV switches, lights) answer first and only other requests reach the agent.
+  - **C.** B plus a fallback agent on the Kiais gateway's fast tier. Better language ability; requests leave the house (cloud-routed), and it needs a custom or HACS integration.
+- **Dependencies:** owner decision; the homelab GitOps repository for any change; the HA pod stability issue.
+- **Evidence needed before acceptance:** for the chosen option, end-to-end latency and success on the owner's own phrases through the satellite, and for C, what leaves the house and under which terms.
+

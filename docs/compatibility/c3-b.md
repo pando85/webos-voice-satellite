@@ -26,6 +26,8 @@
 | App package: downgrade (older version over newer) | Active | PASS (accepted by appinstalld) | EXP-009 |
 | Boot hook in `/var/lib/webosbrew/init.d` (opt-in), start after 60 s | Reboot (`micomPower`) | PASS (2 boots, no failsafe; update applied at boot; firmware guard honoured at boot) | EXP-009 |
 | App removal, uninstall, purge | Active, 1 boot | PASS (inert hook after app removal; nothing left after purge) | EXP-009 |
+| TV control getters as root through `luna-send`, no SSAP pairing: `getPowerState`, audio `master/getVolume` (`volume`, `muteStatus`, `maxVolume`, `soundOutput`), `apiadapter/audio/getSoundOutput`, `apiadapter/tv/getExternalInputList`, `applicationManager/getForegroundAppInfo`, `com.webos.media/getForegroundAppInfo` (`playState`), `applicationManager/listLaunchPoints` (about 35 KB) | TV running (exact power state not recorded here) | PASS (read-only, 2026-11-04) | [TV control design](../design/tv-control.md) |
+| TV control setters (volume, mute, volume up and down, input switch, launch of other apps, `turnOffScreen` from `Screen Saver`) | any | NOT TESTED (planned, owner's go needed) | [EXP-010](../experiments/EXP-010-tv-control-setters.md) |
 
 ## Notes and redacted evidence
 

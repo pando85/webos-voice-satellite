@@ -17,6 +17,7 @@ This file starts with the install record. Earlier c3-a results (capture, playbac
 | Start at boot after a real restart | Reboot | NOT TESTED (owner's next natural restart; passed on c3-b with HBC 0.7.2, EXP-009) | P4 |
 | App UI through HBC `exec` | Active | NOT TESTED (not opened on the owner's screen) | P4 |
 | Reply playback, announcements, "Keep listening (screen off)", resume after suspend with 0.1.0 | any | NOT TESTED on this unit (no sound, no power-state change allowed in the session); c3-b only | P4 |
+| TV control getters and setters (volume, mute, input, apps) | any | NOT TESTED on this unit; getters passed on c3-b (`03.30.73`) only | [TV control design](../design/tv-control.md), [EXP-010](../experiments/EXP-010-tv-control-setters.md) |
 
 ## Notes and redacted evidence
 
