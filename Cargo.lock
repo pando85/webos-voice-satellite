@@ -1562,6 +1562,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "webos-compat"
+version = "0.1.1"
+
+[[package]]
 name = "webos-dsp"
 version = "0.1.1"
 dependencies = [

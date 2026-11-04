@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/satellite",
     "crates/capture",
+    "crates/compat",
     "crates/dsp",
     "crates/esphome-api",
     "crates/playback",

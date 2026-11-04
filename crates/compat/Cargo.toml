@@ -1,0 +1,11 @@
+[package]
+name = "webos-compat"
+description = "webos-voice-satellite: microphone self-check engine and sanitized compatibility report builder (pure, no I/O)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
