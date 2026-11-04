@@ -15,8 +15,12 @@
 #   DIR/crashloop exists                     (the supervisor gave up earlier)
 #   /tmp/webos-satellite.disable exists      (kill switch)
 #   the app in DIR/app-dir was removed       (no appinfo.json there)
-#   `webos-satellite --check-firmware` fails (firmware not validated, or
-#                                             the allow-list is empty)
+#   `--check-firmware` fails AND the config says `firmware_policy = "strict"`
+#                                            (the old hard gate; with the
+#                                             default "warn" policy an
+#                                             unverified firmware is logged
+#                                             and the daemon starts anyway:
+#                                             owner decision 2026-11-04)
 #
 # Pending update: when the app's payload (DIR/app-dir/payload) differs from
 # the installed one (SHA256SUMS against DIR/package.sums), its ctl.sh install
@@ -32,7 +36,7 @@ while [ $# -gt 0 ]; do
     case $1 in
     --prefix) [ $# -ge 2 ] || die "--prefix needs a value"; prefix_arg=$2; shift 2 ;;
     --delay) [ $# -ge 2 ] || die "--delay needs a value"; delay=$2; shift 2 ;;
-    -h | --help) sed -n '2,25p' "$0"; exit 0 ;;
+    -h | --help) sed -n '2,29p' "$0"; exit 0 ;;
     *) die "unknown argument: $1 (see --help)" ;;
     esac
 done
@@ -83,11 +87,16 @@ else
     fw=$("$BIN" --config "$CFG" --check-firmware 2>&1)
 fi
 rc=$?
-if [ "$rc" -ne 0 ]; then
-    alog "firmware check failed (status $rc): $fw; not starting"
+policy=$(sed -n 's/^[[:space:]]*firmware_policy[[:space:]]*=[[:space:]]*"\{0,1\}\([a-z]*\).*/\1/p' "$CFG" 2>/dev/null | head -n 1)
+if [ "$rc" -ne 0 ] && [ "$policy" = strict ]; then
+    alog "firmware check failed (status $rc): $fw; firmware_policy = strict, not starting"
     exit 0
 fi
-alog "$fw; starting"
+if [ "$rc" -ne 0 ]; then
+    alog "firmware check (status $rc): $fw; starting anyway (firmware_policy ${policy:-warn})"
+else
+    alog "$fw; starting"
+fi
 sh "$PREFIX/bin/start.sh" --supervise >>"$PREFIX/log/autostart.log" 2>&1
 alog "start.sh exited with status $?"
 exit 0

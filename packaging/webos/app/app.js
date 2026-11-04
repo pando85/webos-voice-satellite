@@ -1,5 +1,8 @@
 /*
- * Voice Satellite status app. ES5 only (old webOS web runtimes).
+ * Voice Satellite status app. ES5 only (old webOS web runtimes), except the
+ * vendored qrcodegen.js (Project Nayuki, MIT; ES2015, see
+ * QRCODEGEN-LICENSE.txt), which draws the compatibility-report QR code
+ * offline.
  *
  * Talks to the satellite through the Homebrew Channel's root `exec` method
  * (luna://org.webosbrew.hbchannel.service/exec), running the package's own
@@ -16,7 +19,8 @@
   // The only argument lists the app sends to ctl.sh.
   var ALLOWED = ['status --json', 'install', 'start', 'stop', 'autostart on',
     'autostart off', 'mic off', 'mic on', 'pair', 'reset-pairing',
-    'clear-crashloop', 'uninstall', 'purge'];
+    'clear-crashloop', 'uninstall', 'purge', 'report --json', 'selfcheck', 'ack-firmware'];
+  var QR_SIZE = 640;
 
   var appDir = decodeURIComponent(window.location.pathname.replace(/\/[^\/]*$/, ''));
   var ctlPath = appDir + '/payload/ctl.sh';
@@ -25,6 +29,7 @@
   var autoUpdateTried = false;
   var tvAddress = '';
   var last = null;
+  var reportOpen = false;
 
   function $(id) { return document.getElementById(id); }
 
@@ -89,6 +94,39 @@
     none: ['no key and pairing off: check the config', 'bad']
   };
 
+  var COMPAT_CLASS = {
+    'verified': 'ok',
+    'series verified (firmware not yet reported)': '',
+    'not verified': 'warn',
+    'firmware changed': 'warn',
+    'capture problem': 'bad',
+    'unknown': 'warn',
+    'checking': ''
+  };
+
+  // The one-paragraph banner under the headline: what the compatibility
+  // status means and what to do. Returns [text, class] or null.
+  function compatBanner(s) {
+    var c = s.compat;
+    if (!s.installed || !c) { return null; }
+    if (c.capture_problem) {
+      return ['The microphone check failed (' + (c.selfcheck || 'no details') + '). The microphone is closed and retried a few times. ' +
+        'If LG hands-free voice is on, turn it off. Otherwise press Report compatibility so this TV and firmware can be looked at.', 'bad'];
+    }
+    if (c.firmware_changed) {
+      return ['The TV firmware changed since the satellite last ran. The microphone keeps running and is being checked again. ' +
+        'When it works for you, press Acknowledge. If it does not, press Report compatibility.', ''];
+    }
+    if (c.compat_status === 'not verified' || c.compat_status === 'unknown') {
+      return ['This TV and firmware are not in the project\'s verified list yet. The microphone runs anyway and is checked. ' +
+        'If it does not work, press Report compatibility.', ''];
+    }
+    if (c.compat_status === 'series verified (firmware not yet reported)') {
+      return ['This TV series is verified; this firmware version has not been reported yet. If it works, a report helps everyone: press Report compatibility.', 'ok'];
+    }
+    return null;
+  }
+
   function render(s) {
     last = s;
     var facts = $('facts');
@@ -104,7 +142,8 @@
       detail = 'Set up installs the service under ' + s.prefix + ', starts it and opens a 10-minute pairing window for Home Assistant.';
     } else if (s.running) {
       headline = 'Running';
-      if (!s.firmware_ok) { detail = 'The microphone stays off: this firmware is not validated.'; }
+      if (!s.firmware_ok) { detail = 'The microphone stays off: strict firmware policy and this firmware is not in the list.'; }
+      else if (s.compat && s.compat.capture_problem) { detail = 'The microphone check failed; the microphone is closed (see below).'; }
       else if (s.mic_off) { detail = 'The microphone is off (kill switch).'; }
       else { detail = 'Listening through Home Assistant.'; }
     } else {
@@ -124,6 +163,12 @@
     addFact(facts, 'Start at boot', s.autostart ? 'on' : 'off');
     addFact(facts, 'Microphone', s.mic_off ? 'off (kill switch)' : 'on', s.mic_off ? 'warn' : '');
     addFact(facts, 'Firmware', s.firmware || '?', s.firmware_ok ? '' : 'warn');
+    var c = s.compat || null;
+    if (c) {
+      addFact(facts, 'Compatibility', c.compat_status || '?', COMPAT_CLASS[c.compat_status] || '');
+      if (c.tv_model) { addFact(facts, 'TV model', c.tv_model); }
+      addFact(facts, 'Microphone check', c.selfcheck || '?', c.capture_problem ? 'bad' : '');
+    }
     if (s.installed) {
       var k = KEY_TEXT[s.key] || [s.key, ''];
       addFact(facts, 'Home Assistant', k[0], k[1]);
@@ -150,6 +195,12 @@
     show('b-boot-off', root && s.autostart);
     show('b-mic-off', root && !s.mic_off);
     show('b-mic-on', root && s.mic_off);
+    show('b-report', inst);
+    show('b-selfcheck', inst && s.running && !!s.compat);
+    show('b-ack', inst && s.running && !!s.compat && !!s.compat.firmware_changed);
+    var banner = compatBanner(s);
+    show('compat', !!banner);
+    if (banner) { text($('compat-text'), banner[0]); $('compat').className = 'panel banner ' + banner[1]; }
     show('b-pair', inst && s.running && (s.key === 'unpaired' || s.key === 'cleared'));
     show('b-reset', inst && s.running && s.key === 'paired');
     show('b-crash', inst && s.crashloop);
@@ -163,6 +214,69 @@
       autoUpdateTried = true;
       run('install', 'Applying update ' + (s.installed_version || '?') + ' -> ' + (s.package_version || '?') + '...');
     }
+  }
+
+  // --- compatibility report screen -------------------------------------------
+
+  function drawQr(url) {
+    var canvas = $('qr');
+    var ctx = canvas.getContext('2d');
+    var qr = window.qrcodegen.QrCode.encodeText(url, window.qrcodegen.QrCode.Ecc.LOW);
+    var border = 4;
+    var cells = qr.size + border * 2;
+    var scale = Math.max(1, Math.floor(QR_SIZE / cells));
+    var px = cells * scale;
+    canvas.width = px;
+    canvas.height = px;
+    canvas.style.width = px + 'px';
+    canvas.style.height = px + 'px';
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0, 0, px, px);
+    ctx.fillStyle = '#000000';
+    for (var y = 0; y < qr.size; y++) {
+      for (var x = 0; x < qr.size; x++) {
+        if (qr.getModule(x, y)) { ctx.fillRect((x + border) * scale, (y + border) * scale, scale, scale); }
+      }
+    }
+    return qr.size;
+  }
+
+  function openReport() {
+    if (busy) { return; }
+    busy = true;
+    message('Building the report...');
+    ctl('report --json', function (r) {
+      busy = false;
+      var rep = null;
+      try { rep = JSON.parse(lastLine(r.out)); } catch (e) { rep = null; }
+      if (!rep) {
+        message(lastLine(r.out) || r.err || 'The report could not be built.');
+        return;
+      }
+      message('');
+      reportOpen = true;
+      show('main', false);
+      show('report-view', true);
+      text($('report-error'), '');
+      text($('report-title'), rep.title || '');
+      text($('report-url'), rep.url || '');
+      text($('report-text'), rep.full || rep.short || '');
+      $('report-text').scrollTop = 0;
+      if (rep.error || !rep.url) {
+        text($('report-error'), 'The report was withheld: ' + (rep.error || 'no link') + '. See ctl.sh report over SSH.');
+      } else {
+        try { drawQr(rep.url); } catch (e) { text($('report-error'), 'The QR code could not be drawn (' + e + '). Type the address instead.'); }
+      }
+      $('r-back').focus();
+    });
+  }
+
+  function closeReport() {
+    reportOpen = false;
+    show('report-view', false);
+    show('main', true);
+    focusFirst();
+    refresh();
   }
 
   function refresh() {
@@ -197,6 +311,7 @@
   function onButton(btn) {
     var args = btn.getAttribute('data-cmd');
     if (args === '') { message(''); refresh(); return; }
+    if (args === 'report --json') { openReport(); return; }
     if (btn.getAttribute('data-confirm') && !btn.armed) {
       btn.armed = true;
       btn.className = 'armed';
@@ -226,6 +341,16 @@
 
   // Remote control: arrow keys move between buttons, OK (Enter) presses.
   document.addEventListener('keydown', function (ev) {
+    if (reportOpen) {
+      var box = $('report-text');
+      var kc = ev.keyCode;
+      if (kc === 38) { box.scrollTop = Math.max(0, box.scrollTop - 80); }
+      else if (kc === 40) { box.scrollTop += 80; }
+      else if (kc === 27 || kc === 8 || kc === 461) { closeReport(); }
+      else { return; }
+      ev.preventDefault();
+      return;
+    }
     var b = visibleButtons();
     var i = b.indexOf(document.activeElement);
     var k = ev.keyCode;
@@ -242,6 +367,8 @@
     buttons[j].hidden = true;
   }
   show('b-refresh', true);
+  show('report-view', false);
+  $('r-back').addEventListener('click', closeReport);
 
   function findAddress(idx) {
     if (idx >= CONN_SERVICES.length) { return; }
@@ -256,5 +383,5 @@
 
   findAddress(0);
   refresh();
-  setInterval(function () { if (!busy) { refresh(); } }, 10000);
+  setInterval(function () { if (!busy && !reportOpen) { refresh(); } }, 10000);
 }());

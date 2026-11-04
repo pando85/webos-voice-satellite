@@ -436,6 +436,37 @@ impl Tv {
         self.exec(fx)
     }
 
+    /// Per control `ok`, `off` or `failed`, for the compatibility report
+    /// (check C10).
+    pub(crate) fn control_results(
+        &self,
+    ) -> Vec<(
+        webos_compat::report::ControlKind,
+        webos_compat::report::ControlResult,
+    )> {
+        use webos_compat::report::{ControlKind as K, ControlResult as R};
+        use webos_tv_control::{Control, ControlStatus};
+        [
+            (K::Screen, Control::Screen),
+            (K::Mute, Control::Mute),
+            (K::Volume, Control::Volume),
+            (K::Input, Control::Input),
+            (K::App, Control::Apps),
+        ]
+        .into_iter()
+        .map(|(k, c)| {
+            (
+                k,
+                match self.ctl.control_status(c) {
+                    ControlStatus::Ok => R::Ok,
+                    ControlStatus::Off => R::Off,
+                    ControlStatus::Failed => R::Failed,
+                },
+            )
+        })
+        .collect()
+    }
+
     /// Stops the subscription children.
     pub(crate) async fn shutdown(self) {
         for (_, w) in self.subs {

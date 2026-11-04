@@ -1608,6 +1608,7 @@ dependencies = [
  "tokio",
  "toml",
  "webos-capture",
+ "webos-compat",
  "webos-dsp",
  "webos-esphome-api",
  "webos-playback",

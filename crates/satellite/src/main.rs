@@ -15,6 +15,7 @@
 
 mod alarm;
 mod capture;
+mod compat;
 mod config;
 mod daemon;
 mod darken;
@@ -24,10 +25,12 @@ mod logger;
 mod player;
 mod power;
 mod resume;
+mod selfcheck;
 mod selftest;
 #[cfg(test)]
 mod testutil;
 mod tv_control;
+mod verified;
 mod volume;
 mod watchdog;
 
@@ -42,6 +45,30 @@ use config::{Command, USAGE};
 
 pub(crate) const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub(crate) const TARGET: &str = env!("WEBOS_SATELLITE_TARGET");
+
+/// `--report`: a static compatibility report (no live self-check).
+fn report(settings: &config::Settings, full: bool, json: bool) -> ExitCode {
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("webos-satellite: cannot start the runtime: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match rt.block_on(compat::static_report(settings)) {
+        Ok(r) => {
+            println!("{}", compat::render_report(&r, full, json));
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("webos-satellite: no report: {e:?}");
+            ExitCode::FAILURE
+        }
+    }
+}
 
 fn main() -> ExitCode {
     let cmd = match config::parse_args(std::env::args().skip(1)) {
@@ -73,6 +100,11 @@ fn main() -> ExitCode {
             println!("{v}");
             ExitCode::from(v.exit_code())
         }
+        Command::Report {
+            settings,
+            full,
+            json,
+        } => report(&settings, full, json),
         Command::Run(s, triggers) => {
             // validate() already checked the level.
             logger::init(s.log_level().unwrap_or(log::LevelFilter::Info));

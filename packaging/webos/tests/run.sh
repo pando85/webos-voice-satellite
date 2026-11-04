@@ -71,6 +71,7 @@ type = "null"
 [safety]
 kill_switch = "$T/kill"
 mute_file = "$T/muted"
+firmware_policy = "strict"
 validated_firmware = ["99.99.99"]
 firmware_info = "$T/os_info.json"
 [limits]
@@ -81,10 +82,20 @@ echo "== ops scripts on the host (prefix $P) =="
 sh "$PKG/install.sh" --prefix "$P" --config "$T/sat.toml" --binary "$BIN" --persistent >/dev/null
 check "install copies supervise.sh and autostart.sh" '[ -x "$P/bin/supervise.sh" ] && [ -x "$P/bin/autostart.sh" ]'
 
-check "--check-firmware: validated (exit 0)" '"$P/bin/webos-satellite" --config "$P/etc/config.toml" --check-firmware >/dev/null'
+check "--check-firmware: in the list (exit 0)" '"$P/bin/webos-satellite" --config "$P/etc/config.toml" --check-firmware >/dev/null'
 sed 's/"99.99.99"]/"01.00.00"]/' "$T/sat.toml" >"$T/bad.toml"
 "$P/bin/webos-satellite" --config "$T/bad.toml" --check-firmware >/dev/null && rc=0 || rc=$?
-check "--check-firmware: not validated (exit 1)" '[ "$rc" -eq 1 ]'
+check "--check-firmware: strict policy, not in the list (exit 1)" '[ "$rc" -eq 1 ]'
+# The default policy (warn): the same firmware only reports "not verified".
+sed -e 's/^firmware_policy = .*/firmware_policy = "warn"/' -e 's/^validated_firmware = .*/validated_firmware = []/' "$T/sat.toml" >"$T/warn.toml"
+out=$("$P/bin/webos-satellite" --config "$T/warn.toml" --check-firmware 2>&1) && rc=0 || rc=$?
+check "--check-firmware: warn policy, unverified firmware (exit 1, says not verified)" '[ "$rc" -eq 1 ] && echo "$out" | grep -q "not verified"'
+sed -e 's/^firmware_policy = .*/firmware_policy = "warn"/' "$T/sat.toml" >"$T/warn-listed.toml"
+"$P/bin/webos-satellite" --config "$T/warn-listed.toml" --check-firmware >/dev/null && rc=0 || rc=$?
+check "--check-firmware: warn policy, firmware in the owner's list (exit 0)" '[ "$rc" -eq 0 ]'
+sed -e 's/^validated_firmware = .*/validated_firmware = []/' "$T/sat.toml" >"$T/strict-empty.toml"
+"$P/bin/webos-satellite" --config "$T/strict-empty.toml" --check-firmware >/dev/null && rc=0 || rc=$?
+check "--check-firmware: strict policy, empty list (exit 3)" '[ "$rc" -eq 3 ]'
 
 sh "$P/bin/start.sh" --supervise >/dev/null
 . "$PKG/lib.sh"
@@ -134,7 +145,14 @@ rm -f "$P/disable"
 
 cp "$T/bad.toml" "$P/etc/config.toml"
 sh "$P/bin/autostart.sh" --delay 0
-check "autostart: firmware guard failure prevents the start" 'grep -q "firmware check failed (status 1)" "$P/log/autostart.log" && ! supervisor_alive'
+check "autostart: strict policy and a firmware not in the list prevent the start" 'grep -q "firmware check failed (status 1)" "$P/log/autostart.log" && grep -q "strict, not starting" "$P/log/autostart.log" && ! supervisor_alive'
+# The default policy never blocks: an unverified firmware is logged and the
+# daemon starts (owner decision 2026-11-04).
+cp "$T/warn.toml" "$P/etc/config.toml"
+sh "$P/bin/autostart.sh" --delay 0
+pidw=$(read_pid "$PIDFILE")
+check "autostart: warn policy and an unverified firmware: logged, started anyway" 'grep -q "starting anyway (firmware_policy warn)" "$P/log/autostart.log" && is_ours "$pidw" && supervisor_alive'
+sh "$P/bin/stop.sh" >/dev/null
 cp "$T/sat.toml" "$P/etc/config.toml"
 
 sh "$P/bin/autostart.sh" --delay 0

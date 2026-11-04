@@ -32,6 +32,19 @@ An experimental, local-first Home Assistant voice satellite for **rooted LG webO
 
 **Development:** [build, cross-compile and deploy](docs/development.md) · **Architecture:** [overview](docs/architecture/overview.md) (provisional, partly superseded by the ADRs) · **Backlog:** [post-Phase-5 ideas](docs/project/backlog.md) · **Agent skills:** [.agents/skills](.agents/skills) · **CI:** [documentation checks](.github/workflows/validate.yml), [Rust](.github/workflows/rust.yml)
 
+## Verified TVs
+
+The microphone starts on every TV and firmware; the daemon, Home Assistant and the TV app only say how well known the combination is. Matching is by **series and firmware** ([how it works](docs/compatibility/verified-models.md)). Nothing here has run with the soft policy on a TV yet (implemented 2026-11-04, host tests only).
+
+| Series | Tested firmware | Units |
+| --- | --- | --- |
+| LG OLED C3 (2023, webOS 8.x) | `03.30.74`, `03.30.73` | c3-a (`OLED42C34LA`), c3-b (`OLED55C36LC`) |
+
+- **Same series, other firmware or size:** "series verified, firmware not yet reported".
+- **Anything else is "not verified"**: that means nobody has reported it yet, not that it does not work. The microphone still starts; the daemon checks that audio flows and has a sane level, and closes the microphone with a visible `capture problem` status if it measurably does not.
+- **Report your TV, working or not:** open the TV app, press "Report compatibility" and scan the QR code (or run `ctl.sh report` over SSH). It opens a prefilled GitHub issue; you review it and press Submit. The report holds only the TV model, webOS and firmware, architecture, audio device ids, check results and levels, power states and TV control results; never a serial number, MAC or IP address, device or Home Assistant name, key, audio or transcript. The satellite sends nothing by itself.
+- Want the old behaviour (microphone off on unlisted firmware)? Set `[safety] firmware_policy = "strict"` and `validated_firmware`.
+
 ## License
 
 GPL-3.0-or-later. The full text is in [LICENSE](LICENSE). Third-party dependencies and their licenses are audited in the [packaging design](docs/design/packaging.md#8-license-decision-and-dependency-audit). The vendored ESPHome `.proto` files keep their MIT notice.

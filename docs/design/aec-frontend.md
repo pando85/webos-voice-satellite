@@ -181,7 +181,7 @@ ERLE in 200 to 4000 Hz over frames where the reference is active, the output lag
 | Delay not found (reference silent, unrelated) | No lock; AEC3 still estimates on its own | no `echo delay` line | **verified-on-host** |
 | Delay jumps (reopen, unknown causes) | Re-estimated every 30 s; AEC3 tracks it itself | `info aec: echo delay changed A -> B ms` | jump behaviour on the TV **unknown** |
 | Unsupported reference rate | Rejected by `--check-config`; at runtime, no canceller | config error / `warn` | **verified-on-host** |
-| Mute, kill switch, firmware guard, unpaired | Both PCMs closed with the mic (the duplex is one source) | existing `microphone closed` lines | **verified-on-target** for HA mute, the kill switch and `stop.sh` (both `closed` in the same 10 ms poll, reopened linked; [P3 TV verification](../discovery/c3-a/P3-tv-verify-aec-pairing.md#2-daemon-smoke-with-aec-section-9-step-2)); firmware guard and unpaired not exercised with AEC on |
+| Mute, kill switch, strict firmware guard, failed self-check, unpaired | Both PCMs closed with the mic (the duplex is one source) | existing `microphone closed` lines | **verified-on-target** for HA mute, the kill switch and `stop.sh` (both `closed` in the same 10 ms poll, reopened linked; [P3 TV verification](../discovery/c3-a/P3-tv-verify-aec-pairing.md#2-daemon-smoke-with-aec-section-9-step-2)); firmware guard and unpaired not exercised with AEC on |
 
 ## 6. Configuration
 

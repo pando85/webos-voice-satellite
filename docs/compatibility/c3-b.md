@@ -38,7 +38,7 @@
 
 - The API key `networkinput/controls/power` and the IR remote's power key gave the same state sequences and the reason `remoteKey`. The IR key is a `KEY_POWER` event on `LGE RCU`; the API key appears on `Smart Remote RCU Input`.
 - `suspend_stats/success` rises for each Suspend and does not rise in Always Ready's `Active Standby`.
-- The firmware guard needed `validated_firmware = ["03.30.73"]`; the permanent install on 2026-11-04 lists `03.30.73` and `03.30.74` in this TV's own config (the package default stays c3-a's `03.30.74`). With LG hands-free on, capture is busy (see the P4 row); the capture rows above were measured with hands-free off.
+- The firmware guard needed `validated_firmware = ["03.30.73"]`; the permanent install on 2026-11-04 lists `03.30.73` and `03.30.74` in this TV's own config (the package default stays c3-a's `03.30.74`). With LG hands-free on, capture is busy (see the P4 row); the capture rows above were measured with hands-free off. Since 2026-11-04 `03.30.73` is a row of the [verified list](verified-models.md) (series LG OLED C3) and the default policy no longer blocks the microphone on a firmware that is not listed (not yet run on this unit).
 - The TV's sound output falls back to ARC after a power cycle even if set to `tv_speaker` earlier.
 - One of three `reboot`s over SSH ended in `Active Standby` 53 s after boot (power-off reason `homekit` from `com.webos.service.qbd`); `networkinput/controls/power` brought it back to the home app (EXP-009).
 - Other apps' boot hooks are present in `init.d` (four symlinks); the satellite's hook sorts after them.

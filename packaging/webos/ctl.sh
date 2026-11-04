@@ -24,6 +24,14 @@
 #   mic off|on        create or delete the kill switch (the mic is released
 #                     at once; lost at reboot)
 #   pair              open the pairing window (daemon running, pairing on)
+#   report [--full|--json]
+#                     the compatibility report and a prefilled GitHub issue
+#                     link (nothing is sent: you open the link, review it and
+#                     press Submit). --full: the whole report text; --json:
+#                     what the status app shows. Uses the daemon's last
+#                     report (run/report.*), or builds a static one
+#   selfcheck         re-run the microphone self-check (daemon running)
+#   ack-firmware      acknowledge a firmware change (clears the warning)
 #   reset-pairing     forget the stored key and open the window
 #   clear-crashloop   delete DIR/crashloop after fixing the cause
 #   uninstall         delete the boot hook, stop, delete the daemon; KEEP
@@ -41,7 +49,7 @@ here=$(cd "$(dirname "$0")" && pwd)
 . "$here/lib.sh"
 
 usage() {
-    sed -n '2,39p' "$0" >&2
+    sed -n '2,45p' "$0" >&2
     exit 2
 }
 
@@ -219,6 +227,77 @@ cmd_trigger() { # pair | reset-pairing
     note "$1 requested; the daemon acts on it within a second"
 }
 
+# Directory the daemon writes its report and status files to, and polls for
+# the trigger files ([report] dir; <config dir>/../run for etc/config.toml).
+RUN_DIR=$P/run
+
+cmd_report() {
+    mode=short
+    case ${1:-} in
+    '') ;;
+    --full) mode=full ;;
+    --json) mode=json ;;
+    *) usage ;;
+    esac
+    [ $# -le 1 ] || usage
+    installed || die "not installed (ctl.sh install)"
+    if [ -f "$RUN_DIR/report.json" ] && [ -f "$RUN_DIR/report.short.txt" ] && [ -f "$RUN_DIR/report.url" ]; then
+        # A withheld report has an "error" and no usable text.
+        if grep -q '"error"' "$RUN_DIR/report.json" 2>/dev/null; then
+            if [ "$mode" = json ]; then
+                cat "$RUN_DIR/report.json"
+                return 0
+            fi
+            die "the report was withheld: $(sed -n 's/.*"error":"\([^"]*\)".*/\1/p' "$RUN_DIR/report.json")"
+        fi
+        if [ "$mode" != json ] && ! running; then
+            note "(the daemon is not running: this is the last saved report)"
+        fi
+        case $mode in
+        json) cat "$RUN_DIR/report.json" ;;
+        full) cat "$RUN_DIR/report.full.txt" ;;
+        short)
+            cat "$RUN_DIR/report.short.txt"
+            echo
+            echo "Create the GitHub issue (prefilled; you review it and press Submit):"
+            cat "$RUN_DIR/report.url"
+            ;;
+        esac
+        return 0
+    fi
+    case $mode in
+    short) exec "$BIN" --config "$CFG" --report ;;
+    *) exec "$BIN" --config "$CFG" --report "--$mode" ;;
+    esac
+}
+
+cmd_selfcheck() {
+    installed || die "not installed"
+    if running; then
+        mkdir -p "$RUN_DIR"
+        : >"$RUN_DIR/selfcheck-run"
+        note "microphone self-check requested; the result shows in Home Assistant (sensor Microphone self-check) and in the app within about 15 seconds"
+    else
+        note "the daemon is not running: the microphone self-check runs at the next start"
+    fi
+}
+
+cmd_ack_firmware() {
+    installed || die "not installed"
+    if running; then
+        mkdir -p "$RUN_DIR"
+        : >"$RUN_DIR/firmware-ack"
+        note "firmware change acknowledged; the daemon clears the warning within a few seconds"
+    else
+        fwv=$(sed -n 's/.*"webos_manufacturing_version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+            "${WEBOS_SAT_OS_INFO:-/var/run/nyx/os_info.json}" 2>/dev/null | head -n 1)
+        [ -n "$fwv" ] || die "cannot read the firmware version"
+        mkdir -p "$P/etc"
+        echo "$fwv" >"$P/etc/firmware_seen.new.$$" && mv -f "$P/etc/firmware_seen.new.$$" "$P/etc/firmware_seen"
+        note "firmware $fwv recorded as the one this daemon runs on"
+    fi
+}
+
 remove_hook_and_stop() {
     rm -f "$HOOK"
     if [ -f "$P/$MARKER" ]; then
@@ -301,15 +380,34 @@ cmd_status() {
     build=
     fw=
     fw_ok=false
+    fw_verified=false
     if [ "$is_inst" = true ]; then
         build=$("$BIN" --version 2>/dev/null || true)
         rc=0
         fw=$("$BIN" --config "$CFG" --check-firmware 2>&1) || rc=$?
         case $rc in
-        0 | 3) fw_ok=true ;; # validated, or the guard is off
+        0) fw_verified=true ;;
         esac
+        # May the daemon start the microphone? Always, except with the strict
+        # policy (the old hard gate) on a firmware that is not in its list.
+        if [ "$(cfg_value firmware_policy)" = strict ]; then
+            case $rc in
+            0 | 3) fw_ok=true ;;
+            esac
+        else
+            fw_ok=true
+        fi
     else
-        fw="$(firmware_version) (checked against the allow-list after set up)"
+        fw="firmware $(firmware_version) (compared with the verified list after set up)"
+        fw_ok=true
+    fi
+    compat=null
+    if [ -f "$RUN_DIR/compat.json" ]; then
+        compat=$(tr -d '\n\r' <"$RUN_DIR/compat.json" 2>/dev/null || true)
+        case $compat in
+        '{'*'}') ;;
+        *) compat=null ;;
+        esac
     fi
     keys=$(key_state)
     # Written by the daemon when Home Assistant changes them (etc/). `1{...;p;}`
@@ -329,7 +427,16 @@ cmd_status() {
         [ ! -e "$DISABLE" ] || note "marker $DISABLE present: starts are refused"
         [ ! -e "$CRASHLOOP" ] || note "marker $CRASHLOOP present: the supervisor gave up"
         [ ! -e "$KILL_SWITCH_DEFAULT" ] || note "microphone off (kill switch $KILL_SWITCH_DEFAULT)"
-        note "firmware: $fw"
+        if [ "$fw_verified" = true ]; then
+            note "firmware: $fw"
+        else
+            note "firmware: $fw (not verified yet: the microphone runs anyway, press Report compatibility in the app if it does not work)"
+        fi
+        if [ "$compat" != null ]; then
+            cstat=$(printf '%s' "$compat" | sed -n 's/.*"compat_status":"\([^"]*\)".*/\1/p')
+            csel=$(printf '%s' "$compat" | sed -n 's/.*"selfcheck":"\([^"]*\)".*/\1/p')
+            note "compatibility: ${cstat:-?}; microphone self-check: ${csel:-?} (ctl.sh report: the report and the issue link)"
+        fi
         note "device: ${name:-?} port ${port:-6053}, key: $keys"
         if [ -n "$reply_volume" ]; then
             vol_text="$reply_volume %"
@@ -350,7 +457,8 @@ cmd_status() {
     printf '"autostart":%s,' "$(json_bool test -e "$HOOK")"
     printf '"disabled":%s,"crashloop":%s,' "$(json_bool test -e "$DISABLE")" "$(json_bool test -e "$CRASHLOOP")"
     printf '"mic_off":%s,' "$(json_bool test -e "$KILL_SWITCH_DEFAULT")"
-    printf '"firmware":%s,"firmware_ok":%s,' "$(json_str "$fw")" "$fw_ok"
+    printf '"firmware":%s,"firmware_ok":%s,"firmware_verified":%s,' "$(json_str "$fw")" "$fw_ok" "$fw_verified"
+    printf '"compat":%s,' "$compat"
     printf '"key":%s,"name":%s,"port":%s,' "$(json_str "$keys")" "$(json_str "$name")" "$(json_str "${port:-6053}")"
     printf '"remote_off":%s,"reply_volume":%s,' "$(json_str "${remote_off:-normal}")" "$(json_str "$reply_volume")"
     printf '"reply_volume_default":%s,' "$(json_str "$reply_volume_default")"
@@ -385,6 +493,9 @@ autostart) cmd_autostart "$@" ;;
 mic) cmd_mic "$@" ;;
 pair) [ $# -eq 0 ] || usage; cmd_trigger pair ;;
 reset-pairing) [ $# -eq 0 ] || usage; cmd_trigger reset-pairing ;;
+report) cmd_report "$@" ;;
+selfcheck) [ $# -eq 0 ] || usage; cmd_selfcheck ;;
+ack-firmware) [ $# -eq 0 ] || usage; cmd_ack_firmware ;;
 clear-crashloop) [ $# -eq 0 ] || usage; need_root; rm -f "$CRASHLOOP"; note "crash-loop marker removed" ;;
 uninstall) [ $# -eq 0 ] || usage; cmd_uninstall ;;
 purge) [ $# -eq 0 ] || usage; cmd_purge ;;

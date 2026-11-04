@@ -48,3 +48,14 @@ button.armed { background: #5a2a2a; }
 pre { font-size: 17px; white-space: pre-wrap; word-break: break-all; margin: 0; color: var(--muted); max-height: 9em; overflow: hidden; }
 code { font-size: 22px; }
 .message { min-height: 32px; color: var(--warn); }
+.banner { border-left: 8px solid var(--warn); }
+.banner.bad { border-left-color: var(--bad); color: var(--text); }
+.banner.ok { border-left-color: var(--ok); color: var(--text); }
+.banner p { margin: 0; }
+[hidden] { display: none !important; }
+.report-grid { display: flex; gap: 40px; align-items: flex-start; }
+.qr-box { background: #fff; padding: 0; border-radius: 8px; flex: none; }
+#qr { display: block; width: 640px; height: 640px; image-rendering: pixelated; }
+.report-side { flex: 1; }
+.url { font-size: 20px; word-break: break-all; color: var(--text); }
+.report-text { font-size: 18px; color: var(--text); max-height: 12em; overflow-y: auto; white-space: pre-wrap; word-break: break-all; }

@@ -7,12 +7,12 @@ body:
     attributes:
       value: |
         Thank you. This issue is **public**. The report below was built by the satellite from a fixed list of fields: TV model, webOS and firmware version, architecture, audio device ids and formats, self-check results, capture level numbers, power states and TV control results. It never contains a serial number, MAC or IP address, device name, Home Assistant address, key, audio or transcript, and the satellite sends nothing by itself.
-        Please read it before you submit and remove anything you do not want to share. How to create it: Home Assistant button "Create compatibility report", the TV app "Report compatibility", or `ctl.sh report`.
+        Please read it before you submit and remove anything you do not want to share. How to create it: in the TV app press "Report compatibility" and scan the QR code with a phone (it opens this form already filled in), or run `ctl.sh report` over SSH and open the link it prints.
   - type: textarea
     id: report
     attributes:
       label: Report
-      description: Filled in by the link. Paste the output of `ctl.sh report` if it is empty.
+      description: Filled in by the link or the QR code. If it is empty, paste the report text from the TV app or from `ctl.sh report`.
       render: text
     validations:
       required: true

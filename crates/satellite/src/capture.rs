@@ -42,12 +42,15 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 use webos_capture::{AudioSource, CaptureError, FilePair, FileSource, ReferenceState};
+use webos_compat::pcm::WantedPcm;
+use webos_compat::window::FrameStats;
 use webos_dsp::{AecConfig, AecMetrics, DelayEvent, EchoCanceller, Frontend, FrontendConfig};
 use webos_esphome_api::AppCommand;
 use webos_esphome_api::config::BinarySensorEntity;
 use webos_esphome_api::proto::EntityCategory;
 
 use crate::config::{MicSource, Settings};
+use crate::selfcheck::{Glue, Note, SAMPLE_BITS, SelfCheckSettings};
 
 /// Samples per chunk sent to HA (32 ms at 16 kHz, as ESPHome sends).
 pub(crate) const CHUNK_SAMPLES: usize = 512;
@@ -87,6 +90,9 @@ pub(crate) struct Shared {
     pub(crate) releases: AtomicU64,
     /// Test aid (`--test-hang capture`): freeze the thread.
     pub(crate) test_hang: AtomicBool,
+    /// Re-run the microphone self-check (HA button, `ctl.sh selfcheck`, a
+    /// firmware change): set by the daemon, taken by the capture thread.
+    pub(crate) selfcheck_rerun: AtomicBool,
 }
 
 /// What the capture thread needs from the configuration.
@@ -105,6 +111,8 @@ pub(crate) struct CaptureSettings {
     frontend: FrontendConfig,
     kill_switch: Option<PathBuf>,
     aec: Option<AecSettings>,
+    /// The microphone self-check (`[safety] self_check`); `None`: off.
+    pub(crate) selfcheck: Option<SelfCheckSettings>,
 }
 
 /// Echo canceller part of [`CaptureSettings`] (`[aec] enabled`).
@@ -142,6 +150,20 @@ impl CaptureSettings {
             frontend: s.frontend_config(),
             kill_switch: Some(s.safety.kill_switch.clone()),
             aec,
+            // A file mic that pauses while idle delivers no frames until HA
+            // streams, which the check would read as "no audio": not checked.
+            selfcheck: (s.safety.self_check
+                && (s.mic.source == MicSource::Alsa || !s.mic.pause_when_idle))
+                .then(|| SelfCheckSettings {
+                    window: Duration::from_secs(u64::from(s.safety.self_check_window_s)),
+                    rate: s.mic.rate,
+                    wanted: (s.mic.source == MicSource::Alsa).then(|| WantedPcm {
+                        card_id: s.mic.card_id.clone(),
+                        device: s.mic.device,
+                    }),
+                    pcm_name: s.mic.pcm_name.clone(),
+                    asound: PathBuf::from("/proc/asound"),
+                }),
         }
     }
 }
@@ -556,15 +578,23 @@ fn log_aec_metrics(m: &AecMetrics, window_s: u64) {
     );
 }
 
-/// Starts the capture thread.
+/// Starts the capture thread. `notes` receives the self-check results
+/// (without a receiver the check still runs and closes the mic on a failure).
 pub(crate) fn spawn(
     cfg: CaptureSettings,
     shared: Arc<Shared>,
     tx: mpsc::Sender<AppCommand>,
+    notes: Option<mpsc::UnboundedSender<Note>>,
 ) -> std::io::Result<JoinHandle<()>> {
     std::thread::Builder::new()
         .name("capture".into())
-        .spawn(move || run(&cfg, &shared, &tx))
+        .spawn(move || {
+            let glue = cfg
+                .selfcheck
+                .clone()
+                .map(|c| Glue::new(c, notes.unwrap_or_else(|| mpsc::unbounded_channel().0)));
+            run(&cfg, &shared, &tx, glue);
+        })
 }
 
 /// How [`pump`] ended without an error.
@@ -574,6 +604,8 @@ enum PumpEnd {
     Stop,
     /// The microphone is not wanted any more (the reason).
     Released(&'static str),
+    /// The self-check measured a failure and closed the microphone.
+    CheckClosed,
 }
 
 fn backoff(n: u32) -> Duration {
@@ -582,7 +614,13 @@ fn backoff(n: u32) -> Duration {
         .min(RETRY_MAX)
 }
 
-fn run(cfg: &CaptureSettings, shared: &Shared, tx: &mpsc::Sender<AppCommand>) {
+#[allow(clippy::too_many_lines)] // one loop: gates, self-check, open, pump, errors
+fn run(
+    cfg: &CaptureSettings,
+    shared: &Shared,
+    tx: &mpsc::Sender<AppCommand>,
+    mut glue: Option<Glue>,
+) {
     let mut failures = 0_u32;
     let mut stream_errors = 0_u32;
     let mut busy_logged = false;
@@ -590,7 +628,14 @@ fn run(cfg: &CaptureSettings, shared: &Shared, tx: &mpsc::Sender<AppCommand>) {
     let mut idle_reason: Option<&'static str> = None;
     let mut ind = Indicators::new(tx, shared);
     while !shared.stop.load(Ordering::Relaxed) {
+        let rerun = glue.as_mut().is_some_and(|g| g.poll_rerun(shared, false));
         if let Some(why) = unwanted(shared, &mut kill) {
+            if let Some(g) = glue.as_mut() {
+                g.mic_closed();
+                if rerun {
+                    g.not_run();
+                }
+            }
             // Not inside `pump`, so the PCM is closed here.
             ind.listening(false);
             ind.muted(true);
@@ -604,12 +649,31 @@ fn run(cfg: &CaptureSettings, shared: &Shared, tx: &mpsc::Sender<AppCommand>) {
             continue;
         }
         idle_reason = None;
+        if let Some(g) = glue.as_mut() {
+            // The self-check holds the open while it waits for a retry or
+            // after the retries are used up: the microphone is closed because
+            // of a capture problem, not because a gate wants it off.
+            if !g.may_open() {
+                ind.listening(false);
+                ind.muted(true);
+                if !sleep_unless_stopped(shared, Duration::from_millis(20)) {
+                    break;
+                }
+                continue;
+            }
+            if cfg.source == MicSource::Alsa && g.check_pcm(shared) {
+                continue;
+            }
+        }
         // Wanted, so no gate holds the mic closed (it is closed right now).
         ind.listening(false);
         ind.muted(false);
         let src = match open_source(cfg) {
             Ok(src) => src,
             Err(e) => {
+                if let Some(g) = glue.as_mut() {
+                    g.open_failed(matches!(e, CaptureError::MicBusy), shared);
+                }
                 failures = failures.saturating_add(1);
                 let delay = backoff(failures);
                 match e {
@@ -640,15 +704,28 @@ fn run(cfg: &CaptureSettings, shared: &Shared, tx: &mpsc::Sender<AppCommand>) {
         failures = 0;
         busy_logged = false;
         let opened = Instant::now();
-        let end = pump(cfg, src, shared, tx, &mut kill, &mut ind);
+        let end = pump(cfg, src, shared, tx, &mut kill, &mut ind, &mut glue);
         // `pump` consumed and dropped the source: the PCM is closed now.
         shared.open.store(false, Ordering::Relaxed);
         ind.listening(false);
         if opened.elapsed() >= STREAM_OK_AFTER {
             stream_errors = 0;
         }
+        if let Some(g) = glue.as_mut() {
+            // A stall is the "no frames" case of the check; anything but a
+            // measured failure leaves a run in progress abandoned.
+            if matches!(end, Err(CaptureError::Stalled(_))) {
+                let _ = g.on_tick(shared);
+            }
+            if !matches!(end, Ok(PumpEnd::CheckClosed)) {
+                g.mic_closed();
+            }
+        }
         match end {
             Ok(PumpEnd::Stop) => break,
+            Ok(PumpEnd::CheckClosed) => {
+                // The self-check logged why; the loop holds the open.
+            }
             Ok(PumpEnd::Released(why)) => {
                 shared.releases.fetch_add(1, Ordering::Relaxed);
                 log::info!("capture: microphone closed, PCM released ({why})");
@@ -697,6 +774,7 @@ fn sleep_unless_wanted_or_stopped(shared: &Shared, kill: &mut KillSwitch<'_>, d:
     }
 }
 
+#[allow(clippy::too_many_lines)] // one read loop with the self-check and the pacing
 /// Reads until stop or release (`Ok`) or a stream error (`Err`, caller
 /// reopens). The source is dropped (PCM closed) when this returns.
 fn pump(
@@ -706,6 +784,7 @@ fn pump(
     tx: &mpsc::Sender<AppCommand>,
     kill: &mut KillSwitch<'_>,
     ind: &mut Indicators<'_>,
+    glue: &mut Option<Glue>,
 ) -> Result<PumpEnd, CaptureError> {
     let ch = usize::from(src.channels());
     let rate = src.rate();
@@ -720,6 +799,13 @@ fn pump(
     ind.listening(true);
     let mut frontend = build_frontend(cfg, src.as_ref(), rate);
     let mut feed = ReferenceFeed::new(src.as_ref(), &frontend);
+    if let Some(g) = glue.as_mut() {
+        let reference = cfg
+            .aec
+            .is_some()
+            .then(|| matches!(src.reference_state(), ReferenceState::Active { .. }));
+        g.opened(src.channels(), rate, reference);
+    }
     let mut buf = vec![0_i32; READ_FRAMES * ch];
     let mut mono = Vec::with_capacity(READ_FRAMES);
     let mut chunker = Chunker::default();
@@ -738,6 +824,10 @@ fn pump(
         if let Some(why) = unwanted(shared, kill) {
             return Ok(PumpEnd::Released(why));
         }
+        if let Some(g) = glue.as_mut() {
+            // A rerun on the open stream measures from now, no second open.
+            g.poll_rerun(shared, true);
+        }
         let streaming = shared.streaming.load(Ordering::Relaxed);
         if streaming != was_streaming {
             chunker.clear();
@@ -746,6 +836,9 @@ fn pump(
             paced_frames = 0;
         }
         if is_file && (eof || (cfg.pause_when_idle && !streaming)) {
+            if glue.as_mut().is_some_and(|g| g.on_tick(shared)) {
+                return Ok(PumpEnd::CheckClosed);
+            }
             std::thread::sleep(Duration::from_millis(10));
             continue;
         }
@@ -760,6 +853,18 @@ fn pump(
             let due = Duration::from_micros(paced_frames * 1_000_000 / u64::from(rate));
             if let Some(wait) = due.checked_sub(pace_start.elapsed()) {
                 std::thread::sleep(wait);
+            }
+        }
+        if let Some(g) = glue.as_mut() {
+            // Levels of what was read, before the front-end; the samples are
+            // not kept.
+            let stats = FrameStats::from_samples(
+                &buf[..n * ch],
+                u32::try_from(ch).unwrap_or(1),
+                SAMPLE_BITS,
+            );
+            if g.on_frame(&stats, shared) {
+                return Ok(PumpEnd::CheckClosed);
             }
         }
         feed.feed(src.as_mut(), &mut frontend, cfg.frontend, rate);
@@ -848,7 +953,7 @@ mod tests {
         let cfg = CaptureSettings::from_settings(&s);
         let shared = Arc::new(Shared::default());
         let (tx, mut rx) = mpsc::channel(1024);
-        let h = spawn(cfg, Arc::clone(&shared), tx).unwrap();
+        let h = spawn(cfg, Arc::clone(&shared), tx, None).unwrap();
 
         // Paused while not streaming: no audio arrives (the indicators do).
         std::thread::sleep(Duration::from_millis(100));
@@ -898,7 +1003,13 @@ mod tests {
         s.safety.kill_switch.clone_from(&kill);
         let shared = Arc::new(Shared::default());
         let (tx, _rx) = mpsc::channel(1024);
-        let h = spawn(CaptureSettings::from_settings(&s), Arc::clone(&shared), tx).unwrap();
+        let h = spawn(
+            CaptureSettings::from_settings(&s),
+            Arc::clone(&shared),
+            tx,
+            None,
+        )
+        .unwrap();
         assert!(wait_for(|| shared.open.load(Ordering::Relaxed)));
 
         // Mute (daemon flag): closed within a read or two.
@@ -1001,7 +1112,13 @@ mod tests {
             Seen::Muted(b) => Some(*b),
             _ => None,
         };
-        let h = spawn(CaptureSettings::from_settings(&s), Arc::clone(&shared), tx).unwrap();
+        let h = spawn(
+            CaptureSettings::from_settings(&s),
+            Arc::clone(&shared),
+            tx,
+            None,
+        )
+        .unwrap();
 
         // Settled-state check while the gate flips through all its reasons:
         // the PCM state and what the server last heard agree within 300 ms.
@@ -1160,7 +1277,13 @@ mod tests {
         let shared = Arc::new(Shared::default());
         let (tx, mut rx) = mpsc::channel(4096);
         shared.streaming.store(true, Ordering::Relaxed);
-        let h = spawn(CaptureSettings::from_settings(s), Arc::clone(&shared), tx).unwrap();
+        let h = spawn(
+            CaptureSettings::from_settings(s),
+            Arc::clone(&shared),
+            tx,
+            None,
+        )
+        .unwrap();
         let mut samples: Vec<i16> = Vec::new();
         let t = Instant::now();
         while t.elapsed() < Duration::from_secs(20) {
@@ -1236,7 +1359,13 @@ mod tests {
         s.mic.path = Some(PathBuf::from("/nonexistent/mic.raw"));
         let shared = Arc::new(Shared::default());
         let (tx, mut rx) = mpsc::channel(4);
-        let h = spawn(CaptureSettings::from_settings(&s), Arc::clone(&shared), tx).unwrap();
+        let h = spawn(
+            CaptureSettings::from_settings(&s),
+            Arc::clone(&shared),
+            tx,
+            None,
+        )
+        .unwrap();
         std::thread::sleep(Duration::from_millis(100));
         assert!(!shared.open.load(Ordering::Relaxed));
         // A failed open is never reported as listening.
@@ -1254,5 +1383,250 @@ mod tests {
         shared.stop.store(true, Ordering::Relaxed);
         h.join().unwrap();
         assert!(t.elapsed() < Duration::from_millis(500));
+    }
+
+    /// 2-channel S24 raw file of pseudo-random noise (`amp` LSB), or a
+    /// constant when `amp` is 0 (the value 1000).
+    fn write_noise(path: &std::path::Path, frames: usize, amp: i32) {
+        let mut seed = 12_345_u32;
+        let mut bytes = Vec::new();
+        for _ in 0..frames * 2 {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let v = if amp == 0 {
+                1000
+            } else {
+                i32::try_from(seed >> 8).unwrap() % (2 * amp + 1) - amp
+            };
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    /// Settings for a live-paced file mic with a 1 s self-check window.
+    fn selfcheck_settings(dir: &std::path::Path, amp: i32) -> Settings {
+        let path = dir.join("mic.raw");
+        // 2 s of audio, looped: the check sees a steady stream.
+        write_noise(&path, 16_000 * 2, amp);
+        let mut s = Settings::default();
+        s.mic.source = MicSource::File;
+        s.mic.path = Some(path);
+        s.mic.looping = true;
+        s.mic.pause_when_idle = false;
+        s.safety.self_check_window_s = 1;
+        s.safety.kill_switch = dir.join("kill");
+        s
+    }
+
+    fn notes_of(rx: &mut mpsc::UnboundedReceiver<Note>) -> Vec<Note> {
+        let mut out = Vec::new();
+        while let Ok(n) = rx.try_recv() {
+            out.push(n);
+        }
+        out
+    }
+
+    fn last_result(notes: &[Note]) -> Option<&crate::selfcheck::Finished> {
+        notes.iter().rev().find_map(|n| match n {
+            Note::Result(f) => Some(&**f),
+            _ => None,
+        })
+    }
+
+    /// A normal stream passes the check and the microphone stays open.
+    #[test]
+    fn selfcheck_passes_on_a_normal_stream_and_keeps_the_mic_open() {
+        use webos_compat::engine::Overall;
+        let dir = std::env::temp_dir().join(format!("webos-sat-sc-ok-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let s = selfcheck_settings(&dir, 20_000);
+        let shared = Arc::new(Shared::default());
+        let (tx, _rx) = mpsc::channel(4096);
+        let (ntx, mut nrx) = mpsc::unbounded_channel();
+        let h = spawn(
+            CaptureSettings::from_settings(&s),
+            Arc::clone(&shared),
+            tx,
+            Some(ntx),
+        )
+        .unwrap();
+        assert!(wait_for(|| shared.open.load(Ordering::Relaxed)));
+        std::thread::sleep(Duration::from_millis(1700));
+        let notes = notes_of(&mut nrx);
+        assert!(matches!(notes.first(), Some(Note::Checking)), "{notes:?}");
+        let f = last_result(&notes).unwrap();
+        assert_eq!(
+            f.result.overall(),
+            Overall::Passed,
+            "{}",
+            f.result.summary_text()
+        );
+        assert!(shared.open.load(Ordering::Relaxed));
+        shared.stop.store(true, Ordering::Relaxed);
+        h.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A very quiet stream is a warning: the microphone stays open.
+    #[test]
+    fn selfcheck_warns_on_a_silent_stream_and_does_not_close() {
+        use webos_compat::engine::Overall;
+        let dir = std::env::temp_dir().join(format!("webos-sat-sc-warn-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let s = selfcheck_settings(&dir, 1);
+        let shared = Arc::new(Shared::default());
+        let (tx, _rx) = mpsc::channel(4096);
+        let (ntx, mut nrx) = mpsc::unbounded_channel();
+        let h = spawn(
+            CaptureSettings::from_settings(&s),
+            Arc::clone(&shared),
+            tx,
+            Some(ntx),
+        )
+        .unwrap();
+        assert!(wait_for(|| shared.open.load(Ordering::Relaxed)));
+        std::thread::sleep(Duration::from_millis(1700));
+        let notes = notes_of(&mut nrx);
+        let f = last_result(&notes).unwrap();
+        assert_eq!(
+            f.result.overall(),
+            Overall::Warning,
+            "{}",
+            f.result.summary_text()
+        );
+        assert!(shared.open.load(Ordering::Relaxed));
+        shared.stop.store(true, Ordering::Relaxed);
+        h.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A stuck (constant) stream fails: the thread closes the PCM, shows the
+    /// microphone as muted, keeps the retry bounded and retries only on a
+    /// rerun request.
+    #[test]
+    fn selfcheck_fails_on_a_stuck_stream_closes_the_mic_and_reruns_on_request() {
+        use webos_compat::engine::Overall;
+        let dir = std::env::temp_dir().join(format!("webos-sat-sc-fail-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let s = selfcheck_settings(&dir, 0);
+        let shared = Arc::new(Shared::default());
+        let (tx, mut rx) = mpsc::channel(4096);
+        let (ntx, mut nrx) = mpsc::unbounded_channel();
+        let h = spawn(
+            CaptureSettings::from_settings(&s),
+            Arc::clone(&shared),
+            tx,
+            Some(ntx),
+        )
+        .unwrap();
+        assert!(wait_for(|| shared.open.load(Ordering::Relaxed)));
+        assert!(wait_for(|| !shared.open.load(Ordering::Relaxed)));
+        std::thread::sleep(Duration::from_millis(100));
+        let notes = notes_of(&mut nrx);
+        let f = last_result(&notes).unwrap();
+        assert_eq!(f.result.overall(), Overall::Failed);
+        assert!(f.result.summary_text().starts_with("failed:"));
+        // The first retry is 5 s away: the mic stays closed meanwhile and the
+        // indicators say so (muted on, listening off).
+        let mut muted = None;
+        let mut listening = None;
+        while let Ok(cmd) = rx.try_recv() {
+            if let AppCommand::SetBinarySensor { object_id, state } = cmd {
+                match object_id.as_str() {
+                    MUTED_ID => muted = state,
+                    LISTENING_ID => listening = state,
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!((muted, listening), (Some(true), Some(false)));
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(!shared.open.load(Ordering::Relaxed));
+        // A rerun request opens again at once and measures again.
+        shared.selfcheck_rerun.store(true, Ordering::Relaxed);
+        assert!(wait_for(|| shared.open.load(Ordering::Relaxed)));
+        assert!(wait_for(|| !shared.open.load(Ordering::Relaxed)));
+        let notes = notes_of(&mut nrx);
+        assert!(notes.iter().any(|n| matches!(n, Note::Checking)));
+        assert_eq!(
+            last_result(&notes).map(|f| f.result.overall()),
+            Some(Overall::Failed)
+        );
+        shared.stop.store(true, Ordering::Relaxed);
+        h.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A card that is not in `/proc/asound` fails C2 before any open.
+    #[test]
+    fn selfcheck_fails_c2_without_opening_when_the_card_is_missing() {
+        use webos_compat::check::{CheckId, Grade, Reason};
+        let dir = std::env::temp_dir().join(format!("webos-sat-sc-c2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let asound = dir.join("asound");
+        std::fs::create_dir_all(&asound).unwrap();
+        std::fs::write(
+            asound.join("cards"),
+            " 0 [lg115x         ]: lg115x - lg115x\n",
+        )
+        .unwrap();
+        std::fs::write(asound.join("pcm"), "00-10: MixerCapture : : capture 1\n").unwrap();
+        let mut s = Settings::default();
+        s.mic.source = MicSource::Alsa;
+        s.mic.card_id = "NOSUCHCARD".to_owned();
+        s.safety.kill_switch = dir.join("kill");
+        let mut cfg = CaptureSettings::from_settings(&s);
+        cfg.selfcheck.as_mut().unwrap().asound = asound;
+        let shared = Arc::new(Shared::default());
+        let (tx, _rx) = mpsc::channel(64);
+        let (ntx, mut nrx) = mpsc::unbounded_channel();
+        let h = spawn(cfg, Arc::clone(&shared), tx, Some(ntx)).unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!shared.open.load(Ordering::Relaxed), "never opened");
+        let notes = notes_of(&mut nrx);
+        let f = last_result(&notes).unwrap();
+        let c2 = f.result.check(CheckId::C2);
+        assert_eq!((c2.grade, c2.reason), (Grade::Fail, Some(Reason::NoCard)));
+        // The cards are listed for the report (ids only).
+        assert!(notes.iter().any(|n| matches!(
+            n,
+            Note::Audio(a, _) if a.cards.iter().any(|c| c.id == "lg115x")
+        )));
+        shared.stop.store(true, Ordering::Relaxed);
+        h.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `safety.self_check = false`: no check, no notes, nothing changes.
+    #[test]
+    fn selfcheck_off_sends_no_notes() {
+        let dir = std::env::temp_dir().join(format!("webos-sat-sc-off-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut s = selfcheck_settings(&dir, 0);
+        s.safety.self_check = false;
+        let cfg = CaptureSettings::from_settings(&s);
+        assert!(cfg.selfcheck.is_none());
+        let shared = Arc::new(Shared::default());
+        let (tx, _rx) = mpsc::channel(4096);
+        let (ntx, mut nrx) = mpsc::unbounded_channel();
+        let h = spawn(cfg, Arc::clone(&shared), tx, Some(ntx)).unwrap();
+        assert!(wait_for(|| shared.open.load(Ordering::Relaxed)));
+        std::thread::sleep(Duration::from_millis(1700));
+        // A constant stream would have failed the check; the mic stays open.
+        assert!(shared.open.load(Ordering::Relaxed));
+        assert!(notes_of(&mut nrx).is_empty());
+        shared.stop.store(true, Ordering::Relaxed);
+        h.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A paused file mic (frames only while HA streams) is not checked.
+    #[test]
+    fn selfcheck_skips_a_file_mic_that_pauses_when_idle() {
+        let dir = std::env::temp_dir().join(format!("webos-sat-sc-pause-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut s = selfcheck_settings(&dir, 0);
+        s.mic.pause_when_idle = true;
+        assert!(CaptureSettings::from_settings(&s).selfcheck.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

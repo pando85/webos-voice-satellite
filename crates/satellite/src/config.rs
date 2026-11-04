@@ -48,6 +48,8 @@ pub(crate) struct Settings {
     pub(crate) power: PowerSection,
     /// TV control from Home Assistant (screen, power, volume, input, apps).
     pub(crate) tv_control: TvControlSection,
+    /// Compatibility report and self-check files.
+    pub(crate) report: ReportSection,
 }
 
 /// How pipeline runs start.
@@ -463,6 +465,20 @@ impl Default for LogSection {
     }
 }
 
+/// How the daemon treats a firmware that is not in the verified list
+/// (ADR 0006).
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum FirmwarePolicy {
+    /// The microphone starts on any firmware; the status says "not verified"
+    /// and the self-check measures the capture path.
+    #[default]
+    Warn,
+    /// The old gate: on a firmware that is not in `safety.validated_firmware`
+    /// the microphone stays off.
+    Strict,
+}
+
 /// `[safety]`: privacy and firmware gates.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
@@ -474,13 +490,27 @@ pub(crate) struct SafetySection {
     /// Remembers HA's mute switch across daemon restarts: created on mute,
     /// removed on unmute, read at startup.
     pub(crate) mute_file: PathBuf,
-    /// Firmware versions (`webos_manufacturing_version`) the ALSA capture has
-    /// been validated on. On any other version, or if `firmware_info` cannot
-    /// be read, the satellite starts with the microphone disabled. An empty
-    /// list turns the guard off (with a warning).
+    /// `warn` (default): never block the microphone on the firmware version,
+    /// show the compatibility status and self-check instead. `strict`: keep
+    /// the microphone off on a firmware that is not in `validated_firmware`.
+    pub(crate) firmware_policy: FirmwarePolicy,
+    /// Firmware versions (`webos_manufacturing_version`) the owner has
+    /// validated. `strict` mode: the only versions allowed (an empty list
+    /// turns the gate off, with a warning). `warn` mode: extends the built-in
+    /// verified list (`data/verified-models.toml`); an empty list is normal.
     pub(crate) validated_firmware: Vec<String>,
     /// Read-only JSON file with the TV's OS information (nyx).
     pub(crate) firmware_info: PathBuf,
+    /// The firmware version the daemon last ran on (one line). Written at the
+    /// first start and when a firmware change is acknowledged; a different
+    /// current version is the "firmware changed" status.
+    /// (Not set: `firmware_seen` next to the config file.)
+    pub(crate) firmware_seen_file: Option<PathBuf>,
+    /// Run the microphone self-check on the first open, after a firmware
+    /// change and on request (HA button, `ctl.sh selfcheck`).
+    pub(crate) self_check: bool,
+    /// Length of the self-check measurement window in seconds (1 to 60).
+    pub(crate) self_check_window_s: u32,
 }
 
 impl Default for SafetySection {
@@ -488,9 +518,61 @@ impl Default for SafetySection {
         Self {
             kill_switch: PathBuf::from("/tmp/webos-satellite.disable"),
             mute_file: PathBuf::from("/tmp/webos-satellite.muted"),
-            validated_firmware: vec!["03.30.74".to_owned()],
+            firmware_policy: FirmwarePolicy::Warn,
+            validated_firmware: Vec::new(),
             firmware_info: PathBuf::from("/var/run/nyx/os_info.json"),
+            firmware_seen_file: None,
+            self_check: true,
+            self_check_window_s: 10,
         }
+    }
+}
+
+impl SafetySection {
+    /// The firmware-changed marker file (a volatile one when the settings
+    /// did not come from a config file).
+    pub(crate) fn firmware_seen_path(&self) -> PathBuf {
+        self.firmware_seen_file
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("/tmp/webos-satellite.firmware_seen"))
+    }
+}
+
+/// `[report]`: the compatibility report and the files that carry the daemon's
+/// status to `ctl.sh` and the TV app.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct ReportSection {
+    /// Build the report and write the status files. The status entities
+    /// stay.
+    pub(crate) enabled: bool,
+    /// GitHub repository (`owner/name`) the prefilled issue link points at.
+    /// Nothing is sent anywhere by the daemon.
+    pub(crate) repo: String,
+    /// Directory of `report.json`, `report.short.txt`, `report.full.txt`,
+    /// `report.url`, `compat.json` and the trigger files `selfcheck-run` and
+    /// `firmware-ack`. Not set: `<config dir>/../run` when the config file
+    /// is in a directory named `etc` (the TV layout), else
+    /// `/tmp/webos-satellite`.
+    pub(crate) dir: Option<PathBuf>,
+}
+
+impl Default for ReportSection {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            repo: webos_compat::link::DEFAULT_REPO.to_owned(),
+            dir: None,
+        }
+    }
+}
+
+impl ReportSection {
+    /// The directory in use.
+    pub(crate) fn dir_or_default(&self) -> PathBuf {
+        self.dir
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("/tmp/webos-satellite"))
     }
 }
 
@@ -767,6 +849,17 @@ impl Settings {
         resolve(base, &mut s.safety.kill_switch);
         resolve(base, &mut s.safety.mute_file);
         resolve(base, &mut s.safety.firmware_info);
+        match s.safety.firmware_seen_file.as_mut() {
+            Some(p) => resolve(base, p),
+            None => s.safety.firmware_seen_file = Some(base.join("firmware_seen")),
+        }
+        match s.report.dir.as_mut() {
+            Some(p) => resolve(base, p),
+            None if base.file_name().is_some_and(|n| n == "etc") => {
+                s.report.dir = Some(base.join("..").join("run"));
+            }
+            None => {}
+        }
         resolve(base, &mut s.pairing.state_dir);
         if let Some(p) = s.aec.reference_path.as_mut() {
             resolve(base, p);
@@ -804,6 +897,9 @@ impl Settings {
         }
         if self.mic.source == MicSource::File && self.mic.path.is_none() {
             return Err(err("mic.source = \"file\" needs mic.path"));
+        }
+        if !(1..=60).contains(&self.safety.self_check_window_s) {
+            return Err(err("safety.self_check_window_s must be between 1 and 60"));
         }
         if !self.dsp.gain_db.is_finite() || !(-20.0..=60.0).contains(&self.dsp.gain_db) {
             return Err(err("dsp.gain_db must be between -20 and 60"));
@@ -1016,8 +1112,19 @@ impl Settings {
                 ));
             }
         }
-        if self.safety.validated_firmware.is_empty() {
-            w.push("safety.validated_firmware is empty: the firmware guard is off".to_owned());
+        if self.safety.firmware_policy == FirmwarePolicy::Strict
+            && self.safety.validated_firmware.is_empty()
+        {
+            w.push(
+                "safety.firmware_policy = \"strict\" with an empty safety.validated_firmware: the firmware gate is off"
+                    .to_owned(),
+            );
+        }
+        if !webos_compat::link::valid_repo(&self.report.repo) {
+            w.push(format!(
+                "report.repo {:?} is not owner/name; the compatibility report is off",
+                self.report.repo
+            ));
         }
         if self.mic.source == MicSource::File {
             if let Some(p) = self.mic.path.as_ref().filter(|p| !p.exists()) {
@@ -1260,11 +1367,15 @@ impl Settings {
             SinkKind::Null => "null".to_owned(),
         };
         let l = &self.limits;
-        let fw = if self.safety.validated_firmware.is_empty() {
-            "off".to_owned()
-        } else {
-            self.safety.validated_firmware.join(",")
-        };
+        let fw = format!(
+            "{:?}:{}",
+            self.safety.firmware_policy,
+            if self.safety.validated_firmware.is_empty() {
+                "builtin".to_owned()
+            } else {
+                self.safety.validated_firmware.join(",")
+            }
+        );
         let encryption = if self.has_fixed_key() {
             "noise".to_owned()
         } else if self.pairing_active() {
@@ -1411,6 +1522,12 @@ pub(crate) enum Command {
     CheckConfig(Box<Settings>),
     /// Read the firmware version and compare it with the allow-list.
     CheckFirmware(Box<Settings>),
+    /// Build the compatibility report and print it (no live self-check).
+    Report {
+        settings: Box<Settings>,
+        full: bool,
+        json: bool,
+    },
     /// Run the daemon.
     Run(Box<Settings>, TestTriggers),
 }
@@ -1424,8 +1541,12 @@ Runs the Home Assistant voice satellite (ESPHome native API on TCP 6053).
 options (override the config file):
   --config FILE          TOML configuration (see config/example.toml)
   --check-config         validate the configuration, print a summary, exit
-  --check-firmware       compare the TV firmware with safety.validated_firmware, exit
-                         (0 validated, 1 not validated or unreadable, 3 guard off)
+  --check-firmware       say whether this firmware is verified, exit (0 verified, 1 not
+                         verified or unreadable: informational unless safety.firmware_policy
+                         is \"strict\", 3 strict with an empty safety.validated_firmware)
+  --report               print the compatibility report and the prefilled GitHub issue link
+                         (no live self-check; the running daemon writes the full one);
+                         with --full the long text, with --json the JSON
   --mode wake|ptt        wake: continuous server-side wake word; ptt: SIGUSR1 starts a run
   --name NAME            ESPHome node name
   --friendly-name NAME   name shown in Home Assistant
@@ -1487,6 +1608,7 @@ pub(crate) fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Comm
 
     let mut check = false;
     let mut check_fw = false;
+    let (mut report, mut full, mut json) = (false, false, false);
     let mut triggers = TestTriggers::default();
     let mut it = args.iter();
     while let Some(flag) = it.next() {
@@ -1502,6 +1624,9 @@ pub(crate) fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Comm
             }
             "--check-config" => check = true,
             "--check-firmware" => check_fw = true,
+            "--report" => report = true,
+            "--full" => full = true,
+            "--json" => json = true,
             "--kill-switch" => settings.safety.kill_switch = PathBuf::from(value()?),
             "--pair" => settings.pairing.open_now = true,
             "--reset-pairing" => settings.pairing.reset_now = true,
@@ -1539,7 +1664,16 @@ pub(crate) fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Comm
     }
     settings.validate()?;
     let settings = Box::new(settings);
-    Ok(if check_fw {
+    if (full || json) && !report {
+        return Err(err("--full and --json go with --report"));
+    }
+    Ok(if report {
+        Command::Report {
+            settings,
+            full,
+            json,
+        }
+    } else if check_fw {
         Command::CheckFirmware(settings)
     } else if check {
         Command::CheckConfig(settings)
@@ -1625,6 +1759,7 @@ level = "debug"
         expected.sink.volume_file = base.join("reply_volume");
         expected.power.remote_off_file = base.join("remote_off");
         expected.pairing.state_dir = base.join("pairing");
+        expected.safety.firmware_seen_file = Some(base.join("firmware_seen"));
         assert_eq!(s, expected);
     }
 
@@ -2180,11 +2315,13 @@ level = "debug"
         s.mic.source = MicSource::File;
         s.mic.path = Some(PathBuf::from("/nonexistent/webos-sat.raw"));
         assert!(s.warnings().iter().any(|m| m.contains("does not exist")));
-        s.safety.validated_firmware.clear();
+        // The default policy needs no list; strict with none is a warning.
+        assert!(!s.warnings().iter().any(|m| m.contains("firmware gate")));
+        s.safety.firmware_policy = FirmwarePolicy::Strict;
         assert!(
             s.warnings()
                 .iter()
-                .any(|m| m.contains("firmware guard is off"))
+                .any(|m| m.contains("firmware gate is off"))
         );
     }
 

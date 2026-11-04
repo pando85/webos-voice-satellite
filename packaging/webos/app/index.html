@@ -6,7 +6,7 @@
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
-<main>
+<main id="main">
   <header>
     <h1>Voice Satellite</h1>
     <p class="sub">Home Assistant voice satellite for this TV. Everything stays on your network.</p>
@@ -15,6 +15,10 @@
   <section id="summary" aria-live="polite">
     <p id="headline" class="headline">Checking&hellip;</p>
     <p id="detail" class="detail"></p>
+  </section>
+
+  <section id="compat" class="panel banner" hidden aria-live="polite">
+    <p id="compat-text"></p>
   </section>
 
   <section class="grid">
@@ -33,6 +37,9 @@
         <button id="b-boot-off" data-cmd="autostart off">Start at boot: turn off</button>
         <button id="b-mic-off" data-cmd="mic off">Microphone off</button>
         <button id="b-mic-on" data-cmd="mic on">Microphone on</button>
+        <button id="b-report" data-cmd="report --json">Report compatibility</button>
+        <button id="b-selfcheck" data-cmd="selfcheck">Re-run microphone check</button>
+        <button id="b-ack" data-cmd="ack-firmware">Firmware change: acknowledge</button>
         <button id="b-pair" data-cmd="pair">Open pairing window</button>
         <button id="b-reset" data-cmd="reset-pairing" data-confirm="1">Reset pairing</button>
         <button id="b-crash" data-cmd="clear-crashloop">Clear crash-loop marker</button>
@@ -56,6 +63,30 @@
   </section>
   <p id="message" class="message" aria-live="polite"></p>
 </main>
+
+<main id="report-view" hidden>
+  <header>
+    <h1>Report compatibility</h1>
+    <p id="report-title" class="sub"></p>
+  </header>
+  <section class="panel report-grid">
+    <div class="qr-box">
+      <canvas id="qr" width="640" height="640"></canvas>
+    </div>
+    <div class="report-side">
+      <p id="report-how">Scan the code with your phone. GitHub opens a new issue with this report filled in; you log in, read it and press Submit. Nothing is sent from the TV, and the report holds no serial number, address, name, key, audio or transcript.</p>
+      <p class="muted">Or type this address:</p>
+      <p id="report-url" class="url"></p>
+      <p id="report-error" class="bad"></p>
+      <button id="r-back">Back</button>
+    </div>
+  </section>
+  <section class="panel">
+    <h2>The report (up and down keys scroll)</h2>
+    <pre id="report-text" class="report-text"></pre>
+  </section>
+</main>
+<script src="qrcodegen.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

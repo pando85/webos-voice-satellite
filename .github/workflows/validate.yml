@@ -17,4 +17,4 @@ jobs:
       - name: Check research files and Markdown links
         run: python3 tools/check_docs.py
       - name: Unit tests of the PC-side report tool
-        run: python3 -m unittest discover -s tools -p 'test_dogfood*.py'
+        run: python3 -m unittest discover -s tools -p 'test_*.py'

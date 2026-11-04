@@ -4,10 +4,13 @@
 //! their own OS threads.
 //!
 //! Microphone gate ([`MicGate`]): the PCM is open only while HA's mute switch
-//! is off, the kill-switch file is absent, the firmware guard passed and, with
-//! `[pairing]`, a key is active. The kill switch and the guard force the mute
-//! switch on in HA; an unmute from HA is then refused. The API connection
-//! stays up while the mic is off, so HA shows the device and its mute state.
+//! is off, the kill-switch file is absent, the strict firmware gate (opt-in,
+//! `safety.firmware_policy = "strict"`) passed and, with `[pairing]`, a key is
+//! active. The kill switch and the gate force the mute switch on in HA; an
+//! unmute from HA is then refused. The API connection stays up while the mic
+//! is off, so HA shows the device and its mute state. By default (`warn`) a
+//! firmware that is not verified never closes the microphone: the status
+//! entities and the self-check say so instead ([`crate::compat`], ADR 0006).
 //!
 //! Pairing (`[pairing]`): the API server owns the key state; the daemon
 //! prepares the state directory, applies `--reset-pairing`, polls the `pair`
@@ -32,11 +35,13 @@ use crate::capture::{
     self, CaptureSettings, KILL_SWITCH_POLL, OFF_FIRMWARE, OFF_KILL, OFF_MUTED, OFF_NONE,
     OFF_UNPAIRED, Shared,
 };
+use crate::compat::{self, Compat, ModelState};
 use crate::config::{Hang, MicSource, Mode, RemoteOff, Settings, TestTriggers};
 use crate::darken::{self, Action, Darkener};
-use crate::firmware::{self, Verdict};
+use crate::firmware::{self, Model, Verdict};
 use crate::player::{Done, Kind, Player, redact_url};
 use crate::power::{self, PowerUpdate};
+use crate::selfcheck::Note;
 use crate::tv_control::{self, Tv, TvMsg};
 use crate::volume::{self, SharedGain};
 use crate::watchdog::{self, Beats};
@@ -252,7 +257,7 @@ async fn recv_opt<T>(rx: Option<&mut mpsc::UnboundedReceiver<T>>) -> Option<T> {
 /// Starts TV control when `[tv_control]` has anything on and `luna-send` is
 /// there (the power watch runs): the read-only capability check, then the
 /// entities are added to the server configuration. TV control is not gated by
-/// the firmware guard (owner decision 2026-11-04): on an unvalidated firmware it
+/// the firmware status (owner decision 2026-11-04): on an unverified firmware it
 /// runs with a warning, unless `tv_control.follow_firmware_guard` is set.
 async fn start_tv_control(
     settings: &Settings,
@@ -270,10 +275,11 @@ async fn start_tv_control(
         );
         return None;
     };
-    let blocked = if settings.tv_control.follow_firmware_guard && !verdict.allows_capture() {
+    let unverified = !matches!(verdict, Verdict::Verified(..) | Verdict::Off);
+    let blocked = if settings.tv_control.follow_firmware_guard && unverified {
         let why = match verdict {
-            Verdict::NotValidated(i) => {
-                format!("firmware {} is not in safety.validated_firmware", i.version)
+            Verdict::NotVerified { info, .. } | Verdict::SeriesOnly(info, _) => {
+                format!("firmware {} is not verified", info.version)
             }
             _ => "the firmware version cannot be read".to_owned(),
         };
@@ -283,12 +289,12 @@ async fn start_tv_control(
         Some(why)
     } else {
         match verdict {
-            Verdict::NotValidated(i) => log::warn!(
-                "tv_control: firmware {} is not in safety.validated_firmware; TV control runs anyway (owner decision 2026-11-04: not gated by the firmware guard; each control is checked at startup and a failing one is switched off)",
-                i.version
+            Verdict::NotVerified { info, .. } | Verdict::SeriesOnly(info, _) => log::warn!(
+                "tv_control: firmware {} is not verified; TV control runs anyway (owner decision 2026-11-04: not gated by the firmware status; each control is checked at startup and a failing one is switched off)",
+                info.version
             ),
-            Verdict::Unreadable(_) => log::warn!(
-                "tv_control: the firmware version cannot be read; TV control runs anyway (not gated by the firmware guard)"
+            Verdict::Unreadable { .. } => log::warn!(
+                "tv_control: the firmware version cannot be read; TV control runs anyway (not gated by the firmware status)"
             ),
             _ => {}
         }
@@ -530,6 +536,12 @@ struct Daemon {
     /// A conversation is in progress (wake word heard or push-to-talk until
     /// the run ends): list changes of TV control wait.
     in_run: bool,
+    /// Compatibility status, report and status files (ADR 0006).
+    compat: Compat,
+    /// Directory of the trigger files `selfcheck-run` and `firmware-ack`.
+    report_dir: PathBuf,
+    /// Counts kill-switch polls: the compat triggers are checked once a second.
+    compat_poll: u32,
 }
 
 impl Daemon {
@@ -547,6 +559,58 @@ impl Daemon {
         self.shared
             .mic_off
             .store(self.gate.off_code(), Ordering::Relaxed);
+    }
+
+    /// Sends every compatibility entity state and rewrites the status files
+    /// when something changed.
+    async fn publish_compat(&mut self) {
+        let _ = self.compat.refresh_files();
+        for cmd in self.compat.commands() {
+            self.send(cmd).await;
+        }
+    }
+
+    /// A note from the capture thread (self-check results).
+    async fn on_note(&mut self, note: Note) {
+        self.compat.on_note(note);
+        self.publish_compat().await;
+    }
+
+    /// The HA button or `ctl.sh selfcheck`: the capture thread runs the check
+    /// again, on the open stream when the microphone is open.
+    fn request_selfcheck(&self, source: &str) {
+        if self.compat.self_check_on() {
+            log::info!("self-check: re-run requested ({source})");
+            self.shared.selfcheck_rerun.store(true, Ordering::Relaxed);
+        } else {
+            log::info!("self-check: re-run requested ({source}) but safety.self_check = false");
+        }
+    }
+
+    /// The HA button or `ctl.sh ack-firmware`.
+    async fn acknowledge_firmware(&mut self, source: &str) {
+        let line = self.compat.acknowledge();
+        log::info!("{line} ({source})");
+        self.publish_compat().await;
+    }
+
+    /// The trigger files of `ctl.sh`, once a second.
+    async fn poll_compat_triggers(&mut self) {
+        self.compat_poll = self.compat_poll.wrapping_add(1);
+        if self.compat_poll % 4 != 0 {
+            return;
+        }
+        let mut warned = self.trigger_warned;
+        if consume_trigger(
+            &self.report_dir.join(compat::SELFCHECK_TRIGGER),
+            &mut warned,
+        ) {
+            self.request_selfcheck("ctl.sh");
+        }
+        if consume_trigger(&self.report_dir.join(compat::ACK_TRIGGER), &mut warned) {
+            self.acknowledge_firmware("ctl.sh").await;
+        }
+        self.trigger_warned = warned;
     }
 
     /// Polls the kill-switch file.
@@ -734,6 +798,13 @@ impl Daemon {
         if text_changed {
             self.send(AppCommand::SetPowerState(shown.text())).await;
         }
+        if let Some(state) = shown.state.as_deref() {
+            self.compat
+                .on_power_state(state, self.shared.open.load(Ordering::Relaxed));
+            if changed {
+                self.publish_compat().await;
+            }
+        }
         if u.processing_key() == "PrepareResume" {
             self.on_resume("the TV reported Prepare Resume").await;
         }
@@ -787,6 +858,10 @@ impl Daemon {
         };
         let out = tv.tick(env);
         let pending = tv.pending_options();
+        let results = tv.control_results();
+        if self.compat.set_tv_control(results) {
+            self.publish_compat().await;
+        }
         self.apply_tv(out).await;
         if pending.is_empty() || self.in_run || self.player.is_active() {
             return;
@@ -1111,6 +1186,11 @@ impl Daemon {
                 self.runs.error(now, &code);
             }
             AppEvent::Pairing(ev) => self.on_pairing(ev).await,
+            AppEvent::ButtonPressed { object_id } => match object_id.as_str() {
+                compat::SELFCHECK_RUN => self.request_selfcheck("Home Assistant"),
+                compat::FIRMWARE_ACK => self.acknowledge_firmware("Home Assistant").await,
+                other => log::debug!("button {other} pressed (no action)"),
+            },
             AppEvent::VolumeChanged(percent) => self.on_volume(percent),
             AppEvent::SelectChanged { object_id, option } => self.on_select(&object_id, &option),
             AppEvent::MuteChanged(muted) => {
@@ -1196,6 +1276,16 @@ impl Daemon {
     }
 }
 
+/// The firmware version of a verdict, for log lines.
+fn status_version(v: &Verdict) -> &str {
+    match v {
+        Verdict::Verified(i, _)
+        | Verdict::SeriesOnly(i, _)
+        | Verdict::NotVerified { info: i, .. } => i.version.as_str(),
+        _ => "?",
+    }
+}
+
 /// Runs the daemon until SIGTERM/SIGINT.
 #[allow(clippy::too_many_lines)] // linear setup, loop and shutdown
 pub(crate) async fn run(mut settings: Settings, triggers: TestTriggers) -> Result<(), String> {
@@ -1250,10 +1340,29 @@ pub(crate) async fn run(mut settings: Settings, triggers: TestTriggers) -> Resul
         esp.text_sensors.extend(texts);
         esp.binary_sensors.extend(binaries);
     }
+    // The model name (one `luna-send` call for `modelName` only) runs while
+    // TV control does its capability check.
+    let model_task = luna
+        .clone()
+        .map(|l| tokio::spawn(async move { compat::read_model(&l).await }));
     // TV control: the capability check (read-only calls) before the entities
-    // are listed. The firmware guard decides whether setters may run.
+    // are listed. `firmware::check` is the firmware alone (no model): it is
+    // also the strict gate, which does not use the model.
     let verdict = firmware::check(&settings);
     let mut tv_started = start_tv_control(&settings, luna.as_ref(), &verdict, &mut esp).await;
+    let model = match model_task {
+        Some(t) => t.await.ok().flatten(),
+        None => None,
+    };
+    let model_state = model.map_or(ModelState::NotRead, ModelState::Known);
+    let info = firmware::read(&settings.safety.firmware_info);
+    let model_arg = match &model_state {
+        ModelState::Known(m) => Model::Known(m),
+        ModelState::NotRead => Model::NotRead,
+    };
+    let status = firmware::evaluate(&settings, info.clone(), model_arg);
+    let mut compat = Compat::new(&settings, info, model_state, status.clone());
+    compat::add_entities(&mut esp, settings.safety.self_check);
     // Reply volume.
     let (reply_volume, origin) = volume::load(&settings.sink.volume_file, settings.sink.volume);
     match origin {
@@ -1291,18 +1400,31 @@ pub(crate) async fn run(mut settings: Settings, triggers: TestTriggers) -> Resul
     let mut sigint = signal(SignalKind::interrupt()).map_err(|e| e.to_string())?;
     let mut sigusr1 = signal(SignalKind::user_defined1()).map_err(|e| e.to_string())?;
 
-    // Microphone gate: firmware guard, kill switch and the remembered mute.
+    // Microphone gate: the strict firmware gate (opt-in), kill switch and the
+    // remembered mute. The default policy only reports the status.
     let gated = settings.mic.source == MicSource::Alsa;
-    match &verdict {
-        Verdict::Validated(_) => log::info!("firmware guard: {verdict}"),
-        Verdict::Off => log::warn!("{verdict}"),
-        _ if !gated => log::info!("firmware guard (not applied to a file mic): {verdict}"),
-        _ => log::error!("FIRMWARE GUARD: {verdict}"),
+    match &status {
+        Verdict::Verified(..) => log::info!("firmware: {status}"),
+        Verdict::Off => log::warn!("{status}"),
+        _ if verdict.blocks() && !gated => {
+            log::info!("firmware gate (not applied to a file mic): {verdict}");
+        }
+        _ if verdict.blocks() => log::error!("FIRMWARE GUARD: {verdict}"),
+        _ => log::warn!("firmware: {status}"),
+    }
+    if let Some(line) = compat.remember_first_start() {
+        log::info!("{line}");
+    }
+    if let Some(old) = compat.firmware_changed() {
+        log::warn!(
+            "FIRMWARE CHANGED: {old} -> {}; the microphone keeps running and the self-check runs at the first open; press Acknowledge firmware change in Home Assistant or run ctl.sh ack-firmware when you have checked that it works",
+            status_version(&status)
+        );
     }
     let gate = MicGate {
         ha_muted: settings.safety.mute_file.exists(),
         kill: settings.safety.kill_switch.exists(),
-        firmware_block: gated && !verdict.allows_capture(),
+        firmware_block: gated && verdict.blocks(),
         unpaired,
     };
     if gate.kill {
@@ -1324,10 +1446,12 @@ pub(crate) async fn run(mut settings: Settings, triggers: TestTriggers) -> Resul
     let (cmd_tx, cmd_rx) = mpsc::channel(64);
     let shared = Arc::new(Shared::default());
     shared.mic_off.store(gate.off_code(), Ordering::Relaxed);
+    let (notes_tx, mut notes_rx) = mpsc::unbounded_channel();
     let cap = capture::spawn(
         CaptureSettings::from_settings(&settings),
         Arc::clone(&shared),
         cmd_tx.clone(),
+        Some(notes_tx),
     )
     .map_err(|e| format!("cannot start the capture thread: {e}"))?;
     let beats = Arc::new(Beats::default());
@@ -1405,6 +1529,9 @@ pub(crate) async fn run(mut settings: Settings, triggers: TestTriggers) -> Resul
         last_resume: None,
         tv: None,
         in_run: false,
+        compat,
+        report_dir: settings.report.dir_or_default(),
+        compat_poll: 0,
     };
     d.publish_timers().await;
     let mut tv_rx = None;
@@ -1422,7 +1549,12 @@ pub(crate) async fn run(mut settings: Settings, triggers: TestTriggers) -> Resul
         if let Some(out) = out {
             d.apply_tv(out).await;
         }
+        if let Some(results) = d.tv.as_ref().map(tv_control::Tv::control_results) {
+            d.compat.set_tv_control(results);
+        }
     }
+    // The first compatibility states (kept by the server until HA connects).
+    d.publish_compat().await;
     let mut tv_tick = d.tv.as_ref().map(|_| {
         let mut iv = tokio::time::interval(tv_control::TICK);
         iv.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -1462,6 +1594,7 @@ pub(crate) async fn run(mut settings: Settings, triggers: TestTriggers) -> Resul
             Some(done) = done_rx.recv() => d.on_done(done).await,
             Some(u) = power_rx.recv() => d.on_power(u).await,
             Some(m) = recv_opt(tv_rx.as_mut()) => d.on_tv_msg(m).await,
+            Some(n) = notes_rx.recv() => d.on_note(n).await,
             () = tick_opt(tv_tick.as_mut()) => d.poll_tv().await,
             _ = sigterm.recv() => {
                 log::info!("SIGTERM: shutting down");
@@ -1478,6 +1611,7 @@ pub(crate) async fn run(mut settings: Settings, triggers: TestTriggers) -> Resul
                 d.poll_power().await;
                 d.alarm_poll().await;
                 d.publish_timers().await;
+                d.poll_compat_triggers().await;
             }
             () = tick_opt(ptt_timer.as_mut()) => d.ptt("--ptt-every").await,
             () = tick_opt(pairing_poll.as_mut()) => d.poll_pairing().await,
@@ -1640,6 +1774,50 @@ mod tests {
         assert!(g.mic_off());
         assert_eq!(g.on_mute_changed(false), (None, true));
         assert!(!g.mic_off());
+    }
+
+    /// ADR 0006: an unverified or unreadable firmware no longer keeps the
+    /// microphone off; only the opt-in strict policy does.
+    #[test]
+    fn unverified_firmware_does_not_gate_the_mic_unless_strict() {
+        use crate::config::FirmwarePolicy;
+        use crate::firmware::{FirmwareInfo, evaluate};
+        let info = || FirmwareInfo {
+            version: "99.99.99".to_owned(),
+            release: Some("9.9.9".to_owned()),
+            build: None,
+        };
+        let mut s = Settings::default();
+        for model in [
+            Model::Known("SOME-OTHER-TV"),
+            Model::NotRead,
+            Model::NotChecked,
+        ] {
+            let v = evaluate(&s, Ok(info()), model);
+            let g = MicGate {
+                firmware_block: v.blocks(),
+                ..MicGate::default()
+            };
+            assert!(!g.mic_off() && g.forced().is_none(), "{v}");
+            assert_eq!(g.off_code(), OFF_NONE);
+        }
+        // The firmware cannot be read at all: still not gated.
+        let v = evaluate(&s, Err("no file".to_owned()), Model::NotChecked);
+        let g = MicGate {
+            firmware_block: v.blocks(),
+            ..MicGate::default()
+        };
+        assert!(!g.mic_off());
+        // Strict with a list that does not hold this firmware: the old gate.
+        s.safety.firmware_policy = FirmwarePolicy::Strict;
+        s.safety.validated_firmware = vec!["03.30.74".to_owned()];
+        let v = evaluate(&s, Ok(info()), Model::NotChecked);
+        let g = MicGate {
+            firmware_block: v.blocks(),
+            ..MicGate::default()
+        };
+        assert!(g.mic_off());
+        assert_eq!(g.off_code(), OFF_FIRMWARE);
     }
 
     #[test]

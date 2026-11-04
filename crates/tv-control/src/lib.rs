@@ -32,8 +32,8 @@ pub mod luna;
 pub mod setters;
 
 pub use controller::{
-    Action, Command, Config, Controller, Effect, Level, PowerOffEnv, PowerOffRefusal, PowerState,
-    Purpose, Topic,
+    Action, Command, Config, ControlStatus, Controller, Effect, Level, PowerOffEnv,
+    PowerOffRefusal, PowerState, Purpose, Topic,
 };
 pub use entities::{Category, EntityDef, Kind, StateUpdate, StateValue};
 pub use limits::Control;

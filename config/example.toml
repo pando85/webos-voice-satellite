@@ -124,13 +124,50 @@ kill_switch = "/tmp/webos-satellite.disable"
 # on unmute). Under /tmp it is lost at reboot; put it in a persistent
 # directory if a mute must survive reboots.
 mute_file = "/tmp/webos-satellite.muted"
-# Firmware guard: the LG firmware versions (webos_manufacturing_version) the
-# ALSA capture was validated on. On another version, or if firmware_info
-# cannot be read, the satellite starts with the microphone disabled (shown
-# as muted in HA). Check with `webos-satellite --check-firmware`. An empty
-# list turns the guard off. File-mic tests are not gated.
-validated_firmware = ["03.30.74"]
+# Firmware policy (ADR 0006, docs/design/firmware-policy-and-reports.md).
+# "warn" (default): the microphone starts on any firmware. A firmware or model
+# that is not in the verified list (data/verified-models.toml, matched by
+# series and firmware) shows as "not verified" in HA (Compatibility,
+# Firmware verified), the log and the TV app, and the microphone self-check
+# measures the capture path. "strict": the old gate; on a firmware that is not
+# in validated_firmware the microphone stays off (shown as muted in HA).
+# `webos-satellite --check-firmware` prints the status (exit 0 verified, 1 not
+# verified or unreadable, 3 strict with an empty list). File-mic tests are
+# not gated.
+firmware_policy = "warn"
+# Firmware versions (webos_manufacturing_version) you validated yourself. In
+# "strict" mode the only versions allowed (empty: the gate is off); in "warn"
+# mode they count as verified on top of the built-in list. Empty is normal.
+validated_firmware = []
 firmware_info = "/var/run/nyx/os_info.json"
+# The firmware the daemon last ran on (one line). Written at the first start
+# and when "Acknowledge firmware change" is pressed (HA button or
+# `ctl.sh ack-firmware`); a different current firmware is shown as "firmware
+# changed" until then. Not set: firmware_seen next to this file.
+# firmware_seen_file = "firmware_seen"
+# Microphone self-check: on the first open after a start, after a firmware
+# change and on request (HA button "Re-run microphone check", `ctl.sh
+# selfcheck`) the daemon looks at the levels of the normal capture stream for
+# self_check_window_s seconds (no extra open, no recording, no sysfs). A
+# measured failure (no audio frames, a stuck signal, no capture device) closes
+# the microphone with bounded retries and shows "capture problem"; a warning
+# (very quiet, clipping) leaves it open.
+self_check = true
+self_check_window_s = 10
+
+[report]
+# The compatibility report (docs/compatibility/verified-models.md): built from
+# a fixed list of fields (never a serial, address, name, key, audio or
+# transcript) and shown in the TV app (QR code) and by `ctl.sh report`. The
+# daemon sends nothing anywhere.
+enabled = true
+# The GitHub repository the prefilled issue link points at (owner/name).
+repo = "pando85/webos-voice-satellite"
+# Where the daemon writes report.json, report.short.txt, report.full.txt,
+# report.url and compat.json and looks for the trigger files selfcheck-run and
+# firmware-ack. Not set: ../run next to a config in a directory named etc (the
+# TV layout), else /tmp/webos-satellite.
+# dir = "/tmp/webos-satellite"
 
 [limits]
 nice = 10                # scheduling niceness (also applies to pacat)

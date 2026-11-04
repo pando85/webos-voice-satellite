@@ -27,6 +27,8 @@ Before this step HA's mute switch only stopped streaming; the PCM stayed open. N
 
 ## Firmware guard
 
+> Note (2026-11-04): this is a dated finding about the old hard gate, which is now the opt-in strict mode (`safety.firmware_policy = "strict"`). The default is a soft policy with self-checks ([design](../../design/firmware-policy-and-reports.md), [ADR 0006](../../decisions/0006-soft-firmware-policy-and-compatibility-reports.md)); the new behaviour has not been run on a TV yet.
+
 | Check | Result | Label |
 | --- | --- | --- |
 | Read-only source | `/var/run/nyx/os_info.json` (tmpfs, written by nyx at boot) has `"webos_manufacturing_version": "03.30.74"`, the same value as `getSystemInfo`'s `firmwareVersion` in [D0-D1](D0-D1-runtime.md#firmware-and-software-version); also `webos_release` 8.3.0 and `webos_build_datetime` 20240226022140. `/etc/starfish-release` has only the webOS release, not the LG firmware string | verified-on-target |

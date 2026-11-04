@@ -450,6 +450,17 @@ enum Want {
     Set(StateValue),
 }
 
+/// Startup and runtime status of one control, for the compatibility report.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ControlStatus {
+    /// Enabled and working.
+    Ok,
+    /// Not enabled in the configuration.
+    Off,
+    /// Enabled but its getter failed or it was switched off after a failure.
+    Failed,
+}
+
 /// The state machine.
 pub struct Controller {
     cfg: Config,
@@ -757,6 +768,20 @@ impl Controller {
             Control::Apps => ok(Topic::Apps) && ok(Topic::Foreground),
             Control::PlayState => ok(Topic::PlayState),
             Control::Screen | Control::Power => true,
+        }
+    }
+
+    /// What the compatibility report says about a control: `Off` (not
+    /// enabled), `Failed` (its getter did not answer or it was switched off
+    /// after a failed write) or `Ok`.
+    #[must_use]
+    pub fn control_status(&self, control: Control) -> ControlStatus {
+        if !self.control_enabled(control) {
+            ControlStatus::Off
+        } else if self.getter_ready(control) && !self.disabled.contains_key(&control) {
+            ControlStatus::Ok
+        } else {
+            ControlStatus::Failed
         }
     }
 

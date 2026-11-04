@@ -149,7 +149,9 @@ level = "info"
         bins = {e.object_id: e for e in entities if isinstance(e, BinarySensorInfo)}
         mute_sw = [e for e in entities if isinstance(e, SwitchInfo)][0]
         check("S1a listening indicator entities listed (binary sensors, no category)",
-              set(bins) == {"listening", "microphone_muted", "timer_alarm"}
+              {"listening", "microphone_muted", "timer_alarm"} <= set(bins)
+              and set(bins) - {"listening", "microphone_muted", "timer_alarm"} == {"capture_problem", "firmware_changed", "firmware_verified"}
+              and bins["listening"].entity_category.name == "NONE" and bins["microphone_muted"].entity_category.name == "NONE"
               and bins["listening"].name == "Listening" and bins["microphone_muted"].name == "Microphone muted",
               str(sorted(bins)))
         bstate: dict[int, BinarySensorState] = {}
@@ -759,6 +761,7 @@ fi
 uri="$5"; payload="$6"
 echo "$uri $payload" >> "$D/calls"
 case "$uri" in
+  *tv.systemproperty/getSystemInfo) echo '{"returnValue":true,"modelName":"OLED42C34LA","firmwareVersion":"03.30.74","serialNumber":"CANARYSERIAL0123456789","sdkVersion":"8.3.0"}' ;;
   */getPowerState) printf '{"returnValue":true,"state":"%s"}\n' "$(cat "$D/power")" ;;
   */getVolume) vol_json; echo ;;
   */getForegroundAppInfo) case "$uri" in *media*) echo '{"returnValue":true,"playState":"playing"}' ;; *) fg_json; echo ;; esac ;;
@@ -880,12 +883,13 @@ firmware_info = "{os_info}"
         check("V4 tv_power reads unknown while the remote power-off select is on \"Turn off normally\"",
               st("tv_power") is None)
         check("V5 getters ran on a terminal, startup wrote nothing, getSystemInfo never called",
-              "NOT-A-TTY" not in calls() and "getSystemInfo" not in calls()
+              "NOT-A-TTY" not in calls() and "apiadapter/system/getSystemInfo" not in calls()
+              and "CANARYSERIAL" not in sat.text()
               and not any(w in calls().split("SUB")[0] for w in ("setVolume", "setMute", "switchInput", "turnOff")),
               calls()[:300])
         log = sat.text()
-        check("V6 firmware not validated: warning logged, TV control still on",
-              "tv_control: firmware 99.99.99 is not in safety.validated_firmware; TV control runs anyway" in log
+        check("V6 firmware not verified: warning logged, TV control still on",
+              "tv_control: firmware 99.99.99 is not verified; TV control runs anyway" in log
               and "SETTERS ARE OFF" not in log, "")
 
         # tv_power off while not in keep-listening: refused, no key.
@@ -983,6 +987,258 @@ firmware_info = "{os_info}"
         sat.log.close()
 
 
+COMPAT_LUNA = r"""#!/bin/sh
+# A fake luna-send for the compatibility e2e: the model query and a power
+# state; every call is appended to $D/calls. Needs a terminal on stdout.
+D="@D@"
+if [ "$1" = "-i" ]; then
+  printf '{"returnValue":true,"state":"Active","subscribed":true}\n'
+  exec sleep 600
+fi
+echo "$5 $6" >> "$D/calls"
+case "$5" in
+  *tv.systemproperty/getSystemInfo)
+    printf '{"returnValue":true,"modelName":"%s","firmwareVersion":"03.30.74","serialNumber":"CANARYSERIAL0123456789","sdkVersion":"8.3.0"}\n' "$(cat "$D/model")" ;;
+  *) echo '{"returnValue":true}' ;;
+esac
+"""
+
+
+def write_const_mic(path: str, seconds: float) -> None:
+    """A stuck signal: every sample the same (the self-check must fail it)."""
+    with open(path, "wb") as f:
+        f.write(struct.pack("<ii", 1000, 1000) * int(16000 * seconds))
+
+
+async def scenario_compat(binary: str, tmp: str) -> None:
+    print("\n== satellite e2e: firmware status, self-check, report files (ADR 0006) ==")
+    import json as _json
+    import urllib.parse as _up
+
+    cdir = os.path.join(tmp, "compat")
+    os.mkdir(cdir)
+    run_dir = os.path.join(cdir, "run")
+    with open(os.path.join(cdir, "model"), "w") as f:
+        f.write("OLED42C34LA\n")
+    luna = os.path.join(cdir, "luna-send")
+    with open(luna, "w") as f:
+        f.write(COMPAT_LUNA.replace("@D@", cdir))
+    os.chmod(luna, 0o755)
+    write_mic(os.path.join(cdir, "mic-good.raw"), 30.0)
+    write_const_mic(os.path.join(cdir, "mic-stuck.raw"), 30.0)
+    os_info = os.path.join(cdir, "os_info.json")
+    fw_seen = os.path.join(cdir, "fw_seen")
+
+    def set_fw(v: str) -> None:
+        with open(os_info, "w") as f:
+            f.write('{"webos_manufacturing_version": "%s", "webos_release": "8.3.0", "webos_build_datetime": "20240226022140"}' % v)
+
+    async def boot(tag: str, mic: str, fw: str, model: str, policy: str = "warn", validated: str = "[]"):
+        set_fw(fw)
+        with open(os.path.join(cdir, "model"), "w") as f:
+            f.write(model + "\n")
+        psk = base64.b64encode(os.urandom(32)).decode()
+        with open(os.path.join(cdir, "psk"), "w") as f:
+            f.write(psk + "\n")
+        os.chmod(os.path.join(cdir, "psk"), 0o600)
+        port = free_port()
+        config = os.path.join(cdir, f"sat-{tag}.toml")
+        with open(config, "w") as f:
+            f.write(f"""
+mode = "wake"
+[device]
+name = "e2e-compat"
+friendly_name = "Grandma Living Room TV"
+mac = "02:00:00:00:00:c1"
+bind = "127.0.0.1"
+port = {port}
+noise_psk_file = "psk"
+[mic]
+source = "file"
+path = "{mic}"
+loop = true
+pause_when_idle = false
+[sink]
+type = "null"
+[log]
+level = "info"
+[power]
+luna_send = "{luna}"
+[tv_control]
+enabled = false
+[safety]
+kill_switch = "{cdir}/kill"
+mute_file = "{cdir}/muted"
+firmware_policy = "{policy}"
+validated_firmware = {validated}
+firmware_info = "{os_info}"
+firmware_seen_file = "{fw_seen}"
+self_check_window_s = 2
+[report]
+dir = "{run_dir}"
+""")
+        sat = Satellite(binary, config, os.path.join(tmp, f"satellite-compat-{tag}.log"))
+        await sat.start()
+        ha = FakeHA(port, psk)
+        cli = await ha.connect()
+        _i, ents, _ = await cli.device_info_and_list_entities()
+        by = {e.object_id: e for e in ents}
+        states: dict[int, object] = {}
+        cli.subscribe_states(lambda st: states.__setitem__(st.key, st))
+
+        def st(obj: str):
+            v = states.get(by[obj].key)
+            return None if v is None or getattr(v, "missing_state", False) else v.state
+
+        return sat, ha, cli, by, st, port
+
+    async def stop(sat: Satellite) -> int:
+        sat.proc.send_signal(signal.SIGTERM)
+        rc = await asyncio.wait_for(sat.proc.wait(), 8)
+        sat.log.close()
+        return rc
+
+    def read(name: str) -> str:
+        with open(os.path.join(run_dir, name)) as f:
+            return f.read()
+
+    sat = None
+    try:
+        # ---- run 1: a verified TV, a good microphone ----
+        sat, ha, cli, by, st, port = await boot("ok", os.path.join(cdir, "mic-good.raw"), "03.30.74", "OLED42C34LA")
+        want = {"firmware_verified", "capture_problem", "firmware_changed", "tv_firmware", "tv_model", "compat_status",
+                "selfcheck", "report_status", "selfcheck_run", "firmware_ack"}
+        check("K1 every compatibility entity is listed once; no report_compat button",
+              want <= set(by) and "report_compat" not in by, f"missing {want - set(by)}")
+        check("K2 categories: sensors diagnostic, buttons config, problem class",
+              all(by[o].entity_category.name == "DIAGNOSTIC" for o in want - {"selfcheck_run", "firmware_ack"})
+              and all(by[o].entity_category.name == "CONFIG" for o in ("selfcheck_run", "firmware_ack"))
+              and by["capture_problem"].device_class == "problem" and isinstance(by["selfcheck_run"], ButtonInfo), "")
+        ok = await until_true(lambda: (st("selfcheck") or "").startswith("passed"), 12)
+        check("K3 the self-check passes on the normal stream (sine at -30 dBFS)", ok, str(st("selfcheck")))
+        check("K4 status: model and firmware read, verified, no problem, no change",
+              (st("tv_firmware"), st("tv_model"), st("compat_status"), st("firmware_verified"),
+               st("capture_problem"), st("firmware_changed"))
+              == ("03.30.74", "OLED42C34LA", "verified", True, False, False),
+              str([st(o) for o in sorted(want)]))
+        ok = await until_true(lambda: (st("report_status") or "").startswith("ready"), 5)
+        check("K5 report_status says where the report is", ok, str(st("report_status")))
+        check("K6 the firmware is remembered at the first start",
+              open(fw_seen).read().strip() == "03.30.74", "")
+
+        files = {n: read(n) for n in ("report.json", "report.short.txt", "report.full.txt", "report.url", "compat.json")}
+        url = files["report.url"].strip()
+        parsed = _up.urlparse(url)
+        q = _up.parse_qs(parsed.query)
+        check("K7 the link targets the issue form of the repository, with title and report",
+              parsed.netloc == "github.com" and parsed.path == "/pando85/webos-voice-satellite/issues/new"
+              and q.get("template") == ["compatibility-report.yml"] and len(url) <= 1500
+              and q["report"][0].strip() == files["report.short.txt"].strip()
+              and q["title"][0].startswith("[Compat] OLED42C34LA fw 03.30.74: "), url[:200])
+        rj = _json.loads(files["report.json"])
+        cj = _json.loads(files["compat.json"])
+        check("K8 report.json and compat.json parse and agree with the entities",
+              rj["url"] == url and rj["verdict"] in ("works", "partly works") and cj["compat_status"] == "verified"
+              and cj["tv_model"] == "OLED42C34LA" and cj["firmware_verified"] is True and cj["policy"] == "warn",
+              str(cj))
+        check("K9 the report has the checks, levels and the power state from the TV",
+              "checks: C1=pass" in files["report.full.txt"] and "levels: window=2s" in files["report.full.txt"]
+              and "states=Active" in files["report.full.txt"], files["report.full.txt"][:600])
+        secrets = ["CANARYSERIAL", "Grandma", "e2e-compat", "02:00:00:00:00:c1", "02%3A00", "127.0.0.1", "psk"]
+        everything = "\n".join(files.values())
+        check("K10 no serial, device name, MAC, address or key in the report files; no serial in the log",
+              not [s for s in secrets if s in everything] and "CANARYSERIAL" not in sat.text(),
+              str([s for s in secrets if s in everything]))
+        check("K11 only modelName was asked of the model query; apiadapter/system/getSystemInfo never called",
+              '{"keys":["modelName"]}' in open(os.path.join(cdir, "calls")).read()
+              and "apiadapter/system/getSystemInfo" not in open(os.path.join(cdir, "calls")).read(), "")
+
+        # The HA button reruns on the open stream (no second open).
+        opens = sat.text().count("microphone open")
+        cli.button_command(by["selfcheck_run"].key)
+        ok = await until_true(lambda: st("selfcheck") == "checking", 4)
+        check("K12 the Re-run button starts a new measurement (checking)", ok, str(st("selfcheck")))
+        ok = await until_true(lambda: (st("selfcheck") or "").startswith("passed"), 12)
+        check("K13 ...and it passes again without opening the PCM a second time",
+              ok and sat.text().count("microphone open") == opens and "re-run requested (Home Assistant)" in sat.text(),
+              str(st("selfcheck")))
+        # ctl.sh's trigger file.
+        with open(os.path.join(run_dir, "selfcheck-run"), "w"):
+            pass
+        ok = await until_true(lambda: "re-run requested (ctl.sh)" in sat.text(), 4)
+        check("K14 the selfcheck-run trigger file is acted on and deleted",
+              ok and not os.path.exists(os.path.join(run_dir, "selfcheck-run")), "")
+        await until_true(lambda: (st("selfcheck") or "").startswith("passed"), 12)
+        rc = await stop(sat)
+        await ha.cli.disconnect()
+        check("K15 clean exit", rc == 0, f"rc={rc}")
+
+        # ---- run 2: the firmware changed under the daemon ----
+        sat, ha, cli, by, st, port = await boot("chg", os.path.join(cdir, "mic-good.raw"), "03.30.80", "OLED42C34LA")
+        ok = await until_true(lambda: st("compat_status") == "firmware changed" and st("firmware_changed") is True, 8)
+        check("K16 a firmware that differs from the remembered one: status firmware changed, marker on",
+              ok and "FIRMWARE CHANGED: 03.30.74 -> 03.30.80" in sat.text(),
+              str(st("compat_status")))
+        ok = await until_true(lambda: (st("selfcheck") or "").startswith("passed"), 12)
+        check("K17 the microphone kept running and the self-check ran", ok and st("firmware_verified") is False,
+              str(st("selfcheck")))
+        check("K18 the marker is not written by the change itself", open(fw_seen).read().strip() == "03.30.74", "")
+        cli.button_command(by["firmware_ack"].key)
+        ok = await until_true(lambda: st("firmware_changed") is False
+                              and st("compat_status") == "series verified (firmware not yet reported)", 6)
+        check("K19 Acknowledge firmware change clears it; same series, firmware not yet reported",
+              ok and open(fw_seen).read().strip() == "03.30.80", str(st("compat_status")))
+        with open(os.path.join(run_dir, "firmware-ack"), "w"):
+            pass
+        ok = await until_true(lambda: not os.path.exists(os.path.join(run_dir, "firmware-ack")), 4)
+        check("K20 the firmware-ack trigger file is consumed too", ok, "")
+        rc = await stop(sat)
+        await ha.cli.disconnect()
+
+        # ---- run 3: not verified at all, and a stuck microphone ----
+        sat, ha, cli, by, st, port = await boot("bad", os.path.join(cdir, "mic-stuck.raw"), "99.99.99", "SOME-OTHER-TV")
+        listening_seen = await until_true(lambda: st("listening") is True, 6)
+        check("K21 an unverified firmware does not keep the microphone off: it opens (listening)",
+              listening_seen and "FIRMWARE GUARD" not in sat.text()
+              and "not verified; the microphone starts anyway" in sat.text(), str(st("listening")))
+        ok = await until_true(lambda: st("capture_problem") is True and st("compat_status") == "capture problem", 12)
+        check("K22 a stuck signal fails the self-check: capture problem, status, failed text",
+              ok and (st("selfcheck") or "").startswith("failed:"), str(st("selfcheck")))
+        ok = await until_true(lambda: st("microphone_muted") is True and st("listening") is False, 4)
+        check("K23 the microphone is closed (muted on, listening off); HA's own mute switch is untouched",
+              ok and st("mute_microphone") is not True, str(st("microphone_muted")))
+        ok = await until_true(lambda: os.path.exists(os.path.join(run_dir, "report.json")), 4)
+        rj = _json.loads(read("report.json"))
+        check("K24 the report says it does not work and names the model and firmware in the title",
+              ok and rj["verdict"] == "does not work" and rj["title"] == "[Compat] SOME-OTHER-TV fw 99.99.99: does not work",
+              str(rj.get("title")))
+        check("K25 the log names the problem and the way to report it",
+              "capture problem" in sat.text() and "Report compatibility" in sat.text(), "")
+        rc = await stop(sat)
+        await ha.cli.disconnect()
+
+        # ---- run 4: strict policy is the old gate (a fresh install: no marker) ----
+        os.remove(fw_seen)
+        sat, ha, cli, by, st, port = await boot("strict", os.path.join(cdir, "mic-good.raw"), "99.99.99", "SOME-OTHER-TV",
+                                                policy="strict", validated='["03.30.74"]')
+        # A file mic is never gated (the gate is for the ALSA microphone; the
+        # unit test unverified_firmware_does_not_gate_the_mic_unless_strict
+        # covers the closed mic): the strict policy shows in the log and status.
+        ok = await until_true(lambda: st("compat_status") == "not verified", 5)
+        check("K26 firmware_policy = strict: not verified, policy strict, the gate named in the log",
+              ok and '"policy":"strict"' in read("compat.json").replace(" ", "")
+              and "firmware gate (not applied to a file mic)" in sat.text(), str(st("compat_status")))
+        check("K27 ...and no FIRMWARE GUARD error for a file mic",
+              "FIRMWARE GUARD" not in sat.text(), "")
+        rc = await stop(sat)
+        await ha.cli.disconnect()
+        check("K28 clean exit after the strict run", rc == 0, f"rc={rc}")
+    finally:
+        if sat is not None and sat.proc.returncode is None:
+            sat.proc.kill()
+            await sat.proc.wait()
+
+
 async def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary", required=True, help="path to the webos-satellite binary")
@@ -997,12 +1253,15 @@ async def main() -> int:
             await scenario_pairing_window(args.binary, tmp)
             await scenario_aec(args.binary, tmp)
             await scenario_tv_control(args.binary, tmp)
+            await scenario_compat(args.binary, tmp)
         except Exception as err:  # noqa: BLE001
             failed = True
             print(f"FAIL  {type(err).__name__}: {err}", flush=True)
             for name in ("satellite.log", "satellite-timers.log", "satellite-cap.log",
                          "satellite-nosound.log", "satellite-notimers.log", "satellite-pairing.log",
-                         "satellite-pairing.log.2", "satellite-window.log", "satellite-aec.log", "satellite-tv.log"):
+                         "satellite-pairing.log.2", "satellite-window.log", "satellite-aec.log", "satellite-tv.log",
+                         "satellite-compat-ok.log", "satellite-compat-chg.log",
+                         "satellite-compat-bad.log", "satellite-compat-strict.log"):
                 log = os.path.join(tmp, name)
                 if os.path.exists(log):
                     print(f"---- {name} ----")

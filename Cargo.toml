@@ -20,6 +20,7 @@ publish = false
 [workspace.dependencies]
 # Internal crates
 webos-capture = { path = "crates/capture" }
+webos-compat = { path = "crates/compat" }
 webos-dsp = { path = "crates/dsp" }
 webos-esphome-api = { path = "crates/esphome-api" }
 webos-playback = { path = "crates/playback" }

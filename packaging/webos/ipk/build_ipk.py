@@ -49,7 +49,7 @@ PAYLOAD_SCRIPTS = [
     "autostart.sh", "ctl.sh", "install.sh", "lib.sh", "rotate.sh", "start.sh",
     "status.sh", "stop.sh", "supervise.sh", "uninstall.sh",
 ]
-APP_FILES = ["index.html", "app.js", "style.css"]
+APP_FILES = ["index.html", "app.js", "style.css", "qrcodegen.js", "QRCODEGEN-LICENSE.txt"]
 ID_RE = re.compile(r"^[a-z0-9][a-z0-9.+-]+$")  # LG appinfo.json rules; ares-cli's check
 VERSION_RE = re.compile(r"^(0|[1-9]\d{0,8})\.(0|[1-9]\d{0,8})\.(0|[1-9]\d{0,8})$")
 FORBIDDEN_PREFIXES = ("com.palm", "com.webos", "com.lge", "com.palmdts")
@@ -347,6 +347,11 @@ def check(args: argparse.Namespace) -> None:
              f"{key} is not a {size}x{size} PNG")
     need(f"{appdir}/LICENSE" in data and b"GNU GENERAL PUBLIC LICENSE" in (data[f"{appdir}/LICENSE"][1] or b""),
          "the app directory lacks the GPL LICENSE text")
+    for name in APP_FILES:
+        need(f"{appdir}/{name}" in data, f"the app directory lacks {name}")
+    need(b"Project Nayuki" in (data[f"{appdir}/qrcodegen.js"][1] or b"")
+         and b"MIT License" in (data[f"{appdir}/QRCODEGEN-LICENSE.txt"][1] or b""),
+         "the QR generator lacks its copyright and MIT notice")
     pkginfo = json.loads(data[f"{pkgdir}/packageinfo.json"][1])
     need(pkginfo == {"app": app_id, "id": app_id, "version": version}, f"packageinfo.json {pkginfo}")
 

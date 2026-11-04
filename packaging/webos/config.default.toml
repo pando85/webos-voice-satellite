@@ -47,9 +47,19 @@ level = "info"
 kill_switch = "/tmp/webos-satellite.disable"
 # Home Assistant's mute switch, remembered across restarts and reboots.
 mute_file = "muted"
-# The microphone stays off on any other firmware (the capture was validated
-# only on these); the app and the autostart log say so.
-validated_firmware = ["03.30.74"]
+# Firmware policy. "warn" (default): the microphone starts on any firmware; an
+# unverified one is logged, shown in Home Assistant and in the app, and the
+# microphone self-check runs. If something does not work, press "Report
+# compatibility" in the app (or run ctl.sh report): you get a prefilled GitHub
+# issue to review and submit. "strict": the old hard gate, the microphone stays
+# off on a firmware that is not in validated_firmware (an empty list = no gate).
+firmware_policy = "warn"
+# validated_firmware = ["03.30.74"]   # your own list, used by "strict"
+# self_check = true                   # measure the first seconds of the capture stream
+
+# [report]
+# enabled = true
+# repo = "pando85/webos-voice-satellite"   # where the report link points; nothing is sent
 
 [pairing]
 # While no key is stored the pairing window opens at every start for

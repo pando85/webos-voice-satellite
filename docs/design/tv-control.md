@@ -86,7 +86,7 @@ How HA 2026.10.4 renders `missing_state` for a `switch`, `number` and `select` (
 HA entities only, no on-TV indicator. Required semantics (implemented by the parallel change):
 
 - `listening` is on from the moment the capture PCM is open until it is closed again, published from the capture thread in order with the audio, so no audio can reach HA before it reads on. It is derived from the PCM, not from configuration or HA's mute switch.
-- `microphone_muted` is on only while the PCM is closed **and** a gate keeps it closed (mute switch, kill switch, firmware guard, not paired).
+- `microphone_muted` is on only while the PCM is closed **and** a gate keeps it closed (mute switch, kill switch, the strict firmware guard, a failed mic self-check, not paired).
 - Both are listed always, not optional. They matter most in the states this design adds: a TV that looks off (`Screen Off`, `Active Standby`) with an open microphone ([always-on 10.4 item 5](always-on.md#104-recommendation)).
 
 ### 3.4 Behaviour per power state
@@ -240,7 +240,7 @@ follow_firmware_guard = false  # owner decision 2026-11-04: TV control is not ga
 | `app_limit` | 30 | Keeps the select usable in HA and in voice |
 | `play_state` | false | Extra polling for a sensor no v1 feature needs |
 
-Every control is also gated at run time by section 6. **Firmware guard (owner decision 2026-11-04): TV control is not gated by it.** On a firmware that is not in `safety.validated_firmware` (or whose version cannot be read) TV control keeps working and the daemon logs a warning at startup; the microphone guard itself is unchanged. The key `follow_firmware_guard` (default `false`) exists for an owner who wants the stricter behaviour: with `true` every setter is refused on an unvalidated firmware, while getters, sensors and states still report.
+Every control is also gated at run time by section 6. **Firmware guard (owner decision 2026-11-04): TV control is not gated by it.** On a firmware that is not in `safety.validated_firmware` (or whose version cannot be read) TV control keeps working and the daemon logs a warning at startup; since the same day the microphone is not hard-gated either ([firmware policy](firmware-policy-and-reports.md): it starts, warns and self-checks; the old microphone block exists only with `firmware_policy = "strict"`). The key `follow_firmware_guard` (default `false`) exists for an owner who wants the stricter behaviour: with `true` every setter is refused on an unvalidated firmware, while getters, sensors and states still report.
 
 ## 10. Safety
 

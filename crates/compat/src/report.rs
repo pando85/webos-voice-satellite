@@ -60,6 +60,8 @@ impl Verdict {
 pub enum Policy {
     /// Model and firmware are in the verified list.
     Verified,
+    /// The model series is verified; this firmware is not yet reported.
+    SeriesVerified,
     /// Not in the verified list.
     NotVerified,
     /// The firmware differs from the last acknowledged one.
@@ -74,6 +76,7 @@ impl Policy {
     pub const fn as_str(self) -> &'static str {
         match self {
             Policy::Verified => "verified",
+            Policy::SeriesVerified => "series verified",
             Policy::NotVerified => "not verified",
             Policy::FirmwareChanged => "firmware changed",
             Policy::Unknown => "unknown",

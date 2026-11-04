@@ -182,6 +182,7 @@ done
 check "daemon, supervisor and rotator keep no descriptor of the caller" '[ "$leaks" -eq 0 ] && [ -n "$(pgrep -f "$S/bin/supervise.sh")" ]'
 check "no start.sh process stays behind; the supervisor pidfile names supervise.sh" '[ -z "$(pgrep -f "$S/bin/start.sh")" ] && tr "\0" " " </proc/$(cat "$S/run/supervise.pid")/cmdline | grep -q supervise.sh'
 check "start: one supervised daemon" 'json "s[\"running\"] and s[\"supervised\"] and s[\"firmware_ok\"]" && [ "$(daemons)" = 1 ] && [ "$(supervisors)" = 1 ]'
+check "status --json: firmware_ok means may start, firmware_verified and compat are present" 'json "s[\"firmware_ok\"] is True and s[\"firmware_verified\"] is True and \"compat\" in s"'
 check "status --json: no key material" '! $CTL status --json | grep -q "$(cat "$T/psk")"'
 check "status text: reply volume names the default, never 'default %'" '! $CTL status | grep -q "default %" && $CTL status | grep -q "reply volume: .*none stored yet" && json "\"reply_volume_default\" in s and s[\"reply_volume\"]==\"\""'
 printf '55\n' >"$S/etc/reply_volume"
@@ -206,6 +207,47 @@ $CTL mic off >/dev/null
 check "mic off: kill switch file, status reports it" '[ -e "$T/kill" ] && json "s[\"mic_off\"]"'
 $CTL mic on >/dev/null
 check "mic on: kill switch removed" '[ ! -e "$T/kill" ]'
+echo "== compatibility status, report, triggers =="
+# The daemon writes run/compat.json and run/report.* by itself.
+check "daemon: run/compat.json and the report files appear" 'wait_for 20 "[ -f \"$S/run/compat.json\" ] && [ -f \"$S/run/report.json\" ] && [ -f \"$S/run/report.url\" ]"'
+check "status --json: compat is the daemon's object with a status and a self-check text" 'json "isinstance(s[\"compat\"], dict) and s[\"compat\"][\"compat_status\"] and \"selfcheck\" in s[\"compat\"] and \"firmware_changed\" in s[\"compat\"]"'
+check "status text: a compatibility line" '$CTL status | grep -q "^webos-satellite: compatibility: "'
+$CTL report >"$T/report.txt" 2>&1
+check "report: short text, the GitHub issue link, no hand-off to anything else" 'grep -q "^webos-satellite compatibility report v1" "$T/report.txt" && grep -q "^Create the GitHub issue" "$T/report.txt" && grep -q "^https://github.com/pando85/webos-voice-satellite/issues/new?template=compatibility-report.yml&" "$T/report.txt"'
+$CTL report --full >"$T/report-full.txt" 2>&1
+$CTL report --json >"$T/report.json" 2>&1
+check "report --full and --json: the text, and JSON the app can show (url, full)" 'head -n 1 "$T/report-full.txt" | grep -q "compatibility report v1" && python3 -c "
+import json,sys
+r=json.load(open(sys.argv[1]))
+sys.exit(0 if r[\"schema\"]==1 and r[\"url\"].startswith(\"https://github.com/\") and r[\"full\"].startswith(\"webos-satellite compatibility report\") and len(r[\"url\"])<=1500 else 1)" "$T/report.json"'
+printf '%s\n' pkg-test keep-me 127.0.0.1 "$(cat "$T/psk")" "$S" >"$T/secrets"
+check "report: nothing identifying (device name, MAC seed, address, key, install path)" '! cat "$T/report.txt" "$T/report-full.txt" "$T/report.json" | grep -q -F -f "$T/secrets"'
+$CTL selfcheck >"$T/out" 2>&1
+check "selfcheck: trigger file written, consumed by the running daemon" 'grep -q "self-check requested" "$T/out" && wait_for 6 "[ ! -e \"$S/run/selfcheck-run\" ]"'
+$CTL ack-firmware >"$T/out" 2>&1
+check "ack-firmware: trigger consumed by the daemon, etc/firmware_seen holds the firmware" 'grep -q "acknowledged" "$T/out" && wait_for 6 "[ ! -e \"$S/run/firmware-ack\" ]" && [ "$(cat "$S/etc/firmware_seen")" = 99.99.99 ]'
+# A firmware that differs from the remembered one is shown until acknowledged.
+$CTL stop >/dev/null
+echo 01.00.00 >"$S/etc/firmware_seen"
+rm -f "$S/run/compat.json" "$S/run/report.json"
+$CTL start >/dev/null
+check "firmware changed since the last run: compat says so, the microphone is not blocked" 'wait_for 20 "[ -f \"$S/run/compat.json\" ]" && json "s[\"compat\"][\"firmware_changed\"] is True and s[\"compat\"][\"compat_status\"]==\"firmware changed\" and s[\"firmware_ok\"]"'
+$CTL ack-firmware >/dev/null
+fw_changed_false() { grep -Eq '"firmware_changed":[[:space:]]*false' "$S/run/compat.json"; }
+check "ack-firmware clears it" 'wait_for 8 fw_changed_false && [ "$(cat "$S/etc/firmware_seen")" = 99.99.99 ]'
+$CTL stop >/dev/null
+check "report with the daemon stopped: the last saved report, with a note" '$CTL report 2>&1 | grep -q "last saved report"'
+echo 01.00.00 >"$S/etc/firmware_seen"
+WEBOS_SAT_OS_INFO=$T/os_info.json $CTL ack-firmware >"$T/out" 2>&1
+check "ack-firmware with the daemon stopped: writes the current firmware" 'grep -q "99.99.99 recorded" "$T/out" && [ "$(cat "$S/etc/firmware_seen")" = 99.99.99 ]'
+$CTL selfcheck >"$T/out" 2>&1
+check "selfcheck with the daemon stopped: says it runs at the next start" 'grep -q "next start" "$T/out" && [ ! -e "$S/run/selfcheck-run" ]'
+rm -f "$S/run/report.json" "$S/run/report.short.txt" "$S/run/report.full.txt" "$S/run/report.url" "$S/run/compat.json"
+$CTL report >"$T/report.txt" 2>&1
+check "report with nothing saved: a static report from the binary" 'grep -q "^Create the GitHub issue" "$T/report.txt"'
+$CTL report --bogus >/dev/null 2>&1 && rc=0 || rc=$?
+check "report with an unknown flag: usage error (exit 2)" '[ "$rc" -eq 2 ]'
+$CTL start >/dev/null
 $CTL autostart on >/dev/null
 H=$T/initd/webos-satellite
 check "autostart on: hook 0755 with the install directory filled in" '[ "$(stat -c %a "$H")" = 755 ] && grep -q "^PREFIX=$S\$" "$H" && ! grep -q @PREFIX@ "$H" && sh -n "$H" && json "s[\"autostart\"]"'

@@ -1,0 +1,37 @@
+# Verified TVs: the series and firmware the project has run on itself.
+# Compiled into the daemon (crates/satellite/src/verified.rs, include_str!) and
+# mirrored by the "Verified" table of docs/compatibility/verified-models.md
+# (tools/check_docs.py fails when the two differ). Design:
+# docs/design/firmware-policy-and-reports.md, ADR 0006.
+#
+# Matching (owner decision 2026-11-04): by SERIES and firmware.
+#   - A TV is in a series when its model name matches one of `models` (a glob,
+#     case-insensitive: `?` is one character, `*` any run) and, when `webos`
+#     is set, its webOS release starts with that major number.
+#   - In the series with a listed firmware: "verified".
+#   - In the series with another firmware: "series verified, firmware not yet
+#     reported" (the same hardware family, an untested build).
+#   - Anything else: "not verified". Never an error and never a block.
+# A row is added only for a firmware the project itself ran the mic path on
+# (`verified-on-target`, with the experiment); reports from other users go to
+# the "Reported working (unconfirmed)" table of the docs, not here.
+
+schema = 1
+
+[[series]]
+id = "lg-oled-c3"
+name = "LG OLED C3 (2023, webOS 8.x)"
+models = ["OLED??C3*"]
+webos = "8"
+
+[[series.firmware]]
+version = "03.30.74"
+unit = "c3-a"
+model = "OLED42C34LA"
+evidence = "docs/compatibility/c3-a.md"
+
+[[series.firmware]]
+version = "03.30.73"
+unit = "c3-b"
+model = "OLED55C36LC"
+evidence = "docs/compatibility/c3-b.md"
