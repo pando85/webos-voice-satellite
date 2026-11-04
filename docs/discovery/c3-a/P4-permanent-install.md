@@ -58,6 +58,34 @@ Counts only (no transcripts). Source: the satellite log on c3-a, HA's log and th
 
 The 12 "HA disconnected" lines coincide with HA going down: the cluster recreated the HA pod 8 times in the window (pod start times from the cluster metrics, each within seconds of a disconnect or the reconnect that followed), and the other drops are the same pattern (hypothesis: more restarts of the old pod). The TV's power state is not the cause: they happen in Active and Active Standby alike. The satellite reconnected each time, 11 s to 11 min after the drop. Every `intent_end=-` is genuine: the pipeline sent an error instead of an intent end. In the next release the latency line also carries `error_at=<ms>` for that case. `ctl.sh status` also showed `reply volume: default %` and could never show a stored reply volume or remote power-off setting (`sed s///gp` printed nothing for an already clean line); both are fixed.
 
+## Update to 0.1.1 (2026-11-04)
+
+- **Approval:** the owner (2026-11-04): deploy newer versions to c3-a to test them, and verify through Home Assistant everything that makes no sound. Same session rules as above: no reboot, no power-state or setting change, no sound, no reply-producing pipeline run, no ASoC or debugfs reads.
+- **Package:** `0.1.1` (commit `ac8aca6`, "version 0.1.1", which bumps only `Cargo.toml` and `Cargo.lock`; contains d3fd410 and 82f4914), `make ipk` (check passed), sha256 `5d440b8b...`, built from the pushed commit. A bump was not strictly needed: update detection compares `SHA256SUMS`, not versions ([packaging P5](../../design/packaging.md)); it was made so the running build is told apart from 0.1.0.
+- **Method (the same as P4 above, HBC 0.6.3, app not opened):** `make tv-install-ipk` (appinstalld `dev/install`, copy deleted); `ctl.sh status` then said "an update is pending" with the old daemon still running; `ctl.sh install` applied it (stop supervisor and daemon, re-install the aarch64 build chosen by `--arch auto`, "keeping etc/config.toml", boot hook refreshed, started again under a new supervisor). Time without a daemon: about 2 s.
+
+| Check | Result | Label |
+| --- | --- | --- |
+| Version | `ctl.sh status`: package, installed and running build all `0.1.1 (aarch64-unknown-linux-musl)`; `update_pending` false | verified-on-target |
+| State kept | `etc/config.toml` and `etc/noise_psk` sha256 prefixes equal before and after, modes 0600; device name and port unchanged; `etc/muted` absent before and after | verified-on-target |
+| Start at boot | still `on` (hook present, refreshed by the install). Boot itself still not tested on c3-a | verified-on-target (hook); boot unverified |
+| Reply volume line | `reply volume: 40 % (config default; none stored yet)`; 0.1.0 printed `default %`. It showed as soon as the new ipk was installed (before `ctl.sh install`), because `ctl.sh` runs from the app directory | verified-on-target |
+| Startup log | limits, "reply volume 40 %", version line, firmware guard validated, listening on the API port, power watch subscribed, state `Active`, microphone open | verified-on-target |
+| Processes | 1 supervisor, 1 rotator, 1 daemon (+ the power-watch `luna-send` child); nothing of ours left in `/tmp` | verified-on-target |
+| RSS | daemon 1308 kB (1280 kB at 0.1.0), 4 threads; mic PCM `RUNNING` and owned by the daemon | verified-on-target |
+| Kernel | no oops or ASoC warning in the `dmesg` tail (only CPU hotplug lines, the TV's own) | verified-on-target |
+| HA reconnect | `HA connected` 3.7 s after the start (HA 2026.10.4), same entry `lg-c3-a`, no re-auth; "requesting pipeline (wake_word=true)", then "streaming mic audio to HA (wake word stage)" | verified-on-target |
+| Entities in HA | Existing 10 entities unchanged, no `_2` duplicates of the device; **new: binary sensors "Listening" and "Microphone muted"**. Pipeline selects still `preferred`; nothing in HA was changed except the mute switch test below | verified-on-target |
+| Listening in wake-word streaming | "Listening" `on`, "Microphone muted" `off`, mute switch `off` | verified-on-target |
+| Mute ON via HA (`switch.turn_on`) | HA polled every 50 ms through the REST API: switch `on`, Listening `off`, Microphone muted `on` all seen within the first 50 ms poll after the call returned (the call took 0.01 s). Log: "microphone MUTED by Home Assistant", "stopped streaming mic audio", "capture: microphone closed, PCM released (muted)" within 1 ms. States held for 5 s | verified-on-target |
+| Mute OFF (`switch.turn_off`) | switch `off` and Microphone muted `off` within 50 ms; **Listening `on` after 0.13 s**, i.e. after the capture PCM was reopened (log: unmuted, pipeline requested, streaming resumed, "capture: microphone open" 36 ms later). So "Listening" follows the real PCM, not the switch | verified-on-target |
+| Mute ends as it began | switch `off`, Listening `on`, Microphone muted `off`; `etc/muted` still absent; wake-word streaming resumed (log lines above) | verified-on-target |
+| `tools/dogfood_report.py` (`--days 1 --no-ha`) | Parses the 0.1.1 log: daemon version 0.1.1, RSS and threads, "HA mutes 1" and microphone-muted time, 2 starts (1 boot, 1 manual), power-state times. It reports 8 attempts of the day all `intent_error` (the conversation agent problem above, not 0.1.1). **Defect found:** it prints "supervisor not running" although one is (it searches the `ctl.sh status` text for "supervisor running", which the text no longer contains; the JSON has `supervised: true`). Not fixed here | verified-on-target (tool run); defect open |
+
+The unmute made the daemon log a run record with every latency `-` ("run 1 latency ... stt_end=- ..."): the wake-stage restart after the mute counts as a run with no events; harmless, but it will count as a wake-stage cycle in the report. HA access for the test: a short-lived token from the login flow in a 0600 file, deleted afterwards, and the refresh token created for it revoked (only that one).
+
+Left changed on the TV: only the new version (app directory, `/var/lib/webos-satellite/bin`, `VERSION`, `package.sums`, refreshed hook with the same content, rotated log). Rollback: install the 0.1.0 ipk the same way (appinstalld accepts a downgrade, EXP-009) and run `ctl.sh install`.
+
 ## Rollback, as left
 
 - Stop: `ctl.sh stop`. Microphone off without stopping: `ctl.sh mic off`. No start at boot: `ctl.sh autostart off` (or `touch /var/lib/webos-satellite/disable`). Remove everything: `ctl.sh purge`, then `make tv-remove-ipk`. Details: [development: rollback](../../development.md#install-the-app-package-on-a-rooted-tv-persistent).
