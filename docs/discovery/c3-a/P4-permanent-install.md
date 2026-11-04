@@ -44,6 +44,20 @@ Measured from `/proc/<pid>` with `CLK_TCK` 100 while the daemon streamed the mic
 
 Longer-term numbers (hours, days) are not part of this record; the supervisor, the rotator and the memory ceiling (64 MiB) bound a leak, and the P3 soak covered about 1 hour ([P3 robustness](P3-robustness.md)).
 
+## First day of real use (2026-11-03 to 2026-11-04)
+
+Counts only (no transcripts). Source: the satellite log on c3-a, HA's log and the Kiwi pipeline's debug runs. Label: verified-on-target for the TV log, observed on the HA side for the rest.
+
+| Class | Runs | Cause |
+| --- | --- | --- |
+| Wake word detected, speech-to-text returned text, then `intent-failed` | 14 | The conversation agent: HA logged 14 matching "Unexpected error during intent recognition" errors, all `model not found (404)` from the Ollama integration (the server answered; the model was not on it) |
+| Of those, speech-to-text took about 16 s (no end of speech found) | 3 | Hypothesis: HA's speech-to-text ran to its time limit; not explained (cause of the missing end of speech unknown) |
+| Wake stage run ended by HA with no error | 11 | HA going away (see below) |
+| Run in flight when HA disconnected | 11 | Same |
+| Empty speech-to-text, or a successful reply | 0 | |
+
+The 12 "HA disconnected" lines coincide with HA going down: the cluster recreated the HA pod 8 times in the window (pod start times from the cluster metrics, each within seconds of a disconnect or the reconnect that followed), and the other drops are the same pattern (hypothesis: more restarts of the old pod). The TV's power state is not the cause: they happen in Active and Active Standby alike. The satellite reconnected each time, 11 s to 11 min after the drop. Every `intent_end=-` is genuine: the pipeline sent an error instead of an intent end. In the next release the latency line also carries `error_at=<ms>` for that case. `ctl.sh status` also showed `reply volume: default %` and could never show a stored reply volume or remote power-off setting (`sed s///gp` printed nothing for an already clean line); both are fixed.
+
 ## Rollback, as left
 
 - Stop: `ctl.sh stop`. Microphone off without stopping: `ctl.sh mic off`. No start at boot: `ctl.sh autostart off` (or `touch /var/lib/webos-satellite/disable`). Remove everything: `ctl.sh purge`, then `make tv-remove-ipk`. Details: [development: rollback](../../development.md#install-the-app-package-on-a-rooted-tv-persistent).

@@ -312,9 +312,12 @@ cmd_status() {
         fw="$(firmware_version) (checked against the allow-list after set up)"
     fi
     keys=$(key_state)
-    # Written by the daemon when Home Assistant changes them (etc/).
-    remote_off=$(sed -n '1s/[^a-z_]//gp' "$P/etc/remote_off" 2>/dev/null || true)
-    reply_volume=$(sed -n '1s/[^0-9]//gp' "$P/etc/reply_volume" 2>/dev/null || true)
+    # Written by the daemon when Home Assistant changes them (etc/). `1{...;p;}`
+    # prints even when the line is already clean (`s///gp` printed nothing then).
+    remote_off=$(sed -n '1{s/[^a-z_]//g;p;}' "$P/etc/remote_off" 2>/dev/null || true)
+    reply_volume=$(sed -n '1{s/[^0-9]//g;p;}' "$P/etc/reply_volume" 2>/dev/null || true)
+    # Until Home Assistant stores one, the daemon uses sink.volume (percent).
+    reply_volume_default=$(cfg_value volume | sed 's/[^0-9]//g')
     name=$(cfg_value name)
     port=$(cfg_value port)
     if [ "$json" -eq 0 ]; then
@@ -328,7 +331,14 @@ cmd_status() {
         [ ! -e "$KILL_SWITCH_DEFAULT" ] || note "microphone off (kill switch $KILL_SWITCH_DEFAULT)"
         note "firmware: $fw"
         note "device: ${name:-?} port ${port:-6053}, key: $keys"
-        note "reply volume: ${reply_volume:-default} %, remote power-off: ${remote_off:-normal}"
+        if [ -n "$reply_volume" ]; then
+            vol_text="$reply_volume %"
+        elif [ -n "$reply_volume_default" ]; then
+            vol_text="$reply_volume_default % (config default; none stored yet)"
+        else
+            vol_text="default (none stored yet)"
+        fi
+        note "reply volume: $vol_text, remote power-off: ${remote_off:-normal}"
         return 0
     fi
     printf '{"package_version":%s,' "$(json_str "$pkg_version")"
@@ -343,6 +353,7 @@ cmd_status() {
     printf '"firmware":%s,"firmware_ok":%s,' "$(json_str "$fw")" "$fw_ok"
     printf '"key":%s,"name":%s,"port":%s,' "$(json_str "$keys")" "$(json_str "$name")" "$(json_str "${port:-6053}")"
     printf '"remote_off":%s,"reply_volume":%s,' "$(json_str "${remote_off:-normal}")" "$(json_str "$reply_volume")"
+    printf '"reply_volume_default":%s,' "$(json_str "$reply_volume_default")"
     printf '"prefix":%s,"log":[' "$(json_str "$P")"
     sep=
     if [ -f "$LOG" ]; then

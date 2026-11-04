@@ -75,6 +75,8 @@ struct RunTimes {
     expect_tts: bool,
     ended: bool,
     error: Option<String>,
+    /// When the error event arrived (an intent failure has no `intent_end`).
+    error_at: Option<Instant>,
 }
 
 /// Tracks pipeline runs and produces one latency line per run.
@@ -114,7 +116,7 @@ impl RunTracker {
             let _ = write!(s, " reply_audio={}", a.as_millis());
         }
         if let Some(e) = &r.error {
-            let _ = write!(s, " error={e}");
+            let _ = write!(s, " error={e} error_at={}", ms(origin, r.error_at));
         }
         s
     }
@@ -140,6 +142,7 @@ impl RunTracker {
             expect_tts: false,
             ended: false,
             error: None,
+            error_at: None,
         });
         prev
     }
@@ -172,9 +175,10 @@ impl RunTracker {
         });
     }
 
-    pub(crate) fn error(&mut self, code: &str) {
+    pub(crate) fn error(&mut self, now: Instant, code: &str) {
         self.with(|r| {
             r.error = Some(code.to_owned());
+            r.error_at = Some(now);
             r.expect_tts = false;
         });
     }
@@ -829,7 +833,7 @@ impl Daemon {
             AppEvent::Error { code, message } => {
                 log::warn!("HA pipeline error {code}");
                 log::debug!("HA pipeline error message: {message:?}");
-                self.runs.error(&code);
+                self.runs.error(now, &code);
             }
             AppEvent::Pairing(ev) => self.on_pairing(ev).await,
             AppEvent::VolumeChanged(percent) => self.on_volume(percent),
@@ -1220,13 +1224,34 @@ mod tests {
         let t0 = Instant::now();
         let mut r = RunTracker::default();
         r.start(t0, false);
-        r.error("stt-no-text-recognized");
+        r.error(t0 + Duration::from_millis(1500), "stt-no-text-recognized");
         let line = r.run_end().unwrap();
         assert!(
             line.starts_with("run 1 latency ms (from start): stt_end=-"),
             "{line}"
         );
-        assert!(line.ends_with("error=stt-no-text-recognized"), "{line}");
+        assert!(
+            line.ends_with("error=stt-no-text-recognized error_at=1500"),
+            "{line}"
+        );
+    }
+
+    /// An intent failure (conversation agent down) has no `intent_end`; the
+    /// line says when the error arrived so the gap is not a logging hole.
+    #[test]
+    fn intent_failure_records_when_the_error_arrived() {
+        let t0 = Instant::now();
+        let at = |ms| t0 + Duration::from_millis(ms);
+        let mut r = RunTracker::default();
+        r.start(at(0), true);
+        r.wake(at(5000));
+        r.stt(at(7000));
+        r.error(at(7200), "intent-failed");
+        let line = r.run_end().unwrap();
+        assert_eq!(
+            line,
+            "run 1 latency ms (from wake word): stt_end=2000 intent_end=- tts_start=- playback_end=- wake_after_stream_start=5000 error=intent-failed error_at=2200"
+        );
     }
 
     #[test]

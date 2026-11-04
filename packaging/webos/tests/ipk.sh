@@ -183,6 +183,11 @@ check "daemon, supervisor and rotator keep no descriptor of the caller" '[ "$lea
 check "no start.sh process stays behind; the supervisor pidfile names supervise.sh" '[ -z "$(pgrep -f "$S/bin/start.sh")" ] && tr "\0" " " </proc/$(cat "$S/run/supervise.pid")/cmdline | grep -q supervise.sh'
 check "start: one supervised daemon" 'json "s[\"running\"] and s[\"supervised\"] and s[\"firmware_ok\"]" && [ "$(daemons)" = 1 ] && [ "$(supervisors)" = 1 ]'
 check "status --json: no key material" '! $CTL status --json | grep -q "$(cat "$T/psk")"'
+check "status text: reply volume names the default, never 'default %'" '! $CTL status | grep -q "default %" && $CTL status | grep -q "reply volume: .*none stored yet" && json "\"reply_volume_default\" in s and s[\"reply_volume\"]==\"\""'
+printf '55\n' >"$S/etc/reply_volume"
+printf 'keep_listening\n' >"$S/etc/remote_off"
+check "status text and JSON: a stored reply volume wins" '$CTL status | grep -q "reply volume: 55 %," && json "s[\"reply_volume\"]==\"55\" and s[\"remote_off\"]==\"keep_listening\""'
+rm -f "$S/etc/reply_volume" "$S/etc/remote_off"
 $CTL start >/dev/null
 check "a second start does nothing" '[ "$(daemons)" = 1 ] && [ "$(supervisors)" = 1 ]'
 # stop_daemon under `set -e` when every TERM finds its target already gone

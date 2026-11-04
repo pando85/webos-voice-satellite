@@ -128,7 +128,8 @@
       var k = KEY_TEXT[s.key] || [s.key, ''];
       addFact(facts, 'Home Assistant', k[0], k[1]);
       addFact(facts, 'Device name', s.name || '?');
-      addFact(facts, 'Reply volume', s.reply_volume ? s.reply_volume + ' %' : 'default (set it in Home Assistant)');
+      addFact(facts, 'Reply volume', s.reply_volume ? s.reply_volume + ' %'
+        : (s.reply_volume_default ? s.reply_volume_default + ' % (default; set it in Home Assistant)' : 'default (set it in Home Assistant)'));
       // Short form of the risks in docs/design/always-on.md section 12.
       addFact(facts, 'Remote power key',
         s.remote_off === 'keep_listening'
