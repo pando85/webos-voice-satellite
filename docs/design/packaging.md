@@ -141,6 +141,8 @@ There is no license check in CI. The `cargo deny` run above used a scratch confi
 
 ## 9. Verified-models list instead of a firmware whitelist
 
+**Update (owner, 2026-11-04): this section is refined and partly superseded by [firmware policy and reports](firmware-policy-and-reports.md) ([ADR 0006](../decisions/0006-soft-firmware-policy-and-compatibility-reports.md)).** The hard gate is **not** kept until the release: the mic is to start on any firmware, with a visible status, measured self-checks, a firmware-changed marker, an easy compatibility report and an opt-in strict mode. In 9.4 the open point on closing the mic after a failed self-check is answered (a measured failure closes it with bounded retries; a warning does not), the assumed entity "attributes" do not exist in the ESPHome API (separate entities instead), and the confirmation before the first capture is not required. **None of this is implemented yet**; the text below describes the state until step S1 of that design lands.
+
 **Decision (owner, 2026-11-03), P16.** The public release will not hard-whitelist firmware. This section is the design; **nothing here is implemented, and the daemon behaves as before: it refuses to open the microphone unless the TV firmware is in `safety.validated_firmware`** ([config](../../config/example.toml), `crates/satellite/src/firmware.rs`, roadmap Phase 3 "Firmware guard", c3-a evidence). The gate stays until the Homebrew Channel release ([backlog #10](../project/backlog.md#10-official-homebrew-channel-listing)).
 
 ### 9.1 What the gate protects today

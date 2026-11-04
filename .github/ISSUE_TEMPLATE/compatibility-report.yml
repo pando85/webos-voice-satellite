@@ -1,0 +1,36 @@
+name: TV compatibility report
+description: Tell us whether the satellite works on your LG TV and firmware (positive reports help too).
+title: "[Compat] "
+labels: ["compat-report"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you. This issue is **public**. The report below was built by the satellite from a fixed list of fields: TV model, webOS and firmware version, architecture, audio device ids and formats, self-check results, capture level numbers, power states and TV control results. It never contains a serial number, MAC or IP address, device name, Home Assistant address, key, audio or transcript, and the satellite sends nothing by itself.
+        Please read it before you submit and remove anything you do not want to share. How to create it: Home Assistant button "Create compatibility report", the TV app "Report compatibility", or `ctl.sh report`.
+  - type: textarea
+    id: report
+    attributes:
+      label: Report
+      description: Filled in by the link. Paste the output of `ctl.sh report` if it is empty.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: details
+    attributes:
+      label: Full report (optional)
+      description: Output of `ctl.sh report --full`, if you want to include more detail.
+      render: text
+  - type: textarea
+    id: comments
+    attributes:
+      label: What worked or did not (optional)
+      description: For example wake word and replies, LG hands-free setting, power states you tried, anything odd. No private information please.
+  - type: checkboxes
+    id: confirm
+    attributes:
+      label: Before you submit
+      options:
+        - label: I read the report; it has no serial number, address or other private data, and I know this issue is public.
+          required: true
