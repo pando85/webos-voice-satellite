@@ -1,5 +1,7 @@
 # P4: Sound session on c3-b (0.2.1): update, announcement hang, Assist phrasings
 
+> **Session 2 (0.2.2, same evening):** the audible checks were run with the microphone free; see [Session 2](#session-2-022-with-the-microphone-free-2026-11-04-evening). Everything above that section is session 1.
+
 - **Device:** c3-b (LG C3 55", webOS TV 8.3.0, firmware `03.30.73`, aarch64 kernel with 32-bit userland, sound out through ARC). The TV is in a household room. LG hands-free ("Hi LG") is on and holds the microphone, as in [P4 permanent install](P4-permanent-install.md); it was not touched.
 - **Date:** 2026-11-04 (UTC times below).
 - **Approval:** the owner (2026-11-04, about 15:50 CET): sound allowed on c3-b until 22:00 CET at moderate levels (TV volume at most the value found, reply volume default), short sounds; no sound on c3-a; HA pod restarts allowed. Rules kept: no ASoC or debugfs reads, no `apiadapter/system/getSystemInfo`, no LG setting changed, Kiwi's conversation agent not fixed, no pipeline changed.
@@ -77,3 +79,79 @@ On the TV: 0.2.1 instead of 0.2.0 (rollback: install the 0.2.0 ipk and `ctl.sh i
 - Everything audible: announcement start latency and level at reply volume 40 %, the timer chime (start on FINISHED, level, the Timer alarm sensor, stop by the button, the cap), queueing of an announcement behind a ringing alarm, and the executed TV commands with their luna read-back. They need the TV on (the household or an authorized wake) and finding 1 out of the way (fix the daemon, or mute the microphone in HA during the test).
 - The power-off reason (daemon log) and the first `RESUMED` after a real suspend.
 - Whether SoundEngineCapture clocks on c3-b while sound plays through ARC.
+
+## Session 2: 0.2.2 with the microphone free (2026-11-04, evening)
+
+- **Approval:** the owner (2026-11-04): "Turn Hi LG off" on c3-b so the satellite can listen (record the original first, keep it off afterwards); power states, reboots and settings on c3-b allowed (restore originals where sensible); sound until 22:00 CET at the TV volume found and the default reply volume, short sounds; no sound on c3-a and c3-a not touched; HA pod restarts allowed (none needed); the c3-b device assigned to the existing HA area "Living Room". Rules kept: no ASoC or debugfs reads, no `apiadapter/system/getSystemInfo`, no pipeline changed or created.
+- **Failsafe:** the same two PC timers as session 1 (22:00 and 22:00:30 CET), changed to restore the volume found in this session (12); cancelled at 20:03 CET after everything was restored. They never ran.
+- **Measurement:** as in [section 3](#3-measurement-setup-for-the-rerun): `parec` on `pcm_output.monitor` reduced on the PC to 100 ms RMS and peak values (our stream after mixing, **before** the TV volume; nothing kept but the numbers), `pactl list short sink-inputs` every 200 ms, the daemon log, and HA `state_changed` events, all stamped with the PC clock (the TV clock is about 1 s behind; daemon log lines arrive with up to about 1 s of delay, so latencies below are taken from the monitor, the sink inputs and HA). A running `parec` keeps the sink awake, which may make the start latencies slightly shorter than in normal use. Raw numbers are in the gitignored `devices/private/c3-b/P4-sound/s2-*`.
+
+Labels: **verified-on-target** (c3-b, firmware `03.30.73`, HA 2026.10.4) unless marked.
+
+### State found and the "Hi LG" change
+
+- At the start (19:50 CET) the TV was **on** (`Active`, home app; the household had turned it on with the remote about 19:48 CET after two power-offs), volume **12** (not the 3 of session 1: changed by the household), not muted, `external_arc`. It moved to `Screen Saver` by itself a minute later.
+- **LG hands-free was already off:** `voiceinput/setting/getActivation` read `settingStatus false`, `activationState false` for ThinQ, Amazon and the third provider (`currentTriggerWord hiLG`); `option/turnOnByVoice off`, `wakeUpword LGTV`. Earlier the same day it was **on** (`settingStatus true`, `activationState true` for ThinQ: [P4 install](P4-permanent-install.md), [D6 restore table](D6-poweroff-screenoff.md)). **Who or what turned it off is unknown**: the TV's `messages` log rotates within minutes and kept nothing older than the session. The satellite log shows the microphone came free at 15:20:40 UTC, while the TV went to `Active Standby` before the no-signal power-off of session 1, and the satellite has held it since then (through two suspends and the household's power-on). Whether LG's voice service turns its setting off when it cannot reopen a busy microphone, or a person changed it, is a **hypothesis** either way.
+- **Nothing was written** (the owner wanted it off and it read off). `hw:LGSIC,0` (`pcm0c`) is `RUNNING`, held by `webos-satellite` only; `pcm1c` (SpeakerFeedback) closed; `voiceinput` holds no capture PCM. HA's **Listening** is `on`, **Microphone muted** `off`. Kept **off** at the end (owner decision).
+- **To switch "Hi LG" back on:** Settings, General, AI Service, Voice recognition settings, "Hi LG" (the household's way), or as root `luna-send -n 1 luna://com.webos.service.voiceinput/setting/setActivation '{"settingStatus":true}'` (needs a pty, as in [D6](D6-poweroff-screenoff.md)); read it back with `setting/getActivation`. With it on, the satellite reports `MIC BUSY` again and session 1's finding 1 applies.
+
+### Deploy 0.2.2
+
+- `afd6b02` "version 0.2.2" (`Cargo.toml` and `Cargo.lock` only; `main` has the soft firmware policy and self-check `76c3f8c` since 0.2.1). `make ipk` (check passed, sha256 `b5009971...`), `make tv-install-ipk`, `ctl.sh install`: aarch64 build, `etc/config.toml` and the stored pairing key with the same sha256 prefixes before and after, `etc/firmware_seen` written at the first start. HA reconnected 3.7 s after the start with the stored key.
+- Startup: "firmware 03.30.73 ... verified (in safety.validated_firmware)", `tv_control: ready (... volume=ok mute=ok input=ok apps=ok)`, **no launch-declaration warning**, the volume subscription kept with polling until a push, microphone open, `self-check: passed`.
+- HA: **35 entities** (25 before; the new ones are Firmware verified `on`, Capture problem `off`, Firmware changed `off`, Compatibility `verified`, Microphone self-check `passed (peak -40 dBFS)`, TV firmware `03.30.73`, TV model, Compatibility report "ready: TV app > Report compatibility, or ctl.sh report", and the buttons Re-run microphone check and Acknowledge firmware change). The ten new entities got entity ids that start with `living_room_` because the device had just been put in that area (HA's naming of new entities, **hypothesis** for the rule; cosmetic, the older ids were kept).
+- **HA area:** the c3-b device is now in the existing area **Living Room** (no area was created).
+
+### Self-check with the real microphone and the report
+
+| Item | c3-b | Threshold ([design C6, C7](../../design/firmware-policy-and-reports.md#3-self-checks)) | Margin |
+| --- | --- | --- | --- |
+| Checks | C1 to C7 pass, C8 skipped | | |
+| 10 s window at the first open (TV in `Screen Saver`, room quiet) | RMS -67.5 dBFS, peak -39.6 dBFS, clipped 0, xruns 0, 204 chunks, 0 dropped | C6: peak above -80 dBFS; C7: clipped below 0.5 % and RMS below -10 dBFS | C6 about 40 dB; C7 about 57 dB |
+| Two later restarts | passed, peak -20 and -37 dBFS | | |
+
+c3-b's RMS equals c3-a's quiet-room reference (-67.6 dBFS); the peak depends on what happens in the room in those 10 s. No threshold change is suggested by this unit.
+
+**Report privacy:** `ctl.sh report`, `--full`, `--json`, `report.url` and the report files were compared on the PC with 13 identifiers read on the TV for the purpose (MAC of every interface, every IPv4 and IPv6 address, the hostname, the device ids of `nyx-cmd DeviceInfo`): **0 matches**, and no MAC or IPv4 pattern in the text. The identifiers were held in a temporary file that was deleted; none is written anywhere. The report carries the model (`OLED55C36LC`), webOS, firmware, kernel version, PCM parameters, levels and the TV-control results, by design.
+
+### TV control re-checks
+
+- **Refresh TV inputs and apps:** one summary line, `tv_refresh_lists: done: 4 inputs, 30 apps`.
+- **Volume push:** the first mute change produced `an update was pushed on the volume subscription; it streams without the flag, polling stopped` (the `34d39ff` behaviour confirmed).
+- **Spanish commands executed** (`conversation/process`, agent `conversation.home_assistant`, language `es`, the c3-b device as context), each read back with luna: "apaga la pantalla de la tele del hall" (`Screen Saver` to `Screen Off`), "enciende la pantalla de la tele del hall" (`Active`; the screen saver came back by itself later), "activa el silencio de la tele del hall" (`muteStatus true`, volume 12 kept), "desactiva el silencio de la tele del hall" (`muteStatus false`). All `action_done` on the right switch, HA answered in 7 to 16 ms.
+
+### Sound results
+
+Reply volume 40 % (default), TV volume 12 on ARC (as found). Levels are at the PulseAudio monitor, before the TV volume.
+
+| Check | Result |
+| --- | --- |
+| **Announcement, microphone streaming** (`assist_satellite.announce`, `preannounce: false`) | **No hang** (session 1's finding 1 needs a busy microphone). 44 characters: audio at the monitor 1.08 s after the call, 2.68 s of audio, the call returned after 3.71 s. 27 characters: 0.33 s, 1.58 s, 1.84 s. Level: mean RMS -45 to -46 dBFS, peak -30.0 dBFS |
+| **Timer by text** ("pon un temporizador de un minuto") | `action_done`; **Timers** `1 timer, next in 1 min` at once |
+| **Finished: chime** | The chime was at the monitor within 0.1 s of **Timer alarm** turning `on` in HA (the HA event and the first audio frame arrive together); mean RMS -45.7 dBFS, loudest 100 ms -39.9 dBFS, peak -32.9 dBFS (about the announcement level) |
+| **Announcement while it rings** | The alarm paused (`timer alarm paused: a reply or announcement is playing`), the announcement played alone, the alarm resumed within about 0.15 s of its end ("ringing for at most 292 s", the cap still counted from the finish). One stream at a time |
+| **Timer finishing during an announcement** (10 s timer, 101-character announcement) | The alarm waited (Timer alarm `on` while queued) and started right after the announcement (no gap at 100 ms resolution, no overlap) |
+| **Stop timer alarm button** | Sink input gone 0.18 to 0.20 s after the press; audio silent by the next 100 ms frame (2 runs); Timer alarm `off` with the press; Timers `none` |
+| **Media player stop** | Audio silent within 0.13 s, sink input gone within 0.05 s; log `timer alarm stopped (media player stop; was Ringing)` |
+| **Cap** (one run with `timer_alarm_max_s = 20` in the TV's config, the original restored after with the same sha256 prefix, two daemon restarts) | `stopped at the time cap (nobody stopped it)`: Timer alarm `on` for 20.2 s, audio 20.2 s |
+| Stop by the wake word | not tried (needs a person to say it; HA's Kiwi conversation agent still fails, backlog #12) |
+
+**False wakes:** HA detected the wake word **once** in the session (from the first sound to the end, about 8 minutes with about 50 s of our audio: 4 announcements and 4 alarms), about 4 s **before** a chime with nothing playing (room sound; the conversation agent failed, nothing was played). **0 detections during or right after our own sound.** While an announcement plays the wake-word pipeline is closed anyway (see the next finding), so only the chime and the gaps were exposed. One evening, one room, one level: not a rate.
+
+### Findings
+
+1. **Announcements interrupting the idle wake-word run count as failed runs, and the retry backoff grows** (daemon, **verified-on-target** from the log, cause read from `crates/esphome-api/src/voice.rs`). Every announcement cancels the waiting wake-word pipeline; the daemon logs `voice: run failed (N in a row); retry in M ms` and the counter is reset only by a wake word or a speech-to-text result. After three announcements it read "4 in a row; retry in 2000 ms"; the delay doubles from 250 ms up to 60 s. Here the announcement playback outlasted the delay, so streaming resumed at once, but after about eight announcements or alarms without a wake word the satellite would stop streaming for up to a minute after each. **Proposed fix:** do not count a run that HA ended without an error (an announcement, an HA abort) as a failure. Not changed here.
+2. Session 1's announcement hang did not occur with the microphone streaming (4 of 4 announcements returned in 1.8 to 3.7 s). The hang with a **busy** microphone is still unfixed and was not re-tested.
+3. The TV volume and the "Hi LG" setting were changed by the household (or the TV) between the sessions; the TV is in daily use in the evening.
+
+### Restored and left changed
+
+- TV at the end: `Screen Saver` on the home app (how it settled after the household turned it on; not a no-signal input), volume 12, not muted, `external_arc`, no sink input, mic PCM held by the satellite, kernel taint 4097, no oops. `/tmp`: `tv_dualcap.py` from session 1 deleted, the config backup deleted, nothing of ours left. The TV's config is the original (sha256 prefix compared).
+- HA: both assistant selects `preferred`, 2 pipelines (none created), reply volume 0.4, Timer alarm `off`, Timers `none`, TV mute `off`, screen `on`. The session's refresh tokens (two) were deleted by their own ids; a refresh then fails. No other token was touched.
+- **Left changed:** 0.2.2 instead of 0.2.1 (rollback: install the 0.2.1 ipk and `ctl.sh install`); the c3-b device in the HA area Living Room; "Hi LG" **off** (found off, kept off by the owner's decision; how to revert is above).
+
+### Residual unknowns
+
+- Stop by the wake word over the chime; how loud the chime is in the room at other TV volumes (only the level before the TV volume was measured); a long-term false-wake rate with the chime.
+- Why "Hi LG" turned off; whether it comes back after a reboot (the setting reads off).
+- The announcement hang with a busy microphone (session 1, finding 1) and the backoff growth (finding 1 above) are open daemon fixes.
