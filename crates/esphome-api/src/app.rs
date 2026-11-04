@@ -231,6 +231,17 @@ pub enum AppCommand {
     },
     /// Mute or unmute the microphone (reported to HA via the switch entity).
     SetMuted(bool),
+    /// Whether the application's microphone capture is delivering audio right
+    /// now. A host that never sends this is assumed to be capturing. While it
+    /// is `false` no pipeline run is open: HA's Assist satellite cancels a
+    /// running wake word pipeline before an announcement and that cancel
+    /// waits for one more audio chunk, which never comes from a closed or
+    /// busy microphone, so the announcement would hang. Going `false` ends
+    /// the run (HA is told to abort, streaming stops) and `true` re-arms the
+    /// wake word. A push-to-talk request while `false` is ignored. Send it in
+    /// order with the [`AppCommand::Audio`] chunks (`true` before the first
+    /// chunk, `false` when capture stops).
+    CaptureLive(bool),
     /// Open (or restart) the pairing window. Ignored, with a log line, when a
     /// key is active or pairing is not enabled. A local action: it also
     /// removes the marker of a remote clear ([`PairingEvent::Cleared`]).
@@ -443,6 +454,7 @@ impl fmt::Debug for AppCommand {
                 .field("success", success)
                 .finish(),
             Self::SetMuted(m) => write!(f, "SetMuted({m})"),
+            Self::CaptureLive(l) => write!(f, "CaptureLive({l})"),
             Self::OpenPairingWindow => f.write_str("OpenPairingWindow"),
             Self::ResetPairing => f.write_str("ResetPairing"),
             Self::SetVolume(v) => write!(f, "SetVolume({v})"),

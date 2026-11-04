@@ -1446,6 +1446,9 @@ pub(crate) async fn run(mut settings: Settings, triggers: TestTriggers) -> Resul
     let (cmd_tx, cmd_rx) = mpsc::channel(64);
     let shared = Arc::new(Shared::default());
     shared.mic_off.store(gate.off_code(), Ordering::Relaxed);
+    // Nothing captures yet: no wake word session in HA until the capture
+    // thread reports audio (queued before it can send `true`).
+    let _ = cmd_tx.try_send(AppCommand::CaptureLive(false));
     let (notes_tx, mut notes_rx) = mpsc::unbounded_channel();
     let cap = capture::spawn(
         CaptureSettings::from_settings(&settings),

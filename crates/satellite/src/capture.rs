@@ -238,6 +238,8 @@ struct Indicators<'a> {
     shared: &'a Shared,
     listening: Option<bool>,
     muted: Option<bool>,
+    /// What HA's voice layer was told ([`AppCommand::CaptureLive`]).
+    live: Option<bool>,
 }
 
 impl<'a> Indicators<'a> {
@@ -247,15 +249,34 @@ impl<'a> Indicators<'a> {
             shared,
             listening: None,
             muted: None,
+            // The daemon starts the voice layer with "not capturing".
+            live: Some(false),
         }
     }
 
     /// "Listening": the capture PCM is open. Call after opening it and after
     /// closing it, nowhere else.
     fn listening(&mut self, on: bool) {
+        if !on {
+            // A closed PCM delivers nothing: HA's open run must end now.
+            self.capturing(false);
+        }
         if self.listening != Some(on) {
             self.listening = Some(on);
             self.publish(LISTENING_ID, on);
+        }
+    }
+
+    /// The capture delivers audio (the PCM is open and a read returned
+    /// frames). Tells the voice layer, which keeps a wake word session in HA
+    /// open only while this is on: HA's cancel of that session (before an
+    /// announcement) waits for one more audio chunk, so an open session with
+    /// no audio blocks announcements. Off before the PCM is reported closed
+    /// and whenever it stops delivering; on before the first chunk.
+    fn capturing(&mut self, on: bool) {
+        if self.live != Some(on) {
+            self.live = Some(on);
+            self.send(AppCommand::CaptureLive(on));
         }
     }
 
@@ -269,10 +290,13 @@ impl<'a> Indicators<'a> {
     }
 
     fn publish(&self, object_id: &str, on: bool) {
-        let mut cmd = AppCommand::SetBinarySensor {
+        self.send(AppCommand::SetBinarySensor {
             object_id: object_id.to_owned(),
             state: Some(on),
-        };
+        });
+    }
+
+    fn send(&self, mut cmd: AppCommand) {
         loop {
             match self.tx.try_send(cmd) {
                 Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => return,
@@ -797,6 +821,13 @@ fn pump(
     shared.open.store(true, Ordering::Relaxed);
     // Before the first read: no audio can reach HA ahead of this ON.
     ind.listening(true);
+    if is_file {
+        // A file may pause between runs by design (`pause_when_idle`): it
+        // counts as delivering from the open. An ALSA PCM counts after its
+        // first read returns frames (below), so a device that opens but
+        // stays silent never gets a session in HA.
+        ind.capturing(true);
+    }
     let mut frontend = build_frontend(cfg, src.as_ref(), rate);
     let mut feed = ReferenceFeed::new(src.as_ref(), &frontend);
     if let Some(g) = glue.as_mut() {
@@ -848,6 +879,7 @@ fn pump(
             eof = true;
             continue;
         }
+        ind.capturing(true);
         if is_file && cfg.realtime {
             paced_frames += n as u64;
             let due = Duration::from_micros(paced_frames * 1_000_000 / u64::from(rate));
@@ -958,7 +990,13 @@ mod tests {
         // Paused while not streaming: no audio arrives (the indicators do).
         std::thread::sleep(Duration::from_millis(100));
         while let Ok(cmd) = rx.try_recv() {
-            assert!(matches!(cmd, AppCommand::SetBinarySensor { .. }), "{cmd:?}");
+            assert!(
+                matches!(
+                    cmd,
+                    AppCommand::SetBinarySensor { .. } | AppCommand::CaptureLive(true)
+                ),
+                "{cmd:?}"
+            );
         }
 
         shared.streaming.store(true, Ordering::Relaxed);
@@ -1054,6 +1092,7 @@ mod tests {
         Audio,
         Listening(bool),
         Muted(bool),
+        Live(bool),
     }
 
     /// Privacy gate F7: the indicators follow the real PCM state, and the
@@ -1088,6 +1127,7 @@ mod tests {
                 while let Some(cmd) = rx.blocking_recv() {
                     let seen = match cmd {
                         AppCommand::Audio(_) => Seen::Audio,
+                        AppCommand::CaptureLive(on) => Seen::Live(on),
                         AppCommand::SetBinarySensor { object_id, state } => {
                             let on = state.unwrap();
                             match object_id.as_str() {
@@ -1190,6 +1230,7 @@ mod tests {
         // Wire-order invariants over everything the server received.
         let log = log.lock().unwrap();
         let (mut l, mut m): (Option<bool>, Option<bool>) = (None, None);
+        let mut live = false;
         let mut opens = 0;
         let mut audio = 0;
         for e in log.iter() {
@@ -1197,9 +1238,17 @@ mod tests {
                 Seen::Audio => {
                     audio += 1;
                     assert_eq!(l, Some(true), "audio while not shown as listening");
+                    assert!(live, "audio while HA's voice layer is told capture is off");
+                }
+                Seen::Live(on) => {
+                    assert_ne!(live, *on, "repeated capture state");
+                    // On only with the PCM open; off before it is shown closed.
+                    assert_eq!(l, Some(true), "capture state change while not listening");
+                    live = *on;
                 }
                 Seen::Listening(on) => {
                     assert_ne!(l, Some(*on), "repeated listening state");
+                    assert!(!live, "listening state change while capture is shown live");
                     if *on {
                         opens += 1;
                         assert_ne!(m, Some(true), "listening ON while shown muted");
@@ -1368,8 +1417,9 @@ mod tests {
         .unwrap();
         std::thread::sleep(Duration::from_millis(100));
         assert!(!shared.open.load(Ordering::Relaxed));
-        // A failed open is never reported as listening.
+        // A failed open is never reported as listening or as delivering audio.
         while let Ok(cmd) = rx.try_recv() {
+            assert!(!matches!(cmd, AppCommand::CaptureLive(true)), "{cmd:?}");
             assert!(
                 !matches!(
                     cmd,
@@ -1383,6 +1433,126 @@ mod tests {
         shared.stop.store(true, Ordering::Relaxed);
         h.join().unwrap();
         assert!(t.elapsed() < Duration::from_millis(500));
+    }
+
+    /// What HA's voice layer is told about the capture, for every way the
+    /// microphone stops delivering audio (busy or missing device, mute, kill
+    /// switch, firmware guard, unpaired): it is never told "live" without
+    /// audio behind it, "live" comes right after "Listening" ON and before
+    /// the first audio chunk, and "not live" comes before "Listening" OFF.
+    #[test]
+    #[allow(clippy::too_many_lines, clippy::type_complexity)]
+    fn capture_live_follows_whether_audio_flows() {
+        let dir = std::env::temp_dir().join(format!("webos-sat-live-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mic.raw");
+        let kill = dir.join("disable");
+        let mut s = Settings::default();
+        s.mic.source = MicSource::File;
+        s.mic.path = Some(path.clone());
+        s.mic.looping = true;
+        s.mic.pause_when_idle = false;
+        s.safety.kill_switch.clone_from(&kill);
+        // The self-check would hold the open for 5 s after a failed open.
+        s.safety.self_check = false;
+        let shared = Arc::new(Shared::default());
+        shared.streaming.store(true, Ordering::Relaxed);
+        let (tx, mut rx) = mpsc::channel(4096);
+        // The mic is "busy" (cannot be opened): the file does not exist yet.
+        let h = spawn(
+            CaptureSettings::from_settings(&s),
+            Arc::clone(&shared),
+            tx,
+            None,
+        )
+        .unwrap();
+        let mut live = false;
+        let mut listening = false;
+        let mut bad = Vec::new();
+        let mut ever_live = 0_u32;
+        let mut drain = |live: &mut bool, listening: &mut bool, ever: &mut u32| {
+            while let Ok(cmd) = rx.try_recv() {
+                match cmd {
+                    AppCommand::CaptureLive(on) => {
+                        *ever += 1;
+                        if on && !*listening {
+                            bad.push("live before listening");
+                        }
+                        if !on && !*live {
+                            bad.push("repeated not-live");
+                        }
+                        *live = on;
+                    }
+                    AppCommand::SetBinarySensor { object_id, state }
+                        if object_id == LISTENING_ID =>
+                    {
+                        if state == Some(false) && *live {
+                            bad.push("listening OFF while still live");
+                        }
+                        *listening = state == Some(true);
+                    }
+                    AppCommand::Audio(_) if !*live => bad.push("audio while not live"),
+                    _ => {}
+                }
+            }
+        };
+        std::thread::sleep(Duration::from_millis(300));
+        drain(&mut live, &mut listening, &mut ever_live);
+        assert!(!live && ever_live == 0, "busy mic");
+
+        // The mic becomes available (retry backoff is 1 s at first).
+        write_raw(&path, 16_000, 1000);
+        assert!(wait_for(|| shared.open.load(Ordering::Relaxed)));
+        std::thread::sleep(Duration::from_millis(100));
+        drain(&mut live, &mut listening, &mut ever_live);
+        assert!(live && listening);
+
+        // Each way of closing the PCM: not live at once, live again after.
+        let off = |code: u8, on: bool| {
+            shared
+                .mic_off
+                .store(if on { code } else { OFF_NONE }, Ordering::Relaxed);
+        };
+        let gates: [(&str, Box<dyn Fn(bool) + '_>); 4] = [
+            ("mute", Box::new(|on| off(OFF_MUTED, on))),
+            ("firmware", Box::new(|on| off(OFF_FIRMWARE, on))),
+            ("unpaired", Box::new(|on| off(OFF_UNPAIRED, on))),
+            (
+                "kill",
+                Box::new(|on| {
+                    if on {
+                        std::fs::write(&kill, b"").unwrap();
+                    } else {
+                        std::fs::remove_file(&kill).unwrap();
+                    }
+                }),
+            ),
+        ];
+        for (name, gate) in &gates {
+            gate(true);
+            assert!(
+                wait_for(|| !shared.open.load(Ordering::Relaxed)),
+                "{name}: closed"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+            drain(&mut live, &mut listening, &mut ever_live);
+            assert!(!live && !listening, "{name}: not live while closed");
+            gate(false);
+            assert!(
+                wait_for(|| shared.open.load(Ordering::Relaxed)),
+                "{name}: reopened"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+            drain(&mut live, &mut listening, &mut ever_live);
+            assert!(live && listening, "{name}: live again");
+        }
+
+        shared.stop.store(true, Ordering::Relaxed);
+        h.join().unwrap();
+        drain(&mut live, &mut listening, &mut ever_live);
+        assert!(!live, "not live after the thread stopped");
+        assert!(bad.is_empty(), "{bad:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 2-channel S24 raw file of pseudo-random noise (`amp` LSB), or a
@@ -1529,16 +1699,22 @@ mod tests {
         // indicators say so (muted on, listening off).
         let mut muted = None;
         let mut listening = None;
+        let mut live = None;
         while let Ok(cmd) = rx.try_recv() {
-            if let AppCommand::SetBinarySensor { object_id, state } = cmd {
-                match object_id.as_str() {
+            match cmd {
+                AppCommand::SetBinarySensor { object_id, state } => match object_id.as_str() {
                     MUTED_ID => muted = state,
                     LISTENING_ID => listening = state,
                     _ => {}
-                }
+                },
+                AppCommand::CaptureLive(on) => live = Some(on),
+                _ => {}
             }
         }
         assert_eq!((muted, listening), (Some(true), Some(false)));
+        // The closed mic delivers nothing: HA's voice layer was told so (a
+        // run left open would block HA's announcements).
+        assert_eq!(live, Some(false));
         std::thread::sleep(Duration::from_millis(500));
         assert!(!shared.open.load(Ordering::Relaxed));
         // A rerun request opens again at once and measures again.

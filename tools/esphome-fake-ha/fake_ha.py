@@ -150,6 +150,11 @@ class FakeHA:
     announce_finished: asyncio.Queue = field(default_factory=asyncio.Queue)
     states: list = field(default_factory=list)
     stopped: asyncio.Event = field(default_factory=asyncio.Event)
+    # What HA's assist_satellite holds for the device: a pipeline task that is
+    # alive from a start request until a stop/abort or RUN_END, and the number
+    # of audio chunks received so far.
+    session_open: bool = False
+    audio_count: int = 0
 
     async def connect(self) -> APIClient:
         self.cli = APIClient("127.0.0.1", self.port, "", client_info="fake-ha", noise_psk=self.psk)
@@ -162,13 +167,16 @@ class FakeHA:
 
     def subscribe_voice(self) -> None:
         async def handle_start(conversation_id, flags, audio_settings, wake_word_phrase):
+            self.session_open = True
             await self.starts.put((conversation_id, flags, wake_word_phrase))
             return 0  # API audio (no UDP port)
 
         async def handle_stop(abort: bool) -> None:
+            self.session_open = False
             await self.stops.put(abort)
 
         async def handle_audio(data: bytes, data2: bytes | None) -> None:
+            self.audio_count += 1
             await self.audio.put(data)
 
         async def handle_announcement_finished(msg) -> None:
@@ -182,7 +190,31 @@ class FakeHA:
         )
 
     def event(self, ev: Ev, data: dict[str, str] | None = None) -> None:
+        if ev == Ev.VOICE_ASSISTANT_RUN_END:
+            self.session_open = False
         self.cli.send_voice_assistant_event(ev, data or {})
+
+    async def announce_like_ha(self, url: str, text: str = "", hang_after: float = 1.5,
+                               timeout: float = TIMEOUT, **kw):
+        """What HA's assist_satellite does for assist_satellite.announce.
+
+        `async_internal_announce` first awaits `_cancel_running_pipeline()`.
+        With a wake word pipeline open, the Wyoming wake word client's cancel
+        runs `finally: await audio_task`, which waits for the NEXT audio chunk
+        from the device (HA 2026.10.4, read from its source). A device that
+        keeps such a session open while sending no audio therefore blocks the
+        announcement (seen on c3-b with the microphone busy). Returns the
+        announcement result, or None when HA would hang (no chunk within
+        `hang_after` seconds): the harness reports that as a failure.
+        """
+        if self.session_open:
+            seen = self.audio_count
+            if not await until_true(lambda: self.audio_count > seen, hang_after):
+                return None
+        return await asyncio.wait_for(
+            self.cli.send_voice_assistant_announcement_await_response(
+                url, timeout, text, preannounce_media_id="", **kw),
+            timeout + 1)
 
     async def next_start(self, timeout: float = TIMEOUT):
         return await asyncio.wait_for(self.starts.get(), timeout)
@@ -389,6 +421,91 @@ async def scenario_plaintext_speaker(binary: str) -> None:
         await cli.disconnect()
         await dev.wait_event("HaDisconnected")
         check("A24 disconnect reported to app", True)
+    finally:
+        await dev.stop()
+
+
+async def scenario_capture_live(binary: str) -> None:
+    """A microphone that delivers no audio (busy PCM) must not leave a session open in HA."""
+    print("\n== scenario L: no audio from the microphone, no wake word session, announcements work ==")
+    dev = Device(binary, ["--mode", "wake", "--mac", "02:00:00:00:00:1c", "--no-capture"], None)
+    await dev.start()
+    ha = FakeHA(dev.port)
+    try:
+        cli = await ha.connect()
+        await dev.wait_event("HaConnected { client_info: \"fake-ha\"")
+        await cli.device_info_and_list_entities()
+        ha.subscribe_voice()
+        check("L1 busy mic from the start: no pipeline start is requested",
+              await ha.expect_no_start(1.5) and not ha.session_open)
+
+        res = await ha.announce_like_ha("http://127.0.0.1:9/a.flac", "hola")
+        check("L2 announce with no session open completes promptly", res is not None and res.success is True,
+              str(res))
+        await dev.wait_event('Announce { url: "http://127.0.0.1:9/a.flac"')
+        check("L3 nothing is aborted (there was no run) and no session opens after the announcement",
+              ha.stops.empty() and await ha.expect_no_start(1.0))
+
+        await dev.command("capture")
+        conv, flags, _ = await ha.next_start()
+        check("L4 audio flows: the wake word session opens (USE_WAKE_WORD)", bool(flags & USE_WAKE_WORD))
+        await dev.wait_event("StartStreaming { wake_word: true")
+        await asyncio.sleep(0.4)
+        check("L5 audio reaches HA", len(ha.drain_audio()) >= 5)
+        res = await ha.announce_like_ha("http://127.0.0.1:9/b.flac", "hola")
+        check("L6 announce while capturing completes (the next chunk lets HA's cancel finish)",
+              res is not None and res.success is True, str(res))
+        abort = await asyncio.wait_for(ha.stops.get(), TIMEOUT)
+        check("L7 the run is aborted for the announcement", abort is True)
+        await ha.next_start()  # re-armed after the announcement
+        await dev.wait_event("StartStreaming { wake_word: true")
+        while not ha.stops.empty():
+            ha.stops.get_nowait()
+
+        # The microphone stops delivering mid-session (LG hands-free grabs the PCM).
+        await dev.command("nocapture")
+        abort = await asyncio.wait_for(ha.stops.get(), TIMEOUT)
+        check("L8 capture lost: the session is aborted at once (HA ends its audio stream)",
+              abort is True and not ha.session_open)
+        await dev.wait_event("StopStreaming")
+        await asyncio.sleep(0.3)
+        ha.drain_audio()
+        await asyncio.sleep(0.3)
+        check("L9 no audio and no new session while capture is lost",
+              ha.drain_audio() == [] and await ha.expect_no_start(1.0))
+        res = await ha.announce_like_ha("http://127.0.0.1:9/c.flac", "hola")
+        check("L10 announce after the loss completes promptly", res is not None and res.success is True, str(res))
+        check("L11 announce with start_conversation without audio opens no session",
+              (await ha.announce_like_ha("http://127.0.0.1:9/d.flac", "q?", start_conversation=True)) is not None
+              and await ha.expect_no_start(1.0))
+        await dev.command("capture")
+        conv, flags, _ = await ha.next_start()
+        check("L12 capture back: the wake word session returns", bool(flags & USE_WAKE_WORD))
+        await dev.wait_event("StartStreaming { wake_word: true")
+
+        # Many announcements in a row: HA cancels the idle wake word run (it ends
+        # with RUN_END, no error) and announces. Each one must leave the wake
+        # word session back within a moment: an announcement is no failed run,
+        # so the retry backoff never grows (it used to: 250 ms doubling to 60 s).
+        worst = 0.0
+        for n in range(12):
+            while not ha.starts.empty():
+                ha.starts.get_nowait()
+            ha.event(Ev.VOICE_ASSISTANT_RUN_END)
+            t = time.monotonic()
+            res = await ha.announce_like_ha("http://127.0.0.1:9/e.flac", "hola")
+            if res is None or not res.success:
+                check(f"L13 announcement {n} completes", False, str(res))
+            _conv, flags, _ = await ha.next_start(timeout=3)
+            worst = max(worst, time.monotonic() - t)
+            if not flags & USE_WAKE_WORD:
+                check(f"L13 announcement {n} re-arms with the wake word", False, f"flags={flags}")
+            await dev.wait_event("StartStreaming { wake_word: true")
+        check("L13 12 announcements in a row: the wake word session is back within 1 s each time",
+              worst < 1.0, f"worst {worst:.2f} s")
+
+        await cli.disconnect()
+        await dev.wait_event("HaDisconnected")
     finally:
         await dev.stop()
 
@@ -1006,7 +1123,7 @@ async def main() -> int:
     parser.add_argument("--device", required=True, help="path to the fake_device binary")
     args = parser.parse_args()
     failed = False
-    for scenario in (scenario_plaintext_speaker, scenario_noise_url, scenario_timers,
+    for scenario in (scenario_plaintext_speaker, scenario_capture_live, scenario_noise_url, scenario_timers,
                      scenario_pairing, scenario_pairing_window, scenario_window_behind_router,
                      scenario_key_clear, scenario_entities, scenario_generic_entities):
         try:

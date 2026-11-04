@@ -5,7 +5,7 @@
 //! ```text
 //! cargo run -p webos-esphome-api --example fake_device -- \
 //!     [--bind 127.0.0.1] [--port 6053] [--name fake-tv] [--mode wake|ptt|none] \
-//!     [--features 23] [--mac 02:00:00:00:00:01] [--mdns] [--demo-entities] \
+//!     [--features 23] [--mac 02:00:00:00:00:01] [--mdns] [--demo-entities] [--no-capture] \
 //!     [--pair-key-file FILE [--pair-window SECS] [--pair-closed]]
 //! ```
 //!
@@ -13,7 +13,9 @@
 //! (plaintext if unset). `--pair-key-file` enables pairing instead: the device
 //! starts unpaired (or with the key stored in FILE) and HA can set a key while
 //! the window is open (`--pair-closed`: closed at start). Stdin commands:
-//! `ptt`, `wake`, `stop`, `mute`, `unmute`, `pair` (open the window),
+//! `ptt`, `wake`, `stop`, `mute`, `unmute`, `capture` / `nocapture` (the
+//! microphone delivers audio or not, as a busy PCM does; `--no-capture`: not
+//! at start), `pair` (open the window),
 //! `reset-pairing`, `number VALUE|unknown`, `binary on|off|unknown`,
 //! `switch on|off|unknown`, `text VALUE|unknown`, `select OPTION|unknown` and
 //! `options A,B,C` (states and options of the `--demo-entities`), `quit`. Log level: `FAKE_DEVICE_LOG=info|debug|trace`.
@@ -169,7 +171,7 @@ fn sine_chunk(phase: &mut f32) -> Vec<i16> {
         .collect()
 }
 
-fn parse_args() -> (Config, Option<PipelineMode>) {
+fn parse_args() -> (Config, Option<PipelineMode>, bool) {
     let mut cfg = Config {
         name: "fake-tv".to_owned(),
         friendly_name: "Fake TV Satellite".to_owned(),
@@ -180,6 +182,7 @@ fn parse_args() -> (Config, Option<PipelineMode>) {
         ..Config::default()
     };
     let mut mode = Some(PipelineMode::WakeWord);
+    let mut capture = true;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         let mut val = || args.next().unwrap_or_else(|| panic!("{arg} needs a value"));
@@ -191,6 +194,7 @@ fn parse_args() -> (Config, Option<PipelineMode>) {
             "--features" => cfg.voice_features = val().parse().expect("--features: number"),
             "--mdns" => cfg.mdns = true,
             "--demo-entities" => add_demo_entities(&mut cfg),
+            "--no-capture" => capture = false,
             "--pair-key-file" => {
                 cfg.provisioning
                     .get_or_insert_with(Provisioning::default)
@@ -217,7 +221,7 @@ fn parse_args() -> (Config, Option<PipelineMode>) {
             other => panic!("unknown argument {other}"),
         }
     }
-    (cfg, mode)
+    (cfg, mode, capture)
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -232,7 +236,7 @@ async fn main() {
     let _ = log::set_logger(Box::leak(Box::new(StderrLogger(level))));
     log::set_max_level(level);
 
-    let (mut cfg, mode) = parse_args();
+    let (mut cfg, mode, capture) = parse_args();
     if cfg.provisioning.is_some() {
         cfg.noise_psk = None;
     }
@@ -241,6 +245,9 @@ async fn main() {
 
     let (ev_tx, mut ev_rx) = mpsc::unbounded_channel();
     let (cmd_tx, cmd_rx) = mpsc::channel(64);
+    if !capture {
+        cmd_tx.send(AppCommand::CaptureLive(false)).await.unwrap();
+    }
     if let Some(mode) = mode {
         cmd_tx
             .send(AppCommand::StartPipeline { mode })
@@ -264,6 +271,8 @@ async fn main() {
                 "stop" => AppCommand::StopPipeline,
                 "mute" => AppCommand::SetMuted(true),
                 "unmute" => AppCommand::SetMuted(false),
+                "capture" => AppCommand::CaptureLive(true),
+                "nocapture" => AppCommand::CaptureLive(false),
                 "pair" => AppCommand::OpenPairingWindow,
                 "reset-pairing" => AppCommand::ResetPairing,
                 "quit" => std::process::exit(0),

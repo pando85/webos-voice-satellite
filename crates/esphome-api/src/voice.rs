@@ -19,6 +19,10 @@ pub(crate) const CONVERSATION_TIMEOUT: Duration = Duration::from_secs(300);
 pub(crate) const BACKOFF_BASE: Duration = Duration::from_millis(250);
 /// First retry delay when HA reports a configuration error (missing engine).
 pub(crate) const BACKOFF_CONFIG_BASE: Duration = Duration::from_secs(2);
+/// Runs that HA ended without an error and without progress (HA cancelled the
+/// idle wake word run: an announcement, a timer alarm, a reconfiguration) in a
+/// row before the re-arm delay starts to grow. They are not failures.
+pub(crate) const SOFT_ENDS_FREE: u32 = 3;
 /// Retry delay cap.
 pub(crate) const BACKOFF_MAX: Duration = Duration::from_secs(60);
 /// SPEAKER mode: give up waiting for `TTS_STREAM_START` after `TTS_END` after
@@ -121,9 +125,15 @@ pub(crate) struct Voice {
     subscribed: bool,
     armed: bool,
     muted: bool,
+    /// The application's capture delivers audio (`AppCommand::CaptureLive`;
+    /// true until told otherwise). No run is open while it is false.
+    capture_live: bool,
     /// SPEAKER feature advertised: TTS arrives as audio over the API.
     speaker: bool,
     failures: u32,
+    /// Runs in a row that HA ended without an error or any progress (see
+    /// [`SOFT_ENDS_FREE`]); reset by progress and by every announcement.
+    soft_ends: u32,
     conversation: Option<(String, Instant)>,
     /// An abort was sent and the aborted run's `RUN_END` has not arrived.
     stale_run: bool,
@@ -153,8 +163,10 @@ impl Voice {
             subscribed: false,
             armed: false,
             muted: false,
+            capture_live: true,
             speaker,
             failures: 0,
+            soft_ends: 0,
             conversation: None,
             stale_run: false,
             out: Vec::new(),
@@ -215,8 +227,19 @@ impl Voice {
             .map(|(id, _)| id.clone())
     }
 
+    /// A run may be open: subscribed, not muted, and the capture delivers audio.
+    fn can_listen(&self) -> bool {
+        self.subscribed && !self.muted && self.capture_live
+    }
+
     fn start(&mut self, now: Instant, wake_word: bool) {
-        if !self.subscribed || self.muted {
+        if !self.can_listen() {
+            // Not an error: `on_capture(true)` or an unmute re-arms an armed
+            // wake word. A wake word session opened without audio would block
+            // HA's cancel before an announcement (see `AppCommand::CaptureLive`).
+            if self.subscribed && !self.muted {
+                log::debug!("voice: no run while the microphone delivers no audio");
+            }
             self.phase = Phase::Idle;
             return;
         }
@@ -289,7 +312,41 @@ impl Voice {
             self.failures,
             delay.as_millis()
         );
-        if self.armed && self.subscribed && !self.muted {
+        if self.armed && self.can_listen() {
+            self.phase = Phase::Waiting { until: now + delay };
+        } else {
+            self.phase = Phase::Idle;
+        }
+    }
+
+    /// A wake word or a transcript: the run did something, so both backoffs reset.
+    fn made_progress(&mut self) {
+        self.run.progress = true;
+        self.failures = 0;
+        self.soft_ends = 0;
+    }
+
+    /// HA ended a run without an error and nothing happened in it: HA
+    /// cancelled it (its announcement, a timer alarm and other services first
+    /// cancel the idle wake word pipeline, which ends with `RUN_END`). That is
+    /// no failure: the failure backoff is left alone and the wake word is
+    /// requested again after the first delay (an announcement re-arms it
+    /// itself after its playback). Only a stream of such ends with no
+    /// announcement between them is slowed down, so a misbehaving HA cannot
+    /// make the device re-request in a hot loop.
+    fn soft_end(&mut self, now: Instant) {
+        self.soft_ends = self.soft_ends.saturating_add(1);
+        let delay = if self.soft_ends <= SOFT_ENDS_FREE {
+            BACKOFF_BASE
+        } else {
+            backoff_delay(self.soft_ends - SOFT_ENDS_FREE, false)
+        };
+        log::info!(
+            "voice: HA ended the run without an error ({} in a row); asking again in {} ms",
+            self.soft_ends,
+            delay.as_millis()
+        );
+        if self.armed && self.can_listen() {
             self.phase = Phase::Waiting { until: now + delay };
         } else {
             self.phase = Phase::Idle;
@@ -299,9 +356,11 @@ impl Voice {
     /// Both the run and its playback are over: decide what comes next.
     fn finish_run(&mut self, now: Instant) {
         let run = std::mem::take(&mut self.run);
-        if run.error.is_some() || !run.progress {
+        if run.error.is_some() {
             let config_error = run.error.as_deref().is_some_and(is_config_error);
             self.fail(now, config_error);
+        } else if !run.progress {
+            self.soft_end(now);
         } else if run.continue_conversation {
             // Follow-up turn: no wake word, same conversation id.
             self.start(now, false);
@@ -402,15 +461,13 @@ impl Voice {
         }
         match ev {
             Ev::VoiceAssistantWakeWordEnd => {
-                self.run.progress = true;
-                self.failures = 0;
+                self.made_progress();
                 self.app(AppEvent::WakeWordDetected);
             }
             Ev::VoiceAssistantSttVadEnd => self.stop_streaming(true),
             Ev::VoiceAssistantSttEnd => {
                 self.stop_streaming(true);
-                self.run.progress = true;
-                self.failures = 0;
+                self.made_progress();
                 self.app(AppEvent::Transcript(get("text").unwrap_or_default()));
             }
             Ev::VoiceAssistantIntentEnd => {
@@ -510,6 +567,9 @@ impl Voice {
         start_conversation: bool,
     ) {
         self.abort_run();
+        // HA's cancel of the idle run that came with this announcement is
+        // not a failure and does not add to any backoff.
+        self.soft_ends = 0;
         self.phase = Phase::Announcing { start_conversation };
         self.ha(ToHa::MediaState(MediaState::Announcing));
         self.app(AppEvent::Announce {
@@ -544,6 +604,10 @@ impl Voice {
                 }
             }
             PipelineMode::PushToTalk => {
+                if !self.capture_live {
+                    log::warn!("voice: push-to-talk ignored; the microphone delivers no audio");
+                    return;
+                }
                 if matches!(self.phase, Phase::Announcing { .. }) {
                     log::warn!("voice: push-to-talk ignored during an announcement");
                     return;
@@ -595,6 +659,29 @@ impl Voice {
         }
     }
 
+    /// Ends whatever uses the microphone (the mute switch, or a capture that
+    /// stopped delivering): a run is aborted (HA is told, which also ends its
+    /// audio stream), a reply that is playing finishes, and nothing re-arms
+    /// until listening is possible again. An announcement is not touched.
+    fn halt_listening(&mut self) {
+        match self.phase {
+            Phase::Running
+                if self.run.playback_pending || self.run.tts_stream != TtsStream::None =>
+            {
+                // Let the response finish playing; the run ends without re-arming.
+                self.stop_streaming(false);
+            }
+            Phase::Starting { .. }
+            | Phase::Waiting { .. }
+            | Phase::Running
+            | Phase::Draining { .. } => {
+                self.abort_run();
+                self.phase = Phase::Idle;
+            }
+            Phase::Idle | Phase::Announcing { .. } => {}
+        }
+    }
+
     pub(crate) fn on_mute(&mut self, now: Instant, muted: bool) {
         if self.muted == muted {
             return;
@@ -603,24 +690,27 @@ impl Voice {
         self.ha(ToHa::MuteState(muted));
         self.app(AppEvent::MuteChanged(muted));
         if muted {
-            match self.phase {
-                Phase::Running
-                    if self.run.playback_pending || self.run.tts_stream != TtsStream::None =>
-                {
-                    // Let the response finish playing; the run ends without re-arming.
-                    self.stop_streaming(false);
-                }
-                Phase::Starting { .. }
-                | Phase::Waiting { .. }
-                | Phase::Running
-                | Phase::Draining { .. } => {
-                    self.abort_run();
-                    self.phase = Phase::Idle;
-                }
-                Phase::Idle | Phase::Announcing { .. } => {}
-            }
+            self.halt_listening();
         } else if matches!(self.phase, Phase::Idle) {
             self.rearm(now);
+        }
+    }
+
+    /// The capture started or stopped delivering audio
+    /// (`AppCommand::CaptureLive`).
+    pub(crate) fn on_capture(&mut self, now: Instant, live: bool) {
+        if self.capture_live == live {
+            return;
+        }
+        self.capture_live = live;
+        if live {
+            log::debug!("voice: the microphone delivers audio");
+            if matches!(self.phase, Phase::Idle) {
+                self.rearm(now);
+            }
+        } else {
+            log::info!("voice: the microphone stopped delivering audio; no run stays open");
+            self.halt_listening();
         }
     }
 
@@ -856,12 +946,137 @@ mod tests {
     }
 
     #[test]
-    fn run_without_progress_counts_as_failure() {
+    fn run_with_an_error_and_no_progress_counts_as_failure() {
         let t0 = Instant::now();
         let mut v = armed_and_streaming(t0);
+        ev(
+            &mut v,
+            t0,
+            Ev::VoiceAssistantError,
+            &[("code", "stt-stream-failed")],
+        );
         ev(&mut v, t0, Ev::VoiceAssistantRunEnd, &[]);
         v.take();
         assert_eq!(v.next_deadline(), Some(t0 + BACKOFF_BASE));
+        assert_eq!(v.failures, 1);
+    }
+
+    /// Re-arms a waiting run at `t` and answers the start.
+    fn rearm_now(v: &mut Voice, t: Instant) {
+        v.on_tick(t);
+        assert!(v.take().iter().any(|o| is_start(o, true)), "start request");
+        v.on_response(t, 0, false);
+        v.take();
+    }
+
+    #[test]
+    fn a_run_ended_by_ha_without_error_is_no_failure_and_rearms_after_the_base_delay() {
+        let t0 = Instant::now();
+        let mut v = armed_and_streaming(t0);
+        // HA cancelled the idle wake word run (its announcement does that).
+        ev(&mut v, t0, Ev::VoiceAssistantRunEnd, &[]);
+        v.take();
+        assert_eq!(v.failures, 0);
+        assert_eq!(v.next_deadline(), Some(t0 + BACKOFF_BASE));
+        rearm_now(&mut v, t0 + BACKOFF_BASE);
+    }
+
+    #[test]
+    fn many_announcements_in_a_row_re_arm_promptly_every_time() {
+        let mut t = Instant::now();
+        let mut v = armed_and_streaming(t);
+        for n in 0..30 {
+            // HA cancels the idle run (RUN_END, no error), then announces.
+            ev(&mut v, t, Ev::VoiceAssistantRunEnd, &[]);
+            v.take();
+            assert_eq!(v.failures, 0, "announcement {n}");
+            t += Duration::from_millis(400);
+            v.on_announce("u".into(), String::new(), String::new(), false);
+            v.take();
+            // The announcement plays; afterwards the wake word returns at
+            // once (never a delay that grew with the count).
+            v.on_announce_finished(t, true);
+            let out = v.take();
+            assert!(
+                out.iter().any(|o| is_start(o, true)),
+                "announcement {n}: {out:?}"
+            );
+            assert_eq!(v.next_deadline(), Some(t + START_TIMEOUT));
+            v.on_response(t, 0, false);
+            v.take();
+            assert!(v.is_streaming());
+        }
+        assert_eq!(v.failures, 0);
+        assert_eq!(v.soft_ends, 0);
+    }
+
+    #[test]
+    fn many_announcements_with_the_cancel_ending_the_run_late_still_rearm_promptly() {
+        // The announcement arrives first, HA's RUN_END of the cancelled run
+        // after it (as the stale-run logic expects).
+        let mut t = Instant::now();
+        let mut v = armed_and_streaming(t);
+        for n in 0..30 {
+            v.on_announce("u".into(), String::new(), String::new(), false);
+            v.take();
+            ev(&mut v, t, Ev::VoiceAssistantRunEnd, &[]);
+            t += Duration::from_millis(300);
+            v.on_announce_finished(t, true);
+            assert!(
+                v.take().iter().any(|o| is_start(o, true)),
+                "announcement {n}"
+            );
+            v.on_response(t, 0, false);
+            v.take();
+        }
+        assert_eq!(v.failures, 0);
+    }
+
+    #[test]
+    fn a_timer_alarm_cancel_with_no_announcement_does_not_grow_the_error_backoff() {
+        let t0 = Instant::now();
+        let mut v = armed_and_streaming(t0);
+        let mut t = t0;
+        for _ in 0..SOFT_ENDS_FREE {
+            ev(&mut v, t, Ev::VoiceAssistantRunEnd, &[]);
+            v.take();
+            assert_eq!(v.next_deadline(), Some(t + BACKOFF_BASE));
+            t += BACKOFF_BASE;
+            rearm_now(&mut v, t);
+        }
+        assert_eq!(v.failures, 0);
+        // A real error afterwards starts the error backoff from its base.
+        ev(
+            &mut v,
+            t,
+            Ev::VoiceAssistantError,
+            &[("code", "stt-stream-failed")],
+        );
+        ev(&mut v, t, Ev::VoiceAssistantRunEnd, &[]);
+        v.take();
+        assert_eq!(v.next_deadline(), Some(t + BACKOFF_BASE));
+    }
+
+    #[test]
+    fn runs_ended_by_ha_again_and_again_slow_down_but_never_count_as_failures() {
+        let t0 = Instant::now();
+        let mut v = armed_and_streaming(t0);
+        let mut t = t0;
+        let mut last = Duration::ZERO;
+        for n in 1..=40_u32 {
+            ev(&mut v, t, Ev::VoiceAssistantRunEnd, &[]);
+            v.take();
+            let d = v.next_deadline().unwrap() - t;
+            assert!(d >= last && d <= BACKOFF_MAX, "{n}: {d:?}");
+            last = d;
+            t += d;
+            rearm_now(&mut v, t);
+        }
+        assert_eq!(v.failures, 0);
+        assert_eq!(last, BACKOFF_MAX);
+        // A wake word resets it.
+        ev(&mut v, t, Ev::VoiceAssistantWakeWordEnd, &[]);
+        assert_eq!(v.soft_ends, 0);
     }
 
     #[test]
@@ -974,6 +1189,253 @@ mod tests {
                 ..
             }))
         ));
+    }
+
+    fn is_start(o: &Out, wake_word: bool) -> bool {
+        matches!(o, Out::Ha(ToHa::Start { wake_word: w, .. }) if *w == wake_word)
+    }
+
+    /// A device whose capture does not deliver audio yet: armed, subscribed.
+    fn armed_without_capture(now: Instant) -> Voice {
+        let mut v = Voice::new(true);
+        v.on_capture(now, false);
+        v.on_start_pipeline(now, PipelineMode::WakeWord);
+        v.on_subscribe(now, true);
+        v
+    }
+
+    #[test]
+    fn no_session_is_opened_while_the_capture_delivers_no_audio() {
+        let t0 = Instant::now();
+        let mut v = armed_without_capture(t0);
+        // The case of c3-b: mic busy. Nothing is sent to HA, so HA has no
+        // wake word session whose cancel would wait for an audio chunk.
+        assert!(v.take().is_empty());
+        assert!(!v.is_streaming());
+        assert_eq!(v.next_deadline(), None);
+        v.on_tick(t0 + Duration::from_secs(120));
+        assert!(v.take().is_empty());
+        // Audio flows: the wake word is armed at once.
+        v.on_capture(t0, true);
+        assert!(v.take().iter().any(|o| is_start(o, true)));
+    }
+
+    #[test]
+    fn capture_stopping_ends_a_streaming_wake_word_run_and_it_returns_with_the_audio() {
+        let t0 = Instant::now();
+        let mut v = armed_and_streaming(t0);
+        v.on_capture(t0, false);
+        // Abort (HA also ends its audio stream on it) and no more audio.
+        assert_eq!(
+            v.take(),
+            [Out::Ha(ToHa::Abort), Out::App(AppEvent::StopStreaming)]
+        );
+        assert!(!v.is_streaming());
+        // HA's trailing RUN_END of the aborted run does not restart anything.
+        ev(&mut v, t0, Ev::VoiceAssistantRunEnd, &[]);
+        assert!(v.take().is_empty());
+        v.on_capture(t0, true);
+        assert!(v.take().iter().any(|o| is_start(o, true)));
+    }
+
+    #[test]
+    fn capture_stopping_aborts_a_start_in_flight() {
+        let t0 = Instant::now();
+        let mut v = Voice::new(true);
+        v.on_start_pipeline(t0, PipelineMode::WakeWord);
+        v.on_subscribe(t0, true);
+        assert!(v.take().iter().any(|o| is_start(o, true)));
+        v.on_capture(t0, false);
+        assert_eq!(v.take(), [Out::Ha(ToHa::Abort)]);
+        // HA's answer to the aborted start is ignored.
+        v.on_response(t0, 0, false);
+        assert!(v.take().is_empty());
+        assert!(!v.is_streaming());
+        assert_eq!(v.next_deadline(), None);
+    }
+
+    #[test]
+    fn capture_stopping_cancels_a_retry_backoff() {
+        let t0 = Instant::now();
+        let mut v = armed_and_streaming(t0);
+        ev(
+            &mut v,
+            t0,
+            Ev::VoiceAssistantError,
+            &[("code", "stt-no-text")],
+        );
+        ev(&mut v, t0, Ev::VoiceAssistantRunEnd, &[]);
+        v.take();
+        assert!(v.next_deadline().is_some(), "waiting out a backoff");
+        v.on_capture(t0, false);
+        assert!(v.take().is_empty());
+        assert_eq!(v.next_deadline(), None);
+        v.on_tick(t0 + Duration::from_secs(120));
+        assert!(v.take().is_empty());
+        v.on_capture(t0, true);
+        assert!(v.take().iter().any(|o| is_start(o, true)));
+    }
+
+    #[test]
+    fn capture_stopping_during_a_reply_lets_it_play_and_does_not_rearm() {
+        let t0 = Instant::now();
+        let mut v = armed_and_streaming(t0);
+        ev(&mut v, t0, Ev::VoiceAssistantSttEnd, &[("text", "x")]);
+        ev(&mut v, t0, Ev::VoiceAssistantTtsEnd, &[("url", "u")]);
+        ev(&mut v, t0, Ev::VoiceAssistantRunEnd, &[]);
+        v.take();
+        v.on_capture(t0, false);
+        // Nothing to stop: the audio ended with the speech, the reply plays.
+        assert!(v.take().is_empty());
+        v.on_playback_finished(t0, true);
+        assert!(
+            !v.take()
+                .iter()
+                .any(|o| matches!(o, Out::Ha(ToHa::Start { .. })))
+        );
+        v.on_capture(t0, true);
+        assert!(v.take().iter().any(|o| is_start(o, true)));
+    }
+
+    #[test]
+    fn capture_stopping_during_stt_aborts_and_stops_streaming() {
+        let t0 = Instant::now();
+        let mut v = armed_and_streaming(t0);
+        ev(&mut v, t0, Ev::VoiceAssistantWakeWordEnd, &[]);
+        v.take();
+        v.on_capture(t0, false);
+        assert_eq!(
+            v.take(),
+            [Out::Ha(ToHa::Abort), Out::App(AppEvent::StopStreaming)]
+        );
+    }
+
+    #[test]
+    fn mute_and_unmute_without_audio_open_nothing() {
+        let t0 = Instant::now();
+        let mut v = armed_without_capture(t0);
+        v.on_mute(t0, true);
+        v.take();
+        v.on_mute(t0, false);
+        assert!(
+            !v.take()
+                .iter()
+                .any(|o| matches!(o, Out::Ha(ToHa::Start { .. })))
+        );
+        v.on_capture(t0, true);
+        assert!(v.take().iter().any(|o| is_start(o, true)));
+    }
+
+    #[test]
+    fn push_to_talk_needs_audio() {
+        let t0 = Instant::now();
+        let mut v = armed_without_capture(t0);
+        v.on_start_pipeline(t0, PipelineMode::PushToTalk);
+        assert!(v.take().is_empty());
+    }
+
+    #[test]
+    fn an_announcement_without_audio_plays_and_nothing_opens_after_it() {
+        let t0 = Instant::now();
+        let mut v = armed_without_capture(t0);
+        assert!(v.take().is_empty());
+        v.on_announce("u".into(), String::new(), "hi".into(), false);
+        let out = v.take();
+        // No session to abort; the announcement is handed to the app.
+        assert!(!out.contains(&Out::Ha(ToHa::Abort)), "{out:?}");
+        assert!(
+            out.iter()
+                .any(|o| matches!(o, Out::App(AppEvent::Announce { .. })))
+        );
+        assert_eq!(v.media_state(), MediaState::Announcing);
+        v.on_announce_finished(t0, true);
+        assert_eq!(
+            v.take(),
+            [
+                Out::Ha(ToHa::AnnounceFinished(true)),
+                Out::Ha(ToHa::MediaState(MediaState::Idle)),
+            ]
+        );
+        v.on_capture(t0, true);
+        assert!(v.take().iter().any(|o| is_start(o, true)));
+    }
+
+    #[test]
+    fn an_announcement_while_capturing_aborts_the_run_and_rearms() {
+        let t0 = Instant::now();
+        let mut v = armed_and_streaming(t0);
+        v.on_announce("u".into(), String::new(), String::new(), false);
+        let out = v.take();
+        assert!(out.contains(&Out::Ha(ToHa::Abort)));
+        assert!(out.contains(&Out::App(AppEvent::StopStreaming)));
+        // HA ends the aborted run (it also cancelled it before announcing).
+        ev(&mut v, t0, Ev::VoiceAssistantRunEnd, &[]);
+        v.on_announce_finished(t0, true);
+        assert!(v.take().iter().any(|o| is_start(o, true)));
+    }
+
+    #[test]
+    fn an_announcement_during_the_audio_loss_does_not_reopen_a_session() {
+        let t0 = Instant::now();
+        let mut v = armed_and_streaming(t0);
+        v.on_announce("u".into(), String::new(), String::new(), false);
+        v.take();
+        ev(&mut v, t0, Ev::VoiceAssistantRunEnd, &[]);
+        // The mic goes away while the announcement plays.
+        v.on_capture(t0, false);
+        assert!(v.take().is_empty());
+        v.on_announce_finished(t0, true);
+        assert!(
+            !v.take()
+                .iter()
+                .any(|o| matches!(o, Out::Ha(ToHa::Start { .. })))
+        );
+        v.on_capture(t0, true);
+        assert!(v.take().iter().any(|o| is_start(o, true)));
+    }
+
+    #[test]
+    fn start_conversation_without_audio_does_not_open_a_session() {
+        let t0 = Instant::now();
+        let mut v = armed_without_capture(t0);
+        v.on_announce("u".into(), String::new(), "q".into(), true);
+        v.take();
+        v.on_announce_finished(t0, true);
+        assert!(
+            !v.take()
+                .iter()
+                .any(|o| matches!(o, Out::Ha(ToHa::Start { .. })))
+        );
+        // The wake word comes back with the audio.
+        v.on_capture(t0, true);
+        assert!(v.take().iter().any(|o| is_start(o, true)));
+    }
+
+    #[test]
+    fn repeated_capture_reports_change_nothing() {
+        let t0 = Instant::now();
+        let mut v = armed_and_streaming(t0);
+        v.on_capture(t0, true);
+        assert!(v.take().is_empty());
+        assert!(v.is_streaming());
+        v.on_capture(t0, false);
+        v.take();
+        v.on_capture(t0, false);
+        assert!(v.take().is_empty());
+    }
+
+    #[test]
+    fn the_capture_state_survives_a_reconnect() {
+        let t0 = Instant::now();
+        let mut v = armed_and_streaming(t0);
+        v.on_capture(t0, false);
+        v.take();
+        v.on_disconnect();
+        v.take();
+        v.on_subscribe(t0, true);
+        assert!(v.take().is_empty(), "no session for a mic without audio");
+        v.on_capture(t0, true);
+        assert!(v.take().iter().any(|o| is_start(o, true)));
     }
 
     #[test]

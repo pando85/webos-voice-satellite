@@ -1278,6 +1278,7 @@ impl Ctx {
                 self.voice.on_announce_finished(now, success);
             }
             AppCommand::SetMuted(muted) => self.voice.on_mute(now, muted),
+            AppCommand::CaptureLive(live) => self.voice.on_capture(now, live),
             AppCommand::OpenPairingWindow => self.open_window(now),
             AppCommand::ResetPairing => self.reset_pairing(now).await,
             AppCommand::SetVolume(percent) => {

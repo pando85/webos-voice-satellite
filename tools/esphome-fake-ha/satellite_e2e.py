@@ -23,6 +23,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import functools
+import http.server
 import math
 import os
 import signal
@@ -30,7 +32,9 @@ import socket
 import struct
 import sys
 import tempfile
+import threading
 import time
+import wave
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from fake_ha import (  # noqa: E402
@@ -246,6 +250,129 @@ level = "info"
         check("S13 log policy: no transcript, reply text, token URL or key at info level",
               TRANSCRIPT not in log and REPLY not in log and "secret-token" not in log and psk not in log)
     finally:
+        if sat.proc.returncode is None:
+            sat.proc.kill()
+            await sat.proc.wait()
+        sat.log.close()
+
+
+def write_chime(path: str) -> None:
+    """A 0.3 s mono 16 kHz wav the daemon can fetch and play as an announcement."""
+    with wave.open(path, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(16000)
+        w.writeframes(b"".join(
+            struct.pack("<h", int(3000 * math.sin(2 * math.pi * 660 * n / 16000))) for n in range(4800)))
+
+
+class QuietHandler(http.server.SimpleHTTPRequestHandler):
+    def log_message(self, *args) -> None:  # noqa: D102
+        pass
+
+
+async def scenario_busy_mic(binary: str, tmp: str) -> None:
+    print("\n== satellite e2e: busy microphone: no wake word session, announcements complete ==")
+    psk = base64.b64encode(os.urandom(32)).decode()
+    with open(os.path.join(tmp, "psk"), "w") as f:
+        f.write(psk + "\n")
+    os.chmod(os.path.join(tmp, "psk"), 0o600)
+    mic = os.path.join(tmp, "busy-mic.raw")
+    if os.path.exists(mic):
+        os.remove(mic)  # "busy": the PCM cannot be opened
+    write_chime(os.path.join(tmp, "chime.wav"))
+    srv = http.server.ThreadingHTTPServer(
+        ("127.0.0.1", 0), functools.partial(QuietHandler, directory=tmp))
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    chime = f"http://127.0.0.1:{srv.server_address[1]}/chime.wav"
+    os.makedirs(os.path.join(tmp, "wav-busy"), exist_ok=True)
+    port = free_port()
+    config = os.path.join(tmp, "busy.toml")
+    with open(config, "w") as f:
+        f.write(f"""
+mode = "wake"
+[device]
+name = "e2e-busy"
+mac = "02:00:00:00:00:b5"
+bind = "127.0.0.1"
+port = {port}
+noise_psk_file = "psk"
+[mic]
+source = "file"
+path = "busy-mic.raw"
+[sink]
+type = "wav"
+dir = "wav-busy"
+[safety]
+self_check = false
+[log]
+level = "info"
+""")
+    sat = Satellite(binary, config, os.path.join(tmp, "satellite-busy.log"))
+    await sat.start()
+    ha = FakeHA(port, psk)
+    try:
+        cli = await ha.connect()
+        _info, entities, _ = await cli.device_info_and_list_entities()
+        ha.subscribe_voice()
+        check("BM1 microphone cannot be opened: no wake word session is requested",
+              await ha.expect_no_start(2.5) and not ha.session_open
+              and "streaming mic audio" not in sat.text(), sat.text()[-300:])
+        t = time.monotonic()
+        res = await ha.announce_like_ha(chime, "hola")
+        dt = time.monotonic() - t
+        check("BM2 announce while the mic is busy completes promptly (HA's cancel has nothing to wait for)",
+              res is not None and res.success is True and dt < 5.0, f"{res} in {dt:.2f} s")
+        check("BM3 no session opens after the announcement either", await ha.expect_no_start(1.0))
+
+        # The microphone becomes free: the wake word session opens and audio flows.
+        write_mic(mic, 30.0)
+        conv, flags, _ = await ha.next_start(timeout=15)
+        check("BM4 the mic opens (retry backoff): wake word session with USE_WAKE_WORD", bool(flags & USE_WAKE_WORD),
+              f"flags={flags}")
+        ok = await until_true(lambda: ha.audio.qsize() >= 15, TIMEOUT)
+        check("BM5 audio flows into the session", ok)
+        res = await ha.announce_like_ha(chime, "hola")
+        check("BM6 announce while capturing completes", res is not None and res.success is True, str(res))
+        check("BM7 the run was aborted for it and the wake word session returns afterwards",
+              await asyncio.wait_for(ha.stops.get(), TIMEOUT) is True and bool(
+                  (await ha.next_start())[1] & USE_WAKE_WORD))
+
+        # The mic closes again (HA's mute switch here; LG hands-free grabbing the PCM
+        # takes the same path through the capture thread).
+        mute_sw = [e for e in entities if isinstance(e, SwitchInfo)][0]
+        while not ha.stops.empty():
+            ha.stops.get_nowait()
+        cli.switch_command(mute_sw.key, True)
+        check("BM8 mic closed: the open session is aborted at once",
+              await asyncio.wait_for(ha.stops.get(), TIMEOUT) is True and not ha.session_open)
+        res = await ha.announce_like_ha(chime, "hola")
+        check("BM9 announce while the mic is closed completes", res is not None and res.success is True, str(res))
+        check("BM10 still no session while it is closed", await ha.expect_no_start(1.0))
+        cli.switch_command(mute_sw.key, False)
+        check("BM11 reopened: the wake word session returns", bool((await ha.next_start())[1] & USE_WAKE_WORD))
+
+        # Announcements in a row: HA ends the idle wake word run (RUN_END, no error)
+        # before it announces. No failed run, no growing backoff, session back at once.
+        worst = 0.0
+        for n in range(10):
+            while not ha.starts.empty():
+                ha.starts.get_nowait()
+            ha.event(Ev.VOICE_ASSISTANT_RUN_END)
+            t = time.monotonic()
+            res = await ha.announce_like_ha(chime, "hola")
+            check(f"BM13 announcement {n} completes", res is not None and res.success is True, str(res))
+            _conv, flags, _ = await ha.next_start(timeout=3)
+            worst = max(worst, time.monotonic() - t)
+            check(f"BM13 announcement {n} re-arms the wake word", bool(flags & USE_WAKE_WORD))
+        check("BM14 10 announcements in a row: wake word back within 1.5 s each time, no failed run logged",
+              worst < 1.5 and "run failed" not in sat.text(), f"worst {worst:.2f} s")
+
+        sat.proc.send_signal(signal.SIGTERM)
+        rc = await asyncio.wait_for(sat.proc.wait(), 5)
+        check("BM15 clean exit", rc == 0, f"rc={rc}")
+    finally:
+        srv.shutdown()
         if sat.proc.returncode is None:
             sat.proc.kill()
             await sat.proc.wait()
@@ -1247,6 +1374,7 @@ async def main() -> int:
     with tempfile.TemporaryDirectory(prefix="webos-sat-e2e-") as tmp:
         try:
             await scenario(args.binary, tmp)
+            await scenario_busy_mic(args.binary, tmp)
             await scenario_timers(args.binary, tmp)
             await scenario_alarm_cap(args.binary, tmp)
             await scenario_pairing(args.binary, tmp)
@@ -1257,7 +1385,7 @@ async def main() -> int:
         except Exception as err:  # noqa: BLE001
             failed = True
             print(f"FAIL  {type(err).__name__}: {err}", flush=True)
-            for name in ("satellite.log", "satellite-timers.log", "satellite-cap.log",
+            for name in ("satellite.log", "satellite-busy.log", "satellite-timers.log", "satellite-cap.log",
                          "satellite-nosound.log", "satellite-notimers.log", "satellite-pairing.log",
                          "satellite-pairing.log.2", "satellite-window.log", "satellite-aec.log", "satellite-tv.log",
                          "satellite-compat-ok.log", "satellite-compat-chg.log",
