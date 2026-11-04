@@ -2,7 +2,7 @@
 
 - **Device:** c3-a (LG C3 42", webOS TV 8.3.0, firmware `03.30.74`, on the allow-list). aarch64 kernel with 32-bit userland, Homebrew Channel **0.6.3**, Always Ready ON and Quick Start+ ON, LG hands-free off. The TV is the owner's PC display and was in use during the whole session.
 - **Date:** 2026-11-03
-- **Package:** `io.github.pando85.voicesatellite` **0.1.0** (`make ipk`, sha256 `5d66fe00...`), installed with `make tv-install-ipk` (appinstalld `dev/install`).
+- **Package:** `io.github.pando85.voicesatellite` **0.1.0** at first install (updated to 0.1.1 and 0.2.0 below) (`make ipk`, sha256 `5d66fe00...`), installed with `make tv-install-ipk` (appinstalld `dev/install`).
 - **Approval:** the owner asked for a permanent install with start at boot on. No reboot, no power-state change, no setting change, no sound, no TTS, no announcement and no pipeline run was made; the TV volume was not touched (rules of this session).
 - **Related:** [packaging design](../../design/packaging.md), [EXP-009](../../experiments/EXP-009-ipk-install-update.md) (the same procedure on c3-b), [P1 HA integration](P1-ha-integration.md) (the permanent HA entry), [always-on section 13](../../design/always-on.md#13-implemented-in-the-daemon-010-and-checked-on-c3-b).
 - **Privacy:** raw output is in the gitignored `devices/private/c3-a/`. No address, hostname, MAC or key appears here.
@@ -85,6 +85,25 @@ The 12 "HA disconnected" lines coincide with HA going down: the cluster recreate
 The unmute made the daemon log a run record with every latency `-` ("run 1 latency ... stt_end=- ..."): the wake-stage restart after the mute counts as a run with no events; harmless, but it will count as a wake-stage cycle in the report. HA access for the test: a short-lived token from the login flow in a 0600 file, deleted afterwards, and the refresh token created for it revoked (only that one).
 
 Left changed on the TV: only the new version (app directory, `/var/lib/webos-satellite/bin`, `VERSION`, `package.sums`, refreshed hook with the same content, rotated log). Rollback: install the 0.1.0 ipk the same way (appinstalld accepts a downgrade, EXP-009) and run `ctl.sh install`.
+
+## Update to 0.2.0 (2026-11-04, TV control)
+
+- **Approval:** the owner (2026-11-04): all newer versions are deployed to c3-a to test them, and everything that makes no sound is verified through HA. Rules kept: no reboot, no TV reboot, no input switch, no screen off, no power-state change, no app launch (the TV is the owner's active PC display), **no sound** (no TTS, announcement, start_conversation or beep). Allowed and done: volume down one step then restored exactly, mute on then off, the refresh button.
+- **Package:** `0.2.0` (commit `10d298b`, "version 0.2.0", bumps `Cargo.toml` and `Cargo.lock`), `make ipk` (check passed, sha256 `d7a3f3f4...`), `make tv-install-ipk`, then `ctl.sh install` as for 0.1.1 (supervisor and daemon stopped, aarch64 build, "keeping etc/config.toml", hook refreshed, started again; about 2 s without a daemon). The config has no `[tv_control]` section, so the package defaults apply: screen, power_on, volume, mute, input, apps on; `power_off` off; `volume_limit` 40.
+
+| Check | Result | Label |
+| --- | --- | --- |
+| Version and state kept | `ctl.sh status`: package, installed and running `0.2.0 (aarch64-unknown-linux-musl)`; `etc/config.toml` and `etc/noise_psk` sha256 prefixes equal before and after, modes 0600; start at boot still on; firmware validated | verified-on-target |
+| Startup log | "tv_control: ready (power state Active; volume=ok mute=ok input=ok apps=ok)"; three children subscribed (power state, volume, foreground app); warnings: "cannot check that the TV declares launch (no declaration file readable)" and "the volume does not take a subscription; polling every 10 s" (both explained in [EXP-010 findings](../../experiments/EXP-010-tv-control-setters.md#part-b-results-2026-11-04)) | verified-on-target |
+| HA | The entry `lg-c3-a` reconnected 3.7 s after the start (no re-auth); 22 entities of the device in HA's registry, no duplicates; the 10 new TV entities as in EXP-010 B1; `tv_power` not listed; states equal the luna getters (volume 89, mute off, `tv_speaker`, input `HDMI 1`, app `Other`, `Active`) | verified-on-target |
+| Controls | mute on and off, volume down one step, refresh: pass; `volume up` refused because the TV (89) is above `volume_limit` 40; volume restored with a direct `volumeUp` call to 89 (see EXP-010 finding 1) | verified-on-target |
+| Daemon restart (`ctl.sh stop`, `start`) | HA: TV entities `unavailable` about 5 s, back 2 s after the start, same entities, same states, no new registry entries | verified-on-target |
+| Resources | Over 616 s in `Active`: daemon 923 ticks of user plus system time = **1.50 % of one core**, 1.63 % including the one-shot `luna-send` children of the 10 s volume poll; RSS 1408 kB at the start and 1672 kB at 10 min (VmHWM 1740 kB), 5 threads; the two subscription `luna-send` children about 0 ticks, 2.0 MB each. 0.1.1 measured 1.3 % and 1308 kB (a different 331 s window): about 0.2 points more CPU and 0.3 to 0.4 MB more RSS | verified-on-target |
+| Kernel | `dmesg` grep for oops, BUG, panic and call trace: nothing; no ASoC or debugfs path read | verified-on-target |
+
+HA access: a short-lived token from the login flow in a 0600 file, shredded afterwards; the refresh token created for it was deleted over the websocket (it was the only one with the current flag), no other token touched; no HA configuration change.
+
+Left changed on the TV: only the new version (app directory, `/var/lib/webos-satellite/bin`, `VERSION`, `package.sums`, hook with the same content, rotated log). Volume, mute, input, screen and power state are as before. Rollback: install the 0.1.1 ipk the same way and run `ctl.sh install`.
 
 ## Rollback, as left
 

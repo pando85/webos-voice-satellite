@@ -4,7 +4,7 @@
 **webOS:** webOS TV 8.3.0
 **Firmware:** `03.30.74` (on the daemon's allow-list)
 **Kernel and userland architecture:** aarch64 kernel, 32-bit ARM EABI5 userland (glibc 2.31); both static builds run (the aarch64 daemon since 2026-11-03)
-**Source:** consented probes and live runs on 2026-11-01 to 2026-11-03, rooted with the Homebrew Channel **0.6.3**, Always Ready on, Quick Start+ on, LG hands-free off. Details: [D0-D1](../discovery/c3-a/D0-D1-runtime.md), [D3](../discovery/c3-a/D3-mic-identification.md), [P1 HA integration](../discovery/c3-a/P1-ha-integration.md), [P4 permanent install](../discovery/c3-a/P4-permanent-install.md). Scope: this unit and firmware only; c3-b is a different unit and firmware.
+**Source:** consented probes and live runs on 2026-11-01 to 2026-11-04, rooted with the Homebrew Channel **0.6.3**, Always Ready on, Quick Start+ on, LG hands-free off. Details: [D0-D1](../discovery/c3-a/D0-D1-runtime.md), [D3](../discovery/c3-a/D3-mic-identification.md), [P1 HA integration](../discovery/c3-a/P1-ha-integration.md), [P4 permanent install](../discovery/c3-a/P4-permanent-install.md). Scope: this unit and firmware only; c3-b is a different unit and firmware.
 
 This file starts with the install record. Earlier c3-a results (capture, playback, wake word, AEC, soak) are in the discovery notes above and are not repeated per row.
 
@@ -17,7 +17,10 @@ This file starts with the install record. Earlier c3-a results (capture, playbac
 | Start at boot after a real restart | Reboot | NOT TESTED (owner's next natural restart; passed on c3-b with HBC 0.7.2, EXP-009) | P4 |
 | App UI through HBC `exec` | Active | NOT TESTED (not opened on the owner's screen) | P4 |
 | Reply playback, announcements, "Keep listening (screen off)", resume after suspend with 0.1.0 | any | NOT TESTED on this unit (no sound, no power-state change allowed in the session); c3-b only | P4 |
-| TV control getters and setters (volume, mute, input, apps) | any | NOT TESTED on this unit; getters passed on c3-b (`03.30.73`) only | [TV control design](../design/tv-control.md), [EXP-010](../experiments/EXP-010-tv-control-setters.md) |
+| TV control 0.2.0: entity list and states in the owner's HA (10 entities, `tv_power` not listed), match with the luna getters | Active | PASS (2026-11-04; volume 89, mute off, `tv_speaker`, input `HDMI 1`, app `Other`, `Active`) | [EXP-010 Part B](../experiments/EXP-010-tv-control-setters.md#part-b-results-2026-11-04) |
+| TV control 0.2.0: mute on and off, volume down one step (restored), `volume up` refusal above `volume_limit`, refresh button, re-listing after a daemon restart | Active | PASS (the TV's volume 89 is above the default `volume_limit` 40, so HA can only lower it) | EXP-010 Part B |
+| TV control 0.2.0: resources over 10 min with three luna children | Active | 1.50 % of one core (1.63 % with the poll's child processes), RSS 1.4 to 1.7 MB; no kernel warning | EXP-010 Part B, [P4](../discovery/c3-a/P4-permanent-install.md#update-to-020-2026-11-04-tv-control) |
+| TV control: screen off and on, input switch, app launch, power-off in "Keep listening", `Active Standby` states | any | NOT TESTED (the TV is the owner's active PC display); passed on c3-b | EXP-010 |
 
 ## Notes and redacted evidence
 
