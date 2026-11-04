@@ -385,9 +385,12 @@ pub(crate) struct TvControlSection {
     pub(crate) power_off: bool,
     /// `tv_volume` and the volume step buttons.
     pub(crate) volume: bool,
-    /// The highest TV volume Home Assistant may set (the TV's own maximum
-    /// also applies).
-    pub(crate) volume_limit: u32,
+    /// Optional cap on the TV volume Home Assistant may set. Unset (the
+    /// default): no cap below the TV's own `maxVolume` (read from the TV; it
+    /// differs per model). With a cap, sets above it are clamped, "volume up"
+    /// stops at it and the slider ends at it; a TV already above the cap can
+    /// still be lowered.
+    pub(crate) volume_limit: Option<u32>,
     /// `tv_mute` switch.
     pub(crate) mute: bool,
     /// `tv_input` select.
@@ -418,7 +421,7 @@ impl Default for TvControlSection {
             power_on: true,
             power_off: false,
             volume: true,
-            volume_limit: 40,
+            volume_limit: None,
             mute: true,
             input: true,
             apps: true,
@@ -915,7 +918,11 @@ impl Settings {
         if self.power.cooldown_s > 3600 {
             return Err(err("power.cooldown_s must be between 0 and 3600"));
         }
-        if !(1..=100).contains(&self.tv_control.volume_limit) {
+        if self
+            .tv_control
+            .volume_limit
+            .is_some_and(|l| !(1..=100).contains(&l))
+        {
             return Err(err("tv_control.volume_limit must be between 1 and 100"));
         }
         if !(1..=100).contains(&self.tv_control.app_limit) {
@@ -1362,7 +1369,8 @@ impl Settings {
             } else {
                 on.join(",")
             },
-            t.volume_limit,
+            t.volume_limit
+                .map_or_else(|| "tv-max".to_owned(), |l| l.to_string()),
             t.app_limit,
             t.follow_firmware_guard
         )
@@ -1869,7 +1877,7 @@ level = "debug"
         assert!(def.enabled && def.screen && def.power_on && !def.follow_firmware_guard);
         assert!(def.volume && def.mute && def.input && def.apps);
         assert!(!def.power_off && !def.play_state);
-        assert_eq!((def.volume_limit, def.app_limit), (40, 30));
+        assert_eq!((def.volume_limit, def.app_limit), (None, 30));
         let s = Settings::from_toml(
             "[tv_control]\nenabled = true\nscreen = false\npower_off = true\nvolume = true\nvolume_limit = 25\nmute = true\ninput = true\napps = true\napp_limit = 12\nplay_state = true\nfollow_firmware_guard = false\n",
             base,
@@ -1887,7 +1895,7 @@ level = "debug"
         );
         assert_eq!(
             (tvc.volume_limit, tvc.app_limit, tvc.follow_firmware_guard),
-            (25, 12, false)
+            (Some(25), 12, false)
         );
         // Strict: unknown keys and wrong types are rejected with the key.
         let err_unknown = Settings::from_toml("[tv_control]\nvolum = true\n", base).unwrap_err();
@@ -1899,18 +1907,19 @@ level = "debug"
         s.device.allow_plaintext = true;
         s.validate().unwrap();
         for (limit, apps, ok) in [
-            (0, 30, false),
-            (101, 30, false),
-            (1, 1, true),
-            (100, 100, true),
-            (40, 0, false),
-            (40, 101, false),
+            (Some(0), 30, false),
+            (Some(101), 30, false),
+            (Some(1), 1, true),
+            (Some(100), 100, true),
+            (Some(40), 0, false),
+            (Some(40), 101, false),
+            (None, 30, true),
         ] {
             let mut s = s.clone();
             s.tv_control.volume_limit = limit;
             s.tv_control.app_limit = apps;
             let r = s.validate();
-            assert_eq!(r.is_ok(), ok, "limit {limit} apps {apps}: {r:?}");
+            assert_eq!(r.is_ok(), ok, "limit {limit:?} apps {apps}: {r:?}");
             if let Err(err) = r {
                 assert!(err.0.contains("tv_control."), "{err}");
             }
@@ -1935,7 +1944,7 @@ level = "debug"
         let s = Settings::default();
         assert!(
             s.summary()
-                .contains("tv_control=[on=screen,power_on,volume,mute,input,apps volume_limit=40 app_limit=30 firmware_guard=false]"),
+                .contains("tv_control=[on=screen,power_on,volume,mute,input,apps volume_limit=tv-max app_limit=30 firmware_guard=false]"),
             "{}",
             s.summary()
         );

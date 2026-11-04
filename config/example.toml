@@ -188,7 +188,11 @@ power_off = false
 # 03.30.73, 2026-11-04) and each control is checked per TV at startup (c3-a is
 # untested). Set any of them to false to remove the entities.
 volume = true             # number "TV volume" and the up/down buttons
-volume_limit = 40         # highest TV volume Home Assistant may set (LG steps, not percent; the TV's own maximum also applies)
+# volume_limit = 40       # optional cap on the TV volume Home Assistant may set (LG steps, not
+#                         # percent). Unset (default): no cap below the TV's own maxVolume,
+#                         # which differs per TV (60 on c3-b). With a cap: sets above it are
+#                         # clamped, "volume up" stops at it, the slider ends at it; a TV
+#                         # already above it can still be lowered (down button, any value <= cap)
 mute = true               # switch "TV mute"
 input = true              # select "TV input" (the TV's external inputs)
 apps = true               # select "TV app" (launcher apps)

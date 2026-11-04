@@ -37,12 +37,6 @@ use crate::power::{self, Watch};
 pub(crate) const OWN_APP_ID: &str = "io.github.pando85.voicesatellite";
 /// Where the TV declares its luna methods (read-only file reads).
 pub(crate) const DECLARATION_DIR: &str = "/usr/share/luna-service2/api-permissions.d";
-/// Only declaration files whose name mentions one of these services are read.
-const DECLARATION_SERVICES: [&str; 3] = [
-    "com.webos.service.audio",
-    "com.webos.service.apiadapter",
-    "com.webos.applicationManager",
-];
 /// Largest declaration file read.
 const DECLARATION_MAX_BYTES: u64 = 1 << 20;
 /// Total time of the startup capability check; an unanswered getter counts
@@ -217,7 +211,7 @@ pub(crate) fn controller_config(settings: &Settings, blocked: Option<String>) ->
 }
 
 /// The declaration files of the audio, apiadapter and application manager
-/// services in `dir`: `(file name, text)`. Unreadable files are skipped; a
+/// (SAM) services in `dir`: `(file name, text)`. Unreadable files are skipped; a
 /// missing directory gives none (every setter is then `Unchecked`).
 pub(crate) fn read_declarations(dir: &Path) -> Vec<(String, String)> {
     let Ok(rd) = std::fs::read_dir(dir) else {
@@ -227,7 +221,7 @@ pub(crate) fn read_declarations(dir: &Path) -> Vec<(String, String)> {
         .filter_map(Result::ok)
         .filter_map(|e| {
             let name = e.file_name().to_string_lossy().into_owned();
-            if !DECLARATION_SERVICES.iter().any(|s| name.contains(s)) {
+            if !setters::is_declaration_file(&name) {
                 return None;
             }
             let meta = e.metadata().ok()?;
@@ -661,7 +655,7 @@ esac
     #[test]
     fn controller_config_follows_the_settings() {
         let mut s = all_on();
-        s.tv_control.volume_limit = 25;
+        s.tv_control.volume_limit = Some(25);
         s.tv_control.app_limit = 7;
         let c = controller_config(&s, Some("firmware".to_owned()));
         assert!(
@@ -674,7 +668,7 @@ esac
                 && c.apps
                 && c.play_state
         );
-        assert_eq!((c.volume_limit, c.app_limit), (25, 7));
+        assert_eq!((c.volume_limit, c.app_limit), (Some(25), 7));
         assert_eq!(c.setters_blocked.as_deref(), Some("firmware"));
         assert_eq!(c.own_app_ids, [OWN_APP_ID]);
         let c = controller_config(&Settings::default(), None);

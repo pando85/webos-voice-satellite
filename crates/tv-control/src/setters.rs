@@ -121,6 +121,30 @@ impl Setter {
         }
     }
 
+    /// Names the entries of a declaration may use for the setter's service
+    /// (compared case-insensitively). The application manager's methods are
+    /// declared by the system application manager (SAM), so its short name
+    /// is accepted as well (EXP-010 Part B: the file is
+    /// `com.webos.sam.api.json`).
+    fn service_names(self) -> &'static [&'static str] {
+        match self {
+            Self::Launch => &["com.webos.applicationManager", "applicationManager"],
+            Self::VolumeSet | Self::VolumeUp | Self::VolumeDown => &["com.webos.service.audio"],
+            Self::Mute | Self::Input => &["com.webos.service.apiadapter"],
+        }
+    }
+
+    /// Fragments of declaration file names that count as evidence **for** a
+    /// method (a hit gives [`Declared::Yes`]) without ever giving
+    /// [`Declared::No`]: the SAM file for `launch`, whose entry format is not
+    /// verified, so a miss there must not turn the control read-only.
+    fn extra_files(self) -> &'static [&'static str] {
+        match self {
+            Self::Launch => &["com.webos.sam"],
+            _ => &[],
+        }
+    }
+
     /// The setter's name for log lines.
     #[must_use]
     pub fn name(self) -> &'static str {
@@ -163,19 +187,32 @@ fn strings<'a>(v: &'a Value, out: &mut Vec<&'a str>) {
 /// method, the whole category (`service/category/*`) or the whole service
 /// (`service/*`), with or without a `luna://` prefix.
 fn covers(entry: &str, setter: Setter) -> bool {
-    let (service, category, method) = setter.path();
+    let (_, category, method) = setter.path();
     let e = entry.strip_prefix("luna://").unwrap_or(entry);
-    let full = if category.is_empty() {
-        format!("{service}/{method}")
-    } else {
-        format!("{service}/{category}/{method}")
-    };
-    let cat_wild = if category.is_empty() {
-        format!("{service}/*")
-    } else {
-        format!("{service}/{category}/*")
-    };
-    e == full || e == cat_wild || e == format!("{service}/*")
+    setter.service_names().iter().any(|service| {
+        let full = if category.is_empty() {
+            format!("{service}/{method}")
+        } else {
+            format!("{service}/{category}/{method}")
+        };
+        let cat_wild = if category.is_empty() {
+            format!("{service}/*")
+        } else {
+            format!("{service}/{category}/*")
+        };
+        [full, cat_wild, format!("{service}/*")]
+            .iter()
+            .any(|c| c.eq_ignore_ascii_case(e))
+    })
+}
+
+/// Whether a declaration file of this name is read at all (the file name
+/// mentions a service of one of the setters, or the SAM).
+#[must_use]
+pub fn is_declaration_file(name: &str) -> bool {
+    Setter::ALL
+        .iter()
+        .any(|s| name.contains(s.path().0) || s.extra_files().iter().any(|f| name.contains(f)))
 }
 
 /// Decides [`Declared`] for `setter` from the contents of the declaration
@@ -186,13 +223,15 @@ pub fn declared_in(files: &[(String, String)], setter: Setter) -> Declared {
     let (service, _, _) = setter.path();
     let mut read_any = false;
     for (name, text) in files {
-        if !name.contains(service) {
+        let primary = name.contains(service);
+        if !primary && !setter.extra_files().iter().any(|f| name.contains(f)) {
             continue;
         }
         let Ok(v) = serde_json::from_str::<Value>(text) else {
             continue;
         };
-        read_any = true;
+        // Only a primary file can show that a method is missing.
+        read_any |= primary;
         let mut all = Vec::new();
         strings(&v, &mut all);
         if all.iter().any(|s| covers(s, setter)) {
@@ -269,6 +308,59 @@ mod tests {
         // A file that is not JSON counts as unread.
         let junk = [file("com.webos.service.audio.api.json", "not json")];
         assert_eq!(declared_in(&junk, Setter::VolumeSet), Declared::Unchecked);
+    }
+
+    #[test]
+    fn launch_is_found_in_the_sam_declaration_file() {
+        // Synthetic fixture: the real com.webos.sam.api.json (EXP-010 Part
+        // B) lists the application manager's methods as strings; the exact
+        // entry shape is not verified, so the common spellings are accepted.
+        for entry in [
+            "com.webos.applicationManager/launch",
+            "applicationManager/launch",
+            "luna://com.webos.applicationManager/launch",
+            "applicationmanager/launch",
+            "com.webos.applicationManager/*",
+        ] {
+            let sam = [
+                file(
+                    "com.webos.audio.json",
+                    r#"["com.webos.service.audio/master/setVolume"]"#,
+                ),
+                file(
+                    "com.webos.sam.api.json",
+                    &format!(
+                        r#"{{"applicationmanager.operation":["{entry}","applicationManager/close"]}}"#
+                    ),
+                ),
+            ];
+            assert_eq!(declared_in(&sam, Setter::Launch), Declared::Yes, "{entry}");
+        }
+        assert!(is_declaration_file("com.webos.sam.api.json"));
+        assert!(is_declaration_file("com.webos.service.audio.api.json"));
+        assert!(!is_declaration_file("com.webos.service.other.api.json"));
+        // A SAM file without the method is not evidence that it is missing
+        // (the entry format is unverified): unchecked, the read-back guards.
+        let sam_without = [file(
+            "com.webos.sam.api.json",
+            r#"{"x":["applicationManager/close"]}"#,
+        )];
+        assert_eq!(
+            declared_in(&sam_without, Setter::Launch),
+            Declared::Unchecked
+        );
+        // A primary file that lacks the method still means "no".
+        let primary = [file(
+            "com.webos.applicationManager.api.json",
+            r#"{"x":["com.webos.applicationManager/close"]}"#,
+        )];
+        assert_eq!(declared_in(&primary, Setter::Launch), Declared::No);
+        // A hit in the SAM file wins over a miss in a primary file.
+        let both = [
+            primary[0].clone(),
+            file("com.webos.sam.api.json", r#"["applicationManager/launch"]"#),
+        ];
+        assert_eq!(declared_in(&both, Setter::Launch), Declared::Yes);
     }
 
     #[test]

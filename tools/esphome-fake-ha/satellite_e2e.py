@@ -748,7 +748,7 @@ if [ "$1" = "-i" ]; then
       last="$cur"
       case "$2" in
         */getPowerState) printf '{"returnValue":true,"state":"%s","subscribed":true}\n' "$(cat "$D/power")" ;;
-        */getVolume) vol_json | sed 's/{"returnValue":true,/{"returnValue":true,"subscribed":true,/'; echo ;;
+        */getVolume) vol_json; echo ;;   # no "subscribed" flag, like both TVs
         */getForegroundAppInfo) fg_json | sed 's/{"returnValue":true,/{"returnValue":true,"subscribed":true,/'; echo ;;
         *) printf '{"returnValue":true,"subscribed":false}\n' ;;
       esac
@@ -832,6 +832,7 @@ luna_send = "{luna}"
 [tv_control]
 power_off = true
 play_state = true
+volume_limit = 40
 [safety]
 validated_firmware = ["03.30.74"]
 firmware_info = "{os_info}"
@@ -856,8 +857,8 @@ firmware_info = "{os_info}"
                 "remote_power_off", "listening", "microphone_muted", "mute_microphone"}
         check("V1 entity list: every TV control entity, once", want <= set(by) and len(by) == len(ents),
               f"missing {want - set(by)}")
-        check("V2 volume range comes from the TV (60), no unit; selects have no category",
-              isinstance(by["tv_volume"], NumberInfo) and by["tv_volume"].max_value == 60.0
+        check("V2 volume range ends at the configured cap (40; the TV reports 60), no unit; selects have no category",
+              isinstance(by["tv_volume"], NumberInfo) and by["tv_volume"].max_value == 40.0
               and by["tv_volume"].unit_of_measurement == ""
               and list(by["tv_input"].options) == ["CanaryInput 1", "CanaryInput 2", "Other"]
               and list(by["tv_app"].options) == ["CanaryApp A", "CanaryApp B", "Other"]
@@ -905,8 +906,14 @@ firmware_info = "{os_info}"
         ok = await until_true(lambda: st("tv_volume") == 20.0)
         check("V11 the state follows the TV's own value", ok, str(st("tv_volume")))
         await asyncio.sleep(1.2)
+        # With a cap the slider ends at the cap and the server ignores a value
+        # above it (the controller's own clamp is a second line, unit-tested).
         cli.number_command(by["tv_volume"].key, 55.0)
-        check("V12 volume above volume_limit is clamped to 40", await called('master/setVolume {"volume":40}'), calls())
+        await asyncio.sleep(1.0)
+        check("V12a a value above the configured volume_limit (40) is ignored", 'setVolume {"volume":55}' not in calls()
+              and "outside 0..=40" in sat.text(), calls())
+        cli.number_command(by["tv_volume"].key, 40.0)
+        check("V12 the cap itself can be set", await called('master/setVolume {"volume":40}'), calls())
         await asyncio.sleep(1.2)
         cli.button_command(by["tv_volume_up"].key)
         await asyncio.sleep(0.6)
@@ -958,6 +965,11 @@ firmware_info = "{os_info}"
         await cli2.disconnect()
 
         log = sat.text()
+        check("V22b refresh logs a one-line summary with counts",
+              "tv_refresh_lists: done: 2 inputs, 3 apps" in log, log[-600:])
+        check("V22c a getVolume subscription without the flag is kept and confirmed by a pushed update",
+              "reply has no subscribed flag; keeping the subscription" in log
+              and "update was pushed on the volume subscription" in log, log[-1500:])
         leaks = [w for w in ("CanaryApp", "CanaryInput", "app.hdmi", "app.a", "app.b", "app.c", "/secret.png") if w in log]
         check("V23 no app title, input label or app id in the log at info", not leaks, f"{leaks}")
         sat.proc.send_signal(signal.SIGTERM)

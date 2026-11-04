@@ -54,7 +54,7 @@ All entities belong to the satellite's existing ESPHome device. Object ids are s
 | TV screen | `switch` | `tv_screen` | on = picture on, off = `Screen Off` | `[tv_control] screen` | on | none |
 | Turn on TV | `button` | `tv_turn_on` | stateless | `[tv_control] power_on` | on | none |
 | TV power (keep listening) | `switch` | `tv_power` | on = picture on, off = looks off but listening (section 4) | `[tv_control] power_off` | **off (opt-in)** | none |
-| TV volume | `number` | `tv_volume` | 0 to `maxVolume` read from the TV (**60** on c3-b, read 2026-11-04; an earlier draft said 100), step 1, slider, **no unit** (LG volume steps, not percent); commands clamped to `volume_limit` | `[tv_control] volume` | on (EXP-010 Part A passed on c3-b; recommended, section 9) | none |
+| TV volume | `number` | `tv_volume` | 0 to `maxVolume` read from the TV (**60** on c3-b, read 2026-11-04; an earlier draft said 100), step 1, slider, **no unit** (LG volume steps, not percent); the slider ends at `maxVolume`, or at the optional `volume_limit` when that is lower | `[tv_control] volume` | on (EXP-010 Part A passed on c3-b; recommended, section 9) | none |
 | TV volume up / TV volume down | `button` | `tv_volume_up`, `tv_volume_down` | one TV step each | `[tv_control] volume` | as `tv_volume` | none |
 | TV mute | `switch` | `tv_mute` | on = muted | `[tv_control] mute` | on (EXP-010 Part A passed on c3-b) | none |
 | TV input | `select` | `tv_input` | labels of the TV's external inputs, plus `Other` | `[tv_control] input` | on (EXP-010 Part A passed on c3-b) | none |
@@ -173,7 +173,7 @@ Per control, after the power watch delivered its first state and before the ESPH
 1. **Config:** the control's flag is on, and `luna-send` was found (on a PC every TV control is off, as the power watch is today).
 2. **Getter:** one read-only call. Success means `returnValue: true` and the fields this design uses are present with the expected types. The answer seeds the state.
 3. **Setter declared:** the method name is present in the TV's luna-service2 API declaration files (read-only file read, no call). A missing declaration means the control is read-only.
-4. **Subscription:** for volume and foreground app, the getter with `{"subscribe":true}` is started as a supervised `luna-send -i` child; if its first reply lacks `subscribed: true`, the control falls back to polling (section 7).
+4. **Subscription:** for volume and foreground app, the getter with `{"subscribe":true}` is started as a supervised `luna-send -i` child; if its first reply lacks `subscribed: true`, the control polls (and, since the fix of 2026-11-04, keeps the child running to see whether it streams anyway, section 15) (section 7).
 5. **Never a probe write.** Setters are not called at startup, not even with the current value.
 
 Outcomes: a failed getter makes the entity report missing state; a missing setter makes it refuse commands; both are logged once at `warn` with the control name and the luna `errorCode`/`errorText` (no reply body). A setter that fails at run time (`returnValue: false`, a timeout, or a read-back that does not match) is logged once, reported as missing state and disabled until the next restart or list refresh. **No fallback to another, guessed method or parameter set.** The only fallback chain is the existing, verified one in the power path (`powerOn`, then the state-checked toggle key).
@@ -193,7 +193,7 @@ At most three extra `luna-send -i` children (volume, foreground app, and the exi
 
 Setter limits: one call in flight per control; volume set commands from an HA slider are coalesced (latest value wins after 250 ms); volume up and down at most 4 per second; input and app at most one per 2 s; all TV-control setters together at most 30 per minute. A command above a limit is refused with one log line, and the entity's real state is sent again. The power path keeps its own limits (section 4.2).
 
-`volume_limit` (default 40) clamps a volume set and stops `volume up` at the limit; the entity shows the value read back from the TV, so a clamp is visible. The remote is not limited. Reason: one misheard number or a slider slip from a phone should not set the TV to full volume; c3-a and c3-b were used at TV volume 9 to 12 in the tests.
+`volume_limit` is **optional and unset by default** (changed 2026-11-04 after EXP-010 Part B: the first default, 40, was below c3-a's usual volume 89, and `maxVolume` differs per TV, 60 on c3-b). Unset, there is no cap below the TV's own `maxVolume`: the number's range is `0..maxVolume` and a set above it is clamped to it. With `volume_limit = N`: the number's range ends at `min(N, maxVolume)` (so the server also ignores a larger value from HA), a set above the ceiling is clamped to it, and `volume up` is refused at or above it. A TV that is **already above** the cap (set with the remote) is never forced down and can still be lowered from HA: `volume down` always works, and any value up to the ceiling can be set (the slider then shows the real value above its end, and a value between the ceiling and the current volume cannot be chosen). The entity shows the value read back from the TV, so a clamp is visible. The remote is not limited. Use it when one misheard number or a slider slip from a phone must not reach full volume.
 
 ## 8. Input and app lists
 
@@ -221,7 +221,7 @@ screen = true         # tv_screen switch
 power_on = true       # tv_turn_on button
 power_off = false     # tv_power switch: opt-in, needs the "Keep listening" mode
 volume = true         # tv_volume, tv_volume_up/down (EXP-010 Part A passed on c3-b)
-volume_limit = 40     # highest TV volume HA may set
+# volume_limit = 40   # optional cap on the TV volume HA may set; unset = the TV's maxVolume
 mute = true           # tv_mute (passed on c3-b)
 input = true          # tv_input (passed on c3-b)
 apps = true           # tv_app (passed on c3-b)
@@ -235,8 +235,8 @@ follow_firmware_guard = false  # owner decision 2026-11-04: TV control is not ga
 | `enabled` | true | Read-only state is harmless and makes the controls discoverable; the per-control flags gate every write |
 | `screen`, `power_on` | true | Their calls are verified on c3-b (D5, D6, section 13), they keep the satellite running, and any remote key undoes them |
 | `power_off` | **false** | Owner decision: opt-in, and only in the always-on mode. Costs: TV stays running dark (power draw not measured), LG's OLED care at power-off may not run, a brief panel flash, a second remote press takes about 5 s ([always-on 12.2](always-on.md#122-the-setting-to-expose-app-and-ha-ui)) |
-| `volume`, `mute`, `input`, `apps` | **true** (owner, 2026-11-04, after EXP-010 Part A passed for all four on c3-b `03.30.73`) | The setters worked, read back and restored. The evidence is c3-b only; c3-a (`03.30.74`) is untested and each control is still checked per TV at startup and switched off when its getter, its declaration or a write fails (section 6). The `volume_limit` clamp stays. Two caveats: volume and mute were tested on `external_arc` only, and input only on a disconnected HDMI input |
-| `volume_limit` | 40 | Section 7 |
+| `volume`, `mute`, `input`, `apps` | **true** (owner, 2026-11-04, after EXP-010 Part A passed for all four on c3-b `03.30.73`) | The setters worked, read back and restored. The evidence is c3-b only; c3-a (`03.30.74`) is untested and each control is still checked per TV at startup and switched off when its getter, its declaration or a write fails (section 6). The optional `volume_limit` cap is available. Two caveats: volume and mute were tested on `external_arc` only, and input only on a disconnected HDMI input |
+| `volume_limit` | unset (no cap below `maxVolume`) | Section 7. The first default (40) blocked real use on c3-a (volume 89) |
 | `app_limit` | 30 | Keeps the select usable in HA and in voice |
 | `play_state` | false | Extra polling for a sensor no v1 feature needs |
 
@@ -255,7 +255,7 @@ Every control is also gated at run time by section 6. **Firmware guard (owner de
 | Screen off | Low. The TV stays running: more power than standby (not measured), and if left dark for days LG's power-off OLED care does not run | `tv_screen` on, `tv_turn_on`, any remote key |
 | Power-off (keep listening) | Medium. As screen off plus a 0.3 to 0.7 s panel flash (indirect, [D6](../discovery/c3-b/D6-poweroff-screenoff.md)); if the wake fails, LG standby or Suspend (section 4.2) | `tv_turn_on`, the remote; WoL from Suspend |
 | Power-on | Low. Lights the panel in a room that may be dark | screen off or the remote |
-| Volume set and step | Low to medium: loudness, capped by `volume_limit` | set it back; the remote |
+| Volume set and step | Low to medium: loudness, optionally capped by `volume_limit` | set it back; the remote |
 | Mute | Low | unmute; the remote |
 | Input and app | Low: interrupts what is being watched; an app may start playing sound | select the previous one; the remote |
 
@@ -303,7 +303,7 @@ Following [AGENTS.md](../../AGENTS.md) (keep capture, playback, power lifecycle 
 4. Which Assist intents act on buttons, numbers and selects on the owner's HA (section 11).
 5. ~~Whether TV control should follow the firmware guard~~ Decided 2026-11-04 (owner): it does not; a warning is logged (section 9).
 6. c3-a (`03.30.74`): mute, volume down and the getters (through HA) verified; screen, input, app launch and power-off untested there.
-7. Findings of EXP-010 Part B to settle: the volume getter reports no `subscribed` flag on either TV, so the daemon polls every 10 s (section 7 intended a push); the `launch` declaration check never finds its file (`com.webos.sam.api.json`, not `com.webos.applicationManager`); `volume_limit` 40 is below c3-a's usual volume 89 (the HA controls can only lower it); the refresh button logs no result.
+7. Findings of EXP-010 Part B, **fixed on the PC 2026-11-04, to re-check on the TVs** (section 15): the volume subscription without a flag (kept and confirmed by a pushed line, else polling), the `launch` declaration check (SAM file), `volume_limit` (optional, no cap by default), the refresh button's result line.
 
 ## 15. Implementation status (2026-11-04)
 
@@ -319,6 +319,13 @@ Deviations from the text above, and why:
 - **`tv_power` reads unknown** whenever any precondition of section 4.2 fails, including the darkener's 20 s cooldown after a power-off. The way back is `tv_turn_on`.
 - **`launch` payload and app list:** launch points have no hidden marker on c3-b, so every entry with an id and a title is kept, minus the satellite's own app (`io.github.pando85.voicesatellite`), the input apps and duplicate ids, capped at `app_limit`. The parser also honours `visible: false` or `hidden: true` if a firmware sends them (not verified anywhere).
 - **Select options change:** the controller queues new options; the daemon applies them (the server closes the HA connection, HA lists again) only when no conversation or reply is running. Whether HA lists entities on every reconnect is checked in the fake-HA scenario only, not against HA 2026.10.4.
-- **Volume and foreground subscriptions** start only for getters that answered, fall back to polling when the first reply lacks `subscribed: true`, and the play state is always polled (every 10 s in `Active` and `Screen Saver`).
+- **Volume and foreground subscriptions** start only for getters that answered, poll when the first reply lacks `subscribed: true` (the subscription is then kept to see whether it streams, see the fixes below), and the play state is always polled (every 10 s in `Active` and `Screen Saver`).
+
+Fixes after EXP-010 Part B (PC only, 2026-11-04, tests in `crates/tv-control` and the fake-HA scenario V; **not yet run on a TV**):
+
+- **`volume_limit` is optional** (default unset, no cap below `maxVolume`), see section 7 for the semantics. `[tv_control] volume_limit` accepts 1 to 100 when set. The startup summary shows `volume_limit=tv-max` when unset. The HA number's range follows `maxVolume` (or the cap, when lower); because the ESPHome server ignores a number command outside the entity's range, with a cap HA cannot even send a value above it, and the controller's own clamp is a second line.
+- **Launch declaration check:** the declaration files read now include any file whose name contains `com.webos.sam` (the application manager's methods, `com.webos.sam.api.json` on both TVs), and the entry match is case-insensitive and accepts `com.webos.applicationManager/launch`, `applicationManager/launch` (with or without `luna://`) and wildcards. The entry shape inside that file was **not read** (no raw output is committed), so the fixture is synthetic. A SAM file can only prove `Yes`: a miss there leaves `launch` at `Unchecked` (as before), never `No`, so a wrong guess about the format cannot turn the app select read-only. Re-check on a TV: the "cannot check that the TV declares launch" warning must be gone.
+- **Refresh button:** one summary line when both list reads are in: `tv_refresh_lists: done: N inputs, M apps` (counts only, no titles), or a warning `tv_refresh_lists: failed to read (...)` with the lists kept.
+- **Volume subscription without the flag:** the first reply lacking `subscribed: true` no longer ends the subscription. The child keeps running and the 10 s poll keeps running too, until a **second line** arrives on the subscription (a push: `an update was pushed on the volume subscription; it streams without the flag, polling stopped`). If instead a poll sees a different value and no line was pushed within 3 s (`PUSH_GRACE`), the subscription is dropped and the control polls only (warning `pushed nothing for a change`). A luna error as the first line still falls back to polling at once. This rests on EXP-010 A3 (c3-b: one pushed line per change on that subscription) and was verified on the PC only with a fake `luna-send` that does not send the flag. On a TV: change the volume with the remote and look for the "pushed" line within seconds, then no more 10 s volume polls (`tv_control` debug log); or the "pushed nothing" warning if the TV does not stream.
 
 Answered by the TV run (EXP-010 Part B, 2026-11-04): the pty one-shot calls work on the real `luna-send` on both TVs; the declaration files are in `/usr/share/luna-service2/api-permissions.d` as JSON lists of `service/method` strings (audio and apiadapter found; the application manager's methods are in `com.webos.sam.api.json`, which the filter does not match, so `launch` stays `Unchecked`); the subscription children cost about 0 ticks each, the daemon about 1.5 % of one core in all on c3-a (0.1.1: 1.3 %); the volume getter reports no `subscribed` flag, so the daemon polls every 10 s; HA shows a missing state as `unknown`; the refresh button runs without a reconnect when nothing changed. Still open: the disruptive controls on c3-a, a live missing state and a changed option list against HA, B10 and B11.

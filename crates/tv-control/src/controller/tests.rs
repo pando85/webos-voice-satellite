@@ -293,7 +293,11 @@ fn defaults_are_screen_power_on_and_the_checked_controls() {
         !c.power_off && !c.play_state,
         "opt-in and extra polling stay off"
     );
-    assert_eq!((c.volume_limit, c.app_limit), (40, 30));
+    assert_eq!(
+        (c.volume_limit, c.app_limit),
+        (None, 30),
+        "no cap by default"
+    );
     assert_eq!(c.setters_blocked, None, "not gated by the firmware guard");
     let ids: Vec<_> = Controller::new(c).entities().iter().map(|e| e.id).collect();
     assert_eq!(
@@ -795,14 +799,79 @@ fn volume_set_is_coalesced_clamped_and_read_back() {
 }
 
 #[test]
-fn volume_above_the_limit_is_clamped_and_visible() {
-    let mut r = Rig::boot(all_on(), Tv::new());
+fn volume_without_a_cap_goes_up_to_the_tv_maximum() {
+    // The default: no cap below maxVolume (c3-a's owner uses 89 on a TV
+    // whose maximum is higher than c3-b's 60).
+    let mut tv = Tv::new();
+    tv.vol = 55;
+    let mut r = Rig::boot(all_on(), tv);
+    assert_eq!(
+        r.c.entities()
+            .iter()
+            .find(|e| e.id == e::TV_VOLUME)
+            .map(|e| e.kind.clone()),
+        Some(Kind::Number { max: 60.0 })
+    );
+    r.cmd(num_cmd(e::TV_VOLUME, 58.0), 1000).tick(1300);
+    assert_eq!(r.sets[0].2, r#"{"volume":58}"#);
+    assert!(!r.logged("ceiling"));
+    // Volume up works above the old default of 40.
+    let mut tv = Tv::new();
+    tv.vol = 55;
+    let mut r = Rig::boot(all_on(), tv);
+    r.cmd(btn(e::TV_VOLUME_UP), 1000);
+    assert_eq!(r.sets[0].1, setters::URI_VOLUME_UP);
+}
+
+#[test]
+fn a_cap_clamps_sets_limits_the_slider_and_still_lets_the_volume_come_down() {
+    let cap = || Config {
+        volume_limit: Some(40),
+        ..all_on()
+    };
+    let r = Rig::boot(cap(), Tv::new());
+    assert_eq!(
+        r.c.entities()
+            .iter()
+            .find(|e| e.id == e::TV_VOLUME)
+            .map(|e| e.kind.clone()),
+        Some(Kind::Number { max: 40.0 }),
+        "the slider ends at the cap"
+    );
+    let mut r = Rig::boot(cap(), Tv::new());
     r.cmd(num_cmd(e::TV_VOLUME, 55.0), 1000).tick(1300);
     assert_eq!(r.sets[0].2, r#"{"volume":40}"#, "volume_limit 40");
-    assert!(r.logged("volume_limit"));
+    assert!(r.logged("ceiling"));
+    // The TV is above the cap (set at the TV): any value up to the cap and
+    // volume down still work; volume up is refused.
+    let mut tv = Tv::new();
+    tv.vol = 55;
+    let mut r = Rig::boot(cap(), tv);
+    r.cmd(btn(e::TV_VOLUME_UP), 1000);
+    assert!(r.sets.is_empty());
+    assert!(r.logged("at the volume limit"));
+    r.cmd(num_cmd(e::TV_VOLUME, 30.0), 3000).tick(3300);
+    assert_eq!(r.sets[0].2, r#"{"volume":30}"#);
+    let mut tv = Tv::new();
+    tv.vol = 55;
+    let mut r = Rig::boot(cap(), tv);
+    r.cmd(btn(e::TV_VOLUME_DOWN), 1000);
+    assert_eq!(r.sets[0].1, setters::URI_VOLUME_DOWN);
+}
+
+#[test]
+fn volume_above_the_limit_is_clamped_and_visible() {
+    let cfg = Config {
+        volume_limit: Some(40),
+        ..all_on()
+    };
+    let mut r = Rig::boot(cfg, Tv::new());
+    r.cmd(num_cmd(e::TV_VOLUME, 55.0), 1000).tick(1300);
+    assert_eq!(r.sets[0].2, r#"{"volume":40}"#, "volume_limit 40");
+    assert!(r.logged("ceiling"));
     // Above the TV's own maximum: also capped (by the lower of the two).
     let cfg = Config {
-        volume_limit: 100,
+        volume_limit: Some(100),
         ..all_on()
     };
     let mut r = Rig::boot(cfg, Tv::new());
@@ -823,7 +892,11 @@ fn volume_above_the_limit_is_clamped_and_visible() {
 fn volume_steps_stop_at_the_limit_and_are_rate_limited() {
     let mut tv = Tv::new();
     tv.vol = 39;
-    let mut r = Rig::boot(all_on(), tv);
+    let cfg = Config {
+        volume_limit: Some(40),
+        ..all_on()
+    };
+    let mut r = Rig::boot(cfg, tv);
     r.cmd(btn(e::TV_VOLUME_UP), 1000);
     assert_eq!(
         (r.sets[0].1, r.sets[0].2.as_str()),
@@ -1303,17 +1376,23 @@ fn polling_runs_in_the_right_states_until_a_subscription_is_established() {
 }
 
 #[test]
-fn a_subscription_without_subscribed_true_falls_back_to_polling() {
+fn a_subscription_without_the_flag_is_kept_and_polled_until_a_push_proves_it() {
+    let reads_of = |r: &mut Rig, t: Topic, at: u64| {
+        r.c.tick(ms(r.t0, at))
+            .iter()
+            .filter(|f| matches!(f, Effect::Call { purpose: Purpose::Read(x), .. } if *x == t))
+            .count()
+    };
     let mut r = Rig::boot(all_on(), Tv::new());
     let fx =
         r.c.on_subscription_line(Topic::Foreground, &fg("app.b"), ms(r.t0, 100));
     assert!(
-        fx.iter()
-            .any(|f| matches!(f, Effect::Unsubscribe(Topic::Foreground)))
+        !fx.iter().any(|f| matches!(f, Effect::Unsubscribe(_))),
+        "the subscription stays"
     );
     assert!(
         fx.iter()
-            .any(|f| matches!(f, Effect::Log(Level::Warn, m) if m.contains("polling")))
+            .any(|f| matches!(f, Effect::Log(Level::Info, m) if m.contains("no subscribed flag")))
     );
     r.run(fx);
     assert_eq!(
@@ -1321,21 +1400,96 @@ fn a_subscription_without_subscribed_true_falls_back_to_polling() {
         Some("App B"),
         "the line is still used"
     );
+    // Polling goes on while it is unconfirmed.
+    assert_eq!(reads_of(&mut r, Topic::Foreground, 6000), 1);
+    // A second line is a push: the subscription streams, polling stops.
+    let fx =
+        r.c.on_subscription_line(Topic::Foreground, &fg("app.a"), ms(r.t0, 7000));
+    assert!(
+        fx.iter()
+            .any(|f| matches!(f, Effect::Log(Level::Info, m) if m.contains("pushed")))
+    );
+    assert!(!fx.iter().any(|f| matches!(f, Effect::Unsubscribe(_))));
+    r.run(fx);
+    assert_eq!(r.sel(e::TV_APP).as_deref(), Some("App A"));
+    assert_eq!(reads_of(&mut r, Topic::Foreground, 30_000), 0);
+    assert_eq!(reads_of(&mut r, Topic::Foreground, 60_000), 0);
+}
+
+#[test]
+fn a_silent_subscription_is_dropped_when_polling_sees_a_change_it_did_not_push() {
+    // The rig answers reads at its start time; here a poll is answered at
+    // the time it is due.
+    let poll = |r: &mut Rig, at: u64| {
+        for f in r.c.tick(ms(r.t0, at)) {
+            if let Effect::Call {
+                purpose: Purpose::Read(t),
+                ..
+            } = f
+            {
+                let text = r.tv.answer(t);
+                let fx = r.c.on_reply(Purpose::Read(t), Ok(text), ms(r.t0, at));
+                r.run(fx);
+            }
+        }
+    };
+    let mut r = Rig::boot(all_on(), Tv::new());
+    let first = r#"{"returnValue":true,"volumeStatus":{"volume":12,"maxVolume":60,"muteStatus":false,"soundOutput":"external_arc"}}"#;
+    let fx =
+        r.c.on_subscription_line(Topic::Volume, first, ms(r.t0, 100));
+    r.run(fx);
+    // The volume changes at the TV and only the poll sees it.
+    r.tv.vol = 20;
+    poll(&mut r, 10_100);
+    assert_eq!(r.num(e::TV_VOLUME), Some(20.0));
+    // Within the grace period nothing is dropped.
+    let fx = r.c.tick(ms(r.t0, 11_000));
+    assert!(!fx.iter().any(|f| matches!(f, Effect::Unsubscribe(_))));
+    // After it: polling only, with a warning.
+    let fx = r.c.tick(ms(r.t0, 13_200));
+    assert!(
+        fx.iter()
+            .any(|f| matches!(f, Effect::Unsubscribe(Topic::Volume)))
+    );
+    assert!(
+        fx.iter()
+            .any(|f| matches!(f, Effect::Log(Level::Warn, m) if m.contains("pushed nothing")))
+    );
+    // Polling continues.
+    r.tv.vol = 21;
+    poll(&mut r, 20_300);
+    assert_eq!(r.num(e::TV_VOLUME), Some(21.0));
+    // A change that is pushed within the grace period keeps the subscription.
+    let mut r = Rig::boot(all_on(), Tv::new());
+    let fx =
+        r.c.on_subscription_line(Topic::Volume, first, ms(r.t0, 100));
+    r.run(fx);
+    r.tv.vol = 20;
+    poll(&mut r, 10_100);
+    let push = r#"{"returnValue":true,"volumeStatus":{"volume":20,"maxVolume":60,"muteStatus":false,"soundOutput":"external_arc"}}"#;
+    let fx =
+        r.c.on_subscription_line(Topic::Volume, push, ms(r.t0, 11_000));
+    r.run(fx);
+    let fx = r.c.tick(ms(r.t0, 14_000));
+    assert!(!fx.iter().any(|f| matches!(f, Effect::Unsubscribe(_))));
     let n =
-        r.c.tick(ms(r.t0, 6000))
+        r.c.tick(ms(r.t0, 40_000))
             .iter()
             .filter(|f| {
                 matches!(
                     f,
                     Effect::Call {
-                        purpose: Purpose::Read(Topic::Foreground),
+                        purpose: Purpose::Read(Topic::Volume),
                         ..
                     }
                 )
             })
             .count();
-    assert_eq!(n, 1);
-    // A luna error on the first line also falls back.
+    assert_eq!(n, 0, "confirmed by the push: no polling");
+}
+
+#[test]
+fn a_subscription_that_answers_with_an_error_falls_back_to_polling() {
     let mut r = Rig::boot(all_on(), Tv::new());
     let fx = r.c.on_subscription_line(
         Topic::Volume,
@@ -1445,6 +1599,11 @@ fn refresh_reads_the_lists_and_a_change_waits_for_the_daemon() {
     );
     r.cmd(btn(e::TV_REFRESH_LISTS), 10_000);
     assert!(r.logged("the app list changed (3 entries)"));
+    assert!(
+        r.logged("tv_refresh_lists: done: 2 inputs, 3 apps"),
+        "{:?}",
+        r.logs
+    );
     assert_eq!(
         r.c.pending_options(),
         [(
@@ -1518,6 +1677,14 @@ fn a_failed_list_refresh_keeps_the_old_lists() {
         }
     }
     assert!(r.c.pending_options().is_empty());
+    assert!(
+        r.logs
+            .iter()
+            .any(|(l, m)| *l == Level::Warn && m.contains("tv_refresh_lists: failed to read")),
+        "{:?}",
+        r.logs
+    );
+    assert!(!r.logged("tv_refresh_lists: done"));
     assert_eq!(
         r.c.entities()
             .iter()

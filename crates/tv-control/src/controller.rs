@@ -49,6 +49,9 @@ pub const POWER_ON_TRIES: u8 = 2;
 pub const POLL_SLOW: Duration = Duration::from_secs(10);
 /// Poll interval of the foreground app, when no subscription runs.
 pub const POLL_FOREGROUND: Duration = Duration::from_secs(5);
+/// How long a change seen by polling may go without a pushed line before the
+/// subscription of an unconfirmed topic is dropped (polling only).
+pub const PUSH_GRACE: Duration = Duration::from_secs(3);
 /// Minimum time between two list refreshes.
 pub const REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 
@@ -64,8 +67,12 @@ pub struct Config {
     pub power_off: bool,
     /// `tv_volume` and the step buttons.
     pub volume: bool,
-    /// Highest TV volume HA may set.
-    pub volume_limit: u32,
+    /// Optional cap on the TV volume HA may set. `None` (the default): no cap
+    /// below the TV's own `maxVolume`. With a cap, a set above it is clamped
+    /// to it, "volume up" stops at it, and the HA slider ends at it; a
+    /// volume above the cap (set at the TV) can still be lowered by any set
+    /// or "volume down".
+    pub volume_limit: Option<u32>,
     /// `tv_mute`.
     pub mute: bool,
     /// `tv_input`.
@@ -93,7 +100,7 @@ impl Default for Config {
             power_on: true,
             power_off: false,
             volume: true,
-            volume_limit: 40,
+            volume_limit: None,
             mute: true,
             input: true,
             apps: true,
@@ -480,9 +487,22 @@ pub struct Controller {
     power_on_at: Option<(Instant, u8)>,
     polling: HashSet<Topic>,
     subscribed: HashSet<Topic>,
+    /// Topics whose subscription has delivered a first line.
+    first_line_seen: HashSet<Topic>,
+    /// Subscriptions whose first reply lacked `subscribed: true`: kept
+    /// running next to polling until a second (pushed) line proves that they
+    /// stream, or a change seen by polling shows that they do not.
+    unconfirmed: HashSet<Topic>,
+    /// An unconfirmed topic whose polled value changed without a pushed line,
+    /// and since when.
+    suspect: HashMap<Topic, Instant>,
     next_poll: HashMap<Topic, Instant>,
     reads_inflight: HashSet<Topic>,
     last_refresh: Option<Instant>,
+    /// Lists a refresh button press is still waiting for, and the reasons
+    /// of the reads of it that failed (for the one summary line).
+    refresh_pending: Vec<Topic>,
+    refresh_failed: Vec<String>,
 }
 
 fn log(level: Level, msg: impl Into<String>) -> Effect {
@@ -524,9 +544,14 @@ impl Controller {
             power_on_at: None,
             polling: HashSet::new(),
             subscribed: HashSet::new(),
+            first_line_seen: HashSet::new(),
+            unconfirmed: HashSet::new(),
+            suspect: HashMap::new(),
             next_poll: HashMap::new(),
             reads_inflight: HashSet::new(),
             last_refresh: None,
+            refresh_pending: Vec::new(),
+            refresh_failed: Vec::new(),
         }
     }
 
@@ -619,7 +644,10 @@ impl Controller {
         }
         if self.cfg.volume {
             #[allow(clippy::cast_precision_loss)] // a TV volume range is tiny
-            let max = self.vol.as_ref().map_or(100, |v| v.max_volume) as f32;
+            let max = self
+                .vol
+                .as_ref()
+                .map_or(100, |v| self.volume_ceiling(v.max_volume)) as f32;
             add(
                 ent::TV_VOLUME,
                 "TV volume",
@@ -1221,8 +1249,17 @@ impl Controller {
         self.probe_pending.remove(&topic);
         self.resume_pending.remove(&topic);
         let mut out = Vec::new();
+        let mut failed = None;
+        let before = self
+            .unconfirmed
+            .contains(&topic)
+            .then(|| self.fingerprint(topic));
         match parsed.and_then(|v| self.apply_read(topic, &v, now)) {
             Ok(fx) => {
+                if before.is_some_and(|b| b != self.fingerprint(topic)) {
+                    // Polling saw a change that no pushed line announced.
+                    self.suspect.entry(topic).or_insert(now);
+                }
                 self.getter_ok.insert(topic);
                 if self.warned_read.remove(&topic) {
                     out.push(log(
@@ -1232,11 +1269,59 @@ impl Controller {
                 }
                 out.extend(fx);
             }
-            Err(e) => out.extend(self.read_failed(topic, &e)),
+            Err(e) => {
+                out.extend(self.read_failed(topic, &e));
+                failed = Some(e.to_string());
+            }
         }
+        out.extend(self.refresh_progress(topic, failed));
         out.extend(self.evaluate_check(topic, now));
         out.extend(self.sync());
         out
+    }
+
+    /// One summary line when the last list read of a refresh button press
+    /// is in: how many inputs and apps, or what failed. Counts only (the
+    /// titles are not logged).
+    fn refresh_progress(&mut self, topic: Topic, failed: Option<String>) -> Option<Effect> {
+        let at = self.refresh_pending.iter().position(|t| *t == topic)?;
+        self.refresh_pending.remove(at);
+        if let Some(why) = failed {
+            self.refresh_failed.push(format!("{}: {why}", topic.name()));
+        }
+        if !self.refresh_pending.is_empty() {
+            return None;
+        }
+        let failures = std::mem::take(&mut self.refresh_failed);
+        Some(if failures.is_empty() {
+            log(
+                Level::Info,
+                format!(
+                    "tv_refresh_lists: done: {} inputs, {} apps",
+                    self.inputs.len(),
+                    self.apps.len()
+                ),
+            )
+        } else {
+            log(
+                Level::Warn,
+                format!(
+                    "tv_refresh_lists: failed to read ({}); keeping the old lists: {} inputs, {} apps",
+                    failures.join("; "),
+                    self.inputs.len(),
+                    self.apps.len()
+                ),
+            )
+        })
+    }
+
+    /// What a subscription of `topic` would have to keep current.
+    fn fingerprint(&self, topic: Topic) -> String {
+        match topic {
+            Topic::Volume => format!("{:?}", self.vol),
+            Topic::Foreground => format!("{:?}", self.fg),
+            _ => String::new(),
+        }
     }
 
     fn read_failed(&mut self, topic: Topic, e: &ReplyError) -> Vec<Effect> {
@@ -1387,7 +1472,7 @@ impl Controller {
 
     /// One line of a subscription (`getVolume` or the foreground app).
     pub fn on_subscription_line(&mut self, topic: Topic, line: &str, now: Instant) -> Vec<Effect> {
-        let first = !self.subscribed.contains(&topic);
+        let first = self.first_line_seen.insert(topic);
         let parsed = luna::parse_reply(line);
         let mut out = Vec::new();
         match parsed {
@@ -1401,19 +1486,34 @@ impl Controller {
                             format!("tv_control: subscribed to the {}", topic.name()),
                         ));
                     } else {
+                        // No `subscribed` flag (the volume getter on c3-a and
+                        // c3-b). EXP-010 A3 saw pushes on such a subscription,
+                        // so keep it, and poll until a second line shows
+                        // that it streams.
                         let every = Self::poll_every(topic);
                         self.polling.insert(topic);
                         self.next_poll.insert(topic, now + every);
+                        self.unconfirmed.insert(topic);
                         out.push(log(
-                            Level::Warn,
+                            Level::Info,
                             format!(
-                                "tv_control: the {} does not take a subscription; polling every {} s",
+                                "tv_control: the {} reply has no subscribed flag; keeping the subscription and polling every {} s until an update is pushed",
                                 topic.name(),
                                 every.as_secs()
                             ),
                         ));
-                        out.push(Effect::Unsubscribe(topic));
                     }
+                } else if self.unconfirmed.remove(&topic) {
+                    self.suspect.remove(&topic);
+                    self.subscribed.insert(topic);
+                    self.polling.remove(&topic);
+                    out.push(log(
+                        Level::Info,
+                        format!(
+                            "tv_control: an update was pushed on the {} subscription; it streams without the flag, polling stopped",
+                            topic.name()
+                        ),
+                    ));
                 }
                 match self.apply_read(topic, &v, now) {
                     Ok(fx) => out.extend(fx),
@@ -1645,6 +1745,14 @@ impl Controller {
         }
     }
 
+    /// The highest volume HA may set: the TV's `maxVolume`, or the
+    /// configured cap when that is lower.
+    fn volume_ceiling(&self, max_volume: u32) -> u32 {
+        self.cfg
+            .volume_limit
+            .map_or(max_volume, |l| l.min(max_volume))
+    }
+
     fn cmd_volume_set(&mut self, value: f32, now: Instant) -> Vec<Effect> {
         let id = ent::TV_VOLUME;
         if let Err(why) = self
@@ -1660,7 +1768,7 @@ impl Controller {
         if !value.is_finite() || value < 0.0 {
             return self.refuse(id, "not a volume");
         }
-        let limit = self.cfg.volume_limit.min(max);
+        let limit = self.volume_ceiling(max);
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         // finite, >= 0, then capped
         let mut target = (value.round().min(1_000_000.0) as u32).min(max);
@@ -1669,7 +1777,7 @@ impl Controller {
             target = limit;
             out.push(log(
                 Level::Info,
-                format!("tv_volume: request above volume_limit; using {limit}"),
+                format!("tv_volume: request above the volume ceiling; using {limit}"),
             ));
         }
         self.pending_volume = Some((target, now + VOLUME_COALESCE));
@@ -1693,7 +1801,7 @@ impl Controller {
         let Some(v) = self.vol.clone() else {
             return self.refuse(id, "the TV volume is not known");
         };
-        let limit = self.cfg.volume_limit.min(v.max_volume);
+        let limit = self.volume_ceiling(v.max_volume);
         if up && v.volume >= limit {
             return self.refuse(id, "at the volume limit");
         }
@@ -1839,9 +1947,14 @@ impl Controller {
             Level::Info,
             "tv_refresh_lists: reading the input and app lists",
         )];
+        self.refresh_pending.clear();
+        self.refresh_failed.clear();
         for t in [Topic::Inputs, Topic::Apps] {
-            if self.wanted(t) && !self.reads_inflight.contains(&t) {
-                out.push(self.read_call(t));
+            if self.wanted(t) {
+                self.refresh_pending.push(t);
+                if !self.reads_inflight.contains(&t) {
+                    out.push(self.read_call(t));
+                }
             }
         }
         out
@@ -2026,6 +2139,29 @@ impl Controller {
                     }
                 }
             }
+        }
+        // A subscription that pushed nothing for a change polling saw.
+        let mut dropped: Vec<Topic> = self
+            .suspect
+            .iter()
+            .filter(|(t, since)| {
+                self.unconfirmed.contains(*t)
+                    && now.saturating_duration_since(**since) >= PUSH_GRACE
+            })
+            .map(|(t, _)| *t)
+            .collect();
+        dropped.sort_by_key(|t| t.name());
+        for topic in dropped {
+            self.suspect.remove(&topic);
+            self.unconfirmed.remove(&topic);
+            out.push(log(
+                Level::Warn,
+                format!(
+                    "tv_control: the {} subscription pushed nothing for a change; polling only",
+                    topic.name()
+                ),
+            ));
+            out.push(Effect::Unsubscribe(topic));
         }
         // Polling, only where the TV is in a state it answers in.
         for topic in [Topic::Volume, Topic::Foreground, Topic::PlayState] {
