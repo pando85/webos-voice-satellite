@@ -614,6 +614,33 @@ def split_bundle(text):
     return sec
 
 
+def firmware_status(ctl):
+    """Firmware status from the `ctl.sh status` text (the soft policy, ADR 0006).
+
+    Returns "verified", "series verified", "not verified", "changed" or "unknown", or None when
+    the status has no firmware line. The verdict is the text that `--check-firmware` prints after
+    the firmware info ("firmware <version> (...): <verdict>"). The older wording ("validated", "NOT in
+    safety.validated_firmware") is still read: "validated" counts as verified, the strict gate
+    text as not verified. "changed" comes from the compatibility line (`compat_status`).
+    """
+    m = re.search(r"^(?:webos-satellite: )?firmware: (.*)$", ctl, re.M)
+    if not m:
+        return None
+    line = m.group(1).strip()
+    # "firmware <version> (webOS ..., build ...): <verdict>", or the unreadable text on its own.
+    rest = line.split("): ", 1)[1].strip() if line.startswith("firmware ") and "): " in line else line
+    c = re.search(r"^(?:webos-satellite: )?compatibility: ([^;\n]*)", ctl, re.M)
+    if c and c.group(1).strip() == "firmware changed":
+        return "changed"
+    if rest.startswith("verified") or rest.startswith("validated"):
+        return "verified"
+    if "is a verified series" in rest:
+        return "series verified"
+    if rest.startswith("not verified") or rest.startswith("not validated") or "NOT in safety.validated_firmware" in rest:
+        return "not verified"
+    return "unknown"
+
+
 def live_from(sec, now_local, offset=True):
     """Live state of the daemon from the status/proc sections."""
     live = {"running": False}
@@ -637,8 +664,7 @@ def live_from(sec, now_local, offset=True):
     live["version"] = m.group(1) if m else None
     m = re.search(r"start at boot: (on|off)", ctl)
     live["autostart"] = m.group(1) if m else None
-    m = re.search(r"firmware: firmware .*\): (.*)$", ctl, re.M)
-    live["firmware_validated"] = (m.group(1).strip() == "validated") if m else None
+    live["firmware_status"] = firmware_status(ctl)
     live["markers"] = [x for x in sec.get("markers", []) if x in ("disable", "crashloop", "webos-satellite.disable")]
     proc = sec.get("proc", [])
     # The supervisor: its pid and a supervise.sh cmdline in the /proc probe (the same test as
@@ -1059,7 +1085,7 @@ def render(rep):
                  + (f"; TV up {fmt_s(live.get('tv_uptime_s'))}" if live.get("tv_uptime_s") is not None else ""))
         L.append(f"- RSS {live.get('rss_kib', '-')} KiB, threads {live.get('threads', '-')}; supervisor "
                  f"{'running' if live.get('supervisor_running') else 'not running'}; start at boot: {live.get('autostart')}; "
-                 f"markers: {', '.join(live.get('markers') or []) or 'none'}; firmware validated: {live.get('firmware_validated')}")
+                 f"markers: {', '.join(live.get('markers') or []) or 'none'}; firmware status: {live.get('firmware_status') or 'no data'}")
         if live.get("clock_offset_s") is not None:
             L.append(f"- TV clock minus PC clock: {live['clock_offset_s']} s")
         L.append("")

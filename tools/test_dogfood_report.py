@@ -493,6 +493,63 @@ class LiveSupervisor(unittest.TestCase):
         self.assertFalse(live["supervisor_running"])
 
 
+class FirmwareStatus(unittest.TestCase):
+    """Firmware status from the ctl.sh status text. Hand-written synthetic lines in the format of
+    packaging/webos/ctl.sh (`note "firmware: $fw"` with the --check-firmware verdict of
+    crates/satellite/src/firmware.rs) and the old "validated" wording."""
+
+    FW = "webos-satellite: firmware: firmware 99.1 (webOS 9.9.9, build 1)"
+
+    def st(self, *lines):
+        return d.firmware_status("\n".join(lines))
+
+    def test_verified(self):
+        self.assertEqual(self.st(self.FW + ": verified (model OLED00X1 in the verified series)"), "verified")
+
+    def test_verified_with_compat_line(self):
+        self.assertEqual(self.st(self.FW + ": verified (why)",
+                                 "webos-satellite: compatibility: verified; microphone self-check: pass"), "verified")
+
+    def test_series_verified(self):
+        line = (self.FW + ": not verified: OLED00X1 is a verified series, but this firmware is not yet reported; "
+                "the microphone starts anyway (not verified yet: the microphone runs anyway)")
+        self.assertEqual(self.st(line), "series verified")
+
+    def test_not_verified(self):
+        line = (self.FW + ": not verified; the microphone starts anyway (report if it does not work) "
+                "(not verified yet: the microphone runs anyway, press Report compatibility in the app if it does not work)")
+        self.assertEqual(self.st(line), "not verified")
+
+    def test_strict_gate_wording_is_not_verified(self):
+        self.assertEqual(self.st(self.FW + ': NOT in safety.validated_firmware (firmware_policy = "strict"); '
+                                 "the microphone stays disabled"), "not verified")
+
+    def test_unreadable_is_unknown(self):
+        self.assertEqual(self.st("webos-satellite: firmware: cannot read the firmware version (no file): unknown; "
+                                 "the microphone starts anyway"), "unknown")
+
+    def test_changed_comes_from_compatibility_line(self):
+        self.assertEqual(self.st(self.FW + ": verified (why)",
+                                 "webos-satellite: compatibility: firmware changed; microphone self-check: pass"), "changed")
+
+    def test_legacy_validated_wording(self):
+        self.assertEqual(self.st(self.FW + ": validated"), "verified")
+        self.assertEqual(self.st("webos-satellite: firmware: firmware 99.1 (webOS 9.9.9, build 1): validated"), "verified")
+
+    def test_legacy_not_validated_wording(self):
+        self.assertEqual(self.st(self.FW + ": not validated"), "not verified")
+
+    def test_no_firmware_line(self):
+        self.assertIsNone(self.st("webos-satellite: running: pid 4321"))
+        self.assertIsNone(self.st(""))
+
+    def test_live_reads_status_from_bundle_text(self):
+        text = "\n".join(["@@now", "1000", "@@uptime", "100.00 50.00", "@@clk", "100", "@@ctl",
+                          self.FW + ": verified (why)", "@@markers", "@@proc", "@@end"])
+        live = d.live_from(d.split_bundle(text), 1000, offset=False)
+        self.assertEqual(live["firmware_status"], "verified")
+
+
 # ---------------------------------------------------------------- end to end
 
 BUNDLE = "\n".join(["@@now", str(int(ts("12:00:00"))), "@@uptime", "5000.00 4000.00", "@@clk", "100", "@@ctl",
