@@ -105,6 +105,10 @@ HA access: a short-lived token from the login flow in a 0600 file, shredded afte
 
 Left changed on the TV: only the new version (app directory, `/var/lib/webos-satellite/bin`, `VERSION`, `package.sums`, hook with the same content, rotated log). Volume, mute, input, screen and power state are as before. Rollback: install the 0.1.1 ipk the same way and run `ctl.sh install`.
 
+## Home Assistant side, 2026-11-04 (no change on the TV)
+
+The owner asked for the TV control entities to be exposed to Assist: the screen switch, mute switch, turn-on button, volume number and up and down buttons, input select and app select of `lg-c3-a` are exposed to `conversation` with Spanish aliases ("tele del despacho", "televisión del despacho", "volumen de la tele del despacho" and similar), and the device was put in the HA area "Office A". Details and the c3-b equivalent: [c3-b P4](../c3-b/P4-permanent-install.md#home-assistant-side-done-with-a-short-lived-token-that-was-deleted-afterwards). No setter was called on c3-a.
+
 ## Rollback, as left
 
 - Stop: `ctl.sh stop`. Microphone off without stopping: `ctl.sh mic off`. No start at boot: `ctl.sh autostart off` (or `touch /var/lib/webos-satellite/disable`). Remove everything: `ctl.sh purge`, then `make tv-remove-ipk`. Details: [development: rollback](../../development.md#install-the-app-package-on-a-rooted-tv-persistent).
