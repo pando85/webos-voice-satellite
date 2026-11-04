@@ -18,6 +18,7 @@ How to build, test, package and run the Rust workspace. Status: Phase 1 plus the
 | `config/example.toml` | Commented configuration with all defaults |
 | `packaging/webos/` | POSIX sh install, start, stop, status, uninstall and supervisor scripts for a TV ([below](#install-on-a-tv-non-persistent)); `ctl.sh`, `app/`, `config.default.toml` and `ipk/build_ipk.py` make the installable webOS app package ([below](#install-the-app-package-on-a-rooted-tv-persistent), [packaging design](design/packaging.md)); `init.d/` holds the boot hook template ([autostart design](design/autostart.md)); `tv/appinstall.sh` runs appinstalld on the TV; `tests/` tests all of it on the host |
 | `tools/esphome-fake-ha/` | Fake-HA harnesses (`run.sh`) and the HA bridge (`ha_bridge.py`) |
+| `tools/dogfood_report.py` | PC-side real-use health report from the TV logs (read-only ssh) and HA's Assist debug runs, stdlib only, with `tools/test_dogfood_report.py` ([usage](development/dogfood-report.md)) |
 | `tools/lifecycle/` | Microphone-gate check of the real binary (`local_check.py`), an HA-side client for mute cycles, state watching and reconnect loops against a TV (`lifecycle_client.py`), `run.sh` for both host checks |
 
 Keep the root files minimal and stable; add per-crate dependencies in the crate's own `Cargo.toml`, with versions declared once in `[workspace.dependencies]`. Workspace lints forbid `unsafe` code; a crate that genuinely needs it (for example tinyalsa ioctls in `capture`) must opt out locally and say why.
@@ -312,7 +313,7 @@ When HA cannot open a connection to the satellite (the situation on the owner's 
 
 ## CI
 
-- [`.github/workflows/validate.yml`](../.github/workflows/validate.yml): documentation checks (`sh -n tools/probe/probe.sh`, `sh -n` of the packaging and lifecycle scripts, `python3 tools/check_docs.py`).
+- [`.github/workflows/validate.yml`](../.github/workflows/validate.yml): documentation checks (`sh -n tools/probe/probe.sh`, `sh -n` of the packaging and lifecycle scripts, `python3 tools/check_docs.py`, the dogfood report unit tests).
 - [`.github/workflows/rust.yml`](../.github/workflows/rust.yml): `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test`, `packaging/webos/tests/run.sh`, `tests/ipk.sh` and `tests/app_smoke.js` on the host; then the armv7 and aarch64 cross-builds, ELF checks, a run of the armv7 binary under `qemu-user-static`, `make ipk` (built and checked, not uploaded), and the armv7 binary uploaded as a short-lived workflow artifact.
 
 Actions are pinned to commit SHAs with the version in a comment. Update them deliberately.
@@ -322,6 +323,7 @@ Actions are pinned to commit SHAs with the version in a comment. Update them del
 ```sh
 make lint test
 python3 tools/check_docs.py
+python3 -m unittest discover -s tools -p 'test_dogfood*.py'
 sh -n tools/probe/probe.sh
 for f in packaging/webos/*.sh packaging/webos/init.d/* packaging/webos/tests/*.sh packaging/webos/tv/*.sh tools/lifecycle/*.sh; do sh -n "$f"; done
 shellcheck -x -P SCRIPTDIR -s sh packaging/webos/*.sh packaging/webos/init.d/* packaging/webos/tests/*.sh packaging/webos/tv/*.sh   # if installed

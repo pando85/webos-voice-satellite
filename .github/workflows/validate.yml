@@ -16,3 +16,5 @@ jobs:
           for f in packaging/webos/*.sh packaging/webos/init.d/* packaging/webos/tests/*.sh packaging/webos/tv/*.sh tools/lifecycle/*.sh tools/lifecycle/tv/*.sh; do sh -n "$f"; done
       - name: Check research files and Markdown links
         run: python3 tools/check_docs.py
+      - name: Unit tests of the PC-side report tool
+        run: python3 -m unittest discover -s tools -p 'test_dogfood*.py'
