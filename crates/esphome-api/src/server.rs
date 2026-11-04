@@ -13,7 +13,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinSet;
 use tokio::time::{Duration, Instant, sleep_until, timeout};
 
-use crate::app::{AppCommand, AppEvent, PairingEvent};
+use crate::app::{AppCommand, AppEvent, PairingEvent, PlayerStatus};
 use crate::config::{Config, ConfigError, Resolved, features};
 use crate::entities;
 use crate::frame::{
@@ -197,6 +197,7 @@ impl Server {
             binary_sensors: vec![None; self.cfg.binary_sensors.len()],
             switches: vec![None; self.cfg.switches.len()],
             text_sensors: vec![None; self.cfg.text_sensors.len()],
+            media_players: vec![None; self.cfg.media_players.len()],
         };
         let mut pending: JoinSet<Result<Session, (SocketAddr, FrameError)>> = JoinSet::new();
         let mut keyless: JoinSet<()> = JoinSet::new();
@@ -619,6 +620,9 @@ struct Ctx {
     switches: Vec<Option<bool>>,
     /// State of each text sensor in `cfg.text_sensors` (same order).
     text_sensors: Vec<Option<String>>,
+    /// State of each application-owned media player in `cfg.media_players`
+    /// (same order); `None` until the application sent one.
+    media_players: Vec<Option<PlayerStatus>>,
 }
 
 enum Flow {
@@ -1051,6 +1055,9 @@ impl Ctx {
             }
             pb::ListEntitiesRequest::ID => {
                 s.send(&entities::list_media_player(&self.cfg)).await?;
+                for mp in &self.cfg.media_players {
+                    s.send(&entities::list_app_media_player(mp)).await?;
+                }
                 s.send(&entities::list_mute_switch()).await?;
                 for sw in &self.cfg.switches {
                     s.send(&entities::list_switch(sw)).await?;
@@ -1082,6 +1089,13 @@ impl Ctx {
                     self.volume,
                 ))
                 .await?;
+                // An application player with no state yet sends none: the
+                // protocol has no "unknown" media player state.
+                for (mp, state) in self.cfg.media_players.iter().zip(&self.media_players) {
+                    if let Some(st) = state {
+                        s.send(&entities::app_media_player_state(mp, st)).await?;
+                    }
+                }
                 s.send(&entities::mute_state(self.voice.is_muted())).await?;
                 if self.cfg.power_sensor {
                     s.send(&entities::power_state(self.power_state.as_deref()))
@@ -1313,6 +1327,9 @@ impl Ctx {
             }
             AppCommand::SetTextSensor { object_id, state } => {
                 self.set_text_sensor(&object_id, state).await;
+            }
+            AppCommand::SetMediaPlayer { object_id, status } => {
+                self.set_app_media_player(&object_id, status).await;
             }
             AppCommand::ClearSelect { object_id } => self.clear_select(&object_id).await,
             AppCommand::SetSelectOptions { object_id, options } => {
@@ -1628,8 +1645,96 @@ impl Ctx {
         }
     }
 
-    /// `MediaPlayerCommandRequest`: stop, and the reply volume (set, step).
+    async fn set_app_media_player(&mut self, object_id: &str, status: PlayerStatus) {
+        let Some(i) = self
+            .cfg
+            .media_players
+            .iter()
+            .position(|mp| mp.object_id == object_id)
+        else {
+            log::warn!(
+                "esphome-api: SetMediaPlayer for unknown media player {object_id:?} ignored"
+            );
+            return;
+        };
+        if self.media_players[i] == Some(status) {
+            return;
+        }
+        self.media_players[i] = Some(status);
+        if let Err(err) = self.send_app_media_player_state(i).await {
+            self.close(&err.to_string());
+        }
+    }
+
+    async fn send_app_media_player_state(&mut self, i: usize) -> Result<(), FrameError> {
+        let Some(status) = &self.media_players[i] else {
+            return Ok(());
+        };
+        let msg = entities::app_media_player_state(&self.cfg.media_players[i], status);
+        match self.session.as_mut() {
+            Some(s) if s.states_subscribed => s.send(&msg).await,
+            _ => Ok(()),
+        }
+    }
+
+    /// `MediaPlayerCommandRequest`: routed by key. The built-in player (the
+    /// reply volume) handles stop and the volume; an application-owned one
+    /// reports the commands of its advertised features
+    /// ([`AppEvent::MediaPlayerCommand`]) and is not echoed. An unknown key is
+    /// ignored.
     async fn media_player_command(
+        &mut self,
+        c: &pb::MediaPlayerCommandRequest,
+    ) -> Result<(), FrameError> {
+        if c.key == entities::media_player_key() {
+            return self.satellite_media_player_command(c).await;
+        }
+        let Some(i) = self
+            .cfg
+            .media_players
+            .iter()
+            .position(|mp| entities::entity_key(&mp.object_id) == c.key)
+        else {
+            log::info!("esphome-api: media player command for an unknown entity ignored");
+            return Ok(());
+        };
+        let mp = &self.cfg.media_players[i];
+        if c.has_media_url {
+            log::info!(
+                "esphome-api: {}: media or announcement refused (this media player plays nothing)",
+                mp.object_id
+            );
+        }
+        let cmds = entities::app_media_player_commands(mp, c);
+        if cmds.is_empty() {
+            if !c.has_media_url {
+                log::info!(
+                    "esphome-api: {}: unsupported media player command ignored (command {}, volume {})",
+                    mp.object_id,
+                    if c.has_command {
+                        c.command.to_string()
+                    } else {
+                        "-".to_owned()
+                    },
+                    c.has_volume
+                );
+            }
+            // HA keeps what the application reported last.
+            return self.send_app_media_player_state(i).await;
+        }
+        let object_id = mp.object_id.clone();
+        for command in cmds {
+            log::info!("esphome-api: {object_id}: {command:?} by HA");
+            self.emit(AppEvent::MediaPlayerCommand {
+                object_id: object_id.clone(),
+                command,
+            });
+        }
+        Ok(())
+    }
+
+    /// The built-in player: stop, and the reply volume (set, step).
+    async fn satellite_media_player_command(
         &mut self,
         c: &pb::MediaPlayerCommandRequest,
     ) -> Result<(), FrameError> {

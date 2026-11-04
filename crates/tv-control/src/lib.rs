@@ -32,9 +32,11 @@ pub mod luna;
 pub mod setters;
 
 pub use controller::{
-    Action, Command, Config, ControlStatus, Controller, Effect, Level, PowerOffEnv,
+    Action, Command, Config, ControlStatus, Controller, Effect, Level, MediaAction, PowerOffEnv,
     PowerOffRefusal, PowerState, Purpose, Topic,
 };
-pub use entities::{Category, EntityDef, Kind, StateUpdate, StateValue};
+pub use entities::{
+    Category, EntityDef, Kind, MediaFeatures, MediaPower, MediaState, StateUpdate, StateValue,
+};
 pub use limits::Control;
 pub use setters::{Declared, Setter};

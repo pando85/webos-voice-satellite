@@ -2,16 +2,18 @@
 //! format selects HA's TTS/announcement format and whose volume is the reply
 //! volume), a "Mute microphone" switch and, optionally, a diagnostic "TV
 //! power state" text sensor, plus the application-defined `select`, `number`,
-//! `button` and `binary_sensor` entities from [`crate::Config`].
+//! `button`, `binary_sensor`, `switch`, `text_sensor` and control-only
+//! `media_player` entities from [`crate::Config`].
 //!
 //! Availability: the ESPHome API has no per-entity "unavailable". All entities
 //! become unavailable in HA while the device is disconnected; a number or
 //! binary sensor with no valid state is sent with `missing_state` (HA shows
 //! "unknown").
 
+use crate::app::{PlayerState, PlayerStatus};
 use crate::config::{
-    BinarySensorEntity, ButtonEntity, NumberEntity, Resolved, SelectEntity, SwitchEntity,
-    TextSensorEntity,
+    BinarySensorEntity, ButtonEntity, MediaPlayerEntity, NumberEntity, Resolved, SelectEntity,
+    SwitchEntity, TextSensorEntity,
 };
 use crate::proto::{
     BinarySensorStateResponse, EntityCategory, ListEntitiesBinarySensorResponse,
@@ -38,12 +40,43 @@ pub const FEATURE_VOLUME_SET: u32 = 1 << 2;
 pub const FEATURE_VOLUME_STEP: u32 = 1 << 10;
 /// `MediaPlayerEntityFeature.STOP`.
 pub const FEATURE_STOP: u32 = 1 << 12;
+/// `MediaPlayerEntityFeature.PAUSE`.
+pub const FEATURE_PAUSE: u32 = 1;
+/// `MediaPlayerEntityFeature.VOLUME_MUTE`: HA sends `MUTE`/`UNMUTE`.
+pub const FEATURE_VOLUME_MUTE: u32 = 1 << 3;
+/// `MediaPlayerEntityFeature.TURN_ON`: HA sends `TURN_ON`.
+pub const FEATURE_TURN_ON: u32 = 1 << 7;
+/// `MediaPlayerEntityFeature.TURN_OFF`: HA sends `TURN_OFF`.
+pub const FEATURE_TURN_OFF: u32 = 1 << 8;
+/// `MediaPlayerEntityFeature.PLAY_MEDIA` (never offered by an
+/// application-owned media player).
+pub const FEATURE_PLAY_MEDIA: u32 = 1 << 9;
+/// `MediaPlayerEntityFeature.PLAY`.
+pub const FEATURE_PLAY: u32 = 1 << 14;
+/// `MediaPlayerEntityFeature.MEDIA_ANNOUNCE` (never offered by an
+/// application-owned media player).
+pub const FEATURE_MEDIA_ANNOUNCE: u32 = 1 << 20;
 
 /// The media player features offered: stop and the reply volume (set and
 /// step). HA 2026.10.4 takes the entity's features from these flags
 /// (`feature_flags_compat` for API 1.14). play_media and mute are not
 /// implemented.
 pub const MEDIA_PLAYER_FEATURES: u32 = FEATURE_STOP | FEATURE_VOLUME_SET | FEATURE_VOLUME_STEP;
+
+/// The features an application-owned media player
+/// ([`crate::MediaPlayerEntity`]) may advertise: controls only. No
+/// `PLAY_MEDIA`, `MEDIA_ANNOUNCE`, `BROWSE_MEDIA` or `MEDIA_ENQUEUE`, so HA
+/// never sends it media or announcements. `SELECT_SOURCE` is not offered
+/// either: the ESPHome API has no source list and HA 2026.10.4's ESPHome
+/// platform drops the flag (`_UNSUPPORTED_FEATURES`).
+pub const APP_MEDIA_PLAYER_FEATURES: u32 = FEATURE_PAUSE
+    | FEATURE_VOLUME_SET
+    | FEATURE_VOLUME_MUTE
+    | FEATURE_TURN_ON
+    | FEATURE_TURN_OFF
+    | FEATURE_VOLUME_STEP
+    | FEATURE_STOP
+    | FEATURE_PLAY;
 
 /// Reply volume change for one `VOLUME_UP`/`VOLUME_DOWN`, in percent.
 pub const VOLUME_STEP_PERCENT: u8 = 5;
@@ -301,6 +334,79 @@ pub(crate) fn media_player_state(
     }
 }
 
+/// An application-owned media player: no audio format (HA never picks it
+/// for TTS or proxied announcement media), its control features only.
+pub(crate) fn list_app_media_player(mp: &MediaPlayerEntity) -> ListEntitiesMediaPlayerResponse {
+    ListEntitiesMediaPlayerResponse {
+        object_id: mp.object_id.clone(),
+        key: entity_key(&mp.object_id),
+        name: mp.name.clone(),
+        icon: mp.icon.clone(),
+        entity_category: mp.entity_category as i32,
+        supported_formats: Vec::new(),
+        feature_flags: mp.feature_flags & APP_MEDIA_PLAYER_FEATURES,
+        ..Default::default()
+    }
+}
+
+pub(crate) fn app_media_player_state(
+    mp: &MediaPlayerEntity,
+    status: &PlayerStatus,
+) -> MediaPlayerStateResponse {
+    MediaPlayerStateResponse {
+        key: entity_key(&mp.object_id),
+        state: match status.state {
+            PlayerState::Idle => MediaPlayerState::Idle,
+            PlayerState::Playing => MediaPlayerState::Playing,
+            PlayerState::Paused => MediaPlayerState::Paused,
+            PlayerState::On => MediaPlayerState::On,
+            PlayerState::Off => MediaPlayerState::Off,
+        } as i32,
+        // NaN: HA 2026.10.4 shows no volume level (`esphome_float_state_property`).
+        volume: status
+            .volume
+            .filter(|v| v.is_finite())
+            .map_or(f32::NAN, |v| v.clamp(0.0, 1.0)),
+        muted: status.muted,
+        ..Default::default()
+    }
+}
+
+/// The commands of a `MediaPlayerCommandRequest` for an application-owned
+/// media player, keeping only those of advertised features. A media URL
+/// (play media, announcement) is never a command here.
+pub(crate) fn app_media_player_commands(
+    mp: &MediaPlayerEntity,
+    c: &crate::proto::MediaPlayerCommandRequest,
+) -> Vec<crate::app::PlayerCommand> {
+    use crate::app::PlayerCommand as P;
+    use crate::proto::MediaPlayerCommand as M;
+    let has = |f: u32| mp.feature_flags & APP_MEDIA_PLAYER_FEATURES & f != 0;
+    let mut out = Vec::new();
+    if c.has_media_url {
+        return out;
+    }
+    if c.has_volume && has(FEATURE_VOLUME_SET) && c.volume.is_finite() {
+        out.push(P::SetVolume(c.volume.clamp(0.0, 1.0)));
+    }
+    if c.has_command {
+        let cmd = match M::try_from(c.command) {
+            Ok(M::VolumeUp) if has(FEATURE_VOLUME_STEP) => Some(P::VolumeUp),
+            Ok(M::VolumeDown) if has(FEATURE_VOLUME_STEP) => Some(P::VolumeDown),
+            Ok(M::Mute) if has(FEATURE_VOLUME_MUTE) => Some(P::Mute(true)),
+            Ok(M::Unmute) if has(FEATURE_VOLUME_MUTE) => Some(P::Mute(false)),
+            Ok(M::TurnOn) if has(FEATURE_TURN_ON) => Some(P::TurnOn),
+            Ok(M::TurnOff) if has(FEATURE_TURN_OFF) => Some(P::TurnOff),
+            Ok(M::Play) if has(FEATURE_PLAY) => Some(P::Play),
+            Ok(M::Pause) if has(FEATURE_PAUSE) => Some(P::Pause),
+            Ok(M::Stop) if has(FEATURE_STOP) => Some(P::Stop),
+            _ => None,
+        };
+        out.extend(cmd);
+    }
+    out
+}
+
 pub(crate) fn mute_state(muted: bool) -> SwitchStateResponse {
     SwitchStateResponse {
         key: mute_key(),
@@ -499,6 +605,134 @@ mod tests {
         );
         assert!(select_state(&sel, None).missing_state);
         assert!(!select_state(&sel, Some("A")).missing_state);
+    }
+
+    fn tv_player(flags: u32) -> MediaPlayerEntity {
+        MediaPlayerEntity {
+            object_id: "tv_media_player".to_owned(),
+            name: "TV".to_owned(),
+            icon: "mdi:television".to_owned(),
+            feature_flags: flags,
+            entity_category: EntityCategory::None,
+        }
+    }
+
+    #[test]
+    fn app_media_player_lists_no_format_and_control_features_only() {
+        let mp = tv_player(FEATURE_VOLUME_SET | FEATURE_VOLUME_MUTE | FEATURE_TURN_OFF);
+        let l = list_app_media_player(&mp);
+        assert_eq!(
+            (l.object_id.as_str(), l.key, l.name.as_str()),
+            ("tv_media_player", entity_key("tv_media_player"), "TV")
+        );
+        assert!(
+            l.supported_formats.is_empty(),
+            "never a TTS/announcement target"
+        );
+        assert_eq!(l.feature_flags, 4 | 8 | 256);
+        assert_eq!(
+            l.feature_flags & (FEATURE_PLAY_MEDIA | FEATURE_MEDIA_ANNOUNCE),
+            0
+        );
+        assert_ne!(
+            l.key,
+            media_player_key(),
+            "distinct from the satellite player"
+        );
+        // Even an unvalidated flag set is masked to the control features.
+        let l = list_app_media_player(&tv_player(FEATURE_PLAY_MEDIA | FEATURE_TURN_ON));
+        assert_eq!(l.feature_flags, FEATURE_TURN_ON);
+    }
+
+    #[test]
+    fn app_media_player_state_maps_state_volume_and_unknown_volume() {
+        let mp = tv_player(FEATURE_VOLUME_SET);
+        let st = |state, volume, muted| {
+            app_media_player_state(
+                &mp,
+                &PlayerStatus {
+                    state,
+                    volume,
+                    muted,
+                },
+            )
+        };
+        let s = st(PlayerState::On, Some(0.2), true);
+        assert_eq!(s.key, entity_key("tv_media_player"));
+        assert_eq!(s.state, MediaPlayerState::On as i32);
+        assert!((s.volume - 0.2).abs() < 1e-6 && s.muted);
+        assert_eq!(
+            st(PlayerState::Off, None, false).state,
+            MediaPlayerState::Off as i32
+        );
+        assert!(st(PlayerState::Off, None, false).volume.is_nan());
+        assert!(
+            st(PlayerState::On, Some(f32::INFINITY), false)
+                .volume
+                .is_nan()
+        );
+        assert!((st(PlayerState::Playing, Some(3.0), false).volume - 1.0).abs() < 1e-6);
+        for (p, m) in [
+            (PlayerState::Idle, MediaPlayerState::Idle),
+            (PlayerState::Playing, MediaPlayerState::Playing),
+            (PlayerState::Paused, MediaPlayerState::Paused),
+        ] {
+            assert_eq!(st(p, None, false).state, m as i32);
+        }
+    }
+
+    #[test]
+    fn app_media_player_commands_follow_the_advertised_features() {
+        use crate::app::PlayerCommand as P;
+        use crate::proto::{MediaPlayerCommand as M, MediaPlayerCommandRequest as Req};
+        let cmd = |c: M| Req {
+            key: entity_key("tv_media_player"),
+            has_command: true,
+            command: c as i32,
+            ..Default::default()
+        };
+        let vol = |v: f32| Req {
+            key: entity_key("tv_media_player"),
+            has_volume: true,
+            volume: v,
+            ..Default::default()
+        };
+        let all = tv_player(
+            FEATURE_VOLUME_SET
+                | FEATURE_VOLUME_STEP
+                | FEATURE_VOLUME_MUTE
+                | FEATURE_TURN_ON
+                | FEATURE_TURN_OFF,
+        );
+        let got = |mp: &MediaPlayerEntity, r: &Req| app_media_player_commands(mp, r);
+        assert_eq!(got(&all, &vol(0.25)), [P::SetVolume(0.25)]);
+        assert_eq!(got(&all, &vol(1.5)), [P::SetVolume(1.0)]);
+        assert!(got(&all, &vol(f32::NAN)).is_empty());
+        assert_eq!(got(&all, &cmd(M::VolumeUp)), [P::VolumeUp]);
+        assert_eq!(got(&all, &cmd(M::VolumeDown)), [P::VolumeDown]);
+        assert_eq!(got(&all, &cmd(M::Mute)), [P::Mute(true)]);
+        assert_eq!(got(&all, &cmd(M::Unmute)), [P::Mute(false)]);
+        assert_eq!(got(&all, &cmd(M::TurnOn)), [P::TurnOn]);
+        assert_eq!(got(&all, &cmd(M::TurnOff)), [P::TurnOff]);
+        // Not advertised: dropped.
+        for m in [M::Play, M::Pause, M::Stop, M::Toggle, M::Enqueue] {
+            assert!(got(&all, &cmd(m)).is_empty(), "{m:?}");
+        }
+        let none = tv_player(0);
+        assert!(got(&none, &vol(0.5)).is_empty());
+        assert!(got(&none, &cmd(M::Mute)).is_empty());
+        // A media URL (play_media / announcement) is never acted on.
+        let media = Req {
+            key: entity_key("tv_media_player"),
+            has_media_url: true,
+            media_url: "http://h/a.flac".to_owned(),
+            has_announcement: true,
+            announcement: true,
+            has_volume: true,
+            volume: 0.5,
+            ..Default::default()
+        };
+        assert!(got(&all, &media).is_empty());
     }
 
     #[test]

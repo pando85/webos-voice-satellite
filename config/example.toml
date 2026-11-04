@@ -235,6 +235,16 @@ input = true              # select "TV input" (the TV's external inputs)
 apps = true               # select "TV app" (launcher apps)
 app_limit = 30            # most apps in the "TV app" select
 play_state = false        # sensor "TV play state"
+# Media player "TV" (ADR 0007): the TV itself as a Home Assistant media player,
+# so HA's own voice intents work on it once you give it an alias ("turn down
+# the TV volume", "mute the TV", "turn off the TV"). Volume (share of the TV's
+# maxVolume), up/down (one TV step), mute, turn on (as "Turn on TV") and turn
+# off (the power-off above when it is on and the select is on "Keep listening",
+# otherwise the screen off) follow the switches above. It plays nothing: no
+# TTS, announcements or media go to it. Reads the play state every 10 s while
+# the TV is lit to show "playing". The satellite's own media player (the reply
+# volume) is a separate entity and does not change.
+media_player = true
 # Owner decision 2026-11-04: TV control is NOT gated by the firmware guard. On
 # a firmware that is not in safety.validated_firmware it keeps working and the
 # daemon logs a warning at startup (the microphone guard is separate). true

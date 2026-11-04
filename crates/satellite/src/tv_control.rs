@@ -18,15 +18,19 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
+use webos_esphome_api::entities::{
+    FEATURE_TURN_OFF, FEATURE_TURN_ON, FEATURE_VOLUME_MUTE, FEATURE_VOLUME_SET, FEATURE_VOLUME_STEP,
+};
 use webos_esphome_api::proto::{EntityCategory, NumberMode};
 use webos_esphome_api::{
-    AppCommand, AppEvent, ButtonEntity, NumberEntity, SelectEntity, SwitchEntity, TextSensorEntity,
+    AppCommand, AppEvent, ButtonEntity, MediaPlayerEntity, NumberEntity, PlayerCommand,
+    PlayerState, PlayerStatus, SelectEntity, SwitchEntity, TextSensorEntity,
 };
 use webos_tv_control::luna::MAX_REPLY_BYTES;
 use webos_tv_control::setters::{self, Setter};
 use webos_tv_control::{
-    Category, Command, Config, Controller, Effect, EntityDef, Kind, Level, PowerOffEnv, Purpose,
-    StateUpdate, StateValue, Topic,
+    Category, Command, Config, Controller, Effect, EntityDef, Kind, Level, MediaAction,
+    MediaFeatures, MediaPower, PowerOffEnv, Purpose, StateUpdate, StateValue, Topic,
 };
 
 use crate::config::Settings;
@@ -71,6 +75,7 @@ pub(crate) struct Entities {
     pub(crate) numbers: Vec<NumberEntity>,
     pub(crate) selects: Vec<SelectEntity>,
     pub(crate) text_sensors: Vec<TextSensorEntity>,
+    pub(crate) media_players: Vec<MediaPlayerEntity>,
 }
 
 impl Entities {
@@ -81,7 +86,23 @@ impl Entities {
         cfg.numbers.extend(self.numbers);
         cfg.selects.extend(self.selects);
         cfg.text_sensors.extend(self.text_sensors);
+        cfg.media_players.extend(self.media_players);
     }
+}
+
+/// HA's media player feature bits for the TV media player: controls only,
+/// never play media or announce (ADR 0007).
+pub(crate) fn media_feature_flags(f: MediaFeatures) -> u32 {
+    [
+        (f.volume_set, FEATURE_VOLUME_SET),
+        (f.volume_step, FEATURE_VOLUME_STEP),
+        (f.mute, FEATURE_VOLUME_MUTE),
+        (f.turn_on, FEATURE_TURN_ON),
+        (f.turn_off, FEATURE_TURN_OFF),
+    ]
+    .into_iter()
+    .filter(|(on, _)| *on)
+    .fold(0, |acc, (_, bit)| acc | bit)
 }
 
 fn category(c: Category) -> EntityCategory {
@@ -141,6 +162,13 @@ pub(crate) fn map_entities(defs: &[EntityDef]) -> Entities {
                 device_class: String::new(),
                 entity_category: category(d.category),
             }),
+            Kind::MediaPlayer { features } => out.media_players.push(MediaPlayerEntity {
+                object_id,
+                name,
+                icon,
+                feature_flags: media_feature_flags(*features),
+                entity_category: category(d.category),
+            }),
         }
     }
     out
@@ -155,6 +183,18 @@ pub(crate) fn state_command(u: StateUpdate) -> AppCommand {
         StateValue::Select(Some(option)) => AppCommand::SetSelect { object_id, option },
         StateValue::Select(None) => AppCommand::ClearSelect { object_id },
         StateValue::Text(state) => AppCommand::SetTextSensor { object_id, state },
+        StateValue::Media(m) => AppCommand::SetMediaPlayer {
+            object_id,
+            status: PlayerStatus {
+                state: match m.power {
+                    MediaPower::On => PlayerState::On,
+                    MediaPower::Playing => PlayerState::Playing,
+                    MediaPower::Off => PlayerState::Off,
+                },
+                volume: m.volume,
+                muted: m.muted,
+            },
+        },
     }
 }
 
@@ -186,6 +226,22 @@ pub(crate) fn command_for(ev: &AppEvent) -> Option<Command> {
                 id: object_id.clone(),
             })
         }
+        AppEvent::MediaPlayerCommand { object_id, command } if object_id.starts_with("tv_") => {
+            let action = match *command {
+                PlayerCommand::SetVolume(v) => MediaAction::SetVolume(v),
+                PlayerCommand::VolumeUp => MediaAction::VolumeUp,
+                PlayerCommand::VolumeDown => MediaAction::VolumeDown,
+                PlayerCommand::Mute(m) => MediaAction::Mute(m),
+                PlayerCommand::TurnOn => MediaAction::TurnOn,
+                PlayerCommand::TurnOff => MediaAction::TurnOff,
+                // Not advertised by the TV media player (no playback control).
+                PlayerCommand::Play | PlayerCommand::Pause | PlayerCommand::Stop => return None,
+            };
+            Some(Command::Media {
+                id: object_id.clone(),
+                action,
+            })
+        }
         _ => None,
     }
 }
@@ -205,6 +261,7 @@ pub(crate) fn controller_config(settings: &Settings, blocked: Option<String>) ->
         apps: t.apps,
         app_limit: t.app_limit as usize,
         play_state: t.play_state,
+        media_player: t.media_player,
         setters_blocked: blocked,
         own_app_ids: vec![OWN_APP_ID.to_owned()],
     }
@@ -596,12 +653,102 @@ esac
                 .iter()
                 .all(|t| t.entity_category == EntityCategory::Diagnostic)
         );
+        // The TV media player: controls only (volume set and step, mute,
+        // turn on and off), never play media or announce.
+        assert_eq!(ents.media_players.len(), 1);
+        let mp = &ents.media_players[0];
+        assert_eq!(
+            (mp.object_id.as_str(), mp.name.as_str(), mp.entity_category),
+            ("tv_media_player", "TV", EntityCategory::None)
+        );
+        assert_eq!(mp.feature_flags, 4 | 1024 | 8 | 128 | 256);
+        assert_eq!(
+            media_feature_flags(MediaFeatures {
+                mute: true,
+                ..MediaFeatures::default()
+            }),
+            FEATURE_VOLUME_MUTE
+        );
         // The server accepts the whole set (ids valid, no collisions).
         let mut esp = webos_esphome_api::Config::default();
         esp.power_sensor = true;
         esp.selects.push(crate::darken::select_entity());
         ents.add_to(&mut esp);
         esp.validate().unwrap();
+        assert_eq!(esp.media_players.len(), 1);
+    }
+
+    #[test]
+    fn the_media_player_state_and_commands_map_both_ways() {
+        let m = |power, volume, muted| {
+            state_command(StateUpdate {
+                id: e::TV_MEDIA_PLAYER,
+                value: StateValue::Media(webos_tv_control::MediaState {
+                    power,
+                    volume,
+                    muted,
+                }),
+            })
+        };
+        assert_eq!(
+            m(MediaPower::Playing, Some(0.2), true),
+            AppCommand::SetMediaPlayer {
+                object_id: "tv_media_player".into(),
+                status: PlayerStatus {
+                    state: PlayerState::Playing,
+                    volume: Some(0.2),
+                    muted: true
+                }
+            }
+        );
+        for (p, s) in [
+            (MediaPower::On, PlayerState::On),
+            (MediaPower::Off, PlayerState::Off),
+        ] {
+            assert!(matches!(
+                m(p, None, false),
+                AppCommand::SetMediaPlayer { status, .. } if status.state == s && status.volume.is_none()
+            ));
+        }
+        let ev = |command| AppEvent::MediaPlayerCommand {
+            object_id: "tv_media_player".into(),
+            command,
+        };
+        for (c, a) in [
+            (PlayerCommand::SetVolume(0.5), MediaAction::SetVolume(0.5)),
+            (PlayerCommand::VolumeUp, MediaAction::VolumeUp),
+            (PlayerCommand::VolumeDown, MediaAction::VolumeDown),
+            (PlayerCommand::Mute(true), MediaAction::Mute(true)),
+            (PlayerCommand::Mute(false), MediaAction::Mute(false)),
+            (PlayerCommand::TurnOn, MediaAction::TurnOn),
+            (PlayerCommand::TurnOff, MediaAction::TurnOff),
+        ] {
+            assert_eq!(
+                command_for(&ev(c)),
+                Some(Command::Media {
+                    id: "tv_media_player".into(),
+                    action: a
+                })
+            );
+        }
+        for c in [
+            PlayerCommand::Play,
+            PlayerCommand::Pause,
+            PlayerCommand::Stop,
+        ] {
+            assert!(command_for(&ev(c)).is_none());
+        }
+        // Not a TV control media player.
+        assert!(
+            command_for(&AppEvent::MediaPlayerCommand {
+                object_id: "other".into(),
+                command: PlayerCommand::TurnOff
+            })
+            .is_none()
+        );
+        // The satellite's own media player events are not TV control.
+        assert!(command_for(&AppEvent::VolumeChanged(30)).is_none());
+        assert!(command_for(&AppEvent::MediaStop).is_none());
     }
 
     #[test]
@@ -786,6 +933,16 @@ esac
             object_id: "tv_app".into(),
             option: "App A".into()
         }));
+        // The TV media player: on (the fake reports no playState), 12 of 60.
+        assert!(out.commands.contains(&AppCommand::SetMediaPlayer {
+            object_id: "tv_media_player".into(),
+            status: PlayerStatus {
+                state: PlayerState::On,
+                volume: Some(0.2),
+                muted: false
+            }
+        }));
+        assert_eq!(st.entities.media_players.len(), 1);
         // Subscription children run and their first lines come back as messages.
         let mut got = 0;
         while got < 2 {
@@ -875,6 +1032,48 @@ esac
         assert!(set_seen);
         assert!(
             calls(&d).contains(r#"luna://com.webos.service.audio/master/setVolume {"volume":20}"#),
+            "{}",
+            calls(&d)
+        );
+        st.tv.shutdown().await;
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_media_player_command_runs_the_same_setter() {
+        let d = tempdir("mp");
+        let luna = fake_luna(&d, false);
+        let mut st = start(&all_on(), luna, None, &d.join("no-declarations")).await;
+        let fx = std::mem::take(&mut st.effects);
+        st.tv.exec(fx);
+        // Half of maxVolume (60): setVolume 30, after the coalescing delay.
+        let out = st
+            .tv
+            .on_event(&AppEvent::MediaPlayerCommand {
+                object_id: "tv_media_player".into(),
+                command: PlayerCommand::SetVolume(0.5),
+            })
+            .unwrap();
+        assert!(out.commands.is_empty(), "not echoed");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        st.tv.tick(PowerOffEnv::default());
+        let mut set_seen = false;
+        for _ in 0..20 {
+            let m = tokio::time::timeout(Duration::from_secs(5), st.rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            if matches!(&m, TvMsg::Reply(Purpose::Set(_), _)) {
+                set_seen = true;
+            }
+            st.tv.on_msg(m);
+            if set_seen {
+                break;
+            }
+        }
+        assert!(set_seen);
+        assert!(
+            calls(&d).contains(r#"luna://com.webos.service.audio/master/setVolume {"volume":30}"#),
             "{}",
             calls(&d)
         );

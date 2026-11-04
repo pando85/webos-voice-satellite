@@ -1,6 +1,6 @@
 # ADR 0005: TV control from Home Assistant through separate satellite entities
 
-- **Status:** Accepted (2026-11-04, owner)
+- **Status:** Accepted (2026-11-04, owner). **Decision 3 amended by [ADR 0007](0007-tv-media-player.md)** (same day, owner): a control-only TV `media_player` is added next to the separate entities, so HA's built-in volume, mute and turn on/off intents reach the TV.
 - **Scope:** whether and how the satellite exposes TV controls (power, screen, volume, mute, input, apps) to Home Assistant. Design: [TV control](../design/tv-control.md). Not implemented; setters untested ([EXP-010](../experiments/EXP-010-tv-control-setters.md)).
 - **Related:** [ADR 0001](0001-esphome-native-api.md), [backlog #11](../project/backlog.md#11-tv-control-from-home-assistant-via-the-satellite), [always-on design](../design/always-on.md)
 
@@ -16,7 +16,7 @@
 
 1. **Complement HA's `webostv` integration, do not replace it.** The satellite adds no-pairing, standby-aware and voice-friendly control; owners may run both.
 2. **v1 controls:** power and screen, TV volume and mute, input selection, app launch. **No toasts or notifications in v1.**
-3. **Separate entities** (`switch`, `number`, `select`, `button`, sensors), not a TV `media_player`. The existing media player stays the reply volume.
+3. **Separate entities** (`switch`, `number`, `select`, `button`, sensors), not a TV `media_player`. The existing media player stays the reply volume. *(Amended 2026-11-04 by [ADR 0007](0007-tv-media-player.md): the separate entities and the reply-volume player stay, and a second, control-only media player "TV" is added; HA's Spanish volume and mute intents only target media players, [P4](../discovery/c3-b/P4-sound-session.md).)*
 4. **Power-off only into a state where the satellite keeps running, only when enabled.** An HA power-off sends the remote's power key and relies on the always-on mode "Keep listening (screen off)" (wake and darken) to end in `Screen Off`. It is opt-in (`[tv_control] power_off`, default off), not listed when off, and refused unless the always-on mode is selected and the darkener would act. No real Suspend power-off from HA.
 5. **Listening indicator as HA entities only:** truthful `listening` and `microphone_muted` binary sensors tied to the real capture PCM state. No on-TV indicator.
 
@@ -34,7 +34,7 @@ Also decided by the owner on 2026-11-04: the audible timer and announcement chec
 ## Alternatives considered
 
 - **Replace `webostv`:** would duplicate a maintained integration and its media features; the satellite's advantage is only standby and pairing.
-- **One TV `media_player`:** clashes with the reply-volume media player, and its single state mixes power, input and volume.
+- **One TV `media_player`:** clashes with the reply-volume media player, and its single state mixes power, input and volume. (Revisited in [ADR 0007](0007-tv-media-player.md): added as a second, control-only player with its own key, in addition to the separate entities.)
 - **Real power-off (key without the always-on mode, or `tvpower/power/powerOff`):** the satellite is frozen in Suspend or cannot reply in `Active Standby`.
 - **Power-off as `turnOffScreen`:** keeps the running app's sound playing; kept as the separate screen switch.
 - **Toasts and an on-TV listening indicator:** deferred by the owner; no controllable status LED exists.

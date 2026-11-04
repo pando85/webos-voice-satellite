@@ -16,6 +16,63 @@ pub enum PipelineMode {
     PushToTalk,
 }
 
+/// The state of an application-owned media player
+/// ([`crate::MediaPlayerEntity`]). HA 2026.10.4 maps only these five
+/// (`esphome/media_player.py` `_STATES`); `NONE` and `ANNOUNCING` would raise
+/// a `KeyError` there, so they cannot be sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlayerState {
+    /// Idle.
+    Idle,
+    /// Playing.
+    Playing,
+    /// Paused.
+    Paused,
+    /// On (HA's `on`: powered, nothing known about playback).
+    On,
+    /// Off.
+    Off,
+}
+
+/// What an application-owned media player reports
+/// ([`AppCommand::SetMediaPlayer`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PlayerStatus {
+    /// The state.
+    pub state: PlayerState,
+    /// Volume from 0.0 to 1.0 (clamped); `None` when not known (sent as NaN,
+    /// which HA 2026.10.4 shows as no volume level).
+    pub volume: Option<f32>,
+    /// Muted. The protocol has no "unknown" here: send `false` when not known.
+    pub muted: bool,
+}
+
+/// A command from HA to an application-owned media player
+/// ([`AppEvent::MediaPlayerCommand`]). Only commands of the features the
+/// entity advertises are reported.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PlayerCommand {
+    /// Set the volume (0.0 to 1.0, already clamped; `VOLUME_SET`).
+    SetVolume(f32),
+    /// One volume step up (`VOLUME_STEP`). The step size is the
+    /// application's.
+    VolumeUp,
+    /// One volume step down (`VOLUME_STEP`).
+    VolumeDown,
+    /// Mute (`true`) or unmute (`VOLUME_MUTE`).
+    Mute(bool),
+    /// Turn on (`TURN_ON`).
+    TurnOn,
+    /// Turn off (`TURN_OFF`).
+    TurnOff,
+    /// Play (`PLAY`).
+    Play,
+    /// Pause (`PAUSE`).
+    Pause,
+    /// Stop (`STOP`).
+    Stop,
+}
+
 /// Pairing (HA-driven key provisioning, [`crate::pairing`]) changes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -167,6 +224,15 @@ pub enum AppEvent {
         object_id: String,
         /// The value HA asked for.
         value: f32,
+    },
+    /// HA sent a command to an application-owned media player
+    /// ([`crate::Config::media_players`]). Not echoed: the application acts
+    /// and reports the resulting state with [`AppCommand::SetMediaPlayer`].
+    MediaPlayerCommand {
+        /// The media player's object id.
+        object_id: String,
+        /// What HA asked for.
+        command: PlayerCommand,
     },
     /// HA pressed a button entity ([`crate::Config::buttons`]).
     ButtonPressed {
@@ -329,9 +395,20 @@ pub enum AppCommand {
         /// The state, or `None` for unknown.
         state: Option<bool>,
     },
+    /// The state of an application-owned media player
+    /// ([`crate::Config::media_players`]). Sent to HA on a change and again
+    /// when HA connects or resubscribes; an unchanged state is not repeated.
+    /// There is no way back to "unknown" once a state was sent.
+    SetMediaPlayer {
+        /// The media player's object id.
+        object_id: String,
+        /// The state.
+        status: PlayerStatus,
+    },
 }
 
 impl fmt::Debug for AppEvent {
+    #[allow(clippy::too_many_lines)] // one arm per event
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::HaConnected { client_info, peer } => f
@@ -408,6 +485,11 @@ impl fmt::Debug for AppEvent {
                 .field("object_id", object_id)
                 .field("value", value)
                 .finish(),
+            Self::MediaPlayerCommand { object_id, command } => f
+                .debug_struct("MediaPlayerCommand")
+                .field("object_id", object_id)
+                .field("command", command)
+                .finish(),
             Self::ButtonPressed { object_id } => f
                 .debug_struct("ButtonPressed")
                 .field("object_id", object_id)
@@ -474,6 +556,11 @@ impl fmt::Debug for AppCommand {
                 .debug_struct("SetBinarySensor")
                 .field("object_id", object_id)
                 .field("state", state)
+                .finish(),
+            Self::SetMediaPlayer { object_id, status } => f
+                .debug_struct("SetMediaPlayer")
+                .field("object_id", object_id)
+                .field("status", status)
                 .finish(),
             Self::SetSwitch { object_id, state } => f
                 .debug_struct("SetSwitch")

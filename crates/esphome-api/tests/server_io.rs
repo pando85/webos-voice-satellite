@@ -423,6 +423,194 @@ async fn reply_volume_on_the_media_player() {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn two_media_players_are_listed_and_routed_by_key() {
+    use webos_esphome_api::entities::{
+        self as ents, FEATURE_TURN_OFF, FEATURE_TURN_ON, FEATURE_VOLUME_MUTE, FEATURE_VOLUME_SET,
+        FEATURE_VOLUME_STEP,
+    };
+    use webos_esphome_api::{MediaPlayerEntity, PlayerCommand, PlayerState, PlayerStatus};
+    let flags = FEATURE_VOLUME_SET
+        | FEATURE_VOLUME_STEP
+        | FEATURE_VOLUME_MUTE
+        | FEATURE_TURN_ON
+        | FEATURE_TURN_OFF;
+    let mut cfg = plain_cfg();
+    cfg.media_players.push(MediaPlayerEntity {
+        object_id: "tv_media_player".into(),
+        name: "TV".into(),
+        icon: "mdi:television".into(),
+        feature_flags: flags,
+        entity_category: pb::EntityCategory::None,
+    });
+    let (port, mut events, cmds) = start_cfg(cfg).await;
+    cmds.send(AppCommand::SetVolume(40)).await.unwrap();
+    let mut c = connect_plain(port).await;
+    c.send(&pb::ListEntitiesRequest {}).await;
+    let sat: pb::ListEntitiesMediaPlayerResponse = c.recv_as().await;
+    let tv: pb::ListEntitiesMediaPlayerResponse = c.recv_as().await;
+    // The satellite player is unchanged: same object id, key, format, features.
+    assert_eq!(sat.object_id, "media_player");
+    assert_eq!(sat.key, ents::entity_key("media_player"));
+    assert_eq!(sat.feature_flags, ents::MEDIA_PLAYER_FEATURES);
+    assert_eq!(sat.supported_formats.len(), 1);
+    // The TV player: own key, no format, controls only.
+    assert_eq!(
+        (tv.object_id.as_str(), tv.name.as_str()),
+        ("tv_media_player", "TV")
+    );
+    assert_eq!(tv.key, ents::entity_key("tv_media_player"));
+    assert_ne!(tv.key, sat.key);
+    assert_eq!(tv.supported_formats.len(), 0, "no audio format");
+    assert_eq!(tv.feature_flags, flags);
+
+    // States: the TV player has none until the application sends one.
+    c.send(&pb::SubscribeStatesRequest {}).await;
+    let st: pb::MediaPlayerStateResponse = c.recv_as().await;
+    assert_eq!(st.key, sat.key);
+    c.send(&pb::PingRequest {}).await;
+    loop {
+        let m = c.recv().await;
+        assert_ne!(
+            m.type_id,
+            pb::MediaPlayerStateResponse::ID,
+            "no TV player state before the application sent one"
+        );
+        if m.type_id == pb::PingResponse::ID {
+            break;
+        }
+    }
+    let on = PlayerStatus {
+        state: PlayerState::On,
+        volume: Some(0.2),
+        muted: false,
+    };
+    for status in [on, on] {
+        cmds.send(AppCommand::SetMediaPlayer {
+            object_id: "tv_media_player".into(),
+            status,
+        })
+        .await
+        .unwrap();
+    }
+    cmds.send(AppCommand::SetMediaPlayer {
+        object_id: "tv_media_player".into(),
+        status: PlayerStatus {
+            state: PlayerState::Off,
+            volume: None,
+            muted: true,
+        },
+    })
+    .await
+    .unwrap();
+    let st: pb::MediaPlayerStateResponse = c.recv_as().await;
+    assert_eq!(
+        (st.key, st.state),
+        (tv.key, pb::MediaPlayerState::On as i32)
+    );
+    assert!((st.volume - 0.2).abs() < 1e-6 && !st.muted);
+    let st: pb::MediaPlayerStateResponse = c.recv_as().await;
+    assert_eq!(
+        (st.key, st.state),
+        (tv.key, pb::MediaPlayerState::Off as i32),
+        "no duplicate of an unchanged state"
+    );
+    assert!(st.volume.is_nan() && st.muted);
+
+    // Commands to the TV player become events and are not echoed.
+    let send = |key: u32, cmd: Option<pb::MediaPlayerCommand>, vol: Option<f32>| {
+        pb::MediaPlayerCommandRequest {
+            key,
+            has_command: cmd.is_some(),
+            command: cmd.map_or(0, |c| c as i32),
+            has_volume: vol.is_some(),
+            volume: vol.unwrap_or_default(),
+            ..Default::default()
+        }
+    };
+    for (cmd, vol, want) in [
+        (None, Some(0.5), PlayerCommand::SetVolume(0.5)),
+        (
+            Some(pb::MediaPlayerCommand::VolumeUp),
+            None,
+            PlayerCommand::VolumeUp,
+        ),
+        (
+            Some(pb::MediaPlayerCommand::Mute),
+            None,
+            PlayerCommand::Mute(true),
+        ),
+        (
+            Some(pb::MediaPlayerCommand::Unmute),
+            None,
+            PlayerCommand::Mute(false),
+        ),
+        (
+            Some(pb::MediaPlayerCommand::TurnOff),
+            None,
+            PlayerCommand::TurnOff,
+        ),
+        (
+            Some(pb::MediaPlayerCommand::TurnOn),
+            None,
+            PlayerCommand::TurnOn,
+        ),
+    ] {
+        c.send(&send(tv.key, cmd, vol)).await;
+        assert_eq!(
+            next_event(&mut events).await,
+            AppEvent::MediaPlayerCommand {
+                object_id: "tv_media_player".into(),
+                command: want
+            }
+        );
+    }
+    // Play media / an announcement to the TV player and a stop (not
+    // advertised): no event, the last state is sent again.
+    c.send(&pb::MediaPlayerCommandRequest {
+        key: tv.key,
+        has_media_url: true,
+        media_url: "http://h/a.flac".into(),
+        has_announcement: true,
+        announcement: true,
+        ..Default::default()
+    })
+    .await;
+    let st: pb::MediaPlayerStateResponse = c.recv_as().await;
+    assert_eq!(st.key, tv.key);
+    c.send(&send(tv.key, Some(pb::MediaPlayerCommand::Stop), None))
+        .await;
+    let st: pb::MediaPlayerStateResponse = c.recv_as().await;
+    assert_eq!(st.key, tv.key);
+
+    // The satellite player's volume still works and only it moves; its stop
+    // is MediaStop, never a TV command.
+    c.send(&send(sat.key, None, Some(0.3))).await;
+    let st: pb::MediaPlayerStateResponse = c.recv_as().await;
+    assert_eq!(st.key, sat.key);
+    assert!((st.volume - 0.3).abs() < 1e-6);
+    assert_eq!(next_event(&mut events).await, AppEvent::VolumeChanged(30));
+    c.send(&send(sat.key, Some(pb::MediaPlayerCommand::Stop), None))
+        .await;
+    assert_eq!(next_event(&mut events).await, AppEvent::MediaStop);
+    // An unknown key does nothing.
+    c.send(&send(777, Some(pb::MediaPlayerCommand::TurnOff), None))
+        .await;
+    c.send(&pb::PingRequest {}).await;
+    let _: pb::PingResponse = c.recv_as().await;
+    assert!(events.try_recv().is_err(), "unknown key: no event");
+
+    // A reconnect gets both states again.
+    drop(c);
+    let mut c = connect_plain(port).await;
+    c.send(&pb::SubscribeStatesRequest {}).await;
+    let a: pb::MediaPlayerStateResponse = c.recv_as().await;
+    let b: pb::MediaPlayerStateResponse = c.recv_as().await;
+    assert_eq!((a.key, b.key), (sat.key, tv.key));
+    assert_eq!(b.state, pb::MediaPlayerState::Off as i32);
+}
+
+#[tokio::test]
 async fn power_sensor_and_select_entities() {
     let mut cfg = plain_cfg();
     cfg.power_sensor = true;

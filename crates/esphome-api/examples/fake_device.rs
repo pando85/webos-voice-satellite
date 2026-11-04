@@ -17,8 +17,9 @@
 //! microphone delivers audio or not, as a busy PCM does; `--no-capture`: not
 //! at start), `pair` (open the window),
 //! `reset-pairing`, `number VALUE|unknown`, `binary on|off|unknown`,
-//! `switch on|off|unknown`, `text VALUE|unknown`, `select OPTION|unknown` and
-//! `options A,B,C` (states and options of the `--demo-entities`), `quit`. Log level: `FAKE_DEVICE_LOG=info|debug|trace`.
+//! `switch on|off|unknown`, `text VALUE|unknown`, `select OPTION|unknown`,
+//! `options A,B,C` and `mp on|off|playing VOLUME|unknown muted|unmuted`
+//! (states and options of the `--demo-entities`), `quit`. Log level: `FAKE_DEVICE_LOG=info|debug|trace`.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -27,11 +28,36 @@ use std::time::Duration;
 
 use tokio::io::AsyncBufReadExt as _;
 use tokio::sync::mpsc;
+use webos_esphome_api::entities::{
+    FEATURE_TURN_OFF, FEATURE_TURN_ON, FEATURE_VOLUME_MUTE, FEATURE_VOLUME_SET, FEATURE_VOLUME_STEP,
+};
 use webos_esphome_api::proto::{EntityCategory, NumberMode};
 use webos_esphome_api::{
-    AppCommand, AppEvent, BinarySensorEntity, ButtonEntity, Config, NumberEntity, PipelineMode,
-    Provisioning, SelectEntity, Server, SwitchEntity, TextSensorEntity,
+    AppCommand, AppEvent, BinarySensorEntity, ButtonEntity, Config, MediaPlayerEntity,
+    NumberEntity, PipelineMode, PlayerState, PlayerStatus, Provisioning, SelectEntity, Server,
+    SwitchEntity, TextSensorEntity,
 };
+
+/// `mp on|off|playing VOLUME|unknown muted|unmuted`.
+fn parse_mp(args: &str) -> Option<PlayerStatus> {
+    let mut it = args.split_whitespace();
+    let state = match it.next()? {
+        "on" => PlayerState::On,
+        "off" => PlayerState::Off,
+        "playing" => PlayerState::Playing,
+        _ => return None,
+    };
+    let volume = match it.next()? {
+        "unknown" => None,
+        v => Some(v.parse().ok()?),
+    };
+    let muted = it.next()? == "muted";
+    Some(PlayerStatus {
+        state,
+        volume,
+        muted,
+    })
+}
 
 /// A number, two buttons and two binary sensors, to exercise the generic
 /// entity types from the fake-HA harness (the ids mirror TV control).
@@ -90,6 +116,17 @@ fn add_demo_entities(cfg: &mut Config) {
         icon: String::new(),
         device_class: "running".to_owned(),
         entity_category: EntityCategory::Diagnostic,
+    });
+    cfg.media_players.push(MediaPlayerEntity {
+        object_id: "demo_tv".to_owned(),
+        name: "TV".to_owned(),
+        icon: "mdi:television".to_owned(),
+        feature_flags: FEATURE_VOLUME_SET
+            | FEATURE_VOLUME_STEP
+            | FEATURE_VOLUME_MUTE
+            | FEATURE_TURN_ON
+            | FEATURE_TURN_OFF,
+        entity_category: EntityCategory::None,
     });
 }
 
@@ -312,6 +349,16 @@ async fn main() {
                         .map(|o| o.trim().to_owned())
                         .collect(),
                 },
+                other if other.starts_with("mp ") => {
+                    let Some(status) = parse_mp(&other["mp ".len()..]) else {
+                        eprintln!("bad mp command {other}");
+                        continue;
+                    };
+                    AppCommand::SetMediaPlayer {
+                        object_id: "demo_tv".to_owned(),
+                        status,
+                    }
+                }
                 other if other.starts_with("binary ") => AppCommand::SetBinarySensor {
                     object_id: "demo_state".to_owned(),
                     state: match other["binary ".len()..].trim() {

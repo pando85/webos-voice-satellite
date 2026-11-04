@@ -403,6 +403,13 @@ pub(crate) struct TvControlSection {
     pub(crate) app_limit: u32,
     /// `tv_play_state` sensor.
     pub(crate) play_state: bool,
+    /// `tv_media_player`: the TV as a media player in Home Assistant (ADR
+    /// 0007), so HA's own volume, mute and turn on/off voice intents work.
+    /// Its features follow `volume`, `mute`, `power_on` and `screen` or
+    /// `power_off`; it polls the play state (every 10 s while the TV is lit)
+    /// to show `playing`. The satellite's own media player (the reply
+    /// volume) is a different entity and is unchanged.
+    pub(crate) media_player: bool,
     /// Refuse the TV control setters on firmware that is not in
     /// `safety.validated_firmware` (sensors and states still report). Default
     /// false: **owner decision 2026-11-04, TV control is not gated by the
@@ -414,8 +421,9 @@ pub(crate) struct TvControlSection {
 impl Default for TvControlSection {
     /// Screen and power-on on, power-off off (opt-in), volume, mute, input and
     /// apps on (EXP-010 Part A passed on c3-b, 2026-11-04; each control is
-    /// still checked per TV at startup), play state off, firmware guard not
-    /// followed (owner decision 2026-11-04).
+    /// still checked per TV at startup), play state off, the TV media player
+    /// on (owner decision 2026-11-04, ADR 0007), firmware guard not followed
+    /// (owner decision 2026-11-04).
     fn default() -> Self {
         Self {
             enabled: true,
@@ -429,6 +437,7 @@ impl Default for TvControlSection {
             apps: true,
             app_limit: 30,
             play_state: false,
+            media_player: true,
             follow_firmware_guard: false,
         }
     }
@@ -1468,6 +1477,7 @@ impl Settings {
             (t.input, "input"),
             (t.apps, "apps"),
             (t.play_state, "play_state"),
+            (t.media_player, "media_player"),
         ] {
             if flag {
                 on.push(name);
@@ -2012,15 +2022,17 @@ level = "debug"
         assert!(def.enabled && def.screen && def.power_on && !def.follow_firmware_guard);
         assert!(def.volume && def.mute && def.input && def.apps);
         assert!(!def.power_off && !def.play_state);
+        assert!(def.media_player, "the TV media player is on (ADR 0007)");
         assert_eq!((def.volume_limit, def.app_limit), (None, 30));
         let s = Settings::from_toml(
-            "[tv_control]\nenabled = true\nscreen = false\npower_off = true\nvolume = true\nvolume_limit = 25\nmute = true\ninput = true\napps = true\napp_limit = 12\nplay_state = true\nfollow_firmware_guard = false\n",
+            "[tv_control]\nenabled = true\nscreen = false\npower_off = true\nvolume = true\nvolume_limit = 25\nmute = true\ninput = true\napps = true\napp_limit = 12\nplay_state = true\nmedia_player = false\nfollow_firmware_guard = false\n",
             base,
         )
         .unwrap();
         let tvc = &s.tv_control;
         assert!(
             !tvc.screen
+                && !tvc.media_player
                 && tvc.power_off
                 && tvc.volume
                 && tvc.mute
@@ -2079,7 +2091,7 @@ level = "debug"
         let s = Settings::default();
         assert!(
             s.summary()
-                .contains("tv_control=[on=screen,power_on,volume,mute,input,apps volume_limit=tv-max app_limit=30 firmware_guard=false]"),
+                .contains("tv_control=[on=screen,power_on,volume,mute,input,apps,media_player volume_limit=tv-max app_limit=30 firmware_guard=false]"),
             "{}",
             s.summary()
         );

@@ -46,6 +46,12 @@
 //!   switch are not echoed: HA shows what the application reports.
 //!   [`AppCommand::SetSelectOptions`] changes a select's options at run time
 //!   (the HA connection is closed so HA lists the entities again).
+//!   Application-owned, control-only media players
+//!   ([`Config::media_players`], for example the TV itself) are listed after
+//!   the built-in one with their own keys: no audio format, no play media or
+//!   announce feature; commands arrive as [`AppEvent::MediaPlayerCommand`]
+//!   and states go out with [`AppCommand::SetMediaPlayer`]. The built-in
+//!   media player keeps its object id `media_player` and key.
 //!
 //! # Usage
 //!
@@ -133,10 +139,12 @@ pub mod timers;
 pub mod varint;
 mod voice;
 
-pub use app::{AppCommand, AppEvent, PairingEvent, PipelineMode};
+pub use app::{
+    AppCommand, AppEvent, PairingEvent, PipelineMode, PlayerCommand, PlayerState, PlayerStatus,
+};
 pub use config::{
-    AudioFormat, BinarySensorEntity, ButtonEntity, Config, ConfigError, Mac, NumberEntity,
-    SelectEntity, SwitchEntity, TextSensorEntity, features,
+    AudioFormat, BinarySensorEntity, ButtonEntity, Config, ConfigError, Mac, MediaPlayerEntity,
+    NumberEntity, SelectEntity, SwitchEntity, TextSensorEntity, features,
 };
 pub use frame::{NOISE_PREAMBLE, PLAINTEXT_PREAMBLE};
 pub use pairing::Provisioning;

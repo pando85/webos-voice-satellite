@@ -206,6 +206,39 @@ pub struct TextSensorEntity {
     pub entity_category: crate::proto::EntityCategory,
 }
 
+/// An application-owned `media_player` entity besides the built-in one (the
+/// satellite's reply-volume and announcement player, whose object id and key
+/// never change). Use it for a thing the application controls, such as the
+/// TV itself, so HA's media player voice intents (volume, mute, turn on and
+/// off) can target it.
+///
+/// It **plays nothing**: it advertises no audio format (so HA never picks it
+/// for TTS or announcement media) and [`MediaPlayerEntity::feature_flags`]
+/// may only hold the control bits of
+/// [`crate::entities::APP_MEDIA_PLAYER_FEATURES`] (no `PLAY_MEDIA`, no
+/// `MEDIA_ANNOUNCE`, no `BROWSE_MEDIA`; [`Config::validate`] rejects them). A
+/// media URL sent to it anyway is ignored with a log line.
+///
+/// HA's commands arrive as [`crate::AppEvent::MediaPlayerCommand`], only for
+/// advertised features, and are **not echoed**: HA shows the state the
+/// application reports with [`crate::AppCommand::SetMediaPlayer`]. The
+/// protocol has no "unknown" media player state: until the application sends
+/// one, HA shows unknown; after that the last state stays.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediaPlayerEntity {
+    /// Object id (see [`NumberEntity::object_id`]).
+    pub object_id: String,
+    /// Name shown in HA after the device name.
+    pub name: String,
+    /// Material Design icon.
+    pub icon: String,
+    /// `MediaPlayerEntityFeature` bits (aioesphomeapi 46.6.0, the same values
+    /// as HA's); HA 2026.10.4 takes the entity's features from them.
+    pub feature_flags: u32,
+    /// None (primary), configuration or diagnostic.
+    pub entity_category: crate::proto::EntityCategory,
+}
+
 /// Configuration of the ESPHome API server.
 #[derive(Clone)]
 pub struct Config {
@@ -257,6 +290,8 @@ pub struct Config {
     pub switches: Vec<SwitchEntity>,
     /// Generic `text_sensor` entities (besides the built-in power state).
     pub text_sensors: Vec<TextSensorEntity>,
+    /// Application-owned media players (besides the built-in one).
+    pub media_players: Vec<MediaPlayerEntity>,
 }
 
 impl Default for Config {
@@ -281,6 +316,7 @@ impl Default for Config {
             binary_sensors: Vec::new(),
             switches: Vec::new(),
             text_sensors: Vec::new(),
+            media_players: Vec::new(),
         }
     }
 }
@@ -306,6 +342,7 @@ impl fmt::Debug for Config {
             .field("binary_sensors", &self.binary_sensors)
             .field("switches", &self.switches)
             .field("text_sensors", &self.text_sensors)
+            .field("media_players", &self.media_players)
             .finish_non_exhaustive()
     }
 }
@@ -426,6 +463,7 @@ pub(crate) struct Resolved {
     pub(crate) binary_sensors: Vec<BinarySensorEntity>,
     pub(crate) switches: Vec<SwitchEntity>,
     pub(crate) text_sensors: Vec<TextSensorEntity>,
+    pub(crate) media_players: Vec<MediaPlayerEntity>,
 }
 
 /// An ESPHome object id: `[a-z0-9_]`, 1 to 120 characters.
@@ -442,7 +480,8 @@ impl Config {
     /// keys (including the built-in entities), sane number ranges.
     fn check_entities(&self) -> Result<(), ConfigError> {
         use crate::entities::{
-            MEDIA_PLAYER_OBJECT_ID, MUTE_OBJECT_ID, POWER_STATE_OBJECT_ID, entity_key,
+            APP_MEDIA_PLAYER_FEATURES, MEDIA_PLAYER_OBJECT_ID, MUTE_OBJECT_ID,
+            POWER_STATE_OBJECT_ID, entity_key,
         };
         let err = |why: String| Err(ConfigError::InvalidEntity(why));
         let ids = self
@@ -453,7 +492,8 @@ impl Config {
             .chain(self.buttons.iter().map(|e| e.object_id.as_str()))
             .chain(self.binary_sensors.iter().map(|e| e.object_id.as_str()))
             .chain(self.switches.iter().map(|e| e.object_id.as_str()))
-            .chain(self.text_sensors.iter().map(|e| e.object_id.as_str()));
+            .chain(self.text_sensors.iter().map(|e| e.object_id.as_str()))
+            .chain(self.media_players.iter().map(|e| e.object_id.as_str()));
         let mut seen: Vec<(&str, u32)> = vec![
             (MEDIA_PLAYER_OBJECT_ID, entity_key(MEDIA_PLAYER_OBJECT_ID)),
             (MUTE_OBJECT_ID, entity_key(MUTE_OBJECT_ID)),
@@ -478,6 +518,15 @@ impl Config {
                 return err(format!(
                     "select {:?}: needs at least one option",
                     sel.object_id
+                ));
+            }
+        }
+        for mp in &self.media_players {
+            let extra = mp.feature_flags & !APP_MEDIA_PLAYER_FEATURES;
+            if extra != 0 {
+                return err(format!(
+                    "media player {:?}: feature bits {extra:#x} are not control features (it plays no media)",
+                    mp.object_id
                 ));
             }
         }
@@ -588,6 +637,7 @@ impl Config {
             binary_sensors: self.binary_sensors.clone(),
             switches: self.switches.clone(),
             text_sensors: self.text_sensors.clone(),
+            media_players: self.media_players.clone(),
         })
     }
 }
@@ -798,6 +848,44 @@ mod tests {
         assert!(bad(&c), "a select needs options");
         c.selects[0].options.push("Other".to_owned());
         c.validate().unwrap();
+    }
+
+    #[test]
+    fn media_player_definitions_are_validated() {
+        use crate::entities::{
+            FEATURE_MEDIA_ANNOUNCE, FEATURE_PLAY_MEDIA, FEATURE_TURN_OFF, FEATURE_TURN_ON,
+            FEATURE_VOLUME_MUTE, FEATURE_VOLUME_SET, FEATURE_VOLUME_STEP,
+        };
+        use crate::proto::EntityCategory;
+        let mp = |id: &str, flags: u32| MediaPlayerEntity {
+            object_id: id.to_owned(),
+            name: "TV".to_owned(),
+            icon: String::new(),
+            feature_flags: flags,
+            entity_category: EntityCategory::None,
+        };
+        let control = FEATURE_VOLUME_SET
+            | FEATURE_VOLUME_STEP
+            | FEATURE_VOLUME_MUTE
+            | FEATURE_TURN_ON
+            | FEATURE_TURN_OFF;
+        let mut cfg = Config::default();
+        cfg.media_players.push(mp("tv_media_player", control));
+        cfg.validate().unwrap();
+        let bad = |c: &Config| matches!(c.validate(), Err(ConfigError::InvalidEntity(_)));
+        // Play media, announce, browse media and select source (which HA's
+        // ESPHome platform drops anyway) are refused.
+        for flags in [FEATURE_PLAY_MEDIA, FEATURE_MEDIA_ANNOUNCE, 1 << 17, 1 << 11] {
+            let mut c = Config::default();
+            c.media_players.push(mp("tv_media_player", control | flags));
+            assert!(bad(&c), "{flags:#x} must be refused");
+        }
+        let mut c = Config::default();
+        c.media_players.push(mp("media_player", control));
+        assert!(bad(&c), "the built-in media player id");
+        let mut c = cfg.clone();
+        c.numbers.push(number("tv_media_player"));
+        assert!(bad(&c), "duplicate across types");
     }
 
     #[test]

@@ -26,6 +26,55 @@ pub const TV_REFRESH_LISTS: &str = "tv_refresh_lists";
 pub const TV_SOUND_OUTPUT: &str = "tv_sound_output";
 /// Object id of `tv_play_state` (text sensor).
 pub const TV_PLAY_STATE: &str = "tv_play_state";
+/// Object id of `tv_media_player` (the TV as a media player, ADR 0007).
+pub const TV_MEDIA_PLAYER: &str = "tv_media_player";
+
+/// What the TV media player offers (each needs its control enabled).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[allow(clippy::struct_excessive_bools)] // one bool per HA feature
+pub struct MediaFeatures {
+    /// Volume set (`volume`).
+    pub volume_set: bool,
+    /// Volume up and down (`volume`): one TV step each, as the remote.
+    pub volume_step: bool,
+    /// Mute and unmute (`mute`).
+    pub mute: bool,
+    /// Turn on (`power_on`).
+    pub turn_on: bool,
+    /// Turn off (`screen` or `power_off`).
+    pub turn_off: bool,
+}
+
+impl MediaFeatures {
+    /// Any feature at all.
+    #[must_use]
+    pub fn any(self) -> bool {
+        self.volume_set || self.volume_step || self.mute || self.turn_on || self.turn_off
+    }
+}
+
+/// The TV media player's power and playback state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaPower {
+    /// Lit (`Active`, `Screen Saver`), the media service does not report
+    /// `playing`.
+    On,
+    /// Lit and the media service reports `playState` `playing`.
+    Playing,
+    /// Looks off: `Screen Off` or `Active Standby`.
+    Off,
+}
+
+/// The TV media player's state.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MediaState {
+    /// Power and playback.
+    pub power: MediaPower,
+    /// TV volume over its `maxVolume` (0.0 to 1.0), `None` when not known.
+    pub volume: Option<f32>,
+    /// Muted (`false` when not known: the media player has no unknown here).
+    pub muted: bool,
+}
 
 /// Home Assistant's entity category.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,6 +106,11 @@ pub enum Kind {
     },
     /// A read-only string.
     TextSensor,
+    /// The TV as a control-only media player.
+    MediaPlayer {
+        /// What it offers.
+        features: MediaFeatures,
+    },
 }
 
 /// One entity.
@@ -86,6 +140,10 @@ pub enum StateValue {
     Select(Option<String>),
     /// A text sensor.
     Text(Option<String>),
+    /// The TV media player. It has no "unknown": until the first state is
+    /// sent HA shows unknown, after that a state that cannot be told (a
+    /// transition, an unknown power state) is held.
+    Media(MediaState),
 }
 
 /// A state to send.

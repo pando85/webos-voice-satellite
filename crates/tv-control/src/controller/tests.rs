@@ -3,7 +3,7 @@
 //! committed.
 
 use super::*;
-use crate::entities::{self as e, StateValue as S};
+use crate::entities::{self as e, MediaFeatures, MediaPower, MediaState, StateValue as S};
 
 const OWN_APP: &str = "app.own";
 
@@ -63,6 +63,7 @@ struct Tv {
     fg: String,
     inputs: String,
     points: String,
+    play: String,
 }
 
 impl Tv {
@@ -75,6 +76,7 @@ impl Tv {
             fg: "app.a".to_owned(),
             inputs: INPUTS.to_owned(),
             points: POINTS.to_owned(),
+            play: PLAY.to_owned(),
         }
     }
 
@@ -85,7 +87,7 @@ impl Tv {
             Topic::Foreground => fg(&self.fg),
             Topic::Inputs => self.inputs.clone(),
             Topic::Apps => self.points.clone(),
-            Topic::PlayState => PLAY.to_owned(),
+            Topic::PlayState => self.play.clone(),
         }
     }
 }
@@ -245,6 +247,13 @@ impl Rig {
         }
     }
 
+    fn media(&self) -> MediaState {
+        match self.state(e::TV_MEDIA_PLAYER) {
+            Some(S::Media(m)) => *m,
+            other => panic!("tv_media_player: {other:?}"),
+        }
+    }
+
     fn set_names(&self) -> Vec<&'static str> {
         self.sets.iter().map(|(a, _, _)| a.name()).collect()
     }
@@ -299,10 +308,12 @@ fn defaults_are_screen_power_on_and_the_checked_controls() {
         "no cap by default"
     );
     assert_eq!(c.setters_blocked, None, "not gated by the firmware guard");
+    assert!(c.media_player, "the TV media player is on (ADR 0007)");
     let ids: Vec<_> = Controller::new(c).entities().iter().map(|e| e.id).collect();
     assert_eq!(
         ids,
         [
+            e::TV_MEDIA_PLAYER,
             e::TV_SCREEN,
             e::TV_TURN_ON,
             e::TV_VOLUME,
@@ -315,7 +326,8 @@ fn defaults_are_screen_power_on_and_the_checked_controls() {
             e::TV_SOUND_OUTPUT
         ]
     );
-    // Everything off: only the screen switch and the turn-on button.
+    // Everything off: only the screen switch, the turn-on button and the
+    // media player that turns the TV on and off.
     let off = Config {
         volume: false,
         mute: false,
@@ -323,12 +335,36 @@ fn defaults_are_screen_power_on_and_the_checked_controls() {
         apps: false,
         ..Config::default()
     };
-    let ids: Vec<_> = Controller::new(off)
-        .entities()
-        .iter()
-        .map(|e| e.id)
-        .collect();
-    assert_eq!(ids, [e::TV_SCREEN, e::TV_TURN_ON]);
+    let c = Controller::new(off.clone());
+    let ids: Vec<_> = c.entities().iter().map(|e| e.id).collect();
+    assert_eq!(ids, [e::TV_MEDIA_PLAYER, e::TV_SCREEN, e::TV_TURN_ON]);
+    assert_eq!(
+        c.media_features(),
+        MediaFeatures {
+            turn_on: true,
+            turn_off: true,
+            ..MediaFeatures::default()
+        }
+    );
+    // With nothing to offer, or switched off, it is not listed.
+    for cfg in [
+        Config {
+            screen: false,
+            power_on: false,
+            ..off
+        },
+        Config {
+            media_player: false,
+            ..Config::default()
+        },
+    ] {
+        let ids: Vec<_> = Controller::new(cfg)
+            .entities()
+            .iter()
+            .map(|e| e.id)
+            .collect();
+        assert!(!ids.contains(&e::TV_MEDIA_PLAYER), "{ids:?}");
+    }
 }
 
 #[test]
@@ -339,6 +375,7 @@ fn entity_table_follows_the_flags() {
     assert_eq!(
         ids,
         [
+            e::TV_MEDIA_PLAYER,
             e::TV_SCREEN,
             e::TV_TURN_ON,
             e::TV_POWER,
@@ -374,7 +411,22 @@ fn entity_table_follows_the_flags() {
     assert_eq!(by(e::TV_SOUND_OUTPUT).category, Category::Diagnostic);
     assert_eq!(by(e::TV_PLAY_STATE).category, Category::Diagnostic);
     assert_eq!(by(e::TV_VOLUME).category, Category::None);
-    // power_off off: no tv_power; volume off: no number, no buttons.
+    assert_eq!(by(e::TV_MEDIA_PLAYER).category, Category::None);
+    assert_eq!(by(e::TV_MEDIA_PLAYER).name, "TV");
+    assert_eq!(
+        by(e::TV_MEDIA_PLAYER).kind,
+        Kind::MediaPlayer {
+            features: MediaFeatures {
+                volume_set: true,
+                volume_step: true,
+                mute: true,
+                turn_on: true,
+                turn_off: true
+            }
+        }
+    );
+    // power_off off: no tv_power; volume off: no number, no buttons, and
+    // the media player has no volume features.
     let cfg = Config {
         power_off: false,
         volume: false,
@@ -383,15 +435,20 @@ fn entity_table_follows_the_flags() {
         play_state: false,
         ..all_on()
     };
-    let ids: Vec<_> = Controller::new(cfg)
-        .entities()
-        .iter()
-        .map(|e| e.id)
-        .collect();
+    let c = Controller::new(cfg);
+    let ids: Vec<_> = c.entities().iter().map(|e| e.id).collect();
     assert_eq!(
         ids,
-        [e::TV_SCREEN, e::TV_TURN_ON, e::TV_MUTE, e::TV_SOUND_OUTPUT]
+        [
+            e::TV_MEDIA_PLAYER,
+            e::TV_SCREEN,
+            e::TV_TURN_ON,
+            e::TV_MUTE,
+            e::TV_SOUND_OUTPUT
+        ]
     );
+    let f = c.media_features();
+    assert!(!f.volume_set && !f.volume_step && f.mute && f.turn_on && f.turn_off);
 }
 
 #[test]
@@ -1794,6 +1851,297 @@ fn power_state_updates_with_processing_only_keep_the_state() {
     assert_eq!(r.sw(e::TV_SCREEN), Some(true));
     assert_eq!(PowerState::from_key("ScreenSaver"), PowerState::ScreenSaver);
     assert_eq!(PowerState::from_key("Weird"), PowerState::Other);
+}
+
+// ----- the TV media player (ADR 0007) ----------------------------------------
+
+fn mp(action: MediaAction) -> Command {
+    Command::Media {
+        id: e::TV_MEDIA_PLAYER.to_owned(),
+        action,
+    }
+}
+
+#[test]
+fn media_volume_share_and_steps() {
+    assert_eq!(volume_share(12, 60), Some(0.2));
+    assert_eq!(volume_share(0, 60), Some(0.0));
+    assert_eq!(volume_share(70, 60), Some(1.0), "never above 1");
+    assert_eq!(volume_share(3, 0), None, "no maximum, no share");
+    assert!((share_to_steps(0.2, 60) - 12.0).abs() < 1e-4);
+    assert!((share_to_steps(1.7, 60) - 60.0).abs() < 1e-4);
+    assert!(share_to_steps(-1.0, 60).abs() < 1e-6);
+    // Every TV value survives the round trip HA makes (share, then steps).
+    for max in [60_u16, 100] {
+        for v in 0..=max {
+            let (vv, mm) = (u32::from(v), u32::from(max));
+            let back = share_to_steps(volume_share(vv, mm).unwrap(), mm).round();
+            assert!((back - f32::from(v)).abs() < 1e-6, "{v}/{max}");
+        }
+    }
+}
+
+#[test]
+fn media_player_state_follows_power_play_state_volume_and_mute() {
+    let mut r = Rig::boot(all_on(), Tv::new());
+    // Active and the media service says playing: playing, 12 of 60.
+    assert_eq!(
+        r.media(),
+        MediaState {
+            power: MediaPower::Playing,
+            volume: Some(0.2),
+            muted: false
+        }
+    );
+    // Not playing: on.
+    r.tv.play = r#"{"returnValue":true,"playState":"paused"}"#.to_owned();
+    r.tv.muted = true;
+    r.tick(10_100);
+    assert_eq!(
+        r.media(),
+        MediaState {
+            power: MediaPower::On,
+            volume: Some(0.2),
+            muted: true
+        }
+    );
+    // A transition holds the last state.
+    r.power("Active", true, 11_000);
+    assert_eq!(r.media().power, MediaPower::On);
+    // Screen Off looks off; volume and mute are still live there.
+    r.power("ScreenOff", false, 12_000);
+    assert_eq!(
+        r.media(),
+        MediaState {
+            power: MediaPower::Off,
+            volume: Some(0.2),
+            muted: true
+        }
+    );
+    // Lit again: the play state is read again at once.
+    r.tv.play = PLAY.to_owned();
+    r.power("Active", false, 13_000);
+    assert_eq!(r.media().power, MediaPower::Playing);
+    // Active Standby: off, no volume known.
+    r.power("ActiveStandby", false, 14_000);
+    assert_eq!(
+        r.media(),
+        MediaState {
+            power: MediaPower::Off,
+            volume: None,
+            muted: false
+        }
+    );
+    // An unknown power state is held (no guess, and no "unknown" exists).
+    r.power("Weird", false, 15_000);
+    assert_eq!(r.media().power, MediaPower::Off);
+}
+
+#[test]
+fn media_player_without_a_volume_reading_shows_no_volume_and_refuses_sets() {
+    let mut r = boot_with(
+        all_on(),
+        Topic::Volume,
+        Ok(r#"{"returnValue":false,"errorCode":-1,"errorText":"Denied"}"#),
+    );
+    let m = r.media();
+    assert_eq!(
+        (m.power, m.volume, m.muted),
+        (MediaPower::Playing, None, false)
+    );
+    r.cmd(mp(MediaAction::SetVolume(0.5)), 1000)
+        .cmd(mp(MediaAction::VolumeUp), 1100)
+        .cmd(mp(MediaAction::Mute(true)), 1200)
+        .tick(2000);
+    assert!(r.sets.is_empty(), "{:?}", r.set_names());
+    assert!(r.logged("refused"));
+    // Without the play state getter the media player is just on.
+    let r = boot_with(
+        all_on(),
+        Topic::PlayState,
+        Ok(r#"{"returnValue":false,"errorCode":-1,"errorText":"Denied"}"#),
+    );
+    assert_eq!(r.media().power, MediaPower::On);
+}
+
+#[test]
+fn media_player_commands_use_the_same_setters_limits_and_read_backs() {
+    let mut r = Rig::boot(all_on(), Tv::new());
+    // Volume set: share of maxVolume (60), rounded, coalesced, read back.
+    r.cmd(mp(MediaAction::SetVolume(0.5)), 1000).tick(1300);
+    assert_eq!(
+        (r.sets[0].1, r.sets[0].2.as_str()),
+        (setters::URI_SET_VOLUME, r#"{"volume":30}"#)
+    );
+    r.set_reply(r#"{"returnValue":true,"volume":30,"soundOutput":""}"#, 1350);
+    r.tv.vol = 30;
+    r.tick(1900);
+    assert_eq!(r.media().volume, Some(0.5));
+    assert_eq!(r.num(e::TV_VOLUME), Some(30.0), "the number follows too");
+    assert!(r.logged("read back matches"));
+    // A share that is not a whole step rounds to the nearest one.
+    r.cmd(mp(MediaAction::SetVolume(0.209)), 5000).tick(5300);
+    assert_eq!(r.sets[1].2, r#"{"volume":13}"#);
+    r.set_reply(OK, 5350);
+    r.tv.vol = 13;
+    r.tick(5900);
+    // Volume up and down: one TV step each, the remote's methods.
+    r.cmd(mp(MediaAction::VolumeUp), 7000);
+    assert_eq!(r.sets[2].1, setters::URI_VOLUME_UP);
+    r.set_reply(OK, 7050);
+    r.tv.vol = 14;
+    r.tick(7600);
+    r.cmd(mp(MediaAction::VolumeDown), 8000);
+    assert_eq!(r.sets[3].1, setters::URI_VOLUME_DOWN);
+    r.set_reply(OK, 8050);
+    r.tv.vol = 13;
+    r.tick(8600);
+    // Mute and unmute: the verified setter.
+    r.cmd(mp(MediaAction::Mute(true)), 9000);
+    assert_eq!(
+        (r.sets[4].1, r.sets[4].2.as_str()),
+        (setters::URI_SET_MUTE, r#"{"mute":true}"#)
+    );
+    r.set_reply(OK, 9050);
+    r.tv.muted = true;
+    r.tick(9600);
+    assert!(r.media().muted);
+    assert_eq!(r.sw(e::TV_MUTE), Some(true));
+    // Already muted: nothing to do.
+    r.cmd(mp(MediaAction::Mute(true)), 12_000);
+    assert_eq!(r.sets.len(), 5);
+    // The step rate limit is shared with the buttons (4 per second).
+    let n = r.sets.len();
+    for i in 0..6 {
+        r.cmd(mp(MediaAction::VolumeDown), 20_000 + i * 10);
+        let fx = r.c.on_reply(
+            Purpose::Set(Action::VolumeDown),
+            Ok(OK.to_owned()),
+            ms(r.t0, 20_000 + i * 10 + 1),
+        );
+        r.run(fx);
+    }
+    assert!(r.sets.len() - n <= 4, "{}", r.sets.len() - n);
+}
+
+#[test]
+fn media_player_volume_follows_the_volume_limit() {
+    let mut tv = Tv::new();
+    tv.vol = 50;
+    let mut r = Rig::boot(
+        Config {
+            volume_limit: Some(40),
+            ..all_on()
+        },
+        tv,
+    );
+    // The share is of maxVolume, not of the cap: 50 of 60 shows as 0.83.
+    assert!((r.media().volume.unwrap() - 50.0 / 60.0).abs() < 1e-6);
+    // Full volume is clamped to the cap (logged); up is refused above it;
+    // down still works.
+    r.cmd(mp(MediaAction::VolumeUp), 1000);
+    assert!(r.sets.is_empty());
+    r.cmd(mp(MediaAction::SetVolume(1.0)), 2000).tick(2300);
+    assert_eq!(r.sets[0].2, r#"{"volume":40}"#);
+    assert!(r.logged("volume ceiling"));
+}
+
+#[test]
+fn media_player_turn_off_is_the_power_off_in_the_always_on_mode_else_the_screen() {
+    // power_off enabled and the always-on mode selected: the remote's key.
+    let mut r = Rig::boot(all_on(), Tv::new());
+    r.cmd(mp(MediaAction::TurnOff), 1000);
+    assert_eq!(r.set_names(), ["power key"]);
+    // power_off enabled but the select is on "Turn off normally": screen off.
+    let mut r = Rig::boot(all_on(), Tv::new());
+    let fx = r.c.set_env(env(false, false, Ok(())));
+    r.run(fx);
+    r.cmd(mp(MediaAction::TurnOff), 1000);
+    assert_eq!(r.set_names(), ["turnOffScreen"]);
+    // power_off disabled (the default): screen off.
+    let mut r = Rig::boot(
+        Config {
+            power_off: false,
+            ..all_on()
+        },
+        Tv::new(),
+    );
+    r.cmd(mp(MediaAction::TurnOff), 1000);
+    assert_eq!(r.set_names(), ["turnOffScreen"]);
+    r.set_reply(OK, 1050).power("ScreenOff", false, 1100);
+    assert_eq!(r.media().power, MediaPower::Off);
+    // Already off: nothing; turn on wakes the screen as the button does.
+    r.cmd(mp(MediaAction::TurnOff), 3000);
+    assert_eq!(r.sets.len(), 1);
+    r.cmd(mp(MediaAction::TurnOn), 4000);
+    assert_eq!(r.set_names(), ["turnOffScreen", "turnOnScreen"]);
+    assert_eq!(r.own_wakes, 1);
+    // From Active Standby: powerOn after the key block.
+    r.set_reply(OK, 4050).power("ActiveStandby", false, 5000);
+    r.cmd(mp(MediaAction::TurnOff), 5100);
+    assert_eq!(r.sets.len(), 2, "already off");
+    r.cmd(mp(MediaAction::TurnOn), 5200).tick(6600);
+    assert_eq!(r.sets[2].1, setters::URI_POWER_ON);
+    // In the always-on mode, a darkener that would refuse refuses the
+    // power-off (no silent fallback to the screen).
+    let mut r = Rig::boot(all_on(), Tv::new());
+    let fx = r.c.set_env(env(true, false, Err("cooldown")));
+    r.run(fx);
+    r.cmd(mp(MediaAction::TurnOff), 1000);
+    assert!(r.sets.is_empty());
+    assert!(r.logged("refused"));
+}
+
+#[test]
+fn media_player_features_that_are_off_are_refused() {
+    let mut r = Rig::boot(
+        Config {
+            volume: false,
+            mute: false,
+            power_on: false,
+            ..all_on()
+        },
+        Tv::new(),
+    );
+    r.cmd(mp(MediaAction::SetVolume(0.5)), 1000)
+        .cmd(mp(MediaAction::VolumeUp), 1100)
+        .cmd(mp(MediaAction::Mute(true)), 1200)
+        .cmd(mp(MediaAction::TurnOn), 1300)
+        .tick(3000);
+    assert!(r.sets.is_empty(), "{:?}", r.set_names());
+    assert!(r.logged("not enabled"));
+    // Another id, or the media player switched off: ignored.
+    let mut r = Rig::boot(
+        Config {
+            media_player: false,
+            ..all_on()
+        },
+        Tv::new(),
+    );
+    assert!(r.state(e::TV_MEDIA_PLAYER).is_none(), "no state when off");
+    r.cmd(mp(MediaAction::TurnOff), 1000);
+    r.cmd(
+        Command::Media {
+            id: "tv_other".to_owned(),
+            action: MediaAction::TurnOff,
+        },
+        1100,
+    );
+    assert!(r.sets.is_empty());
+}
+
+#[test]
+fn media_player_logs_no_title_or_label() {
+    let mut r = Rig::boot(all_on(), Tv::new());
+    r.cmd(mp(MediaAction::SetVolume(0.5)), 1000)
+        .tick(1300)
+        .cmd(mp(MediaAction::TurnOff), 2000);
+    for (_, m) in &r.logs {
+        for w in ["App A", "App B", "HDMI 1", "app.a", "app.b"] {
+            assert!(!m.contains(w), "{m}");
+        }
+    }
+    assert!(r.logged("tv_media_player: volume set"));
 }
 
 #[test]

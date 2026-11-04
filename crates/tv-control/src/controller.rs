@@ -83,6 +83,10 @@ pub struct Config {
     pub app_limit: usize,
     /// `tv_play_state`.
     pub play_state: bool,
+    /// `tv_media_player`: the TV as a media player (ADR 0007), so HA's
+    /// native volume, mute and turn on/off intents work. Its features follow
+    /// the other flags; it reads the play state (polled) for `playing`.
+    pub media_player: bool,
     /// `Some(reason)` while every setter is refused (the firmware guard).
     /// Getters and sensors still report.
     pub setters_blocked: Option<String>,
@@ -93,7 +97,8 @@ pub struct Config {
 impl Default for Config {
     /// The defaults: screen and power-on on, power-off off (opt-in), volume,
     /// mute, input and apps on (EXP-010 Part A passed on c3-b, 2026-11-04;
-    /// each control is still checked per TV at startup).
+    /// each control is still checked per TV at startup), the TV media player
+    /// on (owner, 2026-11-04).
     fn default() -> Self {
         Self {
             screen: true,
@@ -106,6 +111,7 @@ impl Default for Config {
             apps: true,
             app_limit: 30,
             play_state: false,
+            media_player: true,
             setters_blocked: None,
             own_app_ids: Vec::new(),
         }
@@ -411,6 +417,45 @@ pub enum Command {
         /// The entity's object id.
         id: String,
     },
+    /// A media player command.
+    Media {
+        /// The entity's object id.
+        id: String,
+        /// What HA asked for.
+        action: MediaAction,
+    },
+}
+
+/// A command HA sends to the TV media player.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum MediaAction {
+    /// Volume as a share of the TV's `maxVolume` (0.0 to 1.0).
+    SetVolume(f32),
+    /// One TV volume step up (`volumeUp`, as the remote).
+    VolumeUp,
+    /// One TV volume step down.
+    VolumeDown,
+    /// Mute (`true`) or unmute.
+    Mute(bool),
+    /// Turn on: as the `tv_turn_on` button.
+    TurnOn,
+    /// Turn off: the opt-in power-off when it is enabled and the always-on
+    /// mode is selected, else the screen off.
+    TurnOff,
+}
+
+impl MediaAction {
+    fn name(self) -> &'static str {
+        match self {
+            Self::SetVolume(_) => "volume set",
+            Self::VolumeUp => "volume up",
+            Self::VolumeDown => "volume down",
+            Self::Mute(true) => "mute",
+            Self::Mute(false) => "unmute",
+            Self::TurnOn => "turn on",
+            Self::TurnOff => "turn off",
+        }
+    }
 }
 
 /// What a read-back must show.
@@ -520,6 +565,27 @@ fn log(level: Level, msg: impl Into<String>) -> Effect {
     Effect::Log(level, msg.into())
 }
 
+/// The TV volume as the media player's share of `maxVolume` (0.0 to 1.0);
+/// `None` for a TV that reports no maximum.
+#[must_use]
+pub fn volume_share(volume: u32, max_volume: u32) -> Option<f32> {
+    if max_volume == 0 {
+        return None;
+    }
+    #[allow(clippy::cast_precision_loss)] // TV volumes are tiny
+    let share = volume.min(max_volume) as f32 / max_volume as f32;
+    Some(share)
+}
+
+/// The media player's share (0.0 to 1.0, clamped) in TV volume steps of
+/// `maxVolume`, not yet rounded (the volume set rounds to the nearest step).
+#[must_use]
+pub fn share_to_steps(share: f32, max_volume: u32) -> f32 {
+    #[allow(clippy::cast_precision_loss)] // TV volumes are tiny
+    let max = max_volume as f32;
+    share.clamp(0.0, 1.0) * max
+}
+
 impl Controller {
     /// A controller for `cfg`. Setters are treated as not declared until
     /// [`Controller::set_declared`] says otherwise.
@@ -598,8 +664,31 @@ impl Controller {
             Topic::Foreground => self.cfg.input || self.cfg.apps,
             Topic::Inputs => self.cfg.input,
             Topic::Apps => self.cfg.apps,
-            Topic::PlayState => self.cfg.play_state,
+            Topic::PlayState => self.play_reader(),
         }
+    }
+
+    /// The play state is read: for its sensor, or for the media player's
+    /// `playing`.
+    fn play_reader(&self) -> bool {
+        self.cfg.play_state || self.media_listed()
+    }
+
+    /// The TV media player's features: each follows its control's flag.
+    #[must_use]
+    pub fn media_features(&self) -> ent::MediaFeatures {
+        ent::MediaFeatures {
+            volume_set: self.cfg.volume,
+            volume_step: self.cfg.volume,
+            mute: self.cfg.mute,
+            turn_on: self.cfg.power_on,
+            turn_off: self.cfg.screen || self.cfg.power_off,
+        }
+    }
+
+    /// The TV media player is listed: enabled and it offers something.
+    fn media_listed(&self) -> bool {
+        self.cfg.media_player && self.media_features().any()
     }
 
     const TOPICS: [Topic; 6] = [
@@ -626,6 +715,19 @@ impl Controller {
                 kind,
             });
         };
+        if self.media_listed() {
+            // HA names it after the device ("<device> TV"); the owner adds
+            // the Assist aliases ("tele del hall") in HA.
+            add(
+                ent::TV_MEDIA_PLAYER,
+                "TV",
+                "mdi:television",
+                Category::None,
+                Kind::MediaPlayer {
+                    features: self.media_features(),
+                },
+            );
+        }
         if self.cfg.screen {
             add(
                 ent::TV_SCREEN,
@@ -874,8 +976,46 @@ impl Controller {
                 }
                 _ => Want::Set(S::Text(None)),
             },
+            ent::TV_MEDIA_PLAYER => self.media_want(class),
             _ => Want::Hold,
         }
+    }
+
+    /// The TV media player (ADR 0007): on or playing while lit, off in
+    /// `Screen Off` and `Active Standby` (the TV looks off; in `Screen Off`
+    /// an app's sound may still play); the volume as a share of `maxVolume`
+    /// and the mute where they are live. A transition or an unknown power
+    /// state is held: the media player has no "unknown" once a state was
+    /// sent.
+    fn media_want(&self, class: Pwr) -> Want {
+        let power = match class {
+            Pwr::Lit => {
+                let playing = self.getter_ok.contains(&Topic::PlayState)
+                    && self.play.as_deref() == Some("playing");
+                if playing {
+                    ent::MediaPower::Playing
+                } else {
+                    ent::MediaPower::On
+                }
+            }
+            Pwr::Dark | Pwr::Standby => ent::MediaPower::Off,
+            Pwr::Transition | Pwr::Unknown | Pwr::Other => return Want::Hold,
+        };
+        let vol = self
+            .vol
+            .as_ref()
+            .filter(|_| matches!(class, Pwr::Lit | Pwr::Dark));
+        let volume = vol
+            .filter(|_| self.state_known(Control::Volume))
+            .and_then(|v| volume_share(v.volume, v.max_volume));
+        let muted = vol
+            .filter(|_| self.state_known(Control::Mute))
+            .is_some_and(|v| v.muted);
+        Want::Set(StateValue::Media(ent::MediaState {
+            power,
+            volume,
+            muted,
+        }))
     }
 
     /// A control whose state is live in `Active`, `Screen Saver` and
@@ -886,6 +1026,7 @@ impl Controller {
             StateValue::Number(_) => StateValue::Number(None),
             StateValue::Select(_) => StateValue::Select(None),
             StateValue::Text(_) => StateValue::Text(None),
+            StateValue::Media(m) => StateValue::Media(*m),
         };
         match class {
             Pwr::Transition => Want::Hold,
@@ -923,9 +1064,11 @@ impl Controller {
             ent::TV_APP,
             ent::TV_SOUND_OUTPUT,
             ent::TV_PLAY_STATE,
+            ent::TV_MEDIA_PLAYER,
         ]
         .into_iter()
         .filter(|id| match *id {
+            ent::TV_MEDIA_PLAYER => self.media_listed(),
             ent::TV_SCREEN => self.cfg.screen,
             ent::TV_POWER => self.cfg.power_off,
             ent::TV_VOLUME => self.cfg.volume,
@@ -1148,7 +1291,7 @@ impl Controller {
                 out.push(Effect::Subscribe(topic));
             }
         }
-        if self.cfg.play_state && self.getter_ok.contains(&Topic::PlayState) {
+        if self.play_reader() && self.getter_ok.contains(&Topic::PlayState) {
             self.polling.insert(Topic::PlayState);
         }
         for topic in &self.polling {
@@ -1219,6 +1362,16 @@ impl Controller {
                     out.push(self.read_call(t));
                 }
             }
+        }
+        // Lit again after Screen Off: the play state (polled only while lit)
+        // may be stale; the media player shows it.
+        if self.ready
+            && after == Pwr::Lit
+            && before == Pwr::Dark
+            && self.polling.contains(&Topic::PlayState)
+            && !self.reads_inflight.contains(&Topic::PlayState)
+        {
+            out.push(self.read_call(Topic::PlayState));
         }
         out.extend(self.sync());
         out
@@ -1643,8 +1796,54 @@ impl Controller {
                     "tv_control: button for an unknown entity ignored",
                 )],
             },
+            Command::Media { id, action } => match id.as_str() {
+                ent::TV_MEDIA_PLAYER if self.media_listed() => self.cmd_media(action, now),
+                _ => vec![log(
+                    Level::Debug,
+                    "tv_control: media player command for an unknown entity ignored",
+                )],
+            },
         };
         out.extend(self.sync());
+        out
+    }
+
+    /// A TV media player command (ADR 0007): the same paths, limits,
+    /// read-backs and refusals as the separate entities. Volume set maps the
+    /// share to `maxVolume` steps (rounded; `volume_limit` clamps as for the
+    /// number); volume up and down are one TV step each (as the remote and
+    /// the step buttons); turn on is the `tv_turn_on` button; turn off is the
+    /// opt-in power-off (`power_off` enabled and the always-on mode
+    /// selected, with all of its preconditions) or else the screen off.
+    fn cmd_media(&mut self, action: MediaAction, now: Instant) -> Vec<Effect> {
+        let id = ent::TV_MEDIA_PLAYER;
+        let mut out = vec![log(Level::Info, format!("{id}: {}", action.name()))];
+        let f = self.media_features();
+        out.extend(match action {
+            MediaAction::SetVolume(share) if f.volume_set => {
+                if !share.is_finite() {
+                    self.refuse(id, "not a volume")
+                } else if let Some(max) = self.vol.as_ref().map(|v| v.max_volume) {
+                    self.cmd_volume_set(share_to_steps(share, max), now)
+                } else {
+                    self.refuse(id, "the TV volume is not known")
+                }
+            }
+            MediaAction::VolumeUp if f.volume_step => self.cmd_volume_step(true, now),
+            MediaAction::VolumeDown if f.volume_step => self.cmd_volume_step(false, now),
+            MediaAction::Mute(m) if f.mute => self.cmd_mute(m, now),
+            MediaAction::TurnOn if f.turn_on => self.cmd_turn_on(now),
+            MediaAction::TurnOff if f.turn_off => match self.class() {
+                Pwr::Dark | Pwr::Standby => self.noop(id, "the TV is already off"),
+                _ if self.cfg.power_off && self.env.keep_listening => self.cmd_power(false, now),
+                _ if self.cfg.screen => self.cmd_screen(false, now),
+                _ => self.refuse(
+                    id,
+                    "turn off needs the always-on mode for the power-off, or the screen control",
+                ),
+            },
+            _ => self.refuse(id, "not enabled in [tv_control]"),
+        });
         out
     }
 

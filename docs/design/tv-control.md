@@ -23,7 +23,7 @@ Labels follow [AGENTS.md](../../AGENTS.md): `documented`, `observed-on-other-dev
 - No toasts, notifications or on-screen indicators (owner 2026-11-04). No controllable status LED exists (research 2026-11-04).
 - No real power-off into LG standby or Suspend from HA (section 4). No Wake-on-LAN from the satellite: a TV in Suspend cannot run it. Waking from Suspend stays HA's job (its `wake_on_lan` integration), outside this project.
 - No TV settings writes: no picture or sound mode, no sound output change, no Always Ready, Quick Start+, energy saving or auto-off changes. The daemon's existing rule stands ([always-on section 7](always-on.md#7-exposing-power-options-in-the-ui-design)).
-- No TV `media_player` entity: the satellite's media player keeps meaning "reply volume" (owner 2026-11-04).
+- ~~No TV `media_player` entity~~ Changed the same day by [ADR 0007](../decisions/0007-tv-media-player.md): a second, control-only media player "TV" is added (section 3.5). The satellite's own media player keeps meaning "reply volume" (owner 2026-11-04).
 - No channel control, no playback control (play/pause), no remote-key injection beyond the existing power key path.
 - No replacement of HA's `webostv` integration. The satellite **complements** it (section 2).
 - Audible timer and announcement verification: skipped for now (owner 2026-11-04).
@@ -51,6 +51,7 @@ All entities belong to the satellite's existing ESPHome device. Object ids are s
 
 | Entity (name) | Type | Object id | Range, options, unit | Listed when | Default | Category |
 | --- | --- | --- | --- | --- | --- | --- |
+| TV | `media_player` | `tv_media_player` | control only: volume set and step, mute, turn on and off (section 3.5) | `[tv_control] media_player` and any of its controls | on (ADR 0007) | none |
 | TV screen | `switch` | `tv_screen` | on = picture on, off = `Screen Off` | `[tv_control] screen` | on | none |
 | Turn on TV | `button` | `tv_turn_on` | stateless | `[tv_control] power_on` | on | none |
 | TV power (keep listening) | `switch` | `tv_power` | on = picture on, off = looks off but listening (section 4) | `[tv_control] power_off` | **off (opt-in)** | none |
@@ -68,7 +69,7 @@ All entities belong to the satellite's existing ESPHome device. Object ids are s
 
 `listening` and `microphone_muted` are defined by the parallel daemon change of 2026-11-04 (capture thread, `crates/satellite/src/capture.rs`); this design only requires their semantics (section 3.3). The existing "Mute microphone" switch, the reply-volume media player and the select "When the TV is turned off with the remote" (`remote_power_off`) are unchanged.
 
-**Why separate entities** (owner 2026-11-04): a TV `media_player` would clash with the reply-volume media player, and separate entities each carry one truthful state. `Other` in the two selects is the state when the foreground app is not in the list; choosing `Other` from HA is refused (the state is sent again).
+**Why separate entities** (owner 2026-11-04): a TV `media_player` would clash with the reply-volume media player, and separate entities each carry one truthful state. They stay; since [ADR 0007](../decisions/0007-tv-media-player.md) a second, control-only media player sits next to them for HA's built-in voice intents (section 3.5). `Other` in the two selects is the state when the foreground app is not in the list; choosing `Other` from HA is refused (the state is sent again).
 
 ### 3.2 Availability rules
 
@@ -102,7 +103,35 @@ States are the settled `state` (and `processing` while in transition) of the exi
 | `tv_input`, `tv_app` | read and set | read; set allowed. Launch in `Screen Off` kept the power state `Screen Off` (c3-b A8); whether the panel lights was **not looked at** | missing; refused | kept; refused | daemon frozen |
 | sensors | live | live | `tv_play_state` missing | live | daemon frozen |
 
+The TV media player (section 3.5) follows the same table: `off` in `Screen Off` and `Active Standby`, `on` or `playing` in `Active` and `Screen Saver`, held during a transition.
+
 Why refuse in `Active Standby`: the audio DSP input gain is near zero there ([D6 variant C](../discovery/c3-b/D6-poweroff-screenoff.md#variant-c-why-active-standby-is-silent)), nothing else is tested in that state, and the remote itself does not act there except the power key. After a resume from Suspend (the daemon's G2 detection) every getter is read again before any state is sent.
+
+### 3.5 The TV media player (ADR 0007)
+
+Owner decision 2026-11-04 ([ADR 0007](../decisions/0007-tv-media-player.md)), after [P4](../discovery/c3-b/P4-sound-session.md) showed that HA's Spanish volume and mute sentences only target `media_player` entities. Implemented on the PC 2026-11-04; **not yet run on a TV or against the owner's HA**.
+
+**Entity.** A second ESPHome `media_player` of the satellite device: name "TV" (HA shows "<device> TV"), object id `tv_media_player`, key the FNV-1 hash of it, listed after the satellite's own player. The satellite's player (object id `media_player`, key 2232357057, the reply volume and the `ANNOUNCEMENT` format) is unchanged. The owner adds the Assist aliases in HA ("tele del despacho" on c3-a, "tele del hall" on c3-b) and exposes it to Assist.
+
+**Features** (HA `MediaPlayerEntityFeature` bits, each only while its control is enabled):
+
+| Feature | Bit | Enabled by | Action |
+| --- | --- | --- | --- |
+| `VOLUME_SET` | 4 | `volume` | `master/setVolume` with `round(share × maxVolume)`; coalesced, clamped by `volume_limit` (a set above the cap is clamped and logged), read back |
+| `VOLUME_STEP` | 1024 | `volume` | `master/volumeUp` / `volumeDown`: one TV step, as the remote and the step buttons; up refused at the cap; 4 per second |
+| `VOLUME_MUTE` | 8 | `mute` | `apiadapter/audio/setMute`, read back |
+| `TURN_ON` | 128 | `power_on` | as the `tv_turn_on` button: `turnOnScreen` from `Screen Off`, `powerOn` from `Active Standby`, nothing when lit |
+| `TURN_OFF` | 256 | `screen` or `power_off` | `power_off` enabled **and** the select on "Keep listening (screen off)": the power-off of section 4 with all of its preconditions (a refusal stays a refusal, no fallback); otherwise `turnOffScreen`. Nothing in `Screen Off` or `Active Standby` |
+
+Never offered: `PLAY_MEDIA`, `MEDIA_ANNOUNCE`, `BROWSE_MEDIA`, `MEDIA_ENQUEUE`, `PLAY`, `PAUSE`, `STOP`, `SELECT_SOURCE`. It advertises **no audio format**, so HA 2026.10.4's assist satellite keeps taking the TTS and announcement format from the satellite's player (the first `ANNOUNCEMENT` format of any player of the device), and announcements keep going through `VoiceAssistantAnnounceRequest`. HA's `media_player.play_media` on it is refused by HA (feature missing); a media URL that reaches the device anyway is ignored with a log line (`tv_media_player: media or announcement refused`).
+
+**Source (input) selection is not on the media player.** The ESPHome API (`api.proto` 2026.10.1) has no source list or source command, and HA 2026.10.4's ESPHome platform drops `SELECT_SOURCE` (`_UNSUPPORTED_FEATURES`). Input stays the `tv_input` select.
+
+**State.** `playing` when lit (`Active`, `Screen Saver`) and the media service's `playState` is `playing`; `on` when lit otherwise (or the play state getter failed); `off` in `Screen Off` and `Active Standby`. Volume: the TV volume over its `maxVolume` (12 of 60 is 0.2), in `Active`, `Screen Saver` and `Screen Off`; NaN when not known (HA shows no level). Mute where the volume getter is live, else `false`. A transition or an unknown power state is held: the ESPHome media player has no "unknown" state (HA 2026.10.4 maps only idle, playing, paused, off and on), so HA shows unknown only until the first state. The play state is polled every 10 s while lit (section 7) whenever the media player is listed, and read once when the TV is lit again after `Screen Off`.
+
+**Same safety as the other entities:** the startup capability check, the declaration check, rate limits, the read-back and the disable-on-failure of section 6, and the firmware policy of section 9. Every media player command is logged at `info` by its name only (`tv_media_player: volume set`); refusals name the control (`tv_volume: refused: ...`).
+
+**Voice (expected, to verify on the owner's HA 2026.10.4):** "baja/sube el volumen de la tele del hall" (`HassSetVolumeRelative`: one TV step), "pon el volumen de la tele del hall a 20" (`HassSetVolume`: 20 % of `maxVolume`, 12 of 60), "silencia/quita el silencio de la tele del hall" (`HassMediaPlayerMute`/`Unmute`), "apaga/enciende la tele del hall" (`HassTurnOff`/`HassTurnOn`). An unnamed "baja el volumen" in the satellite's area matches both media players; HA then keeps only the `playing` ones (HA source), so it reaches the TV while it plays and fails otherwise. A percentage is a share of `maxVolume` as the TV reports it, not a TV volume value: on c3-b (`maxVolume` 60) "al 50" sets 30. How that compares with the number the TV shows on screen was not looked at.
 
 ## 4. Power-off: which state, and the way back
 
@@ -185,7 +214,7 @@ Outcomes: a failed getter makes the entity report missing state; a missing sette
 | Power state | existing subscription | push |
 | Volume, mute, sound output | `getVolume` subscription if supported, else poll | push, or every 10 s in `Active`, `Screen Saver`, `Screen Off`; none in `Active Standby` |
 | Foreground app (drives `tv_app` and `tv_input`) | `getForegroundAppInfo` subscription if supported, else poll | push, or every 5 s in the same states |
-| Play state (if enabled) | poll | every 10 s in `Active` and `Screen Saver` |
+| Play state (if the sensor or the TV media player is on) | poll | every 10 s in `Active` and `Screen Saver`, and once when lit again after `Screen Off` |
 | Input list, launch points | read once | startup, after a resume, on `tv_refresh_lists` |
 | After any setter | one read-back | 0.5 s after the reply |
 
@@ -227,6 +256,7 @@ input = true          # tv_input (passed on c3-b)
 apps = true           # tv_app (passed on c3-b)
 app_limit = 30        # maximum apps in the tv_app select
 play_state = false    # tv_play_state sensor
+media_player = true   # tv_media_player "TV" (ADR 0007, section 3.5)
 follow_firmware_guard = false  # owner decision 2026-11-04: TV control is not gated by the firmware guard
 ```
 
@@ -238,7 +268,8 @@ follow_firmware_guard = false  # owner decision 2026-11-04: TV control is not ga
 | `volume`, `mute`, `input`, `apps` | **true** (owner, 2026-11-04, after EXP-010 Part A passed for all four on c3-b `03.30.73`) | The setters worked, read back and restored. The evidence is c3-b only; c3-a (`03.30.74`) is untested and each control is still checked per TV at startup and switched off when its getter, its declaration or a write fails (section 6). The optional `volume_limit` cap is available. Two caveats: volume and mute were tested on `external_arc` only, and input only on a disconnected HDMI input |
 | `volume_limit` | unset (no cap below `maxVolume`) | Section 7. The first default (40) blocked real use on c3-a (volume 89) |
 | `app_limit` | 30 | Keeps the select usable in HA and in voice |
-| `play_state` | false | Extra polling for a sensor no v1 feature needs |
+| `play_state` | false | Extra polling for a sensor no v1 feature needs (the TV media player polls the play state itself) |
+| `media_player` | **true** (owner, 2026-11-04, ADR 0007) | HA's built-in volume, mute and turn on/off intents only target media players. Costs one read-only poll every 10 s while lit |
 
 Every control is also gated at run time by section 6. **Firmware guard (owner decision 2026-11-04): TV control is not gated by it.** On a firmware that is not in `safety.validated_firmware` (or whose version cannot be read) TV control keeps working and the daemon logs a warning at startup; since the same day the microphone is not hard-gated either ([firmware policy](firmware-policy-and-reports.md): it starts, warns and self-checks; the old microphone block exists only with `firmware_policy = "strict"`). The key `follow_firmware_guard` (default `false`) exists for an owner who wants the stricter behaviour: with `true` every setter is refused on an unvalidated firmware, while getters, sensors and states still report.
 
@@ -266,6 +297,7 @@ Every control is also gated at run time by section 6. **Firmware guard (owner de
 
 Voice works through HA, not through the satellite: the owner exposes the entities to Assist in HA (Settings, Voice assistants, Expose) and may add aliases ("TV", "television"). Expected behaviour, to be confirmed on the owner's HA 2026.10.4:
 
+- The media player "TV" (`tv_media_player`, section 3.5, [ADR 0007](../decisions/0007-tv-media-player.md)) is the target for HA's built-in volume (set, relative), mute and unmute, and turn on and off intents (HA 2026.10.4 source; the owner's HA not yet checked). Give it the alias, not the satellite's own media player (the reply volume).
 - `switch` entities (`tv_screen`, `tv_power`, `tv_mute`) work with HA's built-in turn on and turn off intents (documented for switches in HA's intents).
 - `button` entities (`tv_turn_on`, volume up and down): HA's turn-on intent presses buttons in recent versions (**hypothesis**, not re-read for 2026.10.4).
 - `number` and `select` (`tv_volume`, `tv_input`, `tv_app`): no built-in intent is known to set them (**hypothesis**). Options: HA scripts exposed to Assist ("set the TV volume to N"), custom sentences, or an LLM conversation agent that can call entity actions. The Kiwi pipeline's agent is a separate pending decision ([backlog #12](../project/backlog.md#12-conversation-agent-for-the-kiwi-pipeline)).
@@ -327,5 +359,7 @@ Fixes after EXP-010 Part B (PC only, 2026-11-04, tests in `crates/tv-control` an
 - **Launch declaration check:** the declaration files read now include any file whose name contains `com.webos.sam` (the application manager's methods, `com.webos.sam.api.json` on both TVs), and the entry match is case-insensitive and accepts `com.webos.applicationManager/launch`, `applicationManager/launch` (with or without `luna://`) and wildcards. The entry shape inside that file was **not read** (no raw output is committed), so the fixture is synthetic. A SAM file can only prove `Yes`: a miss there leaves `launch` at `Unchecked` (as before), never `No`, so a wrong guess about the format cannot turn the app select read-only. Re-check on a TV: the "cannot check that the TV declares launch" warning must be gone.
 - **Refresh button:** one summary line when both list reads are in: `tv_refresh_lists: done: N inputs, M apps` (counts only, no titles), or a warning `tv_refresh_lists: failed to read (...)` with the lists kept.
 - **Volume subscription without the flag:** the first reply lacking `subscribed: true` no longer ends the subscription. The child keeps running and the 10 s poll keeps running too, until a **second line** arrives on the subscription (a push: `an update was pushed on the volume subscription; it streams without the flag, polling stopped`). If instead a poll sees a different value and no line was pushed within 3 s (`PUSH_GRACE`), the subscription is dropped and the control polls only (warning `pushed nothing for a change`). A luna error as the first line still falls back to polling at once. This rests on EXP-010 A3 (c3-b: one pushed line per change on that subscription) and was verified on the PC only with a fake `luna-send` that does not send the flag. On a TV: change the volume with the remote and look for the "pushed" line within seconds, then no more 10 s volume polls (`tv_control` debug log); or the "pushed nothing" warning if the TV does not stream.
+
+TV media player ([ADR 0007](../decisions/0007-tv-media-player.md), PC only, 2026-11-04; **not yet run on a TV or against the owner's HA**): `tv_media_player` in the controller (`Kind::MediaPlayer`, `StateValue::Media`, `Command::Media`, delegating to the same command paths), the ESPHome API crate's application-owned media players (`Config::media_players`, `AppEvent::MediaPlayerCommand`, `AppCommand::SetMediaPlayer`; commands routed by key, the satellite's player unchanged), `[tv_control] media_player`. Tests: controller unit tests (state mapping per power state, volume share round trip, commands, `volume_limit`, turn off mapping, refusals), the adapter's mapping and a fake `luna-send` run (`setVolume 30` for 0.5), `server_io` (two players routed by key), fake-HA scenario J (two players, HA's feature mapping, no audio format, commands, no echo, play media ignored) and satellite scenario V25 to V32. To verify on a TV and on HA: the entity and its state, each native Spanish intent of section 3.5, that announcements and TTS still play on the satellite, and the extra play-state poll's cost.
 
 Answered by the TV run (EXP-010 Part B, 2026-11-04): the pty one-shot calls work on the real `luna-send` on both TVs; the declaration files are in `/usr/share/luna-service2/api-permissions.d` as JSON lists of `service/method` strings (audio and apiadapter found; the application manager's methods are in `com.webos.sam.api.json`, which the filter does not match, so `launch` stays `Unchecked`); the subscription children cost about 0 ticks each, the daemon about 1.5 % of one core in all on c3-a (0.1.1: 1.3 %); the volume getter reports no `subscribed` flag, so the daemon polls every 10 s; HA shows a missing state as `unknown`; the refresh button runs without a reconnect when nothing changed. Still open: the disruptive controls on c3-a, a live missing state and a changed option list against HA, B10 and B11.

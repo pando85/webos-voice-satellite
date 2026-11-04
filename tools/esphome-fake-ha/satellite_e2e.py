@@ -50,11 +50,14 @@ from fake_ha import (  # noqa: E402
 )
 
 from aioesphomeapi import (  # noqa: E402
+    APIVersion,
     BinarySensorInfo,
     BinarySensorState,
     ButtonInfo,
     MediaPlayerCommand,
+    MediaPlayerEntityFeature,
     MediaPlayerInfo,
+    MediaPlayerState,
     NumberInfo,
     NumberState,
     SelectInfo,
@@ -438,7 +441,7 @@ async def scenario_timers(binary: str, tmp: str) -> None:
         btns = {e.object_id: e for e in entities if isinstance(e, ButtonInfo)}
         texts = {e.object_id: e for e in entities if isinstance(e, TextSensorInfo)}
         bins = {e.object_id: e for e in entities if isinstance(e, BinarySensorInfo)}
-        mp = [e for e in entities if isinstance(e, MediaPlayerInfo)][0]
+        mp = [e for e in entities if isinstance(e, MediaPlayerInfo) and e.object_id == "media_player"][0]
         check("T1a entities: Stop timer alarm button, Timers sensor, Timer alarm binary sensor",
               "stop_timer_alarm" in btns and btns["stop_timer_alarm"].name == "Stop timer alarm"
               and "timers" in texts and "timer_alarm" in bins, f"{sorted(btns)} {sorted(texts)} {sorted(bins)}")
@@ -984,7 +987,8 @@ firmware_info = "{os_info}"
         by = {e.object_id: e for e in ents}
         want = {"tv_screen", "tv_power", "tv_mute", "tv_volume", "tv_volume_up", "tv_volume_down", "tv_turn_on",
                 "tv_input", "tv_app", "tv_refresh_lists", "tv_sound_output", "tv_play_state", "tv_power_state",
-                "remote_power_off", "listening", "microphone_muted", "mute_microphone"}
+                "remote_power_off", "listening", "microphone_muted", "mute_microphone", "media_player",
+                "tv_media_player"}
         check("V1 entity list: every TV control entity, once", want <= set(by) and len(by) == len(ents),
               f"missing {want - set(by)}")
         check("V2 volume range ends at the configured cap (40; the TV reports 60), no unit; selects have no category",
@@ -1079,6 +1083,51 @@ firmware_info = "{os_info}"
         cli.button_command(by["tv_turn_on"].key)
         ok = await called("turnOnScreen") and await until_true(lambda: st("tv_screen") is True)
         check("V21 turn on from Screen Off", ok, str(st("tv_screen")))
+
+        # The TV media player (ADR 0007), next to the satellite's own player.
+        mp, sat_mp = by["tv_media_player"], by["media_player"]
+        feat = MediaPlayerEntityFeature
+        flags = feat(mp.feature_flags_compat(APIVersion(1, 14)))
+        check("V25 TV media player \"TV\": volume set/step, mute, turn on/off, no audio format; "
+              "the satellite player keeps its key and its format",
+              isinstance(mp, MediaPlayerInfo) and mp.name == "TV" and not mp.supported_formats
+              and flags == feat.VOLUME_SET | feat.VOLUME_STEP | feat.VOLUME_MUTE | feat.TURN_ON | feat.TURN_OFF
+              and sat_mp.key == 2232357057 and len(sat_mp.supported_formats) == 1 and mp.key != sat_mp.key,
+              repr(flags))
+
+        def mps():
+            return states.get(mp.key)
+
+        ok = await until_true(lambda: mps() is not None and mps().state == MediaPlayerState.PLAYING
+                              and abs(mps().volume - 39 / 60) < 1e-6 and mps().muted is True)
+        check("V26 its state: playing (media playState), volume 39 of 60, muted", ok, str(mps()))
+        cli.media_player_command(mp.key, volume=0.5)
+        ok = await called('master/setVolume {"volume":30}') and await until_true(
+            lambda: abs(mps().volume - 0.5) < 1e-6 and st("tv_volume") == 30.0)
+        check("V27 volume 0.5 sets 30 of maxVolume 60; the media player and the number follow", ok, str(mps()))
+        await asyncio.sleep(1.2)
+        cli.media_player_command(mp.key, command=MediaPlayerCommand.UNMUTE)
+        ok = await called('apiadapter/audio/setMute {"mute":false}') and await until_true(
+            lambda: mps().muted is False and st("tv_mute") is False)
+        check("V28 unmute through the media player", ok, str(mps()))
+        cli.media_player_command(mp.key, command=MediaPlayerCommand.VOLUME_UP)
+        ok = await called("master/volumeUp") and await until_true(lambda: st("tv_volume") == 31.0)
+        check("V29 volume up is one TV step (volumeUp)", ok, str(st("tv_volume")))
+        cli.media_player_command(mp.key, media_url="http://127.0.0.1:9/a.flac", announcement=True)
+        check("V30 play media or an announcement to the TV media player is refused",
+              await sat.wait_log("tv_media_player: media or announcement refused"), "")
+        # With the select on "Turn off normally" turn off is the screen off.
+        cli.select_command(by["remote_power_off"].key, "Turn off normally")
+        await asyncio.sleep(0.8)
+        cli.media_player_command(mp.key, command=MediaPlayerCommand.TURN_OFF)
+        ok = await until_true(lambda: calls().count("turnOffScreen") == 2) and await until_true(
+            lambda: mps().state == MediaPlayerState.OFF)
+        check("V31 turn off without the always-on mode: turnOffScreen, the media player reads off", ok,
+              f"{mps()} {calls().count('turnOffScreen')}")
+        cli.media_player_command(mp.key, command=MediaPlayerCommand.TURN_ON)
+        ok = await until_true(lambda: calls().count("turnOnScreen") == 2) and await until_true(
+            lambda: mps().state == MediaPlayerState.PLAYING)
+        check("V32 turn on from Screen Off: turnOnScreen, playing again", ok, str(mps()))
 
         # Refresh: a new app is installed, HA lists again.
         with open(os.path.join(tv, "points"), "w") as f:

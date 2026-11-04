@@ -20,6 +20,7 @@ import argparse
 import asyncio
 import base64
 import logging
+import math
 import os
 import re
 import sys
@@ -46,10 +47,13 @@ from aioesphomeapi import (
     ConnectionClosedEvent,
     DisconnectReason,
     InvalidEncryptionKeyAPIError,
+    APIVersion,
     MediaPlayerCommand,
+    MediaPlayerEntityFeature,
     MediaPlayerInfo,
     MediaPlayerFormatPurpose,
     MediaPlayerEntityState,
+    MediaPlayerState,
     RequiresEncryptionAPIError,
     SwitchInfo,
     SwitchState,
@@ -1118,6 +1122,101 @@ async def scenario_key_clear(binary: str) -> None:
         await dev.stop()
 
 
+async def scenario_two_media_players(binary: str) -> None:
+    """The satellite's media player and an application-owned, control-only one (the TV)."""
+    print("\n== scenario J: two media players (satellite reply volume + TV controls) ==")
+    dev = Device(binary, ["--mode", "none", "--demo-entities", "--mac", "02:00:00:00:00:0f"], None)
+    await dev.start()
+    ha = FakeHA(dev.port)
+    try:
+        cli = await ha.connect()
+        _info, entities, _ = await cli.device_info_and_list_entities()
+        mps = {e.object_id: e for e in entities if isinstance(e, MediaPlayerInfo)}
+        sat, tv = mps.get("media_player"), mps.get("demo_tv")
+        check("J1 two media players with distinct keys; the satellite one keeps its object id",
+              len(mps) == 2 and sat is not None and tv is not None and sat.key != tv.key, str(list(mps)))
+        # What HA 2026.10.4's ESPHome media player does with the flags (API 1.14).
+        feat = MediaPlayerEntityFeature
+        tv_flags = feat(tv.feature_flags_compat(APIVersion(1, 14)))
+        sat_flags = feat(sat.feature_flags_compat(APIVersion(1, 14)))
+        check("J2 TV player: volume set/step, mute, turn on/off; no play media, announce, browse or source",
+              tv_flags == (feat.VOLUME_SET | feat.VOLUME_STEP | feat.VOLUME_MUTE | feat.TURN_ON | feat.TURN_OFF)
+              and not tv_flags & (feat.PLAY_MEDIA | feat.MEDIA_ANNOUNCE | feat.BROWSE_MEDIA | feat.SELECT_SOURCE),
+              repr(tv_flags))
+        check("J3 satellite player unchanged: stop + volume set/step, one ANNOUNCEMENT format",
+              sat_flags == (feat.STOP | feat.VOLUME_SET | feat.VOLUME_STEP)
+              and len(sat.supported_formats) == 1, repr(sat_flags))
+        # HA's assist satellite takes the first ANNOUNCEMENT format of any
+        # media player of the device (_update_tts_format): only the satellite has one.
+        fmts = [f for p in (sat, tv) for f in p.supported_formats
+                if f.purpose == MediaPlayerFormatPurpose.ANNOUNCEMENT]
+        check("J4 the TV player has no audio format: HA's TTS/announcement format comes from the satellite player",
+              not tv.supported_formats and len(fmts) == 1 and fmts[0].format == "flac", str(fmts))
+
+        states: dict[int, object] = {}
+        cli.subscribe_states(lambda st: states.__setitem__(st.key, st))
+        ok = await until_true(lambda: sat.key in states)
+        await asyncio.sleep(0.3)
+        check("J5 the satellite player has a state; the TV player none until the app reports one",
+              ok and tv.key not in states, str(states))
+        await dev.command("mp playing 0.2 unmuted")
+        ok = await until_true(lambda: tv.key in states and states[tv.key].state == MediaPlayerState.PLAYING)
+        check("J6 TV player state pushed (playing, volume 0.2, not muted)",
+              ok and abs(states[tv.key].volume - 0.2) < 1e-6 and states[tv.key].muted is False, str(states.get(tv.key)))
+        await dev.command("mp off unknown muted")
+        ok = await until_true(lambda: states[tv.key].state == MediaPlayerState.OFF)
+        check("J7 off with an unknown volume (NaN, HA shows no level) and muted",
+              ok and math.isnan(states[tv.key].volume) and states[tv.key].muted is True, str(states[tv.key]))
+
+        # Commands to the TV player reach the app, routed by key, not echoed.
+        start = len(dev.events)
+        cli.media_player_command(tv.key, volume=0.5)
+        ev = await dev.wait_event("MediaPlayerCommand")
+        check("J8 volume set on the TV player", ev == 'MediaPlayerCommand { object_id: "demo_tv", command: SetVolume(0.5) }', ev)
+        for cmd, want in ((MediaPlayerCommand.VOLUME_DOWN, "VolumeDown"), (MediaPlayerCommand.MUTE, "Mute(true)"),
+                          (MediaPlayerCommand.UNMUTE, "Mute(false)"), (MediaPlayerCommand.TURN_ON, "TurnOn"),
+                          (MediaPlayerCommand.TURN_OFF, "TurnOff")):
+            cli.media_player_command(tv.key, command=cmd)
+            ev = await dev.wait_event("MediaPlayerCommand")
+            check(f"J9 {cmd.name} on the TV player", ev.endswith(f"command: {want} }}"), ev)
+        await asyncio.sleep(0.2)
+        check("J10 TV player commands are not echoed as a state", states[tv.key].state == MediaPlayerState.OFF,
+              str(states[tv.key]))
+        # play_media / an announcement aimed at the TV player: ignored.
+        cli.media_player_command(tv.key, media_url="http://127.0.0.1:1/a.flac", announcement=True)
+        cli.media_player_command(tv.key, command=MediaPlayerCommand.STOP)
+        await asyncio.sleep(0.4)
+        check("J11 play media, an announcement and a stop (not advertised) to the TV player do nothing",
+              dev.count_since("MediaPlayerCommand", start) == 6 and dev.count_since("Announce", start) == 0
+              and dev.count_since("MediaStop", start) == 0, str(dev.events[start:]))
+        # The satellite player is untouched by all of that and still works.
+        cli.media_player_command(sat.key, volume=0.3)
+        ev = await dev.wait_event("VolumeChanged")
+        ok = await until_true(lambda: abs(states[sat.key].volume - 0.3) < 1e-6)
+        check("J12 the satellite player's volume is the reply volume (VolumeChanged), its state follows",
+              ev == "VolumeChanged(30)" and ok, ev)
+        cli.media_player_command(sat.key, command=MediaPlayerCommand.STOP)
+        ev = await dev.wait_event("MediaStop")
+        check("J13 the satellite player's stop is MediaStop, not a TV command",
+              ev == "MediaStop" and dev.count_since("MediaPlayerCommand", start) == 6, ev)
+        # A reconnect gets both states again, same keys.
+        await cli.disconnect()
+        await dev.wait_event("HaDisconnected")
+        ha2 = FakeHA(dev.port)
+        cli2 = await ha2.connect()
+        _i, ents2, _ = await cli2.device_info_and_list_entities()
+        keys2 = {e.object_id: e.key for e in ents2 if isinstance(e, MediaPlayerInfo)}
+        states2: dict[int, object] = {}
+        cli2.subscribe_states(lambda st: states2.__setitem__(st.key, st))
+        ok = await until_true(lambda: sat.key in states2 and tv.key in states2)
+        check("J14 reconnect: same keys, both states re-sent",
+              ok and keys2 == {"media_player": sat.key, "demo_tv": tv.key}
+              and states2[tv.key].state == MediaPlayerState.OFF, f"{keys2} {states2}")
+        await cli2.disconnect()
+    finally:
+        await dev.stop()
+
+
 async def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--device", required=True, help="path to the fake_device binary")
@@ -1125,7 +1224,8 @@ async def main() -> int:
     failed = False
     for scenario in (scenario_plaintext_speaker, scenario_capture_live, scenario_noise_url, scenario_timers,
                      scenario_pairing, scenario_pairing_window, scenario_window_behind_router,
-                     scenario_key_clear, scenario_entities, scenario_generic_entities):
+                     scenario_key_clear, scenario_entities, scenario_generic_entities,
+                     scenario_two_media_players):
         try:
             await scenario(args.device)
         except Exception as err:  # noqa: BLE001
