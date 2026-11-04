@@ -90,8 +90,12 @@ pub(crate) struct DeviceSection {
     pub(crate) mdns: bool,
     /// Advertise ANNOUNCE (bit 16): HA may send announcements.
     pub(crate) announce: bool,
-    /// Advertise TIMERS (bit 8): HA forwards its timers to the device.
+    /// Advertise TIMERS (bit 8): HA forwards its timers to the device, which
+    /// sounds an alarm when one finishes. On by default: HA needs no setup.
     pub(crate) timers: bool,
+    /// Longest one timer alarm rings, in seconds (0: no sound, timers are
+    /// only logged and shown). Needs `timers`.
+    pub(crate) timer_alarm_max_s: u32,
     /// Advertise START_CONVERSATION (bit 32): HA may start a conversation
     /// after an announcement. Needs `announce`.
     pub(crate) start_conversation: bool,
@@ -112,7 +116,8 @@ impl Default for DeviceSection {
             allow_plaintext: false,
             mdns: false,
             announce: true,
-            timers: false,
+            timers: true,
+            timer_alarm_max_s: crate::alarm::DEFAULT_MAX_S,
             start_conversation: false,
         }
     }
@@ -134,6 +139,7 @@ impl fmt::Debug for DeviceSection {
             .field("mdns", &self.mdns)
             .field("announce", &self.announce)
             .field("timers", &self.timers)
+            .field("timer_alarm_max_s", &self.timer_alarm_max_s)
             .field("start_conversation", &self.start_conversation)
             .finish()
     }
@@ -782,6 +788,7 @@ impl Settings {
     }
 
     /// Checks values that the libraries would only reject later.
+    #[allow(clippy::too_many_lines)] // one check per key, flat on purpose
     pub(crate) fn validate(&self) -> Result<(), ConfigError> {
         self.log_level()?;
         if self.mic.rate != 16_000 {
@@ -831,6 +838,12 @@ impl Settings {
         }
         if self.safety.kill_switch == self.safety.mute_file {
             return Err(err("safety.kill_switch and safety.mute_file must differ"));
+        }
+        if self.device.timer_alarm_max_s > crate::alarm::MAX_MAX_S {
+            return Err(err(format!(
+                "device.timer_alarm_max_s must be between 0 (no sound) and {}",
+                crate::alarm::MAX_MAX_S
+            )));
         }
         if self.device.start_conversation && !self.device.announce {
             return Err(err(
@@ -1774,20 +1787,26 @@ level = "debug"
     #[test]
     fn voice_feature_keys_map_onto_the_flags() {
         use webos_esphome_api::features as f;
-        assert_eq!(Settings::default().voice_features(), 23);
-        assert_eq!(Settings::default().voice_features(), f::DEFAULT);
-        let s = Settings::from_toml("[device]\ntimers = true\n", Path::new(".")).unwrap();
-        assert_eq!(s.voice_features(), 31);
+        // Timers are on by default: 7 + announce 16 + timers 8.
+        assert_eq!(Settings::default().voice_features(), 31);
+        assert_eq!(Settings::default().voice_features(), f::DEFAULT_WITH_TIMERS);
+        let s = Settings::from_toml("[device]\ntimers = false\n", Path::new(".")).unwrap();
+        assert_eq!(s.voice_features(), 23);
+        assert_eq!(s.voice_features(), f::DEFAULT);
+        let s =
+            Settings::from_toml("[device]\nstart_conversation = true\n", Path::new(".")).unwrap();
+        assert_eq!(s.voice_features(), 63);
         let s = Settings::from_toml(
-            "[device]\ntimers = true\nstart_conversation = true\n",
+            "[device]\ntimers = false\nstart_conversation = true\n",
             Path::new("."),
         )
         .unwrap();
-        assert_eq!(s.voice_features(), 63);
-        let s =
-            Settings::from_toml("[device]\nstart_conversation = true\n", Path::new(".")).unwrap();
         assert_eq!(s.voice_features(), 55);
-        let s = Settings::from_toml("[device]\nannounce = false\n", Path::new(".")).unwrap();
+        let s = Settings::from_toml(
+            "[device]\ntimers = false\nannounce = false\n",
+            Path::new("."),
+        )
+        .unwrap();
         assert_eq!(s.voice_features(), 7);
         // The flags reach the API config, which accepts every combination.
         let mut s = s;
@@ -1810,6 +1829,20 @@ level = "debug"
         // Typos in the new keys are still rejected.
         assert!(Settings::from_toml("[device]\ntimer = true\n", Path::new(".")).is_err());
         assert!(Settings::from_toml("[device]\ntimers = \"yes\"\n", Path::new(".")).is_err());
+    }
+
+    #[test]
+    fn timer_alarm_cap_is_bounded() {
+        let mut s = Settings::default();
+        s.device.allow_plaintext = true;
+        assert_eq!(s.device.timer_alarm_max_s, 300);
+        s.device.timer_alarm_max_s = 0;
+        s.validate().unwrap();
+        s.device.timer_alarm_max_s = crate::alarm::MAX_MAX_S;
+        s.validate().unwrap();
+        s.device.timer_alarm_max_s = crate::alarm::MAX_MAX_S + 1;
+        let e = s.validate().unwrap_err();
+        assert!(e.0.contains("timer_alarm_max_s"), "{e}");
     }
 
     #[test]

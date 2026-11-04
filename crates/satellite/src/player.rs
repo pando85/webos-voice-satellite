@@ -34,6 +34,8 @@ pub(crate) enum Kind {
     Tts,
     /// Announcement → `AnnounceFinished`.
     Announce,
+    /// The timer alarm chime: HA is told nothing.
+    Alarm,
 }
 
 /// Statistics of a finished playback.
@@ -220,6 +222,52 @@ impl Player {
         self.current.is_some()
     }
 
+    /// What is playing, if anything.
+    pub(crate) fn current_kind(&self) -> Option<Kind> {
+        self.current.as_ref().map(|a| a.kind)
+    }
+
+    /// Like [`Player::stop`], but leaves the timer alarm alone: HA's stop
+    /// and abort messages are about replies and announcements.
+    pub(crate) fn stop_reply(&mut self) -> Option<Kind> {
+        if self.current_kind() == Some(Kind::Alarm) {
+            return None;
+        }
+        self.stop()
+    }
+
+    /// Starts the timer alarm chime, which plays until stopped or `max`
+    /// (plus a short margin as a backstop) has passed. The gain is read for
+    /// every slice, like a streamed reply. Returns the kind of a playback
+    /// that had to be stopped for it.
+    pub(crate) fn start_alarm(&mut self, max: Duration) -> Option<Kind> {
+        self.start_alarm_with(max, ALARM_BACKSTOP)
+    }
+
+    fn start_alarm_with(&mut self, max: Duration, backstop: Duration) -> Option<Kind> {
+        let stopped = self.stop();
+        let (id, cancel_rx, cancel_tx) = self.begin();
+        let cfg = self.cfg.clone();
+        let volume = self.volume.clone();
+        let done_tx = self.done_tx.clone();
+        let task = tokio::spawn(async move {
+            let result = alarm_task(&cfg, &volume, id, max + backstop, cancel_rx).await;
+            let _ = done_tx.send(Done {
+                id,
+                kind: Kind::Alarm,
+                result,
+            });
+        });
+        self.current = Some(Active {
+            id,
+            kind: Kind::Alarm,
+            cancel: Some(cancel_tx),
+            chunks: None,
+            task,
+        });
+        stopped
+    }
+
     fn begin(&mut self) -> (u64, oneshot::Receiver<()>, oneshot::Sender<()>) {
         self.next_id += 1;
         let (tx, rx) = oneshot::channel();
@@ -352,6 +400,10 @@ fn latency_args(cfg: &SinkSection) -> Option<String> {
 }
 
 fn pacat_stream_args(cfg: &SinkSection, rate: u32, channels: u16) -> Vec<String> {
+    pacat_named_args(cfg, rate, channels, "tts-reply")
+}
+
+fn pacat_named_args(cfg: &SinkSection, rate: u32, channels: u16, stream: &str) -> Vec<String> {
     let mut a = vec![
         "--playback".to_owned(),
         "--raw".to_owned(),
@@ -359,7 +411,7 @@ fn pacat_stream_args(cfg: &SinkSection, rate: u32, channels: u16) -> Vec<String>
         format!("--rate={rate}"),
         format!("--channels={channels}"),
         "--client-name=webos-voice-satellite".to_owned(),
-        "--stream-name=tts-reply".to_owned(),
+        format!("--stream-name={stream}"),
     ];
     a.extend(latency_args(cfg));
     if let Some(d) = &cfg.device {
@@ -521,6 +573,7 @@ fn url_sink(cfg: &SinkSection, gain: f32, id: u64, kind: Kind) -> (Box<dyn Sink>
             let prefix = match kind {
                 Kind::Tts => "reply-url",
                 Kind::Announce => "announce",
+                Kind::Alarm => "alarm",
             };
             let path = wav_path(&cfg.dir, prefix, id);
             let mut w = WavFileSink::new(&path);
@@ -532,6 +585,144 @@ fn url_sink(cfg: &SinkSection, gain: f32, id: u64, kind: Kind) -> (Box<dyn Sink>
         }
         SinkKind::Null => (Box::new(NullSink::default()), None),
     }
+}
+
+/// Longest stretch of chime audio written ahead of real time: bounds how
+/// long a stop or a volume change takes to be heard.
+const ALARM_AHEAD: Duration = Duration::from_millis(400);
+/// One write to `pacat`.
+const ALARM_SLICE: Duration = Duration::from_millis(100);
+/// How long the task outlives the cap if the daemon never stops it.
+const ALARM_BACKSTOP: Duration = Duration::from_secs(3);
+
+/// The chime, repeated until cancelled or `limit` passes.
+async fn alarm_task(
+    cfg: &SinkSection,
+    volume: &SharedGain,
+    id: u64,
+    limit: Duration,
+    mut cancel: oneshot::Receiver<()>,
+) -> Result<PlayStats, String> {
+    let cycle: Vec<u8> = crate::alarm::chime_cycle()
+        .iter()
+        .flat_map(|s| s.to_le_bytes())
+        .collect();
+    match cfg.kind {
+        SinkKind::Pacat => alarm_pacat(cfg, volume, &cycle, limit, &mut cancel).await,
+        SinkKind::Wav | SinkKind::Null => {
+            // One cycle to a file (or nowhere), then "ring" silently.
+            let (out, nonzero) = gain_s16le(&cycle, cfg.gain * volume.get());
+            let file = if cfg.kind == SinkKind::Wav {
+                let path = wav_path(&cfg.dir, "alarm", id);
+                let pcm = Pcm {
+                    rate: crate::alarm::CHIME_RATE,
+                    channels: 1,
+                    samples: out
+                        .chunks_exact(2)
+                        .map(|b| i16::from_le_bytes([b[0], b[1]]))
+                        .collect(),
+                };
+                let bytes = webos_playback::wav_bytes(&pcm);
+                let p = path.clone();
+                tokio::task::spawn_blocking(move || std::fs::write(&p, bytes))
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+                Some(path)
+            } else {
+                None
+            };
+            let stats = PlayStats {
+                audio: crate::alarm::CYCLE,
+                bytes: out.len(),
+                nonzero_samples: Some(nonzero),
+                file,
+            };
+            tokio::select! {
+                _ = &mut cancel => Err("cancelled".to_owned()),
+                () = tokio::time::sleep(limit) => Ok(stats),
+            }
+        }
+    }
+}
+
+async fn alarm_pacat(
+    cfg: &SinkSection,
+    volume: &SharedGain,
+    cycle: &[u8],
+    limit: Duration,
+    cancel: &mut oneshot::Receiver<()>,
+) -> Result<PlayStats, String> {
+    let mut child = Command::new(&cfg.binary)
+        .args(pacat_named_args(
+            cfg,
+            crate::alarm::CHIME_RATE,
+            1,
+            "timer-alarm",
+        ))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| format!("cannot start pacat: {e}"))?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "pacat has no stdin".to_owned())?;
+    let slice_bytes = duration_bytes(ALARM_SLICE, crate::alarm::CHIME_RATE);
+    let started = Instant::now();
+    let mut stats = PlayStats {
+        nonzero_samples: Some(0),
+        ..PlayStats::default()
+    };
+    'ring: loop {
+        for slice in cycle.chunks(slice_bytes) {
+            // Pace the writes: pacat's pipe would otherwise take seconds of
+            // audio at once, and a stop would be heard that much later.
+            let ahead = stats.audio.saturating_sub(started.elapsed());
+            if ahead > ALARM_AHEAD {
+                tokio::select! {
+                    biased;
+                    _ = &mut *cancel => {
+                        let _ = child.kill().await;
+                        return Err("cancelled".to_owned());
+                    }
+                    () = tokio::time::sleep(ahead.saturating_sub(ALARM_AHEAD)) => {}
+                }
+            }
+            if started.elapsed() >= limit {
+                break 'ring;
+            }
+            let (out, nonzero) = gain_s16le(slice, cfg.gain * volume.get());
+            tokio::select! {
+                biased;
+                _ = &mut *cancel => {
+                    let _ = child.kill().await;
+                    return Err("cancelled".to_owned());
+                }
+                r = stdin.write_all(&out) => {
+                    if let Err(e) = r {
+                        let _ = child.kill().await;
+                        return Err(format!("writing to pacat failed: {e}"));
+                    }
+                }
+            }
+            stats.bytes += out.len();
+            *stats.nonzero_samples.get_or_insert(0) += nonzero;
+            stats.audio = duration_of(stats.bytes, crate::alarm::CHIME_RATE, 1);
+        }
+    }
+    // Past the limit: let the little that is buffered play, then end.
+    drop(stdin);
+    let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+    let _ = child.kill().await;
+    Ok(stats)
+}
+
+/// Bytes of 16-bit mono audio in `d` (an even number).
+fn duration_bytes(d: Duration, rate: u32) -> usize {
+    (rate as usize * 2 * d.as_millis() as usize / 1000) & !1
 }
 
 async fn play_url_task(
@@ -826,6 +1017,141 @@ mod tests {
         let written = std::fs::read(&out).unwrap();
         assert_eq!(written.len(), 2048);
         assert!(written.iter().all(|&b| b == 0));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn fake_pacat_dir(tag: &str) -> (PathBuf, PathBuf, PathBuf, SinkSection) {
+        let dir = std::env::temp_dir().join(format!("webos-sat-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("written.raw");
+        let args = dir.join("args.txt");
+        let script = dir.join("fake-pacat");
+        crate::testutil::write_script(
+            &script,
+            &format!(
+                "echo \"$@\" > '{}'\ncat > '{}'",
+                args.display(),
+                out.display()
+            ),
+        );
+        let mut cfg = SinkSection::default();
+        cfg.binary.clone_from(&script);
+        (dir, out, args, cfg)
+    }
+
+    fn samples(path: &std::path::Path) -> Vec<i16> {
+        std::fs::read(path)
+            .unwrap()
+            .chunks_exact(2)
+            .map(|b| i16::from_le_bytes([b[0], b[1]]))
+            .collect()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn alarm_chime_streams_to_pacat_paced_and_scaled() {
+        let (dir, out, args, mut cfg) = fake_pacat_dir("alarm-pacat");
+        cfg.gain = 0.5;
+        let volume = SharedGain::new(1.0);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut p = Player::new(cfg, volume, tx);
+        assert!(p.start_alarm(Duration::from_secs(60)).is_none());
+        assert_eq!(p.current_kind(), Some(Kind::Alarm));
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        // A stop for replies and aborts leaves the alarm alone.
+        assert_eq!(p.stop_reply(), None);
+        assert_eq!(p.current_kind(), Some(Kind::Alarm));
+        assert_eq!(p.stop(), Some(Kind::Alarm));
+        let done = rx.recv().await.unwrap();
+        assert_eq!(done.kind, Kind::Alarm);
+        assert!(!p.finish(&done), "a stopped alarm is not reported again");
+        let a = std::fs::read_to_string(&args).unwrap();
+        assert!(a.contains("--rate=16000"), "{a}");
+        assert!(a.contains("--channels=1"), "{a}");
+        assert!(a.contains("--stream-name=timer-alarm"), "{a}");
+        assert!(a.contains("--latency-msec=200"), "{a}");
+        let s = samples(&out);
+        // Paced near real time: about 1.5 s plus the 400 ms lead, not a flood.
+        assert!(
+            (16_000..=38_400).contains(&s.len()),
+            "{} samples written",
+            s.len()
+        );
+        // Gain 0.5 on the 0.7 full-scale chime.
+        let peak = s.iter().map(|x| i32::from(*x).abs()).max().unwrap();
+        assert!((9_000..=12_000).contains(&peak), "peak {peak}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn alarm_chime_repeats_and_ends_at_its_limit() {
+        let (dir, out, _args, cfg) = fake_pacat_dir("alarm-limit");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut p = Player::new(cfg, SharedGain::new(1.0), tx);
+        // Limit 2.9 s: a full 2.6 s cycle and a start of the second.
+        p.start_alarm_with(Duration::from_millis(2900), Duration::ZERO);
+        let done = rx.recv().await.unwrap();
+        assert!(p.finish(&done));
+        let st = done.result.unwrap();
+        assert!(st.nonzero_samples.unwrap() > 10_000);
+        let s = samples(&out);
+        let cycle = crate::alarm::chime_cycle();
+        assert!(s.len() > cycle.len(), "{} samples", s.len());
+        assert_eq!(
+            &s[..cycle.len()],
+            &cycle[..],
+            "the first cycle is the chime"
+        );
+        assert_eq!(
+            &s[cycle.len()..cycle.len() + 1000],
+            &cycle[..1000],
+            "it repeats"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn alarm_at_gain_zero_writes_only_zeros_and_a_reply_replaces_it() {
+        let (dir, out, _args, mut cfg) = fake_pacat_dir("alarm-silent");
+        cfg.gain = 0.0;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut p = Player::new(cfg, SharedGain::new(1.0), tx);
+        p.start_alarm(Duration::from_secs(60));
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        // A reply stream takes the speaker: the alarm is reported as stopped.
+        assert_eq!(p.start_stream(16_000, 1), Some(Kind::Alarm));
+        assert_eq!(p.current_kind(), Some(Kind::Tts));
+        let first = rx.recv().await.unwrap();
+        assert_eq!(first.kind, Kind::Alarm);
+        assert!(!p.finish(&first));
+        let s = samples(&out);
+        assert!(!s.is_empty());
+        assert!(s.iter().all(|x| *x == 0));
+        p.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn alarm_wav_sink_writes_one_cycle() {
+        let dir = std::env::temp_dir().join(format!("webos-sat-alarm-wav-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut cfg = SinkSection::default();
+        cfg.kind = SinkKind::Wav;
+        cfg.dir.clone_from(&dir);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut p = Player::new(cfg, SharedGain::new(1.0), tx);
+        p.start_alarm_with(Duration::from_millis(100), Duration::ZERO);
+        let done = rx.recv().await.unwrap();
+        assert!(p.finish(&done));
+        let st = done.result.unwrap();
+        let file = st.file.unwrap();
+        let name = file.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.starts_with("alarm-"), "{name}");
+        let cycle_bytes = crate::alarm::chime_cycle().len() * 2;
+        assert_eq!(
+            std::fs::metadata(&file).unwrap().len(),
+            44 + cycle_bytes as u64
+        );
+        assert!(st.nonzero_samples.unwrap() > 10_000);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

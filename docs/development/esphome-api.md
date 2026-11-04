@@ -21,7 +21,7 @@ Code generation: `build.rs` compiles the proto with `protox` (pure Rust, so no `
   - With SPEAKER, HA streams the TTS reply as 16 kHz mono s16le PCM over the API, between the `TTS_STREAM_START` and `TTS_STREAM_END` events. The PCM chunks are 512 samples and carry no WAV header. The owner's HA builds media URLs from the pod IP, which the TV cannot reach (orchestrator note, [integration notes](../research/ha-esphome-integration-notes.md)).
   - Without SPEAKER, HA sends `TTS_END{url}` and the app fetches it (`AppEvent::TtsUrl`). After playback the device sends `VoiceAssistantAnnounceFinished`.
   - `START_CONVERSATION` (32) is implemented but off by default (see [START_CONVERSATION status](#start_conversation-status)).
-  - `TIMERS` (8) is implemented but off by default (see [Timers](#timers)).
+  - `TIMERS` (8) is off by default in the API crate; the satellite turns it on by default (see [Timers](#timers)).
   - `MULTI_CHANNEL_AUDIO` (64) is rejected by config validation because it is not implemented.
 - **Request flags:** `USE_WAKE_WORD` (2) is set for wake word runs. `USE_VAD` is never set, because HA 2026.10.4 ignores it.
 - **Entities:**
@@ -84,7 +84,7 @@ Divergences from ESPHome 2026.10.1 (all deliberate):
 
 ## Timers
 
-Status: **implemented in the API crate and wired into the satellite config (`[device] timers = true`), soundless (the chime is Phase 4), off by default.** Verified against aioesphomeapi 46.6.0 acting as HA, not against a real HA.
+Status: **implemented in the API crate; the satellite advertises it by default (`[device] timers = true`) and rings an alarm when a timer finishes (2026-11-04, PC only: unit tests, fake-HA harness; not yet heard on a TV).** Verified against aioesphomeapi 46.6.0 acting as HA, not against a real HA. HA's own code was read on the owner's HA 2026.10 (pod `home-assistant-hass-0`, read-only).
 
 How HA behaves (HA 2026.10.4 `esphome/assist_satellite.py`, `intent/timers.py`; source reading):
 
@@ -95,13 +95,31 @@ How HA behaves (HA 2026.10.4 `esphome/assist_satellite.py`, `intent/timers.py`; 
 
 What the crate does:
 
-- Enable it with `Config::voice_features = features::DEFAULT_WITH_TIMERS` (31). The default stays `features::DEFAULT` (23). `fake_device` takes `--features 31`. In the satellite, set `[device] timers = true` (and optionally `start_conversation = true`, which needs `announce = true`); see the configuration reference in [development.md](../development.md#configuration-reference).
+- Enable it with `Config::voice_features = features::DEFAULT_WITH_TIMERS` (31). The crate's default stays `features::DEFAULT` (23). `fake_device` takes `--features 31`. The satellite sets TIMERS unless `[device] timers = false` (and optionally `start_conversation = true`, which needs `announce = true`); see the configuration reference in [development.md](../development.md#configuration-reference).
 - With TIMERS advertised, each HA timer message becomes `AppEvent::Timer { event: TimerEvent, id, name, total_seconds, seconds_left, is_active }`. Unknown event types are dropped with a debug line. Without TIMERS the messages are ignored.
 - `AppEvent`'s hand-written `Debug` prints event, id and seconds only. The timer name is user speech and stays out of logs (`name_bytes` in `Timer`'s `Debug`). `AppEvent` was already `#[non_exhaustive]`, so adding the variant breaks no match.
 - `TimerTable` is an optional helper for the application: `apply(&AppEvent, Instant)` keeps the timers HA reported (at most 64), `Timer::remaining(now)` counts down locally while the timer is active, and `by_remaining` lists them soonest first. It lives in the application and so survives HA reconnects, which is the only state recovery available given that HA does not replay. The server itself keeps no timer state.
-- The satellite keeps a `TimerTable` (survives HA reconnects) and logs each event at info level (`timer <event> id=... seconds_left=...`, so a finished timer logs `timer finished id=... seconds_left=0`; never the name). It plays no sound yet: the chime is Phase 4 work (see below). `satellite_e2e.py` checks this with a daemon started with `timers = true` and `start_conversation = true` (flags 63).
+- The satellite keeps a `TimerTable` (survives HA reconnects) and logs each event at info level (`timer <event> id=... seconds_left=...`, so a finished timer logs `timer finished id=... seconds_left=0`; never the name). It rings an alarm on `FINISHED` (see below). `satellite_e2e.py` checks this with a daemon on the default config plus `start_conversation = true` (flags 63).
 
-What the TV will do (Phase 4, not now): on `FINISHED` the satellite will play a repeating chime through the playback path until the user stops it (voice command to HA, which cancels the timer, or the media player STOP) or a time limit passes. The chime asset, the stop gesture, the volume and the interaction with a running pipeline run (duck or queue) are open Phase 4 and Phase 2 audio decisions. A disconnected HA cannot send `FINISHED`, so the application may sound a known timer from its local `remaining` time. HA's own `FINISHED` after a reconnect must not sound it twice, which `TimerTable` supports by dropping the timer on the first `FINISHED`.
+### Timer alarm (satellite, 2026-11-04)
+
+What HA does and does not do (HA 2026.10, `intent/timers.py` and `esphome/assist_satellite.py`, read on the owner's HA):
+
+- `_timer_finished` **pops the timer from HA's table before** calling the device's handler. After `FINISHED` the timer no longer exists in HA: it cannot be cancelled, and no `CANCELLED` or `UPDATED` follows for it. "Cancel the timer" by voice does nothing for a ringing alarm.
+- HA has **no "stop ringing" message** to the device; ESPHome devices stop their own sound (a button, or an on-device "stop" wake word). So stopping is the satellite's job. A timer created with a conversation command (`conversation_command`) runs that command and sends the device no `FINISHED`.
+- With TIMERS advertised HA needs **no other setup**: `HassStartTimer` works for the satellite's device (the Assist pipeline passes the device id). That is why `[device] timers` is now **on by default**. Without TIMERS HA answers that timers are not supported on this device. An already added device picks the flag up on its next connection (restart of the satellite or a reload of the ESPHome entry).
+
+What the satellite does:
+
+- **Start.** On `FINISHED` it plays a built-in chime (generated in code, no audio asset): a falling "ding-dong" (C6 then G5, bell-like partials, about 0.7 full scale before the volume) twice, then a pause, a 2.6 s cycle, repeated. It is streamed to `pacat` (16 kHz mono, stream name `timer-alarm`, same `sink.latency_msec`) paced a little ahead of real time, so a stop or a volume change is heard within about half a second.
+- **Volume.** The reply volume (the media player slider in HA, default 40 % = -30 dB) times `sink.gain`, read for every slice. At 0 % the alarm is silent (a warning is logged). The TV's own volume is never touched. The microphone mute and the kill switch are **not** applied to the alarm: they close the microphone, not the speaker, and announcements already play while muted (a timer you set is something you asked for). With the alarm off, set `timer_alarm_max_s = 0`.
+- **Cap.** It stops by itself after `[device] timer_alarm_max_s` (default 300, at most 3600; 0 = no sound). A second timer that finishes while it rings joins it and restarts the cap.
+- **Stop.** The wake word detected by HA (`WakeWordDetected`) or a run that starts at speech-to-text (push-to-talk) stops it before the pipeline streams; the HA button entity **Stop timer alarm** (`stop_timer_alarm`); the media player's stop (`AppEvent::MediaStop`); HA cancelling or updating the timer that rings (a defensive path, see above); the cap. HA's abort and stop messages for replies (`StopPlayback`) leave it alone, and an HA disconnect does not stop it.
+- **Queue.** If a reply or announcement is playing, or a conversation run is in progress, when a timer finishes, the alarm waits (state "queued") and starts when both are over, still counting its cap from the finish. If an announcement or reply arrives while it rings, it takes the speaker (never two `pacat` streams) and the alarm resumes afterwards. After a reconnect nothing is replayed: HA sends nothing for timers already finished.
+- **Entities (when `timers` is on).** Text sensor **Timers**: `none`, `ringing`, or `N timer(s), next in M min` (rounded up, `(paused)` when the next one is paused); binary sensor **Timer alarm** (on from the finish until it stops, including while queued); the button **Stop timer alarm**. With `timer_alarm_max_s = 0` only the Timers sensor exists. They are state of what HA told the satellite: a disconnected HA cannot send `FINISHED` and the satellite does not sound timers on its own.
+- **Logs.** `timer alarm: ringing for at most N s`, `timer alarm stopped (<reason>; was Ringing)`, `timer alarm paused: a reply or announcement is playing`, `timer alarm: stopped at the time cap`, `timer alarm: chime ended (...)` and failures. Never the timer name.
+
+Not verified on a TV: how the chime sounds at 40 % and at other TV volumes, whether the server-side wake word reacts to the chime picked up by the microphone (the alarm rings while the wake word is armed), and the latency of the stop. See the checklist in [development.md](../development.md#timer-alarm).
 
 ## START_CONVERSATION status
 
@@ -152,7 +170,7 @@ The harness plays HA:
   - an announcement that aborts the wake word run, and `start_conversation`;
   - the mute switch, and disconnect.
 - **Scenario A** also checks that a stray timer event is ignored while TIMERS is not advertised.
-- **Scenario C** (plaintext, features 31) covers the TIMERS flag in device info and the app events for started, updated (time added, paused, resumed), finished and cancelled timers, a timer without a name, and that the device log (at debug level) never contains the timer name.
+- **Scenario C** (plaintext, features 31) covers the TIMERS flag in device info and the app events for started, updated (time added, paused, resumed), finished and cancelled timers, a timer without a name, `MediaStop` on the media player's stop, and that the device log (at debug level) never contains the timer name.
 - **Scenario B** (Noise, URL mode, push-to-talk) covers:
   - refusal of a plaintext client and of a wrong key, with the exceptions HA maps to its UI;
   - an encrypted session;

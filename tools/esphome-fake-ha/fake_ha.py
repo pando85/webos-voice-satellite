@@ -46,6 +46,7 @@ from aioesphomeapi import (
     ConnectionClosedEvent,
     DisconnectReason,
     InvalidEncryptionKeyAPIError,
+    MediaPlayerCommand,
     MediaPlayerInfo,
     MediaPlayerFormatPurpose,
     MediaPlayerEntityState,
@@ -493,6 +494,15 @@ async def scenario_timers(binary: str) -> None:
         cli.send_voice_assistant_timer_event(T.VOICE_ASSISTANT_TIMER_CANCELLED, "t-2", None, 60, 41, True)
         ev = await dev.wait_event("Timer ")
         check("C7 CANCELLED", "event: cancelled" in ev and "seconds_left: 41" in ev, ev)
+
+        # The media player's stop is reported to the app even with nothing to
+        # stop in the voice layer, so the app can stop its own sounds (the
+        # timer alarm).
+        _i, ents, _ = await cli.device_info_and_list_entities()
+        mp = [e for e in ents if isinstance(e, MediaPlayerInfo)][0]
+        cli.media_player_command(mp.key, command=MediaPlayerCommand.STOP)
+        ev = await dev.wait_event("MediaStop")
+        check("C7a media player STOP reaches the app as MediaStop", ev == "MediaStop", ev)
 
         # The device log shows ids and seconds but never the timer name.
         await cli.disconnect()

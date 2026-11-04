@@ -1,5 +1,5 @@
 //! Reply volume: an in-process gain on every reply sample (streamed TTS,
-//! TTS URLs, announcements, and the timer sound once it exists), applied
+//! TTS URLs, announcements and the timer alarm), applied
 //! before `pacat`, independent of the TV's own volume.
 //!
 //! Why in-process: on c3-a `pacat --volume` is ignored (P1), so scaling the

@@ -49,6 +49,8 @@ from aioesphomeapi import (  # noqa: E402
     BinarySensorInfo,
     BinarySensorState,
     ButtonInfo,
+    MediaPlayerCommand,
+    MediaPlayerInfo,
     NumberInfo,
     NumberState,
     SelectInfo,
@@ -140,14 +142,14 @@ level = "info"
         cli = await ha.connect()
         info, entities, _ = await cli.device_info_and_list_entities()
         flags = info.voice_assistant_feature_flags_compat(cli.api_version)
-        check("S1 Noise handshake, device info from the config",
+        check("S1 Noise handshake, device info from the config (default flags 31: announce + timers)",
               info.name == "e2e-satellite" and info.friendly_name == "E2E Satellite"
-              and info.mac_address == "02:00:00:00:00:E2" and flags == 23,
+              and info.mac_address == "02:00:00:00:00:E2" and flags == 31,
               f"{info.name} {info.mac_address} flags={flags}")
         bins = {e.object_id: e for e in entities if isinstance(e, BinarySensorInfo)}
         mute_sw = [e for e in entities if isinstance(e, SwitchInfo)][0]
         check("S1a listening indicator entities listed (binary sensors, no category)",
-              set(bins) == {"listening", "microphone_muted"}
+              set(bins) == {"listening", "microphone_muted", "timer_alarm"}
               and bins["listening"].name == "Listening" and bins["microphone_muted"].name == "Microphone muted",
               str(sorted(bins)))
         bstate: dict[int, BinarySensorState] = {}
@@ -248,54 +250,230 @@ level = "info"
         sat.log.close()
 
 
-async def scenario_timers(binary: str, tmp: str) -> None:
-    print("\n== satellite e2e: [device] timers + start_conversation, timer events ==")
-    psk = base64.b64encode(os.urandom(32)).decode()
-    with open(os.path.join(tmp, "psk"), "w") as f:
-        f.write(psk + "\n")
-    os.chmod(os.path.join(tmp, "psk"), 0o600)
-    write_mic(os.path.join(tmp, "mic.raw"), 5.0)
-    port = free_port()
-    config = os.path.join(tmp, "sat-timers.toml")
+def alarm_config(tmp: str, name: str, port: int, mac: str, extra: str = "") -> str:
+    config = os.path.join(tmp, f"{name}.toml")
+    wav = os.path.join(tmp, f"wav-{name}")
+    os.makedirs(wav, exist_ok=True)
     with open(config, "w") as f:
         f.write(f"""
 [device]
-name = "e2e-timers"
-mac = "02:00:00:00:00:e3"
+name = "{name}"
+mac = "{mac}"
 bind = "127.0.0.1"
 port = {port}
 noise_psk_file = "psk"
-timers = true
 start_conversation = true
+{extra}
 [mic]
 source = "file"
 path = "mic.raw"
 [sink]
-type = "null"
+type = "wav"
+dir = "wav-{name}"
 [log]
 level = "info"
 """)
+    return config
+
+
+def alarm_files(tmp: str, name: str) -> list[str]:
+    d = os.path.join(tmp, f"wav-{name}")
+    return sorted(f for f in os.listdir(d) if f.startswith("alarm-"))
+
+
+def wav_peak(path: str) -> int:
+    with open(path, "rb") as f:
+        data = f.read()[44:]
+    n = len(data) // 2
+    return max((abs(v) for v in struct.unpack(f"<{n}h", data[: n * 2])), default=0)
+
+
+async def scenario_timers(binary: str, tmp: str) -> None:
+    print("\n== satellite e2e: timers on by default, alarm (start, stop, queue, cancel), sensors ==")
+    psk = base64.b64encode(os.urandom(32)).decode()
+    with open(os.path.join(tmp, "psk"), "w") as f:
+        f.write(psk + "\n")
+    os.chmod(os.path.join(tmp, "psk"), 0o600)
+    write_mic(os.path.join(tmp, "mic.raw"), 30.0)
+    port = free_port()
+    name = "e2e-timers"
+    config = alarm_config(tmp, name, port, "02:00:00:00:00:e3")
     sat = Satellite(binary, config, os.path.join(tmp, "satellite-timers.log"))
     await sat.start()
     ha = FakeHA(port, psk)
     try:
         cli = await ha.connect()
-        info, _entities, _ = await cli.device_info_and_list_entities()
+        info, entities, _ = await cli.device_info_and_list_entities()
         flags = info.voice_assistant_feature_flags_compat(cli.api_version)
-        check("T1 config keys advertise TIMERS and START_CONVERSATION (63)", flags == 63, f"flags={flags}")
-        name = "timer-name-sentinel"
-        cli.send_voice_assistant_timer_event(TimerEv.VOICE_ASSISTANT_TIMER_STARTED, "t-1", name, 300, 300, True)
-        cli.send_voice_assistant_timer_event(TimerEv.VOICE_ASSISTANT_TIMER_UPDATED, "t-1", name, 360, 342, True)
-        cli.send_voice_assistant_timer_event(TimerEv.VOICE_ASSISTANT_TIMER_FINISHED, "t-1", name, 360, 0, False)
+        check("T1 timers are on by default: TIMERS + START_CONVERSATION advertised (63)", flags == 63, f"flags={flags}")
+        btns = {e.object_id: e for e in entities if isinstance(e, ButtonInfo)}
+        texts = {e.object_id: e for e in entities if isinstance(e, TextSensorInfo)}
+        bins = {e.object_id: e for e in entities if isinstance(e, BinarySensorInfo)}
+        mp = [e for e in entities if isinstance(e, MediaPlayerInfo)][0]
+        check("T1a entities: Stop timer alarm button, Timers sensor, Timer alarm binary sensor",
+              "stop_timer_alarm" in btns and btns["stop_timer_alarm"].name == "Stop timer alarm"
+              and "timers" in texts and "timer_alarm" in bins, f"{sorted(btns)} {sorted(texts)} {sorted(bins)}")
+        shown: dict[str, object] = {}
+
+        def on_state(st) -> None:
+            for obj, info_ in (("timers", texts.get("timers")), ("timer_alarm", bins.get("timer_alarm"))):
+                if info_ is not None and st.key == info_.key and not getattr(st, "missing_state", False):
+                    shown[obj] = st.state
+
+        cli.subscribe_states(on_state)
+        ha.subscribe_voice()
+        ok = await until_true(lambda: shown.get("timers") == "none" and shown.get("timer_alarm") is False)
+        check("T1b initial states: Timers none, Timer alarm off", ok, str(shown))
+        await ha.next_start()
+
+        tname = "timer-name-sentinel"
+        T = TimerEv
+        cli.send_voice_assistant_timer_event(T.VOICE_ASSISTANT_TIMER_STARTED, "t-1", tname, 300, 300, True)
+        cli.send_voice_assistant_timer_event(T.VOICE_ASSISTANT_TIMER_UPDATED, "t-1", tname, 360, 342, True)
+        ok = await until_true(lambda: shown.get("timers") == "1 timer, next in 6 min")
+        check("T2 Timers sensor follows started/updated (rounded up to minutes)", ok, str(shown))
+
+        # Finished: the alarm rings, the sensors say so, a chime reaches the sink.
+        cli.send_voice_assistant_timer_event(T.VOICE_ASSISTANT_TIMER_FINISHED, "t-1", tname, 360, 0, False)
         ok = await sat.wait_log("timer finished id=t-1 seconds_left=0")
+        ok = ok and await sat.wait_log("timer alarm: ringing for at most 300 s")
+        ok = ok and await until_true(lambda: shown.get("timer_alarm") is True and shown.get("timers") == "ringing")
+        files = alarm_files(tmp, name)
+        check("T3 FINISHED rings the alarm: log, sensors, chime written to the sink",
+              ok and len(files) == 1, f"{shown} {files}")
+        peak = wav_peak(os.path.join(tmp, f"wav-{name}", files[0]))
+        # 0.7 full scale at the default reply volume 40 % (-30 dB): about 725.
+        check("T3a chime is audible-level audio at the reply volume (not silent, not full scale)",
+              300 < peak < 1500, f"peak {peak}")
+
+        # The button stops it.
+        cli.button_command(btns["stop_timer_alarm"].key)
+        ok = await sat.wait_log("timer alarm stopped (button in Home Assistant")
+        ok = ok and await until_true(lambda: shown.get("timer_alarm") is False and shown.get("timers") == "none")
+        check("T4 Stop timer alarm button stops it and the sensors clear", ok, str(shown))
+
+        # Media player stop stops it too.
+        cli.send_voice_assistant_timer_event(T.VOICE_ASSISTANT_TIMER_FINISHED, "t-2", "", 10, 0, False)
+        ok = await until_true(lambda: shown.get("timer_alarm") is True)
+        cli.media_player_command(mp.key, command=MediaPlayerCommand.STOP)
+        ok = ok and await sat.wait_log("timer alarm stopped (media player stop")
+        ok = ok and await until_true(lambda: shown.get("timer_alarm") is False)
+        check("T5 media player stop stops it", ok, str(shown))
+
+        # The wake word stops it before the pipeline streams.
+        cli.send_voice_assistant_timer_event(T.VOICE_ASSISTANT_TIMER_FINISHED, "t-3", "", 10, 0, False)
+        ok = await until_true(lambda: shown.get("timer_alarm") is True)
+        ha.event(Ev.VOICE_ASSISTANT_RUN_START)
+        ha.event(Ev.VOICE_ASSISTANT_WAKE_WORD_START)
+        ha.event(Ev.VOICE_ASSISTANT_WAKE_WORD_END)
+        ok = ok and await sat.wait_log("timer alarm stopped (wake word")
+        ok = ok and await until_true(lambda: shown.get("timer_alarm") is False)
+        check("T6 the wake word stops it", ok, str(shown))
+
+        # A timer that finishes during a conversation waits for it to end.
+        n_files = len(alarm_files(tmp, name))
+        rings = sat.text().count("timer alarm: ringing")
+        cli.send_voice_assistant_timer_event(T.VOICE_ASSISTANT_TIMER_FINISHED, "t-4", "", 10, 0, False)
+        ok = await sat.wait_log("timer alarm: timer t-4 finished")
+        await asyncio.sleep(1.0)
+        queued = (ok and len(alarm_files(tmp, name)) == n_files
+                  and sat.text().count("timer alarm: ringing") == rings)
+        check("T7 a timer finishing mid-conversation does not ring over it (queued)", queued,
+              f"{n_files} -> {len(alarm_files(tmp, name))}")
+        ha.event(Ev.VOICE_ASSISTANT_STT_VAD_END)
+        ha.event(Ev.VOICE_ASSISTANT_STT_END, {"text": "x"})
+        ha.event(Ev.VOICE_ASSISTANT_INTENT_END, {"conversation_id": "c9", "speech": "", "continue_conversation": "0"})
+        ha.event(Ev.VOICE_ASSISTANT_RUN_END)
+        ok = await until_true(lambda: len(alarm_files(tmp, name)) == n_files + 1, 8)
+        check("T8 the queued alarm rings once the run ended", ok, f"{len(alarm_files(tmp, name))} files")
+
+        # HA changing the timer that rings stops it (a finished timer is gone
+        # in HA, so this is a defensive path).
+        cli.send_voice_assistant_timer_event(T.VOICE_ASSISTANT_TIMER_CANCELLED, "t-4", "", 10, 0, False)
+        ok = await sat.wait_log("timer alarm stopped: Home Assistant changed timer t-4")
+        ok = ok and await until_true(lambda: shown.get("timer_alarm") is False)
+        check("T9 HA cancelling the finished timer stops the alarm", ok, str(shown))
+
         log = sat.text()
-        check("T2 timer started/updated/finished logged with id and seconds",
-              ok and "timer started id=t-1 seconds_left=300" in log
-              and "timer updated id=t-1 seconds_left=342" in log)
-        check("T3 timer name never logged", name not in log)
+        check("T10 timer name never logged", tname not in log)
         sat.proc.send_signal(signal.SIGTERM)
         rc = await asyncio.wait_for(sat.proc.wait(), 5)
-        check("T4 clean exit", rc == 0, f"rc={rc}")
+        check("T11 clean exit", rc == 0, f"rc={rc}")
+    finally:
+        if sat.proc.returncode is None:
+            sat.proc.kill()
+            await sat.proc.wait()
+        sat.log.close()
+
+
+async def scenario_alarm_cap(binary: str, tmp: str) -> None:
+    print("\n== satellite e2e: alarm time cap and the off switches ==")
+    psk = base64.b64encode(os.urandom(32)).decode()
+    with open(os.path.join(tmp, "psk"), "w") as f:
+        f.write(psk + "\n")
+    port = free_port()
+    config = alarm_config(tmp, "e2e-cap", port, "02:00:00:00:00:e4", "timer_alarm_max_s = 2")
+    sat = Satellite(binary, config, os.path.join(tmp, "satellite-cap.log"))
+    await sat.start()
+    ha = FakeHA(port, psk)
+    try:
+        cli = await ha.connect()
+        await cli.device_info_and_list_entities()
+        cli.send_voice_assistant_timer_event(TimerEv.VOICE_ASSISTANT_TIMER_FINISHED, "c-1", "", 5, 0, False)
+        t0 = time.monotonic()
+        ok = await sat.wait_log("timer alarm: ringing for at most 2 s")
+        ok = ok and await sat.wait_log("timer alarm: stopped at the time cap", 6)
+        dt = time.monotonic() - t0
+        check("C1 an alarm nobody stops ends at its cap", ok and 1.5 < dt < 4.5, f"{dt:.1f} s")
+        sat.proc.send_signal(signal.SIGTERM)
+        await asyncio.wait_for(sat.proc.wait(), 5)
+    finally:
+        if sat.proc.returncode is None:
+            sat.proc.kill()
+            await sat.proc.wait()
+        sat.log.close()
+
+    # timer_alarm_max_s = 0: timers advertised and tracked, no sound, no stop entities.
+    port = free_port()
+    config = alarm_config(tmp, "e2e-nosound", port, "02:00:00:00:00:e5", "timer_alarm_max_s = 0")
+    sat = Satellite(binary, config, os.path.join(tmp, "satellite-nosound.log"))
+    await sat.start()
+    ha = FakeHA(port, psk)
+    try:
+        cli = await ha.connect()
+        info, entities, _ = await cli.device_info_and_list_entities()
+        flags = info.voice_assistant_feature_flags_compat(cli.api_version)
+        names = {e.object_id for e in entities}
+        cli.send_voice_assistant_timer_event(TimerEv.VOICE_ASSISTANT_TIMER_FINISHED, "n-1", "", 5, 0, False)
+        ok = await sat.wait_log("timer alarm: sound is off")
+        await asyncio.sleep(0.5)
+        check("C2 timer_alarm_max_s = 0: TIMERS still advertised, no button or alarm sensor, no sound",
+              ok and flags == 63 and "timers" in names and "stop_timer_alarm" not in names
+              and "timer_alarm" not in names and not alarm_files(tmp, "e2e-nosound"),
+              f"flags={flags} {sorted(names)}")
+        sat.proc.send_signal(signal.SIGTERM)
+        await asyncio.wait_for(sat.proc.wait(), 5)
+    finally:
+        if sat.proc.returncode is None:
+            sat.proc.kill()
+            await sat.proc.wait()
+        sat.log.close()
+
+    # timers = false: the flag is gone (HA then answers that timers are not supported here).
+    port = free_port()
+    config = alarm_config(tmp, "e2e-notimers", port, "02:00:00:00:00:e6", "timers = false")
+    sat = Satellite(binary, config, os.path.join(tmp, "satellite-notimers.log"))
+    await sat.start()
+    ha = FakeHA(port, psk)
+    try:
+        cli = await ha.connect()
+        info, entities, _ = await cli.device_info_and_list_entities()
+        flags = info.voice_assistant_feature_flags_compat(cli.api_version)
+        names = {e.object_id for e in entities}
+        check("C3 timers = false: flags 55 (no TIMERS), no timer entities",
+              flags == 55 and not names & {"timers", "timer_alarm", "stop_timer_alarm"}, f"flags={flags} {sorted(names)}")
+        sat.proc.send_signal(signal.SIGTERM)
+        await asyncio.wait_for(sat.proc.wait(), 5)
     finally:
         if sat.proc.returncode is None:
             sat.proc.kill()
@@ -370,7 +548,7 @@ async def scenario_pairing(binary: str, tmp: str) -> None:
         ok = await until_true(lambda: ha2.audio.qsize() >= 5, TIMEOUT)
         check("P5 reconnect with the provisioned key: wake word run streams the file mic",
               ok and bool(vflags & USE_WAKE_WORD) and not info2.api_encryption_provisionable
-              and info2.voice_assistant_feature_flags_compat(cli2.api_version) == 23)
+              and info2.voice_assistant_feature_flags_compat(cli2.api_version) == 31)
         await cli2.disconnect()
         res = [await fetch_device_info_like_ha(port, k) for k in (None, base64.b64encode(os.urandom(32)).decode())]
         check("P6 no key / wrong key refused", res == ["requires_encryption_key", "invalid_psk"], str(res))
@@ -802,6 +980,7 @@ async def main() -> int:
         try:
             await scenario(args.binary, tmp)
             await scenario_timers(args.binary, tmp)
+            await scenario_alarm_cap(args.binary, tmp)
             await scenario_pairing(args.binary, tmp)
             await scenario_pairing_window(args.binary, tmp)
             await scenario_aec(args.binary, tmp)
@@ -809,7 +988,8 @@ async def main() -> int:
         except Exception as err:  # noqa: BLE001
             failed = True
             print(f"FAIL  {type(err).__name__}: {err}", flush=True)
-            for name in ("satellite.log", "satellite-timers.log", "satellite-pairing.log",
+            for name in ("satellite.log", "satellite-timers.log", "satellite-cap.log",
+                         "satellite-nosound.log", "satellite-notimers.log", "satellite-pairing.log",
                          "satellite-pairing.log.2", "satellite-window.log", "satellite-aec.log", "satellite-tv.log"):
                 log = os.path.join(tmp, name)
                 if os.path.exists(log):

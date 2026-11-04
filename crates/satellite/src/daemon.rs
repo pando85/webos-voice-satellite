@@ -23,8 +23,11 @@ use std::time::Duration;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
 use tokio::time::{Instant, MissedTickBehavior};
-use webos_esphome_api::{AppCommand, AppEvent, PairingEvent, PipelineMode, Server, TimerTable};
+use webos_esphome_api::{
+    AppCommand, AppEvent, PairingEvent, PipelineMode, Server, TimerEvent, TimerTable,
+};
 
+use crate::alarm::{self, Alarm, Phase, Step};
 use crate::capture::{
     self, CaptureSettings, KILL_SWITCH_POLL, OFF_FIRMWARE, OFF_KILL, OFF_MUTED, OFF_NONE,
     OFF_UNPAIRED, Shared,
@@ -221,10 +224,13 @@ fn reply(r: &Result<String, String>) -> String {
     }
 }
 
-fn finished(kind: Kind, success: bool) -> AppCommand {
+/// What HA is told when a playback ends; the timer alarm is local and HA
+/// is told nothing.
+fn finished(kind: Kind, success: bool) -> Option<AppCommand> {
     match kind {
-        Kind::Tts => AppCommand::PlaybackFinished { success },
-        Kind::Announce => AppCommand::AnnounceFinished { success },
+        Kind::Tts => Some(AppCommand::PlaybackFinished { success }),
+        Kind::Announce => Some(AppCommand::AnnounceFinished { success }),
+        Kind::Alarm => None,
     }
 }
 
@@ -485,6 +491,7 @@ fn store_mute(path: &Path, muted: bool) {
     }
 }
 
+#[allow(clippy::struct_excessive_bools)] // independent flags of the daemon's state
 struct Daemon {
     cmd_tx: mpsc::Sender<AppCommand>,
     shared: Arc<Shared>,
@@ -496,6 +503,13 @@ struct Daemon {
     mute_file: PathBuf,
     /// Timers HA reported (kept across HA reconnects, which do not replay them).
     timers: TimerTable,
+    /// The alarm that sounds when a timer finishes.
+    alarm: Alarm,
+    /// `[device] timers`: the timer entities exist.
+    timers_on: bool,
+    /// Last states sent for the timer sensors (only changes are sent).
+    last_timers_text: Option<String>,
+    last_ringing: Option<bool>,
     /// `pair` and `reset-pairing` trigger files, with pairing enabled.
     pairing_triggers: Option<(PathBuf, PathBuf)>,
     trigger_warned: bool,
@@ -634,9 +648,23 @@ impl Daemon {
         .await;
     }
 
-    async fn report_stopped(&self, stopped: Option<Kind>) {
-        if let Some(kind) = stopped {
-            self.send(finished(kind, false)).await;
+    async fn send_finished(&self, kind: Kind, success: bool) {
+        if let Some(cmd) = finished(kind, success) {
+            self.send(cmd).await;
+        }
+    }
+
+    /// A playback was stopped to make room for a new one. A ringing timer
+    /// alarm is not failed to HA: it waits and resumes afterwards.
+    async fn report_stopped(&mut self, stopped: Option<Kind>) {
+        match stopped {
+            Some(Kind::Alarm) => {
+                self.alarm.preempted();
+                log::info!("timer alarm paused: a reply or announcement is playing");
+                self.publish_timers().await;
+            }
+            Some(kind) => self.send_finished(kind, false).await,
+            None => {}
         }
     }
 
@@ -842,9 +870,9 @@ impl Daemon {
         self.run_action(action);
     }
 
-    /// Logs a timer event and keeps the table. The audible chime is not
-    /// implemented (docs/development/esphome-api.md#timers).
-    fn on_timer(&mut self, ev: &AppEvent) {
+    /// A timer event: logged, kept in the table, and a finished timer rings
+    /// the alarm (docs/development/esphome-api.md#timers).
+    async fn on_timer(&mut self, ev: &AppEvent) {
         let AppEvent::Timer {
             event,
             id,
@@ -859,13 +887,100 @@ impl Daemon {
         log::info!("timer {event} id={id} seconds_left={seconds_left}");
         self.timers.apply(ev, std::time::Instant::now());
         log::debug!("timers known: {}", self.timers.len());
+        match event {
+            TimerEvent::Finished => {
+                if self.alarm.on_finished(id, std::time::Instant::now()) {
+                    log::info!("timer alarm: timer {id} finished");
+                } else {
+                    log::info!("timer alarm: sound is off (device.timer_alarm_max_s = 0)");
+                }
+            }
+            TimerEvent::Cancelled | TimerEvent::Updated => {
+                if self.alarm.timer_gone(id) {
+                    self.halt_chime();
+                    log::info!("timer alarm stopped: Home Assistant changed timer {id}");
+                }
+            }
+            TimerEvent::Started => {}
+        }
+        self.alarm_poll().await;
+        self.publish_timers().await;
+    }
+
+    /// Stops the chime's playback when it is the one playing.
+    fn halt_chime(&mut self) {
+        if self.player.current_kind() == Some(Kind::Alarm) {
+            self.player.stop();
+        }
+    }
+
+    /// Stops the alarm for `why` (wake word, button, media player stop).
+    async fn stop_alarm(&mut self, why: &str) {
+        if let Some(was) = self.alarm.stop() {
+            self.halt_chime();
+            log::info!("timer alarm stopped ({why}; was {was:?})");
+            self.publish_timers().await;
+        }
+    }
+
+    /// Starts a queued alarm when the speaker and the conversation are free,
+    /// and ends one that reached its cap.
+    async fn alarm_poll(&mut self) {
+        let busy = self.in_run || self.player.is_active();
+        match self.alarm.poll(std::time::Instant::now(), busy) {
+            Some(Step::Start(max)) => {
+                if self.volume_gain.get() == 0.0 {
+                    log::warn!("timer alarm: the reply volume is 0 %, the alarm is silent");
+                }
+                let stopped = self.player.start_alarm(max);
+                self.alarm.started();
+                log::info!(
+                    "timer alarm: ringing for at most {} s",
+                    (max + Duration::from_millis(500)).as_secs()
+                );
+                self.report_stopped(stopped).await;
+                self.publish_timers().await;
+            }
+            Some(Step::Expire) => {
+                self.alarm.stop();
+                self.halt_chime();
+                log::info!("timer alarm: stopped at the time cap (nobody stopped it)");
+                self.publish_timers().await;
+            }
+            None => {}
+        }
+    }
+
+    /// Sends the "Timers" and "Timer alarm" sensor states when they changed.
+    async fn publish_timers(&mut self) {
+        if !self.timers_on {
+            return;
+        }
+        let ringing = self.alarm.phase() != Phase::Idle;
+        let text = alarm::timers_text(&self.timers, ringing, std::time::Instant::now());
+        if self.last_timers_text.as_deref() != Some(&text) {
+            self.last_timers_text = Some(text.clone());
+            self.send(AppCommand::SetTextSensor {
+                object_id: alarm::TIMERS_SENSOR_ID.to_owned(),
+                state: Some(text),
+            })
+            .await;
+        }
+        if self.alarm.enabled() && self.last_ringing != Some(ringing) {
+            self.last_ringing = Some(ringing);
+            self.send(AppCommand::SetBinarySensor {
+                object_id: alarm::RINGING_SENSOR_ID.to_owned(),
+                state: Some(ringing),
+            })
+            .await;
+        }
     }
 
     #[allow(clippy::too_many_lines)] // one arm per event, flat on purpose
     async fn on_event(&mut self, ev: AppEvent) {
         let now = Instant::now();
         if matches!(ev, AppEvent::Timer { .. }) {
-            self.on_timer(&ev);
+            self.on_timer(&ev).await;
             return;
         }
         // A command for a TV control entity.
@@ -891,6 +1006,9 @@ impl Daemon {
                 }
             }
             AppEvent::StartStreaming { wake_word, .. } => {
+                if !wake_word {
+                    self.stop_alarm("a conversation starts").await;
+                }
                 self.in_run |= !wake_word;
                 self.set_streaming(true);
                 log::info!(
@@ -908,6 +1026,7 @@ impl Daemon {
                 log::info!("stopped streaming mic audio");
             }
             AppEvent::WakeWordDetected => {
+                self.stop_alarm("wake word").await;
                 self.in_run = true;
                 log::info!("wake word detected by HA");
                 self.runs.wake(now);
@@ -968,9 +1087,18 @@ impl Daemon {
                 self.report_stopped(stopped).await;
             }
             AppEvent::StopPlayback => {
-                if let Some(kind) = self.player.stop() {
-                    self.send(finished(kind, false)).await;
+                // Replies and announcements only; the alarm has its own
+                // stops (media player stop, the button, the wake word).
+                if let Some(kind) = self.player.stop_reply() {
+                    self.send_finished(kind, false).await;
                 }
+            }
+            AppEvent::MediaStop => self.stop_alarm("media player stop").await,
+            AppEvent::ButtonPressed { object_id } if object_id == alarm::STOP_BUTTON_ID => {
+                if self.alarm.phase() == Phase::Idle {
+                    log::info!("stop timer alarm pressed; no alarm is ringing");
+                }
+                self.stop_alarm("button in Home Assistant").await;
             }
             AppEvent::RunEnd => {
                 self.in_run = false;
@@ -1017,6 +1145,25 @@ impl Daemon {
             return;
         }
         let now = Instant::now();
+        if done.kind == Kind::Alarm {
+            match &done.result {
+                Ok(st) => log::info!(
+                    "timer alarm: chime ended ({} ms of audio, {} non-zero samples{})",
+                    st.audio.as_millis(),
+                    st.nonzero_samples.unwrap_or(0),
+                    st.file
+                        .as_ref()
+                        .map(|f| format!(", file {}", f.display()))
+                        .unwrap_or_default()
+                ),
+                Err(e) => log::warn!("timer alarm: playback failed: {e}"),
+            }
+            self.alarm
+                .ended(done.result.is_ok(), std::time::Instant::now());
+            self.alarm_poll().await;
+            self.publish_timers().await;
+            return;
+        }
         let success = match &done.result {
             Ok(st) => {
                 log::info!(
@@ -1044,7 +1191,8 @@ impl Daemon {
             let audio = done.result.as_ref().ok().map(|s| s.audio);
             Self::log_line(self.runs.playback_done(now, audio));
         }
-        self.send(finished(done.kind, success)).await;
+        self.send_finished(done.kind, success).await;
+        self.alarm_poll().await;
     }
 }
 
@@ -1094,6 +1242,13 @@ pub(crate) async fn run(mut settings: Settings, triggers: TestTriggers) -> Resul
         }
     } else if remote_off == RemoteOff::KeepListening {
         log::warn!("power: remote_off = keep_listening needs the power watch; ignored");
+    }
+    // Timers: the sensors, and with an alarm sound the stop button.
+    if settings.device.timers {
+        let (buttons, texts, binaries) = alarm::entities(settings.device.timer_alarm_max_s > 0);
+        esp.buttons.extend(buttons);
+        esp.text_sensors.extend(texts);
+        esp.binary_sensors.extend(binaries);
     }
     // TV control: the capability check (read-only calls) before the entities
     // are listed. The firmware guard decides whether setters may run.
@@ -1223,6 +1378,12 @@ pub(crate) async fn run(mut settings: Settings, triggers: TestTriggers) -> Resul
         kill_switch: settings.safety.kill_switch.clone(),
         mute_file: settings.safety.mute_file.clone(),
         timers: TimerTable::new(),
+        alarm: Alarm::new(Duration::from_secs(u64::from(
+            settings.device.timer_alarm_max_s,
+        ))),
+        timers_on: settings.device.timers,
+        last_timers_text: None,
+        last_ringing: None,
         pairing_triggers: settings.pairing_active().then(|| {
             (
                 settings.pairing.pair_trigger(),
@@ -1245,6 +1406,7 @@ pub(crate) async fn run(mut settings: Settings, triggers: TestTriggers) -> Resul
         tv: None,
         in_run: false,
     };
+    d.publish_timers().await;
     let mut tv_rx = None;
     if let Some(started) = tv_started.take() {
         let tv_control::Started {
@@ -1314,6 +1476,8 @@ pub(crate) async fn run(mut settings: Settings, triggers: TestTriggers) -> Resul
                 beats.event_loop.fetch_add(1, Ordering::Relaxed);
                 d.poll_kill_switch().await;
                 d.poll_power().await;
+                d.alarm_poll().await;
+                d.publish_timers().await;
             }
             () = tick_opt(ptt_timer.as_mut()) => d.ptt("--ptt-every").await,
             () = tick_opt(pairing_poll.as_mut()) => d.poll_pairing().await,
@@ -1593,11 +1757,13 @@ mod tests {
     fn finished_maps_kinds() {
         assert_eq!(
             finished(Kind::Tts, true),
-            AppCommand::PlaybackFinished { success: true }
+            Some(AppCommand::PlaybackFinished { success: true })
         );
         assert_eq!(
             finished(Kind::Announce, false),
-            AppCommand::AnnounceFinished { success: false }
+            Some(AppCommand::AnnounceFinished { success: false })
         );
+        // The timer alarm is local: HA is told nothing.
+        assert_eq!(finished(Kind::Alarm, true), None);
     }
 }

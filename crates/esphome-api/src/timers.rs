@@ -33,7 +33,7 @@ pub enum TimerEvent {
     Updated,
     /// The timer was cancelled.
     Cancelled,
-    /// The timer ran out. In Phase 4 the TV plays a chime here.
+    /// The timer ran out. HA has already dropped it; the satellite rings an alarm here.
     Finished,
 }
 

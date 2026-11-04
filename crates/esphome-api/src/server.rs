@@ -1638,7 +1638,10 @@ impl Ctx {
         }
         if c.has_command {
             match pb::MediaPlayerCommand::try_from(c.command) {
-                Ok(pb::MediaPlayerCommand::Stop) => self.voice.on_media_stop(),
+                Ok(pb::MediaPlayerCommand::Stop) => {
+                    self.voice.on_media_stop();
+                    self.emit(AppEvent::MediaStop);
+                }
                 Ok(pb::MediaPlayerCommand::VolumeUp) => {
                     volume = Some(entities::volume_step(self.volume, true));
                 }

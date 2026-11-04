@@ -13,6 +13,7 @@
     allow(clippy::assert_is_empty, clippy::field_reassign_with_default)
 )]
 
+mod alarm;
 mod capture;
 mod config;
 mod daemon;

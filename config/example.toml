@@ -35,15 +35,22 @@ allow_plaintext = false
 # Advertise _esphomelib._tcp over mDNS. HA in a container/pod usually cannot
 # see mDNS; add the device by host and port instead.
 mdns = false
-# Voice features advertised to HA (default 23 = announce only). Each is a
-# bit of the ESPHome voice feature flags; the satellite behaves the same
+# Voice features advertised to HA (default 31 = announce and timers). Each is
+# a bit of the ESPHome voice feature flags; the satellite behaves the same
 # whether or not a bit is advertised, the bit only decides what HA offers.
 # announce: HA may send announcements (bit 16). Needed for start_conversation.
 announce = true
-# timers: HA forwards its voice timers (bit 8). The satellite logs each
-# change (id, event, seconds only; never the timer name) and "timer finished".
-# There is no chime yet (docs/development/esphome-api.md#timers).
-timers = false
+# timers: HA forwards its voice timers (bit 8; "set a timer for 5 minutes"
+# then works for this device, no extra HA setup). The satellite logs each
+# change (id, event, seconds only; never the timer name), shows a "Timers"
+# sensor in HA and rings an alarm when a timer finishes. Set false to turn
+# all of it off (default flags 23).
+timers = true
+# Longest one timer alarm rings, in seconds, if nobody stops it (the wake
+# word, the "Stop timer alarm" button or the media player stop). 0 turns the
+# sound off (timers are still tracked). At most 3600. The alarm plays at the
+# reply volume (the media player's slider in HA).
+timer_alarm_max_s = 300
 # start_conversation: lets the assist_satellite.start_conversation service
 # be called for this device (bit 32). Needs announce = true.
 start_conversation = false
@@ -93,7 +100,7 @@ channels = 2
 latency_msec = 200
 dir = "."                # wav sink output directory
 # Reply volume in percent, independent of the TV's own volume: an in-process
-# gain on replies, announcements (and timer sounds later) before pacat, on a
+# gain on replies, announcements and the timer alarm before pacat, on a
 # decibel taper: 100 = unity (0 dB), each percent below is 0.5 dB quieter
 # (50 = -25 dB, 40 = -30 dB), 0 = silent. Home Assistant sets it with the
 # volume of the satellite's media player; that value is stored in

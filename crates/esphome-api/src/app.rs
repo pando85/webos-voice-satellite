@@ -125,6 +125,11 @@ pub enum AppEvent {
     },
     /// Stop any playback now (media player STOP, barge-in, stop command).
     StopPlayback,
+    /// HA pressed stop on the media player. Sent for every stop command,
+    /// even when the voice layer has no reply or announcement to stop (it
+    /// then sends no [`AppEvent::StopPlayback`]); an application that plays
+    /// its own sounds (a timer alarm) stops them on this.
+    MediaStop,
     /// The pipeline run ended.
     RunEnd,
     /// HA reported a pipeline error.
@@ -372,6 +377,7 @@ impl fmt::Debug for AppEvent {
                 .field("start_conversation", start_conversation)
                 .finish(),
             Self::StopPlayback => f.write_str("StopPlayback"),
+            Self::MediaStop => f.write_str("MediaStop"),
             Self::RunEnd => f.write_str("RunEnd"),
             Self::Error { code, message } => f
                 .debug_struct("Error")
