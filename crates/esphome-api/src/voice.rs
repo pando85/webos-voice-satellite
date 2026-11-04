@@ -59,7 +59,7 @@ pub(crate) enum ToHa {
 }
 
 /// Output of the state machine.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Out {
     Ha(ToHa),
     App(AppEvent),

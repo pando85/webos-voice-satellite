@@ -45,6 +45,7 @@ from fake_ha import (  # noqa: E402
     until_true,
 )
 
+from aioesphomeapi import BinarySensorInfo, BinarySensorState, SwitchInfo  # noqa: E402
 from aioesphomeapi import VoiceAssistantEventType as Ev  # noqa: E402
 from aioesphomeapi import VoiceAssistantTimerEventType as TimerEv  # noqa: E402
 
@@ -125,14 +126,33 @@ level = "info"
     ha = FakeHA(port, psk)
     try:
         cli = await ha.connect()
-        info, _entities, _ = await cli.device_info_and_list_entities()
+        info, entities, _ = await cli.device_info_and_list_entities()
         flags = info.voice_assistant_feature_flags_compat(cli.api_version)
         check("S1 Noise handshake, device info from the config",
               info.name == "e2e-satellite" and info.friendly_name == "E2E Satellite"
               and info.mac_address == "02:00:00:00:00:E2" and flags == 23,
               f"{info.name} {info.mac_address} flags={flags}")
-        cli.subscribe_states(lambda s: None)
+        bins = {e.object_id: e for e in entities if isinstance(e, BinarySensorInfo)}
+        mute_sw = [e for e in entities if isinstance(e, SwitchInfo)][0]
+        check("S1a listening indicator entities listed (binary sensors, no category)",
+              set(bins) == {"listening", "microphone_muted"}
+              and bins["listening"].name == "Listening" and bins["microphone_muted"].name == "Microphone muted",
+              str(sorted(bins)))
+        bstate: dict[int, BinarySensorState] = {}
+
+        def on_state(st) -> None:
+            if isinstance(st, BinarySensorState):
+                bstate[st.key] = st
+
+        def shown(obj: str):
+            st = bstate.get(bins[obj].key)
+            return None if st is None or st.missing_state else st.state
+
+        cli.subscribe_states(on_state)
         ha.subscribe_voice()
+        ok = await until_true(lambda: shown("listening") is True and shown("microphone_muted") is False)
+        check("S1b on connect: Listening ON (PCM open) and Microphone muted OFF", ok,
+              f"listening={shown('listening')} muted={shown('microphone_muted')}")
         conv, flags, _ = await ha.next_start()
         check("S2 wake mode: start request with USE_WAKE_WORD", bool(flags & USE_WAKE_WORD), f"flags={flags}")
         ok = await until_true(lambda: ha.audio.qsize() >= 15, TIMEOUT)
@@ -140,6 +160,22 @@ level = "info"
         check("S3 file mic streamed: 1024-byte chunks, non-silent, after the front-end",
               ok and all(len(c) == 1024 for c in chunks) and any(any(c) for c in chunks),
               f"{len(chunks)} chunks")
+
+        # Mute from HA: the PCM closes, so Listening goes OFF and muted ON;
+        # unmute reopens it. The indicator follows the capture, never the intent.
+        cli.switch_command(mute_sw.key, True)
+        ok = await until_true(lambda: shown("listening") is False and shown("microphone_muted") is True)
+        check("S3a mute: Listening OFF and Microphone muted ON after the PCM closed",
+              ok and "capture: microphone closed, PCM released (muted)" in sat.text(),
+              f"listening={shown('listening')} muted={shown('microphone_muted')}")
+        cli.switch_command(mute_sw.key, False)
+        ok = await until_true(lambda: shown("listening") is True and shown("microphone_muted") is False)
+        check("S3b unmute: Listening ON again, Microphone muted OFF", ok,
+              f"listening={shown('listening')} muted={shown('microphone_muted')}")
+        await ha.next_start()  # the wake word run restarts after the unmute
+        while not ha.stops.empty():
+            ha.stops.get_nowait()  # the mute aborted the first run
+        ha.drain_audio()
 
         ha.event(Ev.VOICE_ASSISTANT_RUN_START)
         ha.event(Ev.VOICE_ASSISTANT_WAKE_WORD_START)

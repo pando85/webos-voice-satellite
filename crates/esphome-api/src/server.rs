@@ -193,6 +193,8 @@ impl Server {
             volume: 100,
             power_state: None,
             selects: vec![None; self.cfg.selects.len()],
+            numbers: vec![None; self.cfg.numbers.len()],
+            binary_sensors: vec![None; self.cfg.binary_sensors.len()],
         };
         let mut pending: JoinSet<Result<Session, (SocketAddr, FrameError)>> = JoinSet::new();
         let mut keyless: JoinSet<()> = JoinSet::new();
@@ -607,6 +609,10 @@ struct Ctx {
     power_state: Option<String>,
     /// State of each select in `cfg.selects` (same order).
     selects: Vec<Option<String>>,
+    /// State of each number in `cfg.numbers` (same order); `None` = unknown.
+    numbers: Vec<Option<f32>>,
+    /// State of each binary sensor in `cfg.binary_sensors` (same order).
+    binary_sensors: Vec<Option<bool>>,
 }
 
 enum Flow {
@@ -1046,6 +1052,15 @@ impl Ctx {
                 for sel in &self.cfg.selects {
                     s.send(&entities::list_select(sel)).await?;
                 }
+                for n in &self.cfg.numbers {
+                    s.send(&entities::list_number(n)).await?;
+                }
+                for b in &self.cfg.buttons {
+                    s.send(&entities::list_button(b)).await?;
+                }
+                for b in &self.cfg.binary_sensors {
+                    s.send(&entities::list_binary_sensor(b)).await?;
+                }
                 s.send(&pb::ListEntitiesDoneResponse::default()).await?;
             }
             pb::SubscribeStatesRequest::ID => {
@@ -1063,6 +1078,12 @@ impl Ctx {
                 for (sel, state) in self.cfg.selects.iter().zip(&self.selects) {
                     s.send(&entities::select_state(sel, state.as_deref()))
                         .await?;
+                }
+                for (n, state) in self.cfg.numbers.iter().zip(&self.numbers) {
+                    s.send(&entities::number_state(n, *state)).await?;
+                }
+                for (b, state) in self.cfg.binary_sensors.iter().zip(&self.binary_sensors) {
+                    s.send(&entities::binary_sensor_state(b, *state)).await?;
                 }
             }
             pb::SubscribeVoiceAssistantRequest::ID => {
@@ -1137,6 +1158,16 @@ impl Ctx {
             pb::SelectCommandRequest::ID => {
                 if let Some(c) = decode::<pb::SelectCommandRequest>(msg) {
                     self.select_command(c.key, c.state).await?;
+                }
+            }
+            pb::NumberCommandRequest::ID => {
+                if let Some(c) = decode::<pb::NumberCommandRequest>(msg) {
+                    self.number_command(c.key, c.state).await?;
+                }
+            }
+            pb::ButtonCommandRequest::ID => {
+                if let Some(c) = decode::<pb::ButtonCommandRequest>(msg) {
+                    self.button_command(c.key);
                 }
             }
             pb::MediaPlayerCommandRequest::ID => {
@@ -1249,6 +1280,12 @@ impl Ctx {
                 }
             }
             AppCommand::Resumed => self.resumed(now).await,
+            AppCommand::SetNumber { object_id, value } => {
+                self.set_number(&object_id, value).await;
+            }
+            AppCommand::SetBinarySensor { object_id, state } => {
+                self.set_binary_sensor(&object_id, state).await;
+            }
             AppCommand::SetSelect { object_id, option } => {
                 let Some(i) = self
                     .cfg
@@ -1271,6 +1308,112 @@ impl Ctx {
                 }
             }
         }
+    }
+
+    async fn set_number(&mut self, object_id: &str, value: Option<f32>) {
+        let Some(i) = self
+            .cfg
+            .numbers
+            .iter()
+            .position(|n| n.object_id == object_id)
+        else {
+            log::warn!("esphome-api: SetNumber for unknown number {object_id:?} ignored");
+            return;
+        };
+        if value.is_some_and(|v| !entities::number_accepts(&self.cfg.numbers[i], v)) {
+            log::warn!("esphome-api: SetNumber {object_id:?}: value out of range; ignored");
+            return;
+        }
+        if self.numbers[i] == value {
+            return;
+        }
+        self.numbers[i] = value;
+        if let Err(err) = self.send_number_state(i).await {
+            self.close(&err.to_string());
+        }
+    }
+
+    async fn set_binary_sensor(&mut self, object_id: &str, state: Option<bool>) {
+        let Some(i) = self
+            .cfg
+            .binary_sensors
+            .iter()
+            .position(|b| b.object_id == object_id)
+        else {
+            log::warn!("esphome-api: SetBinarySensor for unknown sensor {object_id:?} ignored");
+            return;
+        };
+        if self.binary_sensors[i] == state {
+            return;
+        }
+        self.binary_sensors[i] = state;
+        if let Err(err) = self.send_binary_sensor_state(i).await {
+            self.close(&err.to_string());
+        }
+    }
+
+    async fn send_number_state(&mut self, i: usize) -> Result<(), FrameError> {
+        let msg = entities::number_state(&self.cfg.numbers[i], self.numbers[i]);
+        match self.session.as_mut() {
+            Some(s) if s.states_subscribed => s.send(&msg).await,
+            _ => Ok(()),
+        }
+    }
+
+    async fn send_binary_sensor_state(&mut self, i: usize) -> Result<(), FrameError> {
+        let msg =
+            entities::binary_sensor_state(&self.cfg.binary_sensors[i], self.binary_sensors[i]);
+        match self.session.as_mut() {
+            Some(s) if s.states_subscribed => s.send(&msg).await,
+            _ => Ok(()),
+        }
+    }
+
+    /// `NumberCommandRequest`: a finite value inside the range is reported to
+    /// the application, which answers with the actual state
+    /// ([`AppCommand::SetNumber`]); the server does not echo it. Anything else
+    /// is answered with the current state.
+    async fn number_command(&mut self, key: u32, value: f32) -> Result<(), FrameError> {
+        let Some(i) = self
+            .cfg
+            .numbers
+            .iter()
+            .position(|n| entities::entity_key(&n.object_id) == key)
+        else {
+            log::info!("esphome-api: number command for an unknown entity ignored");
+            return Ok(());
+        };
+        let n = &self.cfg.numbers[i];
+        if entities::number_accepts(n, value) {
+            log::info!("esphome-api: {} set to {value} by HA", n.object_id);
+            let object_id = n.object_id.clone();
+            self.emit(AppEvent::NumberChanged { object_id, value });
+            Ok(())
+        } else {
+            log::warn!(
+                "esphome-api: {}: {value} is outside {}..={}; ignored",
+                n.object_id,
+                n.min_value,
+                n.max_value
+            );
+            self.send_number_state(i).await
+        }
+    }
+
+    /// `ButtonCommandRequest`: reported to the application.
+    fn button_command(&mut self, key: u32) {
+        let Some(b) = self
+            .cfg
+            .buttons
+            .iter()
+            .find(|b| entities::entity_key(&b.object_id) == key)
+        else {
+            log::info!("esphome-api: button command for an unknown entity ignored");
+            return;
+        };
+        log::info!("esphome-api: {} pressed by HA", b.object_id);
+        let object_id = b.object_id.clone();
+        self.emit(AppEvent::ButtonPressed { object_id });
     }
 
     async fn send_select_state(&mut self, i: usize) -> Result<(), FrameError> {

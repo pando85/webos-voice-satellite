@@ -84,6 +84,77 @@ pub struct SelectEntity {
     pub options: Vec<String>,
 }
 
+/// A `number` entity: a bounded float setting or control, such as a TV volume.
+///
+/// The application sets its state ([`crate::AppCommand::SetNumber`]) and is
+/// told of HA's commands ([`crate::AppEvent::NumberChanged`]). The server does
+/// **not** echo a command back as a state: HA shows the state the application
+/// reports, so a control (a TV volume) only moves once the application has
+/// acted on it and says so. Use [`crate::proto::EntityCategory`] and
+/// [`crate::proto::NumberMode`] for `entity_category` and `mode`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NumberEntity {
+    /// Object id: `[a-z0-9_]`, at most 120 characters, stable (the entity key
+    /// and HA's entity id derive from it) and unique among all entities.
+    pub object_id: String,
+    /// Name shown in HA.
+    pub name: String,
+    /// Material Design icon, e.g. `mdi:volume-high`.
+    pub icon: String,
+    /// Lowest accepted value.
+    pub min_value: f32,
+    /// Highest accepted value.
+    pub max_value: f32,
+    /// Step HA's slider and box use (greater than zero). Commands are not
+    /// rounded to it.
+    pub step: f32,
+    /// Unit of measurement, e.g. `%`. Empty for none.
+    pub unit: String,
+    /// HA device class (for example `volume`); empty for none. Passed through.
+    pub device_class: String,
+    /// Slider or box (`Auto` lets HA choose).
+    pub mode: crate::proto::NumberMode,
+    /// None (primary), configuration or diagnostic.
+    pub entity_category: crate::proto::EntityCategory,
+}
+
+/// A `button` entity: a stateless action HA can press.
+///
+/// A press arrives as [`crate::AppEvent::ButtonPressed`]. Buttons have no
+/// state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ButtonEntity {
+    /// Object id (see [`NumberEntity::object_id`]).
+    pub object_id: String,
+    /// Name shown in HA.
+    pub name: String,
+    /// Material Design icon.
+    pub icon: String,
+    /// HA device class (`restart`, `update` or empty).
+    pub device_class: String,
+    /// None (primary), configuration or diagnostic.
+    pub entity_category: crate::proto::EntityCategory,
+}
+
+/// A `binary_sensor` entity: a read-only on/off state.
+///
+/// The application sets its state ([`crate::AppCommand::SetBinarySensor`]),
+/// `None` meaning "no valid state" (HA shows unknown). HA cannot change it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BinarySensorEntity {
+    /// Object id (see [`NumberEntity::object_id`]).
+    pub object_id: String,
+    /// Name shown in HA.
+    pub name: String,
+    /// Material Design icon.
+    pub icon: String,
+    /// HA binary sensor device class (`running`, `power`, `sound`, ...); empty
+    /// for none. Passed through.
+    pub device_class: String,
+    /// None (primary), configuration or diagnostic.
+    pub entity_category: crate::proto::EntityCategory,
+}
+
 /// Configuration of the ESPHome API server.
 #[derive(Clone)]
 pub struct Config {
@@ -125,6 +196,12 @@ pub struct Config {
     pub power_sensor: bool,
     /// Configuration select entities (entity category `config`).
     pub selects: Vec<SelectEntity>,
+    /// `number` entities.
+    pub numbers: Vec<NumberEntity>,
+    /// `button` entities.
+    pub buttons: Vec<ButtonEntity>,
+    /// `binary_sensor` entities.
+    pub binary_sensors: Vec<BinarySensorEntity>,
 }
 
 impl Default for Config {
@@ -144,6 +221,9 @@ impl Default for Config {
             voice_features: features::DEFAULT,
             power_sensor: false,
             selects: Vec::new(),
+            numbers: Vec::new(),
+            buttons: Vec::new(),
+            binary_sensors: Vec::new(),
         }
     }
 }
@@ -164,6 +244,9 @@ impl fmt::Debug for Config {
             .field("voice_features", &self.voice_features)
             .field("power_sensor", &self.power_sensor)
             .field("selects", &self.selects)
+            .field("numbers", &self.numbers)
+            .field("buttons", &self.buttons)
+            .field("binary_sensors", &self.binary_sensors)
             .finish_non_exhaustive()
     }
 }
@@ -185,6 +268,9 @@ pub enum ConfigError {
     /// `voice_features` lacks VOICE_ASSISTANT or API_AUDIO, or has
     /// unimplemented bits.
     InvalidFeatures,
+    /// An entity definition is not usable (object id, duplicate id or key,
+    /// number range); the text says which.
+    InvalidEntity(String),
 }
 
 impl fmt::Display for ConfigError {
@@ -197,6 +283,7 @@ impl fmt::Display for ConfigError {
             Self::InvalidFeatures => f.write_str(
                 "voice_features must include VOICE_ASSISTANT and API_AUDIO and only implemented bits",
             ),
+            Self::InvalidEntity(why) => write!(f, "invalid entity: {why}"),
         }
     }
 }
@@ -275,6 +362,70 @@ pub(crate) struct Resolved {
     pub(crate) voice_features: u32,
     pub(crate) power_sensor: bool,
     pub(crate) selects: Vec<SelectEntity>,
+    pub(crate) numbers: Vec<NumberEntity>,
+    pub(crate) buttons: Vec<ButtonEntity>,
+    pub(crate) binary_sensors: Vec<BinarySensorEntity>,
+}
+
+/// An ESPHome object id: `[a-z0-9_]`, 1 to 120 characters.
+fn valid_object_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 120
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+}
+
+impl Config {
+    /// Checks the entity definitions: valid object ids, no duplicate ids or
+    /// keys (including the built-in entities), sane number ranges.
+    fn check_entities(&self) -> Result<(), ConfigError> {
+        use crate::entities::{
+            MEDIA_PLAYER_OBJECT_ID, MUTE_OBJECT_ID, POWER_STATE_OBJECT_ID, entity_key,
+        };
+        let err = |why: String| Err(ConfigError::InvalidEntity(why));
+        let ids = self
+            .selects
+            .iter()
+            .map(|e| e.object_id.as_str())
+            .chain(self.numbers.iter().map(|e| e.object_id.as_str()))
+            .chain(self.buttons.iter().map(|e| e.object_id.as_str()))
+            .chain(self.binary_sensors.iter().map(|e| e.object_id.as_str()));
+        let mut seen: Vec<(&str, u32)> = vec![
+            (MEDIA_PLAYER_OBJECT_ID, entity_key(MEDIA_PLAYER_OBJECT_ID)),
+            (MUTE_OBJECT_ID, entity_key(MUTE_OBJECT_ID)),
+        ];
+        if self.power_sensor {
+            seen.push((POWER_STATE_OBJECT_ID, entity_key(POWER_STATE_OBJECT_ID)));
+        }
+        for id in ids {
+            if !valid_object_id(id) {
+                return err(format!("object id {id:?} must be 1-120 chars of [a-z0-9_]"));
+            }
+            let key = entity_key(id);
+            if let Some((other, _)) = seen.iter().find(|(o, k)| *o == id || *k == key) {
+                return err(format!(
+                    "object id {id:?} duplicates or collides with {other:?}"
+                ));
+            }
+            seen.push((id, key));
+        }
+        for n in &self.numbers {
+            if !(n.min_value.is_finite() && n.max_value.is_finite() && n.min_value <= n.max_value) {
+                return err(format!(
+                    "number {:?}: min_value must be finite and <= max_value",
+                    n.object_id
+                ));
+            }
+            if !(n.step.is_finite() && n.step > 0.0) {
+                return err(format!(
+                    "number {:?}: step must be finite and > 0",
+                    n.object_id
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 fn valid_name(name: &str) -> bool {
@@ -321,6 +472,7 @@ impl Config {
         {
             return Err(ConfigError::InvalidFeatures);
         }
+        self.check_entities()?;
         let psk = self
             .noise_psk
             .as_deref()
@@ -360,6 +512,9 @@ impl Config {
             voice_features: self.voice_features,
             power_sensor: self.power_sensor,
             selects: self.selects.clone(),
+            numbers: self.numbers.clone(),
+            buttons: self.buttons.clone(),
+            binary_sensors: self.binary_sensors.clone(),
         })
     }
 }
@@ -447,6 +602,79 @@ mod tests {
             ..Provisioning::default()
         });
         assert!(cfg.validate().is_err());
+    }
+
+    fn number(id: &str) -> NumberEntity {
+        NumberEntity {
+            object_id: id.to_owned(),
+            name: "N".to_owned(),
+            icon: String::new(),
+            min_value: 0.0,
+            max_value: 100.0,
+            step: 1.0,
+            unit: "%".to_owned(),
+            device_class: String::new(),
+            mode: crate::proto::NumberMode::Slider,
+            entity_category: crate::proto::EntityCategory::None,
+        }
+    }
+
+    fn binary(id: &str) -> BinarySensorEntity {
+        BinarySensorEntity {
+            object_id: id.to_owned(),
+            name: "B".to_owned(),
+            icon: String::new(),
+            device_class: String::new(),
+            entity_category: crate::proto::EntityCategory::None,
+        }
+    }
+
+    #[test]
+    fn entity_definitions_are_validated() {
+        let mut cfg = Config::default();
+        cfg.numbers.push(number("tv_volume"));
+        cfg.binary_sensors.push(binary("listening"));
+        cfg.validate().unwrap();
+        let bad = |c: &Config| matches!(c.validate(), Err(ConfigError::InvalidEntity(_)));
+        // Bad characters, empty, duplicates (also across types) and the
+        // built-in ids.
+        for id in ["", "Tv", "tv-volume", "tv volume"] {
+            let mut c = Config::default();
+            c.numbers.push(number(id));
+            assert!(bad(&c), "{id:?}");
+        }
+        let mut c = cfg.clone();
+        c.binary_sensors.push(binary("tv_volume"));
+        assert!(bad(&c));
+        let mut c = Config::default();
+        c.numbers.push(number("media_player"));
+        assert!(bad(&c));
+        let mut c = Config::default();
+        c.binary_sensors.push(binary("mute_microphone"));
+        assert!(bad(&c));
+        // The power sensor id is reserved only while the sensor exists.
+        let mut c = Config::default();
+        c.binary_sensors.push(binary("tv_power_state"));
+        c.validate().unwrap();
+        c.power_sensor = true;
+        assert!(bad(&c));
+        // Ranges.
+        let mut c = Config::default();
+        let mut n = number("a");
+        n.min_value = 5.0;
+        n.max_value = 1.0;
+        c.numbers.push(n);
+        assert!(bad(&c));
+        let mut c = Config::default();
+        let mut n = number("a");
+        n.step = 0.0;
+        c.numbers.push(n);
+        assert!(bad(&c));
+        let mut c = Config::default();
+        let mut n = number("a");
+        n.max_value = f32::NAN;
+        c.numbers.push(n);
+        assert!(bad(&c));
     }
 
     #[test]

@@ -31,7 +31,14 @@
 //!   arrive as [`AppEvent::Timer`]; [`TimerTable`] keeps their state.
 //! - Entities: a media player whose single ANNOUNCEMENT format (default
 //!   flac/22050/mono/16-bit) is HA's TTS format in URL mode and the format of
-//!   proxied announcement media, and a "Mute microphone" switch.
+//!   proxied announcement media, and a "Mute microphone" switch. The
+//!   application can add `select`, `number`, `button` and `binary_sensor`
+//!   entities ([`Config::selects`], [`Config::numbers`], [`Config::buttons`],
+//!   [`Config::binary_sensors`]) with stable object ids and keys; states go
+//!   out with [`AppCommand::SetSelect`], [`AppCommand::SetNumber`] and
+//!   [`AppCommand::SetBinarySensor`], HA's commands arrive as
+//!   [`AppEvent::SelectChanged`], [`AppEvent::NumberChanged`] and
+//!   [`AppEvent::ButtonPressed`].
 //!
 //! # Usage
 //!
@@ -120,7 +127,10 @@ pub mod varint;
 mod voice;
 
 pub use app::{AppCommand, AppEvent, PairingEvent, PipelineMode};
-pub use config::{AudioFormat, Config, ConfigError, Mac, SelectEntity, features};
+pub use config::{
+    AudioFormat, BinarySensorEntity, ButtonEntity, Config, ConfigError, Mac, NumberEntity,
+    SelectEntity, features,
+};
 pub use frame::{NOISE_PREAMBLE, PLAINTEXT_PREAMBLE};
 pub use pairing::Provisioning;
 pub use server::{Server, ServerError};

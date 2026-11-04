@@ -60,7 +60,7 @@ pub enum PairingEvent {
 /// `Debug` is written by hand and never prints payloads (audio bytes, URLs,
 /// transcripts, reply text): it shows variant names and sizes only, so
 /// `{ev:?}` in a log line cannot leak them.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq)]
 #[non_exhaustive]
 pub enum AppEvent {
     /// HA completed the hello exchange.
@@ -152,6 +152,22 @@ pub enum AppEvent {
         /// The option chosen.
         option: String,
     },
+    /// HA set a number entity ([`crate::Config::numbers`]). Only finite values
+    /// inside the entity's range are reported (others are answered with the
+    /// current state). The server does not echo the value: the application
+    /// applies it and reports the resulting state with
+    /// [`AppCommand::SetNumber`].
+    NumberChanged {
+        /// The number's object id.
+        object_id: String,
+        /// The value HA asked for.
+        value: f32,
+    },
+    /// HA pressed a button entity ([`crate::Config::buttons`]).
+    ButtonPressed {
+        /// The button's object id.
+        object_id: String,
+    },
     /// A timer event from HA. Only sent when the `TIMERS` feature
     /// ([`crate::features::TIMERS`]) is enabled. HA owns and counts the timers;
     /// the device shows or sounds them (see [`crate::TimerTable`]).
@@ -174,7 +190,7 @@ pub enum AppEvent {
 /// Command from the application to the server.
 ///
 /// `Debug` never prints the audio samples (sizes only).
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq)]
 #[non_exhaustive]
 pub enum AppCommand {
     /// Microphone audio: 16 kHz, signed 16-bit, mono. Forwarded only while
@@ -230,6 +246,25 @@ pub enum AppCommand {
         object_id: String,
         /// One of its options.
         option: String,
+    },
+    /// The state of a number entity ([`crate::Config::numbers`]): the actual
+    /// value, at startup, after a [`AppEvent::NumberChanged`] or on a local
+    /// change. `None` means no valid state (HA shows "unknown"). A value
+    /// outside the entity's range is ignored with a log line.
+    SetNumber {
+        /// The number's object id.
+        object_id: String,
+        /// The value, or `None` for unknown.
+        value: Option<f32>,
+    },
+    /// The state of a binary sensor entity ([`crate::Config::binary_sensors`]).
+    /// `None` means no valid state (HA shows "unknown"). Sent to HA on every
+    /// change and again when HA connects or resubscribes.
+    SetBinarySensor {
+        /// The sensor's object id.
+        object_id: String,
+        /// The state, or `None` for unknown.
+        state: Option<bool>,
     },
 }
 
@@ -304,6 +339,15 @@ impl fmt::Debug for AppEvent {
                 .field("object_id", object_id)
                 .field("option", option)
                 .finish(),
+            Self::NumberChanged { object_id, value } => f
+                .debug_struct("NumberChanged")
+                .field("object_id", object_id)
+                .field("value", value)
+                .finish(),
+            Self::ButtonPressed { object_id } => f
+                .debug_struct("ButtonPressed")
+                .field("object_id", object_id)
+                .finish(),
             // The timer name is user speech: id, event and seconds only.
             Self::Timer {
                 event,
@@ -350,6 +394,16 @@ impl fmt::Debug for AppCommand {
                 .debug_struct("SetSelect")
                 .field("object_id", object_id)
                 .field("option", option)
+                .finish(),
+            Self::SetNumber { object_id, value } => f
+                .debug_struct("SetNumber")
+                .field("object_id", object_id)
+                .field("value", value)
+                .finish(),
+            Self::SetBinarySensor { object_id, state } => f
+                .debug_struct("SetBinarySensor")
+                .field("object_id", object_id)
+                .field("state", state)
                 .finish(),
         }
     }

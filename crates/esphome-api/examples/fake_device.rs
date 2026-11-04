@@ -5,7 +5,7 @@
 //! ```text
 //! cargo run -p webos-esphome-api --example fake_device -- \
 //!     [--bind 127.0.0.1] [--port 6053] [--name fake-tv] [--mode wake|ptt|none] \
-//!     [--features 23] [--mac 02:00:00:00:00:01] [--mdns] \
+//!     [--features 23] [--mac 02:00:00:00:00:01] [--mdns] [--demo-entities] \
 //!     [--pair-key-file FILE [--pair-window SECS] [--pair-closed]]
 //! ```
 //!
@@ -14,7 +14,8 @@
 //! starts unpaired (or with the key stored in FILE) and HA can set a key while
 //! the window is open (`--pair-closed`: closed at start). Stdin commands:
 //! `ptt`, `wake`, `stop`, `mute`, `unmute`, `pair` (open the window),
-//! `reset-pairing`, `quit`. Log level: `FAKE_DEVICE_LOG=info|debug|trace`.
+//! `reset-pairing`, `number VALUE|unknown` and `binary on|off|unknown` (states of
+//! the `--demo-entities`), `quit`. Log level: `FAKE_DEVICE_LOG=info|debug|trace`.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -23,7 +24,49 @@ use std::time::Duration;
 
 use tokio::io::AsyncBufReadExt as _;
 use tokio::sync::mpsc;
-use webos_esphome_api::{AppCommand, AppEvent, Config, PipelineMode, Provisioning, Server};
+use webos_esphome_api::proto::{EntityCategory, NumberMode};
+use webos_esphome_api::{
+    AppCommand, AppEvent, BinarySensorEntity, ButtonEntity, Config, NumberEntity, PipelineMode,
+    Provisioning, Server,
+};
+
+/// A number, two buttons and two binary sensors, to exercise the generic
+/// entity types from the fake-HA harness (the ids mirror TV control).
+fn add_demo_entities(cfg: &mut Config) {
+    cfg.numbers.push(NumberEntity {
+        object_id: "demo_volume".to_owned(),
+        name: "Demo volume".to_owned(),
+        icon: "mdi:volume-high".to_owned(),
+        min_value: 0.0,
+        max_value: 100.0,
+        step: 1.0,
+        unit: "%".to_owned(),
+        device_class: "volume".to_owned(),
+        mode: NumberMode::Slider,
+        entity_category: EntityCategory::None,
+    });
+    cfg.buttons.push(ButtonEntity {
+        object_id: "demo_press".to_owned(),
+        name: "Demo button".to_owned(),
+        icon: "mdi:gesture-tap".to_owned(),
+        device_class: String::new(),
+        entity_category: EntityCategory::None,
+    });
+    cfg.buttons.push(ButtonEntity {
+        object_id: "demo_config_press".to_owned(),
+        name: "Demo config button".to_owned(),
+        icon: String::new(),
+        device_class: "restart".to_owned(),
+        entity_category: EntityCategory::Config,
+    });
+    cfg.binary_sensors.push(BinarySensorEntity {
+        object_id: "demo_state".to_owned(),
+        name: "Demo state".to_owned(),
+        icon: String::new(),
+        device_class: "running".to_owned(),
+        entity_category: EntityCategory::Diagnostic,
+    });
+}
 
 struct StderrLogger(log::LevelFilter);
 
@@ -124,6 +167,7 @@ fn parse_args() -> (Config, Option<PipelineMode>) {
             "--mac" => cfg.mac = Some(val()),
             "--features" => cfg.voice_features = val().parse().expect("--features: number"),
             "--mdns" => cfg.mdns = true,
+            "--demo-entities" => add_demo_entities(&mut cfg),
             "--pair-key-file" => {
                 cfg.provisioning
                     .get_or_insert_with(Provisioning::default)
@@ -200,6 +244,18 @@ async fn main() {
                 "reset-pairing" => AppCommand::ResetPairing,
                 "quit" => std::process::exit(0),
                 "" => continue,
+                other if other.starts_with("number ") => AppCommand::SetNumber {
+                    object_id: "demo_volume".to_owned(),
+                    value: other["number ".len()..].trim().parse().ok(),
+                },
+                other if other.starts_with("binary ") => AppCommand::SetBinarySensor {
+                    object_id: "demo_state".to_owned(),
+                    state: match other["binary ".len()..].trim() {
+                        "on" => Some(true),
+                        "off" => Some(false),
+                        _ => None,
+                    },
+                },
                 other => {
                     eprintln!("unknown command {other}");
                     continue;

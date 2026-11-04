@@ -30,6 +30,13 @@ from aioesphomeapi import (
     ZERO_NOISE_PSK,
     APIClient,
     APIConnectionError,
+    BinarySensorInfo,
+    BinarySensorState,
+    ButtonInfo,
+    EntityCategory,
+    NumberInfo,
+    NumberMode,
+    NumberState,
     ConnectionClosedEvent,
     DisconnectReason,
     InvalidEncryptionKeyAPIError,
@@ -492,6 +499,93 @@ async def scenario_timers(binary: str) -> None:
         await dev.stop()
 
 
+async def scenario_entities(binary: str) -> None:
+    """number, button and binary_sensor entities: listing, states, commands."""
+    print("\n== scenario H: number / button / binary_sensor entities ==")
+    dev = Device(binary, ["--mode", "none", "--demo-entities", "--mac", "02:00:00:00:00:0d"], None)
+    await dev.start()
+    ha = FakeHA(dev.port)
+    try:
+        cli = await ha.connect()
+        _info, entities, _ = await cli.device_info_and_list_entities()
+        nums = [e for e in entities if isinstance(e, NumberInfo)]
+        btns = {e.object_id: e for e in entities if isinstance(e, ButtonInfo)}
+        bins = [e for e in entities if isinstance(e, BinarySensorInfo)]
+        n = nums[0] if nums else None
+        check("H1 number listed with range, step, unit, class, mode",
+              len(nums) == 1 and (n.object_id, n.min_value, n.max_value, n.step, n.unit_of_measurement,
+                                  n.device_class, n.mode)
+              == ("demo_volume", 0.0, 100.0, 1.0, "%", "volume", NumberMode.SLIDER)
+              and n.entity_category == EntityCategory.NONE, str(n))
+        check("H2 buttons listed with their category and class",
+              set(btns) == {"demo_press", "demo_config_press"}
+              and btns["demo_config_press"].entity_category == EntityCategory.CONFIG
+              and btns["demo_config_press"].device_class == "restart"
+              and btns["demo_press"].entity_category == EntityCategory.NONE, str(btns))
+        check("H3 binary sensor listed (diagnostic, class running)",
+              len(bins) == 1 and bins[0].object_id == "demo_state" and bins[0].device_class == "running"
+              and bins[0].entity_category == EntityCategory.DIAGNOSTIC, str(bins))
+        states: dict[int, object] = {}
+        cli.subscribe_states(lambda s: states.__setitem__(s.key, s))
+        ok = await until_true(lambda: n.key in states and bins[0].key in states)
+        check("H4 initial states are missing_state (unknown), not 0 or off",
+              ok and states[n.key].missing_state and states[bins[0].key].missing_state,
+              f"{states.get(n.key)} {states.get(bins[0].key)}")
+
+        await dev.command("number 37")
+        await dev.command("binary on")
+        ok = await until_true(lambda: isinstance(states[n.key], NumberState) and not states[n.key].missing_state
+                              and states[n.key].state == 37.0
+                              and isinstance(states[bins[0].key], BinarySensorState)
+                              and states[bins[0].key].state is True and not states[bins[0].key].missing_state)
+        check("H5 states pushed on change (number 37, binary on)", ok,
+              f"{states[n.key]} {states[bins[0].key]}")
+        await dev.command("binary off")
+        ok = await until_true(lambda: states[bins[0].key].state is False)
+        check("H6 binary sensor off pushed", ok)
+        await dev.command("number unknown")
+        ok = await until_true(lambda: states[n.key].missing_state)
+        check("H7 a state can go back to unknown", ok)
+
+        cli.number_command(n.key, 55.0)
+        ev = await dev.wait_event("NumberChanged")
+        check("H8 number command reaches the app", ev == 'NumberChanged { object_id: "demo_volume", value: 55.0 }', ev)
+        await asyncio.sleep(0.2)
+        check("H9 the command is not echoed as a state (the app owns the truth)",
+              states[n.key].missing_state, str(states[n.key]))
+        cli.number_command(n.key, 250.0)
+        await asyncio.sleep(0.3)
+        check("H10 an out-of-range command is rejected (no event)",
+              dev.count_since("NumberChanged", 0) == 1, str(dev.events))
+        cli.button_command(btns["demo_press"].key)
+        ev = await dev.wait_event("ButtonPressed")
+        check("H11 button press reaches the app", ev == 'ButtonPressed { object_id: "demo_press" }', ev)
+        cli.button_command(btns["demo_config_press"].key)
+        ev = await dev.wait_event("ButtonPressed")
+        check("H12 second button press", "demo_config_press" in ev, ev)
+
+        # A reconnect gets the current states again.
+        await dev.command("number 12")
+        await dev.command("binary on")
+        await until_true(lambda: states[n.key].state == 12.0 and states[bins[0].key].state is True)
+        await cli.disconnect()
+        await dev.wait_event("HaDisconnected")
+        ha2 = FakeHA(dev.port)
+        cli2 = await ha2.connect()
+        _i, entities2, _ = await cli2.device_info_and_list_entities()
+        n2 = [e for e in entities2 if isinstance(e, NumberInfo)][0]
+        b2 = [e for e in entities2 if isinstance(e, BinarySensorInfo)][0]
+        states2: dict[int, object] = {}
+        cli2.subscribe_states(lambda s: states2.__setitem__(s.key, s))
+        ok = await until_true(lambda: n2.key in states2 and b2.key in states2)
+        check("H13 states re-sent on reconnect",
+              ok and states2[n2.key].state == 12.0 and states2[b2.key].state is True
+              and n2.key == n.key and b2.key == bins[0].key, f"{states2}")
+        await cli2.disconnect()
+    finally:
+        await dev.stop()
+
+
 async def provision_over_zero_psk(port: int, key: bytes) -> bool:
     """What HA 2026.10.4's _async_provision_key_over_noise does."""
     cli = APIClient("127.0.0.1", port, "", client_info="fake-ha-provision", noise_psk=ZERO_NOISE_PSK)
@@ -816,7 +910,7 @@ async def main() -> int:
     failed = False
     for scenario in (scenario_plaintext_speaker, scenario_noise_url, scenario_timers,
                      scenario_pairing, scenario_pairing_window, scenario_window_behind_router,
-                     scenario_key_clear):
+                     scenario_key_clear, scenario_entities):
         try:
             await scenario(args.device)
         except Exception as err:  # noqa: BLE001

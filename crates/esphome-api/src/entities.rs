@@ -1,15 +1,22 @@
 //! The entities this device exposes: one media player (whose ANNOUNCEMENT
 //! format selects HA's TTS/announcement format and whose volume is the reply
 //! volume), a "Mute microphone" switch and, optionally, a diagnostic "TV
-//! power state" text sensor.
+//! power state" text sensor, plus the application-defined `select`, `number`,
+//! `button` and `binary_sensor` entities from [`crate::Config`].
+//!
+//! Availability: the ESPHome API has no per-entity "unavailable". All entities
+//! become unavailable in HA while the device is disconnected; a number or
+//! binary sensor with no valid state is sent with `missing_state` (HA shows
+//! "unknown").
 
-use crate::config::Resolved;
-use crate::config::SelectEntity;
+use crate::config::{BinarySensorEntity, ButtonEntity, NumberEntity, Resolved, SelectEntity};
 use crate::proto::{
-    EntityCategory, ListEntitiesMediaPlayerResponse, ListEntitiesSelectResponse,
-    ListEntitiesSwitchResponse, ListEntitiesTextSensorResponse, MediaPlayerFormatPurpose,
-    MediaPlayerState, MediaPlayerStateResponse, MediaPlayerSupportedFormat, SelectStateResponse,
-    SwitchStateResponse, TextSensorStateResponse,
+    BinarySensorStateResponse, EntityCategory, ListEntitiesBinarySensorResponse,
+    ListEntitiesButtonResponse, ListEntitiesMediaPlayerResponse, ListEntitiesNumberResponse,
+    ListEntitiesSelectResponse, ListEntitiesSwitchResponse, ListEntitiesTextSensorResponse,
+    MediaPlayerFormatPurpose, MediaPlayerState, MediaPlayerStateResponse,
+    MediaPlayerSupportedFormat, NumberStateResponse, SelectStateResponse, SwitchStateResponse,
+    TextSensorStateResponse,
 };
 use crate::voice::MediaState;
 
@@ -59,6 +66,75 @@ pub(crate) fn mute_key() -> u32 {
 
 pub(crate) fn power_state_key() -> u32 {
     entity_key(POWER_STATE_OBJECT_ID)
+}
+
+pub(crate) fn list_number(n: &NumberEntity) -> ListEntitiesNumberResponse {
+    ListEntitiesNumberResponse {
+        object_id: n.object_id.clone(),
+        key: entity_key(&n.object_id),
+        name: n.name.clone(),
+        icon: n.icon.clone(),
+        min_value: n.min_value,
+        max_value: n.max_value,
+        step: n.step,
+        entity_category: n.entity_category as i32,
+        unit_of_measurement: n.unit.clone(),
+        mode: n.mode as i32,
+        device_class: n.device_class.clone(),
+        ..Default::default()
+    }
+}
+
+/// `None`: no valid state (HA shows "unknown").
+pub(crate) fn number_state(n: &NumberEntity, value: Option<f32>) -> NumberStateResponse {
+    NumberStateResponse {
+        key: entity_key(&n.object_id),
+        state: value.unwrap_or_default(),
+        missing_state: value.is_none(),
+        ..Default::default()
+    }
+}
+
+/// A command value the number accepts: finite and within its range.
+pub(crate) fn number_accepts(n: &NumberEntity, value: f32) -> bool {
+    value.is_finite() && value >= n.min_value && value <= n.max_value
+}
+
+pub(crate) fn list_button(b: &ButtonEntity) -> ListEntitiesButtonResponse {
+    ListEntitiesButtonResponse {
+        object_id: b.object_id.clone(),
+        key: entity_key(&b.object_id),
+        name: b.name.clone(),
+        icon: b.icon.clone(),
+        entity_category: b.entity_category as i32,
+        device_class: b.device_class.clone(),
+        ..Default::default()
+    }
+}
+
+pub(crate) fn list_binary_sensor(b: &BinarySensorEntity) -> ListEntitiesBinarySensorResponse {
+    ListEntitiesBinarySensorResponse {
+        object_id: b.object_id.clone(),
+        key: entity_key(&b.object_id),
+        name: b.name.clone(),
+        icon: b.icon.clone(),
+        device_class: b.device_class.clone(),
+        entity_category: b.entity_category as i32,
+        ..Default::default()
+    }
+}
+
+/// `None`: no valid state (HA shows "unknown").
+pub(crate) fn binary_sensor_state(
+    b: &BinarySensorEntity,
+    state: Option<bool>,
+) -> BinarySensorStateResponse {
+    BinarySensorStateResponse {
+        key: entity_key(&b.object_id),
+        state: state.unwrap_or_default(),
+        missing_state: state.is_none(),
+        ..Default::default()
+    }
 }
 
 /// HA's media player volume (0.0 to 1.0) to percent, rounded and clamped.
@@ -230,6 +306,85 @@ mod tests {
         let st = power_state(Some("Active Standby"));
         assert!(!st.missing_state);
         assert_eq!(st.state, "Active Standby");
+    }
+
+    fn number() -> NumberEntity {
+        NumberEntity {
+            object_id: "tv_volume".to_owned(),
+            name: "TV volume".to_owned(),
+            icon: "mdi:volume-high".to_owned(),
+            min_value: 0.0,
+            max_value: 100.0,
+            step: 1.0,
+            unit: "%".to_owned(),
+            device_class: "volume".to_owned(),
+            mode: crate::proto::NumberMode::Slider,
+            entity_category: EntityCategory::None,
+        }
+    }
+
+    #[test]
+    fn number_listing_carries_range_unit_class_and_category() {
+        let mut n = number();
+        n.entity_category = EntityCategory::Config;
+        let l = list_number(&n);
+        assert_eq!(
+            (l.object_id.as_str(), l.key),
+            ("tv_volume", entity_key("tv_volume"))
+        );
+        assert_eq!((l.min_value, l.max_value, l.step), (0.0, 100.0, 1.0));
+        assert_eq!(l.unit_of_measurement, "%");
+        assert_eq!(l.device_class, "volume");
+        assert_eq!(l.mode, crate::proto::NumberMode::Slider as i32);
+        assert_eq!(l.entity_category, EntityCategory::Config as i32);
+    }
+
+    #[test]
+    fn number_state_reports_missing_and_accepts_only_in_range_values() {
+        let n = number();
+        assert!(number_state(&n, None).missing_state);
+        let st = number_state(&n, Some(42.5));
+        assert!(!st.missing_state);
+        assert!((st.state - 42.5).abs() < 1e-6);
+        assert_eq!(st.key, entity_key("tv_volume"));
+        assert!(number_accepts(&n, 0.0) && number_accepts(&n, 100.0) && number_accepts(&n, 33.3));
+        assert!(!number_accepts(&n, -0.1) && !number_accepts(&n, 100.1));
+        assert!(!number_accepts(&n, f32::NAN) && !number_accepts(&n, f32::INFINITY));
+    }
+
+    #[test]
+    fn button_and_binary_sensor_listing_and_state() {
+        let b = ButtonEntity {
+            object_id: "tv_mute".to_owned(),
+            name: "TV mute".to_owned(),
+            icon: "mdi:volume-off".to_owned(),
+            device_class: String::new(),
+            entity_category: EntityCategory::Diagnostic,
+        };
+        let l = list_button(&b);
+        assert_eq!(
+            (l.key, l.entity_category),
+            (entity_key("tv_mute"), EntityCategory::Diagnostic as i32)
+        );
+        assert_eq!(l.name, "TV mute");
+        let s = BinarySensorEntity {
+            object_id: "listening".to_owned(),
+            name: "Listening".to_owned(),
+            icon: "mdi:ear-hearing".to_owned(),
+            device_class: "running".to_owned(),
+            entity_category: EntityCategory::None,
+        };
+        let l = list_binary_sensor(&s);
+        assert_eq!(
+            (l.key, l.device_class.as_str()),
+            (entity_key("listening"), "running")
+        );
+        assert_eq!(l.entity_category, EntityCategory::None as i32);
+        assert!(binary_sensor_state(&s, None).missing_state);
+        let on = binary_sensor_state(&s, Some(true));
+        assert!(on.state && !on.missing_state);
+        let off = binary_sensor_state(&s, Some(false));
+        assert!(!off.state && !off.missing_state);
     }
 
     #[test]

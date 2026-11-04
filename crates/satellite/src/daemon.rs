@@ -934,6 +934,9 @@ pub(crate) async fn run(mut settings: Settings, triggers: TestTriggers) -> Resul
             settings.power.remote_off
         }
     };
+    // The listening indicator (privacy gate F7): always on, driven by the
+    // capture thread from the real PCM state.
+    esp.binary_sensors.extend(capture::indicator_entities());
     if luna.is_some() {
         esp.power_sensor = true;
         esp.selects.push(darken::select_entity());

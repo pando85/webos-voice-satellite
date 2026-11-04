@@ -20,6 +20,15 @@
 //! within one read (16 ms at the c3-a settings), and it is reopened when the
 //! microphone is wanted again.
 //!
+//! Listening indicator (privacy gate F7): the thread itself publishes two HA
+//! binary sensors, [`Indicators`], from what it actually does with the PCM, in
+//! the same command stream as the audio. "Listening" goes ON right after the
+//! PCM is opened and before any audio is read or forwarded, and OFF only after
+//! the PCM is closed again; so no audio message can precede its ON, and OFF
+//! never claims a closed mic while the PCM is open. "Microphone muted" is ON
+//! only while the PCM is closed and a gate (mute switch, kill switch,
+//! firmware guard, not paired) is what keeps it closed.
+//!
 //! Open failures (mic busy because LG hands-free holds the PCM, device not
 //! found, I/O errors) are logged and retried with a capped backoff. A device
 //! that stops delivering audio for `limits.capture_stall_s` is closed and
@@ -35,6 +44,8 @@ use tokio::sync::mpsc;
 use webos_capture::{AudioSource, CaptureError, FilePair, FileSource, ReferenceState};
 use webos_dsp::{AecConfig, AecMetrics, DelayEvent, EchoCanceller, Frontend, FrontendConfig};
 use webos_esphome_api::AppCommand;
+use webos_esphome_api::config::BinarySensorEntity;
+use webos_esphome_api::proto::EntityCategory;
 
 use crate::config::{MicSource, Settings};
 
@@ -169,6 +180,94 @@ pub(crate) const OFF_KILL: u8 = 2;
 pub(crate) const OFF_FIRMWARE: u8 = 3;
 /// [`Shared::mic_off`]: pairing enabled and no key yet (no HA may listen).
 pub(crate) const OFF_UNPAIRED: u8 = 4;
+
+/// Object id of the "Listening" binary sensor.
+pub(crate) const LISTENING_ID: &str = "listening";
+/// Object id of the "Microphone muted" binary sensor.
+pub(crate) const MUTED_ID: &str = "microphone_muted";
+
+/// The two indicator entities, always listed (they are a privacy feature,
+/// not an option).
+pub(crate) fn indicator_entities() -> Vec<BinarySensorEntity> {
+    vec![
+        BinarySensorEntity {
+            object_id: LISTENING_ID.to_owned(),
+            name: "Listening".to_owned(),
+            icon: "mdi:ear-hearing".to_owned(),
+            device_class: String::new(),
+            entity_category: EntityCategory::None,
+        },
+        BinarySensorEntity {
+            object_id: MUTED_ID.to_owned(),
+            name: "Microphone muted".to_owned(),
+            icon: "mdi:microphone-off".to_owned(),
+            device_class: String::new(),
+            entity_category: EntityCategory::None,
+        },
+    ]
+}
+
+/// Publishes the indicator sensors, sending only changes. Commands go in
+/// order with the audio chunks on the same channel and are never dropped
+/// while the server is alive (unlike audio, which is dropped when the
+/// server is backed up).
+struct Indicators<'a> {
+    tx: &'a mpsc::Sender<AppCommand>,
+    shared: &'a Shared,
+    listening: Option<bool>,
+    muted: Option<bool>,
+}
+
+impl<'a> Indicators<'a> {
+    fn new(tx: &'a mpsc::Sender<AppCommand>, shared: &'a Shared) -> Self {
+        Self {
+            tx,
+            shared,
+            listening: None,
+            muted: None,
+        }
+    }
+
+    /// "Listening": the capture PCM is open. Call after opening it and after
+    /// closing it, nowhere else.
+    fn listening(&mut self, on: bool) {
+        if self.listening != Some(on) {
+            self.listening = Some(on);
+            self.publish(LISTENING_ID, on);
+        }
+    }
+
+    /// "Microphone muted": a gate keeps the (closed) PCM closed. Call only
+    /// while the PCM is closed.
+    fn muted(&mut self, on: bool) {
+        if self.muted != Some(on) {
+            self.muted = Some(on);
+            self.publish(MUTED_ID, on);
+        }
+    }
+
+    fn publish(&self, object_id: &str, on: bool) {
+        let mut cmd = AppCommand::SetBinarySensor {
+            object_id: object_id.to_owned(),
+            state: Some(on),
+        };
+        loop {
+            match self.tx.try_send(cmd) {
+                Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => return,
+                Err(mpsc::error::TrySendError::Full(back)) => {
+                    // The server is backed up: wait (the heartbeat keeps
+                    // beating) rather than lose a state change.
+                    cmd = back;
+                    if self.shared.stop.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    self.shared.beat.fetch_add(1, Ordering::Relaxed);
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            }
+        }
+    }
+}
 
 /// Cached check of the kill-switch file (one `stat` per 250 ms at most).
 #[derive(Debug)]
@@ -489,8 +588,12 @@ fn run(cfg: &CaptureSettings, shared: &Shared, tx: &mpsc::Sender<AppCommand>) {
     let mut busy_logged = false;
     let mut kill = KillSwitch::new(cfg.kill_switch.as_deref());
     let mut idle_reason: Option<&'static str> = None;
+    let mut ind = Indicators::new(tx, shared);
     while !shared.stop.load(Ordering::Relaxed) {
         if let Some(why) = unwanted(shared, &mut kill) {
+            // Not inside `pump`, so the PCM is closed here.
+            ind.listening(false);
+            ind.muted(true);
             if idle_reason != Some(why) {
                 log::info!("capture: microphone off ({why})");
                 idle_reason = Some(why);
@@ -501,6 +604,9 @@ fn run(cfg: &CaptureSettings, shared: &Shared, tx: &mpsc::Sender<AppCommand>) {
             continue;
         }
         idle_reason = None;
+        // Wanted, so no gate holds the mic closed (it is closed right now).
+        ind.listening(false);
+        ind.muted(false);
         let src = match open_source(cfg) {
             Ok(src) => src,
             Err(e) => {
@@ -534,9 +640,10 @@ fn run(cfg: &CaptureSettings, shared: &Shared, tx: &mpsc::Sender<AppCommand>) {
         failures = 0;
         busy_logged = false;
         let opened = Instant::now();
-        let end = pump(cfg, src, shared, tx, &mut kill);
+        let end = pump(cfg, src, shared, tx, &mut kill, &mut ind);
         // `pump` consumed and dropped the source: the PCM is closed now.
         shared.open.store(false, Ordering::Relaxed);
+        ind.listening(false);
         if opened.elapsed() >= STREAM_OK_AFTER {
             stream_errors = 0;
         }
@@ -567,6 +674,7 @@ fn run(cfg: &CaptureSettings, shared: &Shared, tx: &mpsc::Sender<AppCommand>) {
         }
     }
     shared.open.store(false, Ordering::Relaxed);
+    ind.listening(false);
     log::debug!("capture: thread stopped");
 }
 
@@ -597,6 +705,7 @@ fn pump(
     shared: &Shared,
     tx: &mpsc::Sender<AppCommand>,
     kill: &mut KillSwitch<'_>,
+    ind: &mut Indicators<'_>,
 ) -> Result<PumpEnd, CaptureError> {
     let ch = usize::from(src.channels());
     let rate = src.rate();
@@ -607,6 +716,8 @@ fn pump(
         cfg.source
     );
     shared.open.store(true, Ordering::Relaxed);
+    // Before the first read: no audio can reach HA ahead of this ON.
+    ind.listening(true);
     let mut frontend = build_frontend(cfg, src.as_ref(), rate);
     let mut feed = ReferenceFeed::new(src.as_ref(), &frontend);
     let mut buf = vec![0_i32; READ_FRAMES * ch];
@@ -739,18 +850,22 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(1024);
         let h = spawn(cfg, Arc::clone(&shared), tx).unwrap();
 
-        // Paused while not streaming: nothing arrives.
+        // Paused while not streaming: no audio arrives (the indicators do).
         std::thread::sleep(Duration::from_millis(100));
-        assert!(rx.try_recv().is_err());
+        while let Ok(cmd) = rx.try_recv() {
+            assert!(matches!(cmd, AppCommand::SetBinarySensor { .. }), "{cmd:?}");
+        }
 
         shared.streaming.store(true, Ordering::Relaxed);
         std::thread::sleep(Duration::from_millis(300));
         shared.stop.store(true, Ordering::Relaxed);
         h.join().unwrap();
         let mut samples = 0;
-        while let Ok(AppCommand::Audio(chunk)) = rx.try_recv() {
-            assert_eq!(chunk.len(), CHUNK_SAMPLES);
-            samples += chunk.len();
+        while let Ok(cmd) = rx.try_recv() {
+            if let AppCommand::Audio(chunk) = cmd {
+                assert_eq!(chunk.len(), CHUNK_SAMPLES);
+                samples += chunk.len();
+            }
         }
         // 8000 frames - 4000 skipped = 4000 samples = 7 whole chunks.
         assert_eq!(samples, 7 * CHUNK_SAMPLES);
@@ -820,6 +935,173 @@ mod tests {
         shared.stop.store(true, Ordering::Relaxed);
         h.join().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// What the receiving side (the API server) sees, in channel order.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum Seen {
+        Audio,
+        Listening(bool),
+        Muted(bool),
+    }
+
+    /// Privacy gate F7: the indicators follow the real PCM state, and the
+    /// command stream (audio and indicators share one channel) never shows
+    /// audio before "Listening" ON, "Listening" OFF while audio follows,
+    /// "muted" ON while "Listening" is ON, or "Listening" ON while "muted"
+    /// is ON. Also: whenever the PCM has been open (or closed) for a while,
+    /// what the server last heard says so.
+    #[test]
+    #[allow(clippy::too_many_lines, clippy::type_complexity)]
+    fn indicators_follow_the_real_pcm_state() {
+        use std::sync::Mutex;
+        let dir = std::env::temp_dir().join(format!("webos-sat-ind-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mic.raw");
+        write_raw(&path, 16_000, 1000);
+        let kill = dir.join("disable");
+        let mut s = Settings::default();
+        s.mic.source = MicSource::File;
+        s.mic.path = Some(path);
+        s.mic.looping = true;
+        s.mic.pause_when_idle = false;
+        s.safety.kill_switch.clone_from(&kill);
+        let shared = Arc::new(Shared::default());
+        // Audio flows for the whole test (wake word armed).
+        shared.streaming.store(true, Ordering::Relaxed);
+        let (tx, mut rx) = mpsc::channel(4096);
+        let log = Arc::new(Mutex::new(Vec::<Seen>::new()));
+        let collector = {
+            let log = Arc::clone(&log);
+            std::thread::spawn(move || {
+                while let Some(cmd) = rx.blocking_recv() {
+                    let seen = match cmd {
+                        AppCommand::Audio(_) => Seen::Audio,
+                        AppCommand::SetBinarySensor { object_id, state } => {
+                            let on = state.unwrap();
+                            match object_id.as_str() {
+                                LISTENING_ID => Seen::Listening(on),
+                                MUTED_ID => Seen::Muted(on),
+                                other => panic!("unexpected sensor {other}"),
+                            }
+                        }
+                        other => panic!("unexpected command {other:?}"),
+                    };
+                    log.lock().unwrap().push(seen);
+                }
+            })
+        };
+        let shown =
+            |what: fn(&Seen) -> Option<bool>| log.lock().unwrap().iter().rev().find_map(what);
+        let listening = |e: &Seen| match e {
+            Seen::Listening(b) => Some(*b),
+            _ => None,
+        };
+        let muted = |e: &Seen| match e {
+            Seen::Muted(b) => Some(*b),
+            _ => None,
+        };
+        let h = spawn(CaptureSettings::from_settings(&s), Arc::clone(&shared), tx).unwrap();
+
+        // Settled-state check while the gate flips through all its reasons:
+        // the PCM state and what the server last heard agree within 300 ms.
+        let steps: [(&str, Box<dyn Fn()>); 8] = [
+            (
+                "mute",
+                Box::new(|| shared.mic_off.store(OFF_MUTED, Ordering::Relaxed)),
+            ),
+            (
+                "unmute",
+                Box::new(|| shared.mic_off.store(OFF_NONE, Ordering::Relaxed)),
+            ),
+            (
+                "firmware",
+                Box::new(|| shared.mic_off.store(OFF_FIRMWARE, Ordering::Relaxed)),
+            ),
+            (
+                "unmute",
+                Box::new(|| shared.mic_off.store(OFF_NONE, Ordering::Relaxed)),
+            ),
+            ("kill", Box::new(|| std::fs::write(&kill, b"").unwrap())),
+            ("unkill", Box::new(|| std::fs::remove_file(&kill).unwrap())),
+            (
+                "unpaired",
+                Box::new(|| shared.mic_off.store(OFF_UNPAIRED, Ordering::Relaxed)),
+            ),
+            (
+                "paired",
+                Box::new(|| shared.mic_off.store(OFF_NONE, Ordering::Relaxed)),
+            ),
+        ];
+        assert!(
+            wait_for(|| shown(listening) == Some(true)),
+            "listening ON after the first open"
+        );
+        assert_eq!(shown(muted), Some(false));
+        for (name, step) in &steps {
+            step();
+            let want_open = matches!(*name, "unmute" | "unkill" | "paired");
+            assert!(
+                wait_for(|| shared.open.load(Ordering::Relaxed) == want_open),
+                "{name}: PCM open should be {want_open}"
+            );
+            // Sample for 300 ms: never contradicting the settled PCM state.
+            let t = Instant::now();
+            let mut settled_since = Instant::now();
+            let mut last_open = shared.open.load(Ordering::Relaxed);
+            while t.elapsed() < Duration::from_millis(300) {
+                let open = shared.open.load(Ordering::Relaxed);
+                if open != last_open {
+                    last_open = open;
+                    settled_since = Instant::now();
+                }
+                if settled_since.elapsed() > Duration::from_millis(100) {
+                    assert_eq!(shown(listening), Some(open), "{name}: listening vs PCM");
+                    assert_eq!(shown(muted), Some(!open), "{name}: muted vs PCM");
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert_eq!(shown(listening), Some(want_open), "{name}");
+            assert_eq!(shown(muted), Some(!want_open), "{name}");
+        }
+
+        shared.stop.store(true, Ordering::Relaxed);
+        h.join().unwrap();
+        collector.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Wire-order invariants over everything the server received.
+        let log = log.lock().unwrap();
+        let (mut l, mut m): (Option<bool>, Option<bool>) = (None, None);
+        let mut opens = 0;
+        let mut audio = 0;
+        for e in log.iter() {
+            match e {
+                Seen::Audio => {
+                    audio += 1;
+                    assert_eq!(l, Some(true), "audio while not shown as listening");
+                }
+                Seen::Listening(on) => {
+                    assert_ne!(l, Some(*on), "repeated listening state");
+                    if *on {
+                        opens += 1;
+                        assert_ne!(m, Some(true), "listening ON while shown muted");
+                    }
+                    l = Some(*on);
+                }
+                Seen::Muted(on) => {
+                    assert_ne!(m, Some(*on), "repeated muted state");
+                    assert!(!*on || l != Some(true), "muted ON while shown listening");
+                    m = Some(*on);
+                }
+            }
+        }
+        assert!(audio > 0);
+        // One ON per PCM open: the initial one and one per unmute (twice),
+        // unkill and pair.
+        assert_eq!(opens, 5, "{log:?}");
+        // The thread's end closed the PCM and said so.
+        assert_eq!(l, Some(false));
     }
 
     /// Deterministic noise in [-a, a].
@@ -953,10 +1235,21 @@ mod tests {
         s.mic.source = MicSource::File;
         s.mic.path = Some(PathBuf::from("/nonexistent/mic.raw"));
         let shared = Arc::new(Shared::default());
-        let (tx, _rx) = mpsc::channel(4);
+        let (tx, mut rx) = mpsc::channel(4);
         let h = spawn(CaptureSettings::from_settings(&s), Arc::clone(&shared), tx).unwrap();
         std::thread::sleep(Duration::from_millis(100));
         assert!(!shared.open.load(Ordering::Relaxed));
+        // A failed open is never reported as listening.
+        while let Ok(cmd) = rx.try_recv() {
+            assert!(
+                !matches!(
+                    cmd,
+                    AppCommand::SetBinarySensor { ref object_id, state: Some(true) }
+                        if object_id == LISTENING_ID
+                ),
+                "{cmd:?}"
+            );
+        }
         let t = Instant::now();
         shared.stop.store(true, Ordering::Relaxed);
         h.join().unwrap();

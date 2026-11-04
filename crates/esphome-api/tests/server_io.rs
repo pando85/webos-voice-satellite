@@ -489,6 +489,199 @@ async fn power_sensor_and_select_entities() {
     );
 }
 
+fn tv_entities_cfg() -> Config {
+    use webos_esphome_api::config::{BinarySensorEntity, ButtonEntity, NumberEntity};
+    let mut cfg = plain_cfg();
+    cfg.numbers.push(NumberEntity {
+        object_id: "tv_volume".into(),
+        name: "TV volume".into(),
+        icon: "mdi:volume-high".into(),
+        min_value: 0.0,
+        max_value: 100.0,
+        step: 1.0,
+        unit: "%".into(),
+        device_class: "volume".into(),
+        mode: pb::NumberMode::Slider,
+        entity_category: pb::EntityCategory::None,
+    });
+    cfg.buttons.push(ButtonEntity {
+        object_id: "tv_mute".into(),
+        name: "TV mute".into(),
+        icon: "mdi:volume-off".into(),
+        device_class: String::new(),
+        entity_category: pb::EntityCategory::Config,
+    });
+    cfg.binary_sensors.push(BinarySensorEntity {
+        object_id: "listening".into(),
+        name: "Listening".into(),
+        icon: "mdi:ear-hearing".into(),
+        device_class: "running".into(),
+        entity_category: pb::EntityCategory::None,
+    });
+    cfg
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines, clippy::float_cmp)]
+async fn number_button_and_binary_sensor_entities() {
+    let (port, mut events, cmds) = start_cfg(tv_entities_cfg()).await;
+    let mut c = connect_plain(port).await;
+    c.send(&pb::ListEntitiesRequest {}).await;
+    let num: pb::ListEntitiesNumberResponse = c.recv_as().await;
+    assert_eq!(num.object_id, "tv_volume");
+    assert_eq!((num.min_value, num.max_value, num.step), (0.0, 100.0, 1.0));
+    assert_eq!(num.unit_of_measurement, "%");
+    assert_eq!(num.device_class, "volume");
+    assert_eq!(num.mode, pb::NumberMode::Slider as i32);
+    let btn: pb::ListEntitiesButtonResponse = c.recv_as().await;
+    assert_eq!(btn.object_id, "tv_mute");
+    assert_eq!(btn.entity_category, pb::EntityCategory::Config as i32);
+    let bin: pb::ListEntitiesBinarySensorResponse = c.recv_as().await;
+    assert_eq!(bin.object_id, "listening");
+    assert_eq!(bin.device_class, "running");
+    let _: pb::ListEntitiesDoneResponse = c.recv_as().await;
+    // Keys are the stable FNV-1 hashes of the object ids.
+    assert_eq!(
+        num.key,
+        webos_esphome_api::entities::entity_key("tv_volume")
+    );
+    assert_eq!(
+        bin.key,
+        webos_esphome_api::entities::entity_key("listening")
+    );
+
+    // Before any state: "missing state" (HA shows unknown), not off.
+    c.send(&pb::SubscribeStatesRequest {}).await;
+    let n: pb::NumberStateResponse = c.recv_as().await;
+    assert!(n.missing_state);
+    let b: pb::BinarySensorStateResponse = c.recv_as().await;
+    assert!(b.missing_state);
+
+    // Changes are pushed; an unchanged state is not repeated.
+    cmds.send(AppCommand::SetBinarySensor {
+        object_id: "listening".into(),
+        state: Some(true),
+    })
+    .await
+    .unwrap();
+    let b: pb::BinarySensorStateResponse = c.recv_as().await;
+    assert_eq!((b.state, b.missing_state), (true, false));
+    cmds.send(AppCommand::SetBinarySensor {
+        object_id: "listening".into(),
+        state: Some(true),
+    })
+    .await
+    .unwrap();
+    cmds.send(AppCommand::SetNumber {
+        object_id: "tv_volume".into(),
+        value: Some(30.5),
+    })
+    .await
+    .unwrap();
+    // The duplicate binary sensor state was dropped: the next frame is the number.
+    let n: pb::NumberStateResponse = c.recv_as().await;
+    assert_eq!((n.state, n.missing_state), (30.5, false));
+    // Unknown ids and out-of-range values are ignored (no state frame).
+    cmds.send(AppCommand::SetNumber {
+        object_id: "tv_volume".into(),
+        value: Some(101.0),
+    })
+    .await
+    .unwrap();
+    cmds.send(AppCommand::SetNumber {
+        object_id: "nope".into(),
+        value: Some(1.0),
+    })
+    .await
+    .unwrap();
+    cmds.send(AppCommand::SetBinarySensor {
+        object_id: "listening".into(),
+        state: Some(false),
+    })
+    .await
+    .unwrap();
+    let b: pb::BinarySensorStateResponse = c.recv_as().await;
+    assert_eq!((b.state, b.missing_state), (false, false));
+
+    // HA commands: in-range value -> event, no echo; out of range -> the
+    // current state is re-sent and no event; button press -> event.
+    c.send(&pb::NumberCommandRequest {
+        key: num.key,
+        state: 55.0,
+        ..Default::default()
+    })
+    .await;
+    assert_eq!(
+        next_event(&mut events).await,
+        AppEvent::NumberChanged {
+            object_id: "tv_volume".into(),
+            value: 55.0
+        }
+    );
+    c.send(&pb::NumberCommandRequest {
+        key: num.key,
+        state: f32::NAN,
+        ..Default::default()
+    })
+    .await;
+    let n: pb::NumberStateResponse = c.recv_as().await;
+    assert_eq!(n.state, 30.5, "the current state, not the rejected value");
+    c.send(&pb::NumberCommandRequest {
+        key: num.key,
+        state: -1.0,
+        ..Default::default()
+    })
+    .await;
+    let n: pb::NumberStateResponse = c.recv_as().await;
+    assert_eq!(n.state, 30.5);
+    c.send(&pb::NumberCommandRequest {
+        key: 12345,
+        state: 5.0,
+        ..Default::default()
+    })
+    .await;
+    c.send(&pb::ButtonCommandRequest {
+        key: 12345,
+        ..Default::default()
+    })
+    .await;
+    c.send(&pb::ButtonCommandRequest {
+        key: btn.key,
+        ..Default::default()
+    })
+    .await;
+    assert_eq!(
+        next_event(&mut events).await,
+        AppEvent::ButtonPressed {
+            object_id: "tv_mute".into()
+        }
+    );
+    // A command for the binary sensor's key changes nothing.
+    c.send(&pb::SwitchCommandRequest {
+        key: bin.key,
+        state: true,
+        ..Default::default()
+    })
+    .await;
+
+    // A reconnect gets the stored states again, current values included.
+    let mut c2 = connect_plain(port).await;
+    c2.send(&pb::SubscribeStatesRequest {}).await;
+    let n: pb::NumberStateResponse = c2.recv_as().await;
+    assert_eq!((n.state, n.missing_state), (30.5, false));
+    let b: pb::BinarySensorStateResponse = c2.recv_as().await;
+    assert_eq!((b.state, b.missing_state), (false, false));
+    // None puts a sensor back to unknown.
+    cmds.send(AppCommand::SetBinarySensor {
+        object_id: "listening".into(),
+        state: None,
+    })
+    .await
+    .unwrap();
+    let b: pb::BinarySensorStateResponse = c2.recv_as().await;
+    assert!(b.missing_state);
+}
+
 #[tokio::test]
 async fn resume_probe_keeps_a_live_connection_and_drops_a_silent_one() {
     let (port, mut events, cmds) = start_cfg(plain_cfg()).await;
