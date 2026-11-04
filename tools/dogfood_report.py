@@ -578,6 +578,8 @@ for f in "$D/disable" "$D/crashloop" /tmp/webos-satellite.disable; do [ -e "$f" 
 echo '@@proc'
 pid=$(cat "$D/run/webos-satellite.pid" 2>/dev/null)
 if [ -n "$pid" ] && [ -r "/proc/$pid/stat" ]; then echo "pid $pid"; cat "/proc/$pid/stat"; grep -E '^(VmRSS|Threads):' "/proc/$pid/status"; fi
+sp=$(cat "$D/run/supervise.pid" 2>/dev/null)
+if [ -n "$sp" ] && tr '\0' ' ' <"/proc/$sp/cmdline" 2>/dev/null | grep -q supervise.sh; then echo "supervisor $sp"; fi
 echo '@@log1'; cat "$D/log/webos-satellite.log.1" 2>/dev/null
 echo '@@log'; cat "$D/log/webos-satellite.log" 2>/dev/null
 echo '@@autostart'; cat "$D/log/autostart.log" 2>/dev/null
@@ -638,8 +640,14 @@ def live_from(sec, now_local, offset=True):
     m = re.search(r"firmware: firmware .*\): (.*)$", ctl, re.M)
     live["firmware_validated"] = (m.group(1).strip() == "validated") if m else None
     live["markers"] = [x for x in sec.get("markers", []) if x in ("disable", "crashloop", "webos-satellite.disable")]
-    live["supervisor_running"] = "supervisor running" in ctl
     proc = sec.get("proc", [])
+    # The supervisor: its pid and a supervise.sh cmdline in the /proc probe (the same test as
+    # supervisor_alive() in packaging/webos/lib.sh). ctl.sh status text does not name it, so the
+    # text match ("supervisor running", as status.sh prints it) is only a fallback.
+    # The remote script prints `supervisor PID` only after its cmdline check passed.
+    sup_pids = [ln.split()[1] for ln in proc if re.match(r"^supervisor \d+$", ln)]
+    live["supervisor_running"] = bool(sup_pids) or bool(re.search(r"supervisor\W{1,3}running", ctl))
+    live["supervisor_pid"] = int(sup_pids[0]) if sup_pids else None
     clk = 100
     try:
         clk = int(sec["clk"][0])

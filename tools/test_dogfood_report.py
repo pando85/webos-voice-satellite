@@ -450,6 +450,49 @@ class HaWebsocket(unittest.TestCase):
             self.assertEqual(d.read_token(p), ("plain", True))
 
 
+class LiveSupervisor(unittest.TestCase):
+    """Supervisor detection in the live probe. Synthetic bundle sections, hand-written: the ctl.sh
+    status text of the current format has no supervisor line; the probe reads the supervisor's
+    pid file and /proc cmdline instead. The text match is kept for older status output."""
+
+    def live(self, ctl_lines, proc_lines=()):
+        text = "\n".join(["@@now", "1000", "@@uptime", "100.00 50.00", "@@clk", "100", "@@ctl"] + list(ctl_lines) +
+                          ["@@markers", "@@proc"] + list(proc_lines) + ["@@log1", "@@log", "@@end"])
+        return d.live_from(d.split_bundle(text), 1000, offset=False)
+
+    def test_current_format_supervised_by_proc(self):
+        live = self.live(["webos-satellite: running: pid 4321", "webos-satellite: start at boot: on (/x)"],
+                         ["pid 4321", "4321 (webos-satellite) S 1 4321 4321 0 -1 0 0 0 0 0 0 0 0 0 20 0 4 0 100000 0 0 0 0",
+                          "VmRSS:\t   1280 kB", "Threads:\t4", "supervisor 777"])
+        self.assertTrue(live["running"])
+        self.assertEqual(live["pid"], 4321)
+        self.assertTrue(live["supervisor_running"])
+        self.assertEqual(live["supervisor_pid"], 777)
+
+    def test_old_text_format_still_counts(self):
+        live = self.live(["webos-satellite: supervisor running, pid 777", "webos-satellite: running: pid 4321"])
+        self.assertTrue(live["supervisor_running"])
+        self.assertIsNone(live["supervisor_pid"])
+
+    def test_colon_variant_of_old_text(self):
+        self.assertTrue(self.live(["supervisor: running (pid 777)"])["supervisor_running"])
+
+    def test_not_supervised(self):
+        live = self.live(["webos-satellite: running: pid 4321"], ["pid 4321", "Threads:\t4"])
+        self.assertTrue(live["running"])
+        self.assertFalse(live["supervisor_running"])
+        self.assertIsNone(live["supervisor_pid"])
+
+    def test_no_daemon_no_supervisor(self):
+        live = self.live(["webos-satellite: running: no"])
+        self.assertFalse(live["running"])
+        self.assertFalse(live["supervisor_running"])
+
+    def test_supervisor_line_with_text_is_not_a_pid(self):
+        live = self.live(["webos-satellite: running: no"], ["supervisor 777 extra"])
+        self.assertFalse(live["supervisor_running"])
+
+
 # ---------------------------------------------------------------- end to end
 
 BUNDLE = "\n".join(["@@now", str(int(ts("12:00:00"))), "@@uptime", "5000.00 4000.00", "@@clk", "100", "@@ctl",
