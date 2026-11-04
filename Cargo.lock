@@ -1553,7 +1553,7 @@ dependencies = [
 
 [[package]]
 name = "webos-capture"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "libc",
  "nnnoiseless",
@@ -1563,11 +1563,11 @@ dependencies = [
 
 [[package]]
 name = "webos-compat"
-version = "0.2.0"
+version = "0.2.1"
 
 [[package]]
 name = "webos-dsp"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "sonora",
  "sonora-aec3",
@@ -1575,7 +1575,7 @@ dependencies = [
 
 [[package]]
 name = "webos-esphome-api"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "base64 0.22.1",
  "log",
@@ -1589,7 +1589,7 @@ dependencies = [
 
 [[package]]
 name = "webos-playback"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "symphonia",
  "thiserror",
@@ -1599,7 +1599,7 @@ dependencies = [
 
 [[package]]
 name = "webos-satellite"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "dlmalloc",
  "log",
@@ -1616,7 +1616,7 @@ dependencies = [
 
 [[package]]
 name = "webos-tv-control"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "serde_json",
 ]
