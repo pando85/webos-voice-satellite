@@ -15,8 +15,8 @@
 //!
 //! URL media is streamed too ([`webos_playback::play_url`]): fetched,
 //! decoded, converted to `sink.rate`/`sink.channels` and written chunk by
-//! chunk, with bounded buffers (about 1 MiB whatever its length). Until
-//! 0.4.1 a URL was downloaded, decoded and converted whole, about 0.65 MiB of
+//! chunk, with bounded buffers (about 1 MiB whatever its length). Up to
+//! 0.4.2 a URL was downloaded, decoded and converted whole, about 0.65 MiB of
 //! heap per second of audio on c3-a, so a reply of about 90 s would have
 //! passed the 64 MiB RSS ceiling.
 

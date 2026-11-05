@@ -409,7 +409,7 @@ level = "info"
 
         # A 120 s announcement is streamed (fetch, decode, convert and write
         # chunk by chunk): the daemon's peak RSS must not grow with its length.
-        # Until 0.4.1 it was held whole, about 0.65 MiB per second of audio
+        # Up to 0.4.2 it was held whole, about 0.65 MiB per second of audio
         # (c3-a), so 120 s would have added about 75 MiB.
         write_long_announcement(os.path.join(tmp, "long.wav"), 120)
         long_url = f"http://127.0.0.1:{srv.server_address[1]}/long.wav"

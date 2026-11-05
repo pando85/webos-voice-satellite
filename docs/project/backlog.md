@@ -70,6 +70,7 @@ Items not in the ranked list stay in the backlog without a priority or a phase: 
 - **Status update (2026-11-05):** M1 to M5 built; on c3-a the direct HA path, resources ([EXP-017](../experiments/EXP-017-music-engine-resources.md)), mixing and ducking ([EXP-014](../experiments/EXP-014-music-mix-and-ducking.md)) pass ([EXP-016](../experiments/EXP-016-music-real-ha-and-ma.md) for HA); `[music] enabled` stays false.
 - **TODO (owner, 2026-11-05): Music Assistant test, later.** Music Assistant is not installed yet; when the owner installs it, run the Music Assistant part of EXP-016 on c3-a (player appears after a provider reload, continuous flow-mode stream, 44.1 kHz, no Content-Length, duck over it).
 - **TODO:** EXP-015 (false wakes and "stop" with music; gate G4), the wake-word duck and standby entry with music open.
+- **TODO:** re-measure the daemon's RSS on c3-a with an 18 s and a long announcement (EXP-017 method) after the next deploy: replies and announcements now stream (fixed on the PC after 0.4.2; design "Reply path streamed").
 - **Evidence needed:** CPU, memory and underruns of the decode on c3-a (EXP-013), mixing and ducking audible (EXP-014), false wakes and barge-in with music (EXP-015), the real HA and Music Assistant path (EXP-016).
 
 ## 6. Observability
