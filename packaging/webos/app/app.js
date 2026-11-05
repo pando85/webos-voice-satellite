@@ -1,45 +1,83 @@
 /*
- * Voice Satellite status app. ES5 only (old webOS web runtimes), except the
- * vendored qrcodegen.js (Project Nayuki, MIT; ES2015, see
- * QRCODEGEN-LICENSE.txt), which draws the compatibility-report QR code
- * offline.
+ * Voice Satellite TV app. ES5 only (the TV's web engine is not verified for
+ * newer syntax), except the vendored qrcodegen.js (Project Nayuki, MIT;
+ * ES2015, see QRCODEGEN-LICENSE.txt), which draws the QR codes offline.
+ * The sentences and the phone-request texts live in voicepower.js
+ * (window.voicePower), shared with the phone setup page.
  *
  * Talks to the satellite through the Homebrew Channel's root `exec` method
  * (luna://org.webosbrew.hbchannel.service/exec), running the package's own
  * payload/ctl.sh with a fixed argument list: no text typed or received is
- * ever put into a command. Design: docs/design/packaging.md.
+ * ever put into a command, except the 8-hex-digit id of a phone request,
+ * checked by a regular expression (docs/design/phone-setup.md, ADR 0009).
+ *
+ * Screens (design "Calm dark", 2026-11-05): Home, Voice and power, Home
+ * Assistant (with the phone setup QR), Diagnostics (with Report
+ * compatibility and More actions). Back always returns to Home. The arrow
+ * keys move the focus to the nearest element in that direction.
  */
 (function () {
   'use strict';
 
+  var VP = window.voicePower;
   var HBC_EXEC = 'luna://org.webosbrew.hbchannel.service/exec';
   // Documented LG API; the service name changed between webOS versions.
   var CONN_SERVICES = ['luna://com.webos.service.connectionmanager/getStatus',
     'luna://com.palm.connectionmanager/getStatus'];
-  // The only argument lists the app sends to ctl.sh.
+  // The only argument lists the app sends to ctl.sh (plus ANSWER_RE).
   var ALLOWED = ['status --json', 'install', 'start', 'stop', 'autostart on',
     'autostart off', 'mic off', 'mic on', 'pair', 'reset-pairing',
     'clear-crashloop', 'uninstall', 'purge', 'report --json', 'selfcheck', 'ack-firmware',
     // Voice and power screen: one read and six fixed changes, no typed text.
     'tv-settings --json', 'set always-ready on', 'set always-ready off', 'set hi-lg on', 'set hi-lg off',
-    'set remote-off normal', 'set remote-off keep'];
-  var QR_SIZE = 640;
+    'set remote-off normal', 'set remote-off keep',
+    // Phone setup (ADR 0009): start, the poll (also the heartbeat), stop.
+    'setup start', 'setup status --json', 'setup stop'];
+  var ANSWER_RE = /^setup answer [0-9a-f]{8} (allow|refuse)$/;
+  var ID_RE = /^[0-9a-f]{8}$/;
+
+  var QR_SIZE = 552;
+  var ARM_MS = 5000;           // a two-press action stays armed this long
+  var REREAD_MS = 3000;        // re-read after a Voice and power change
+  var REFRESH_MS = 10000;      // status refresh (paused as described in tick())
+  var HOME_TV_EVERY = 3;       // Home reads tv-settings every 3rd refresh (30 s)
+  // Phone session poll, also the heartbeat (design 4.4, EXP-012 P7 on c3-a:
+  // about 80 ms and 77 ms of CPU per exec call): every 2 s while a session
+  // is waiting or active, every 1 s while a request is pending or its result
+  // has not been shown yet.
+  var SETUP_POLL_MS = 2000;
+  var SETUP_POLL_FAST_MS = 1000;
+  var SETUP_HINT_MS = 45000;   // "nothing has opened the link" hint (design 5.3)
+  var REQUEST_MS = 60000;      // a phone request is refused after this (design 7)
+  var CLOCK_MS = 1000;         // countdown texts
 
   var appDir = decodeURIComponent(window.location.pathname.replace(/\/[^\/]*$/, ''));
   var ctlPath = appDir + '/payload/ctl.sh';
-  var pending = [];
-  var busy = false;
+  var bridges = [];
+  var busy = false;            // an action from run() is in flight
   var autoUpdateTried = false;
   var tvAddress = '';
-  var last = null;
-  var reportOpen = false;
-  var voiceOpen = false;
+  var st = null;               // last `status --json`
+  var tvData = null;           // last `tv-settings --json` (Home cards and Voice and power)
+  var tvReading = false;
+  var refreshTicks = 0;
+  var screen = 'home';         // home | voice | ha | setup | diag | report | more
+  var msg = { text: '', cls: '' };
+  var armedBtn = null;         // id of an armed two-press button outside Voice and power
+  var armToken = 0;
+  var pairEnds = 0;            // local end time of the pairing window, 0 when not known
 
   function $(id) { return document.getElementById(id); }
-
   function text(el, s) { el.textContent = s; }
+  function show(id, on) { $(id).hidden = !on; }
+  function now() { return Date.now(); }
+  function fmt(ms) {
+    var s = Math.max(0, Math.ceil(ms / 1000));
+    var r = s % 60;
+    return Math.floor(s / 60) + ':' + (r < 10 ? '0' : '') + r;
+  }
 
-  function message(s) { text($('message'), s || ''); }
+  // ---- Luna and ctl.sh --------------------------------------------------------
 
   // One Luna call through the web runtime's PalmServiceBridge (what LG's
   // webOSTV.js does inside webOS.service.request). The bridge object is kept
@@ -50,19 +88,21 @@
       return;
     }
     var bridge = new window.PalmServiceBridge();
-    pending.push(bridge);
-    bridge.onservicecallback = function (msg) {
+    bridges.push(bridge);
+    bridge.onservicecallback = function (m) {
       var res;
-      try { res = JSON.parse(msg); } catch (e) { res = { returnValue: false, errorText: String(msg) }; }
-      var i = pending.indexOf(bridge);
-      if (i >= 0) { pending.splice(i, 1); }
+      try { res = JSON.parse(m); } catch (e) { res = { returnValue: false, errorText: String(m) }; }
+      var i = bridges.indexOf(bridge);
+      if (i >= 0) { bridges.splice(i, 1); }
       done(res);
     };
     bridge.call(uri, JSON.stringify(params));
   }
 
+  function allowed(args) { return ALLOWED.indexOf(args) >= 0 || ANSWER_RE.test(args); }
+
   function ctl(args, done) {
-    if (ALLOWED.indexOf(args) < 0 || !/^\/[A-Za-z0-9._\/+-]+$/.test(ctlPath)) {
+    if (!allowed(args) || !/^\/[A-Za-z0-9._\/+-]+$/.test(ctlPath)) {
       done({ ok: false, out: '', err: 'refused: ' + args });
       return;
     }
@@ -78,163 +118,440 @@
     return lines[lines.length - 1];
   }
 
-  function addFact(dl, name, value, cls) {
-    var dt = document.createElement('dt');
-    var dd = document.createElement('dd');
-    text(dt, name);
-    text(dd, value);
-    if (cls) { dd.className = cls; }
-    dl.appendChild(dt);
-    dl.appendChild(dd);
-  }
-
-  function show(id, on) { $(id).hidden = !on; }
-
-  var KEY_TEXT = {
-    fixed: ['fixed key from etc/noise_psk', 'ok'],
-    paired: ['paired with Home Assistant', 'ok'],
-    unpaired: ['not paired: add it in Home Assistant while the pairing window is open', 'warn'],
-    cleared: ['unpaired by Home Assistant (device removed there); open the pairing window to pair again', 'warn'],
-    none: ['no key and pairing off: check the config', 'bad']
-  };
-
-  var COMPAT_CLASS = {
-    'verified': 'ok',
-    'series verified (firmware not yet reported)': '',
-    'not verified': 'warn',
-    'firmware changed': 'warn',
-    'capture problem': 'bad',
-    'unknown': 'warn',
-    'checking': ''
-  };
-
-  // The one-paragraph banner under the headline: what the compatibility
-  // status means and what to do. Returns [text, class] or null.
-  function compatBanner(s) {
-    var c = s.compat;
-    if (!s.installed || !c) { return null; }
-    if (c.capture_problem) {
-      return ['The microphone check failed (' + (c.selfcheck || 'no details') + '). The microphone is closed and retried a few times. ' +
-        'If LG hands-free voice is on, turn it off. Otherwise press Report compatibility so this TV and firmware can be looked at.', 'bad'];
-    }
-    if (c.firmware_changed) {
-      return ['The TV firmware changed since the satellite last ran. The microphone keeps running and is being checked again. ' +
-        'When it works for you, press Acknowledge. If it does not, press Report compatibility.', ''];
-    }
-    if (c.compat_status === 'not verified' || c.compat_status === 'unknown') {
-      return ['This TV and firmware are not in the project\'s verified list yet. The microphone runs anyway and is checked. ' +
-        'If it does not work, press Report compatibility.', ''];
-    }
-    if (c.compat_status === 'series verified (firmware not yet reported)') {
-      return ['This TV series is verified; this firmware version has not been reported yet. If it works, a report helps everyone: press Report compatibility.', 'ok'];
+  // The last line of the output that is a JSON object (notes go to stderr,
+  // which the exec merges into the output).
+  function parseJsonLine(out) {
+    var lines = (out || '').replace(/\s+$/, '').split('\n');
+    for (var i = lines.length - 1; i >= 0; i--) {
+      if (lines[i].charAt(0) === '{') {
+        try { return JSON.parse(lines[i]); } catch (e) { return null; }
+      }
     }
     return null;
   }
 
-  function render(s) {
-    last = s;
-    var facts = $('facts');
-    while (facts.firstChild) { facts.removeChild(facts.firstChild); }
-    var root = s.uid === 0;
-    var headline;
-    var detail = '';
-    if (!root) {
-      headline = 'The Homebrew Channel is not running as root';
-      detail = 'This app needs a rooted TV with an elevated Homebrew Channel. Open the Homebrew Channel settings and check "Root status".';
-    } else if (!s.installed) {
-      headline = 'Not set up yet';
-      detail = 'Set up installs the service under ' + s.prefix + ', starts it and opens a 10-minute pairing window for Home Assistant.';
-    } else if (s.running) {
-      headline = 'Running';
-      if (!s.firmware_ok) { detail = 'The microphone stays off: strict firmware policy and this firmware is not in the list.'; }
-      else if (s.compat && s.compat.capture_problem) { detail = 'The microphone check failed; the microphone is closed (see below).'; }
-      else if (s.mic_off) { detail = 'The microphone is off (kill switch).'; }
-      else { detail = 'Listening through Home Assistant.'; }
-    } else {
-      headline = 'Stopped';
-      if (s.crashloop) { detail = 'The supervisor gave up after repeated crashes. See the log, then clear the marker.'; }
-      else if (s.disabled) { detail = 'Starts are refused while ' + s.prefix + '/disable exists.'; }
-    }
-    text($('headline'), headline);
-    text($('detail'), detail);
+  // ---- the message line ---------------------------------------------------------
 
-    addFact(facts, 'Package', s.package_version || '?');
-    addFact(facts, 'Installed', s.installed ? (s.installed_version || '?') + (s.update_pending ? ' (update pending)' : '') : 'no',
-      s.update_pending ? 'warn' : '');
-    if (s.build) { addFact(facts, 'Build', s.build); }
-    addFact(facts, 'Service', s.running ? 'running, pid ' + s.pid + (s.supervised ? ', supervised' : '') : 'stopped',
-      s.running ? 'ok' : 'warn');
-    addFact(facts, 'Start at boot', s.autostart ? 'on' : 'off');
-    addFact(facts, 'Microphone', s.mic_off ? 'off (kill switch)' : 'on', s.mic_off ? 'warn' : '');
-    addFact(facts, 'Firmware', s.firmware || '?', s.firmware_ok ? '' : 'warn');
-    var c = s.compat || null;
-    if (c) {
-      addFact(facts, 'Compatibility', c.compat_status || '?', COMPAT_CLASS[c.compat_status] || '');
-      if (c.tv_model) { addFact(facts, 'TV model', c.tv_model); }
-      addFact(facts, 'Microphone check', c.selfcheck || '?', c.capture_problem ? 'bad' : '');
-    }
-    if (s.installed) {
-      var k = KEY_TEXT[s.key] || [s.key, ''];
-      addFact(facts, 'Home Assistant', k[0], k[1]);
-      addFact(facts, 'Device name', s.name || '?');
-      addFact(facts, 'Reply volume', s.reply_volume ? s.reply_volume + ' %'
-        : (s.reply_volume_default ? s.reply_volume_default + ' % (default; set it in Home Assistant)' : 'default (set it in Home Assistant)'));
-      // Short form of the risks in docs/design/always-on.md section 12.
-      addFact(facts, 'Remote power key',
-        s.remote_off === 'keep_listening'
-          ? 'keeps listening: the TV stays on with the screen dark (uses more power than standby; OLED care at power-off may not run). Change it in Voice and power or in Home Assistant.'
-          : 'turns the TV off normally', s.remote_off === 'keep_listening' ? 'warn' : '');
-    }
-    addFact(facts, 'Address', (tvAddress || 'unknown') + ', port ' + (s.port || '6053'));
-    addFact(facts, 'Kernel', s.machine || '?');
-
-    text($('log'), (s.log || []).slice(-4).join('\n') || '(no log yet)');
-
-    var inst = root && s.installed;
-    show('b-install', root && !s.installed);
-    show('b-update', inst && s.update_pending);
-    show('b-start', inst && !s.running);
-    show('b-stop', inst && s.running);
-    show('b-boot-on', inst && !s.autostart);
-    show('b-boot-off', root && s.autostart);
-    show('b-mic-off', root && !s.mic_off);
-    show('b-mic-on', root && s.mic_off);
-    show('b-voice', inst);
-    show('b-report', inst);
-    show('b-selfcheck', inst && s.running && !!s.compat);
-    show('b-ack', inst && s.running && !!s.compat && !!s.compat.firmware_changed);
-    var banner = compatBanner(s);
-    show('compat', !!banner);
-    if (banner) { text($('compat-text'), banner[0]); $('compat').className = 'panel banner ' + banner[1]; }
-    show('b-pair', inst && s.running && (s.key === 'unpaired' || s.key === 'cleared'));
-    show('b-reset', inst && s.running && s.key === 'paired');
-    show('b-crash', inst && s.crashloop);
-    show('b-uninstall', inst);
-    show('b-purge', root && (s.installed || s.installed_version !== '' || s.key !== 'none'));
-    focusFirst();
-
-    // An update installed through the Homebrew Channel or luna-send is applied
-    // when the app is opened (also at the next boot, when start at boot is on).
-    if (inst && s.update_pending && !autoUpdateTried) {
-      autoUpdateTried = true;
-      run('install', 'Applying update ' + (s.installed_version || '?') + ' -> ' + (s.package_version || '?') + '...');
+  var MSG_IDS = ['h-msg', 'ha-msg', 'd-msg', 'x-msg'];
+  function setMsg(t, cls) {
+    msg = { text: t || '', cls: cls || '' };
+    for (var i = 0; i < MSG_IDS.length; i++) {
+      text($(MSG_IDS[i]), msg.text);
+      $(MSG_IDS[i]).className = 'msg ' + msg.cls;
     }
   }
 
-  // --- compatibility report screen -------------------------------------------
+  // ---- focus: nearest element in the pressed direction ---------------------------
 
-  function drawQr(url) {
-    var canvas = $('qr');
+  var FOCUS = {
+    home: ['h-notice-btn', 'h-mic', 'h-voice', 'h-ha', 'h-diag'],
+    voice: ['v-row-ar', 'v-row-hl', 'v-row-keep', 'v-refresh'],
+    ha: ['a-pair', 'a-phone', 'a-reset', 'a-endphone'],
+    setup: ['q-done', 'q-again'],
+    diag: ['d-check', 'd-report', 'd-ack', 'd-more'],
+    report: ['r-back'],
+    more: ['x-stop', 'x-start', 'x-boot-on', 'x-boot-off', 'x-crash', 'x-uninstall', 'x-purge'],
+    overlay: ['m-allow', 'm-refuse']
+  };
+
+  function layer() { return overlayOpen() ? 'overlay' : screen; }
+
+  function focusables() {
+    var ids = FOCUS[layer()];
+    var out = [];
+    for (var i = 0; i < ids.length; i++) { if (!$(ids[i]).hidden) { out.push($(ids[i])); } }
+    return out;
+  }
+
+  // The element nearest to `cur` in direction dir (left, right, up, down):
+  // only elements entirely beyond cur's edge in that direction count (2 px
+  // tolerance); the score is the distance between the centres along the
+  // direction plus 2.2 times the offset across it. Returns null when there is
+  // none (no wrapping).
+  function nearest(cur, els, dir) {
+    var a = cur.getBoundingClientRect();
+    var ax = a.left + a.width / 2;
+    var ay = a.top + a.height / 2;
+    var best = null;
+    var bestScore = Infinity;
+    for (var i = 0; i < els.length; i++) {
+      var e = els[i];
+      if (e === cur) { continue; }
+      var b = e.getBoundingClientRect();
+      var bx = b.left + b.width / 2;
+      var by = b.top + b.height / 2;
+      var primary;
+      var ortho;
+      if (dir === 'right') { if (b.left < a.right - 2) { continue; } primary = bx - ax; ortho = Math.abs(by - ay); }
+      else if (dir === 'left') { if (b.right > a.left + 2) { continue; } primary = ax - bx; ortho = Math.abs(by - ay); }
+      else if (dir === 'down') { if (b.top < a.bottom - 2) { continue; } primary = by - ay; ortho = Math.abs(bx - ax); }
+      else { if (b.bottom > a.top + 2) { continue; } primary = ay - by; ortho = Math.abs(bx - ax); }
+      if (primary <= 0) { continue; }
+      var score = primary + ortho * 2.2;
+      if (score < bestScore) { bestScore = score; best = e; }
+    }
+    return best;
+  }
+
+  function inLayer(el) {
+    var f = focusables();
+    return f.indexOf(el) >= 0;
+  }
+
+  // Keeps the focus on a visible element of the current layer.
+  function ensureFocus(prefer) {
+    if (inLayer(document.activeElement)) { return; }
+    if (prefer && $(prefer) && !$(prefer).hidden && inLayer($(prefer))) { $(prefer).focus(); return; }
+    var f = focusables();
+    if (f.length) { f[0].focus(); }
+  }
+
+  // ---- two-press buttons (outside Voice and power) ------------------------------
+
+  var ARM_TEXT = {
+    'a-reset': ['a-reset-t', 'a-reset-sub', 'Reset pairing', 'Unpairs this TV', 'Home Assistant then has to pair again.'],
+    'x-uninstall': ['x-uninstall-t', 'x-uninstall-sub', 'Remove service (keep settings)', 'Asks twice', 'The satellite stops and is removed. Settings stay.'],
+    'x-purge': ['x-purge-t', 'x-purge-sub', 'Remove service and all data', 'Asks twice', 'Removes the satellite, its settings and its pairing.']
+  };
+
+  function renderArmed() {
+    for (var id in ARM_TEXT) {
+      if (Object.prototype.hasOwnProperty.call(ARM_TEXT, id)) {
+        var t = ARM_TEXT[id];
+        var on = armedBtn === id;
+        text($(t[0]), on ? 'Press OK again' : t[2]);
+        text($(t[1]), on ? t[4] : t[3]);
+        $(id).className = 'act' + (id.charAt(0) === 'x' ? ' plain' : '') + (on ? ' armed' : '');
+      }
+    }
+  }
+
+  function disarmAll() {
+    var changed = !!armedBtn || !!vArmed;
+    armedBtn = null;
+    armToken++;
+    vArmed = null;
+    vArmToken++;
+    if (changed) { renderArmed(); renderVoice(); }
+  }
+
+  // ---- status, Home and the screens built from it --------------------------------
+
+  function refresh() {
+    ctl('status --json', function (r) {
+      var s = parseJsonLine(r.out);
+      if (!s) {
+        st = null;
+        setMsg('Cannot reach the Homebrew Channel: ' + (r.err || lastLine(r.out) || 'no answer from ' + HBC_EXEC + '.'), 'bad');
+        renderAll();
+        return;
+      }
+      st = s;
+      if (s.pairing && s.pairing.open === true && typeof s.pairing.ends_in_s === 'number') { pairEnds = now() + s.pairing.ends_in_s * 1000; }
+      else if (s.pairing) { pairEnds = 0; }
+      renderAll();
+      if (!tvData && s.uid === 0 && s.installed) { readTv(); }
+      // An update installed through the Homebrew Channel or luna-send is applied
+      // when the app is opened (also at the next boot, when start at boot is on).
+      if (s.uid === 0 && s.installed && s.update_pending && !autoUpdateTried) {
+        autoUpdateTried = true;
+        run('install', 'Applying update ' + (s.installed_version || '?') + ' -> ' + (s.package_version || '?') + '...');
+      }
+    });
+  }
+
+  // tv-settings for the Home cards (the Voice and power screen has its own read).
+  function readTv() {
+    if (tvReading || vReading) { return; }
+    tvReading = true;
+    ctl('tv-settings --json', function (r) {
+      tvReading = false;
+      var d = parseJsonLine(r.out);
+      tvData = d && typeof d === 'object' ? d : null;
+      renderHome();
+    });
+  }
+
+  var root = function () { return !!st && st.uid === 0; };
+  var installed = function () { return root() && !!st.installed; };
+
+  // The facts of tv-settings with the fresher package facts of status.
+  function effectiveTv() {
+    var d = {};
+    var k;
+    if (tvData) { for (k in tvData) { if (Object.prototype.hasOwnProperty.call(tvData, k)) { d[k] = tvData[k]; } } }
+    if (st && st.installed) {
+      d.daemon_running = !!st.running;
+      var mic = {};
+      var m = d.mic || {};
+      for (k in m) { if (Object.prototype.hasOwnProperty.call(m, k)) { mic[k] = m[k]; } }
+      mic.kill_switch = !!st.mic_off || mic.kill_switch === true;
+      d.mic = mic;
+    }
+    return d;
+  }
+
+  // The one notice on Home (most important first): [text, tone, button label, command, then].
+  function homeNotice(s) {
+    if (!s) { return null; }
+    if (s.uid !== 0) {
+      return ['The Homebrew Channel is not running as root. This app needs a rooted TV: open the Homebrew Channel settings and check "Root status".', 'bad', '', '', ''];
+    }
+    if (!s.installed) {
+      return ['Not set up yet. Set up installs the service under ' + s.prefix + ', starts it and opens a 10-minute pairing window for Home Assistant.', 'accent', 'Set up', 'install', 'start'];
+    }
+    if (s.update_pending) {
+      return ['An update is ready: ' + (s.installed_version || '?') + ' to ' + (s.package_version || '?') + '.', 'accent', 'Apply update', 'install', ''];
+    }
+    if (s.crashloop) {
+      return ['The satellite stopped after repeated crashes. See the log in Diagnostics, then clear the marker.', 'bad', 'Clear marker', 'clear-crashloop', ''];
+    }
+    if (!s.running) {
+      if (s.disabled) { return ['The satellite is stopped. Starts are refused while ' + s.prefix + '/disable exists.', 'warn', '', '', '']; }
+      return ['The satellite is stopped.', 'warn', 'Start', 'start', ''];
+    }
+    if (!s.firmware_ok) { return ['The microphone stays off: strict firmware policy and this firmware is not in the list.', 'warn', '', '', '']; }
+    var c = VP.compat(s);
+    if (c && c.short) { return [c.short, c.tone, '', '', '']; }
+    return null;
+  }
+
+  function setCard(prefix, value, detail, tone, live) {
+    $(prefix + '-card').className = 'scard tone-' + tone;
+    text($(prefix + '-value'), value);
+    text($(prefix + '-detail'), detail);
+    if ($(prefix + '-dot')) { $(prefix + '-dot').className = 'dot' + (live ? ' live' : ''); }
+  }
+
+  function haDetail(h) {
+    if (h.key === 'pairing') { return 'Add it in Home Assistant. ' + fmt(pairEnds - now()) + ' left.'; }
+    return h.full;
+  }
+
+  function renderHome() {
+    var s = st;
+    var known = !!s && installed();
+    // Listening and Power: from tv-settings, corrected by status.
+    if (known && tvData) {
+      var o = VP.outcome(effectiveTv());
+      setCard('h-listen', o.listenShort, o.listenDetail, o.listenTone, o.listenCell === 'ok');
+      setCard('h-power', o.powerShort, o.detail + (o.extra ? ' ' + o.extra : ''), o.powerTone, false);
+    } else if (known && !s.running) {
+      var l = VP.LISTEN.stopped;
+      setCard('h-listen', l.short, l.detail, l.tone, false);
+      setCard('h-power', 'Checking', '', 'idle', false);
+    } else {
+      setCard('h-listen', s && !known ? 'No' : 'Checking', s && !known ? 'The satellite is not set up.' : '', 'idle', false);
+      setCard('h-power', s && !known ? 'Not known' : 'Checking', '', 'idle', false);
+    }
+    var h = VP.haSummary(s || {});
+    setCard('h-ha', s ? h.short : 'Checking', s ? haDetail(h) : '', s ? h.tone : 'idle', false);
+
+    // the chip in the top bar
+    var lt = known && tvData ? VP.outcome(effectiveTv()) : null;
+    var listening = !!lt && lt.listenCell === 'ok';
+    $('chip-listen').className = 'chip tone-' + (lt ? lt.listenTone : 'idle');
+    $('chip-dot').className = 'dot' + (listening ? ' live' : '');
+    text($('chip-text'), lt ? (listening ? 'Listening' : 'Not listening') : (s && !known ? 'Not listening' : 'Checking'));
+
+    var n = homeNotice(s);
+    show('h-notice', !!n);
+    if (n) {
+      $('h-notice').className = 'notice tone-' + n[1];
+      text($('h-notice-text'), n[0]);
+      show('h-notice-btn', !!n[2]);
+      text($('h-notice-btn'), n[2]);
+      $('h-notice-btn').setAttribute('data-cmd', n[3]);
+      $('h-notice-btn').setAttribute('data-then', n[4]);
+    } else {
+      show('h-notice-btn', false);
+    }
+
+    var micOff = !!s && !!s.mic_off;
+    show('h-mic', root());
+    show('h-voice', installed());
+    show('h-mic-on', !micOff);
+    show('h-mic-off', micOff);
+    text($('h-mic-pill'), micOff ? 'Off' : 'On');
+    $('h-mic-pill').className = 'pill' + (micOff ? ' off' : '');
+    text($('h-mic-sub'), micOff ? 'OK turns it on' : 'OK turns it off');
+    text($('h-ha-sub'), (tvAddress ? tvAddress + ', port ' : 'Port ') + ((s && s.port) || '6053'));
+    var c = VP.compat(s);
+    text($('h-diag-sub'), c ? 'Firmware: ' + c.tag.toLowerCase() : (s && s.installed ? 'Version ' + (s.installed_version || '?') : 'Version, firmware, log'));
+    if (screen === 'home' && s) { ensureFocus('h-mic'); }
+  }
+
+  function renderHA() {
+    var s = st || {};
+    var h = VP.haSummary(s);
+    $('ha-head').className = 'ha-head tone-' + h.tone;
+    text($('ha-value'), st ? h.short : 'Checking');
+    text($('ha-sub'), st ? h.full : '');
+    show('ha-count', h.key === 'pairing');
+    text($('ha-count-time'), fmt(pairEnds - now()));
+    text($('ha-addr'), tvAddress || 'unknown');
+    text($('ha-port'), s.port || '6053');
+    text($('ha-steps'), VP.HA_STEPS);
+    var inst = installed();
+    show('a-pair', inst && !!s.running && (s.key === 'unpaired' || s.key === 'cleared') && h.key !== 'pairing');
+    show('a-reset', inst && !!s.running && s.key === 'paired');
+    show('a-phone', inst);
+    var live = setupLive();
+    show('a-endphone', live);
+    text($('a-phone-t'), live ? 'Show the phone code' : 'Set up with your phone');
+    text($('a-phone-sub'), live ? (setup.state === 'active' ? 'A phone is connected' : 'The code is still open') : 'Shows a code to scan');
+    $('a-phone').className = 'act' + ($('a-pair').hidden ? ' lead' : '');
+    text($('a-endphone-sub'), setupSessionText());
+    renderArmed();
+    if (screen === 'ha') { ensureFocus($('a-pair').hidden ? 'a-phone' : 'a-pair'); }
+  }
+
+  function checkTag(c) {
+    if (!c) { return ['Not run', 'idle']; }
+    var t = c.selfcheck || '';
+    if (c.capture_problem || /^fail/.test(t)) { return ['Failed', 'bad']; }
+    if (/^pass/.test(t)) { return ['Passed', 'ok']; }
+    if (/^run|check/.test(t)) { return ['Running', 'idle']; }
+    return ['Not run', 'idle'];
+  }
+
+  function renderDiag() {
+    var s = st || {};
+    var inst = installed();
+    text($('d-version'), (s.installed_version || s.package_version || '?') + (s.update_pending ? ' (package ' + (s.package_version || '?') + ' waiting)' : '') + (s.build ? ', ' + s.build : ''));
+    text($('d-fw'), s.firmware || '?');
+    var c = VP.compat(s);
+    show('d-fw-tag', !!c);
+    if (c) { text($('d-fw-tag'), c.tag); $('d-fw-tag').className = 'tag ' + c.tone; }
+    var ct = checkTag(s.compat);
+    text($('d-check-tag'), ct[0]);
+    $('d-check-tag').className = 'tag ' + ct[1];
+    text($('d-check-text'), s.compat ? (s.compat.selfcheck || '') : '');
+    text($('d-service'), !s.installed ? 'Not set up' : (s.running ? 'Running' + (s.supervised ? ', supervised' : '') : 'Stopped') + (s.autostart ? ', starts at boot' : ', not at boot'));
+    var vol = s.reply_volume ? s.reply_volume + ' %' : (s.reply_volume_default ? s.reply_volume_default + ' % (default)' : 'default');
+    text($('d-device'), (s.name || '?') + ', reply volume ' + vol);
+    text($('d-tv'), ((s.compat && s.compat.tv_model) || 'TV model not known') + ', ' + (s.machine || '?'));
+    text($('d-log'), (s.log || []).slice(-4).join('\n') || '(no log yet)');
+    show('d-check', inst && !!s.running && !!s.compat);
+    show('d-report', inst);
+    show('d-ack', inst && !!s.running && !!s.compat && !!s.compat.firmware_changed);
+    $('d-report').className = 'act' + (c && c.name !== 'verified' ? ' lead' : '');
+    show('d-compat', !!c && !!c.full);
+    text($('d-compat'), c ? c.full : '');
+    show('d-more', root());
+    if (screen === 'diag') { ensureFocus('d-check'); }
+  }
+
+  function renderMore() {
+    var s = st || {};
+    var inst = installed();
+    show('x-stop', inst && !!s.running);
+    show('x-start', inst && !s.running);
+    show('x-boot-on', inst && !s.autostart);
+    show('x-boot-off', root() && !!s.autostart);
+    show('x-crash', inst && !!s.crashloop);
+    show('x-uninstall', inst);
+    show('x-purge', root() && (!!s.installed || s.installed_version !== '' || s.key !== 'none'));
+    renderArmed();
+    if (screen === 'more') { ensureFocus('x-stop'); }
+  }
+
+  function renderAll() {
+    renderHome();
+    renderHA();
+    renderDiag();
+    renderMore();
+    renderSetup();
+    renderChrome();
+  }
+
+  // ---- screens -----------------------------------------------------------------------
+
+  var CRUMB = { home: '', voice: 'Voice and power', ha: 'Home Assistant', setup: 'Home Assistant / Phone setup',
+    diag: 'Diagnostics', report: 'Diagnostics / Report', more: 'Diagnostics / More actions' };
+  var SECTIONS = ['home', 'voice', 'ha', 'setup', 'diag', 'report', 'more'];
+  var FIRST = { home: 'h-mic', voice: 'v-row-ar', ha: 'a-pair', setup: 'q-done', diag: 'd-check', report: 'r-back', more: 'x-stop' };
+
+  function renderChrome() {
+    text($('crumb'), CRUMB[screen] ? '/ ' + CRUMB[screen] : '');
+    var ov = overlayOpen();
+    text($('key-ok'), ov ? 'Allow' : 'Select');
+    show('key-back-box', ov || screen !== 'home');
+    text($('key-back'), ov ? 'Refuse' : 'Home');
+    var live = setupLive();
+    show('chip-phone', live);
+    text($('chip-phone-text'), setup.state === 'active' ? 'Phone connected' : 'Phone code open');
+  }
+
+  function go(name, focusId) {
+    disarmAll();
+    var from = screen;
+    if (from === 'voice' && name !== 'voice') { voiceOpen = false; }
+    screen = name;
+    for (var i = 0; i < SECTIONS.length; i++) { show(SECTIONS[i], SECTIONS[i] === name); }
+    if (name !== 'voice') { renderAll(); }
+    renderChrome();
+    if (!overlayOpen()) {
+      var f = focusId && $(focusId) && !$(focusId).hidden ? focusId : null;
+      if (f) { $(f).focus(); } else { ensureFocus(FIRST[name]); }
+    }
+  }
+
+  var HOME_FOCUS = { voice: 'h-voice', ha: 'h-ha', setup: 'h-ha', diag: 'h-diag', report: 'h-diag', more: 'h-diag' };
+  function goHome() {
+    var from = screen;
+    go('home', HOME_FOCUS[from]);
+    refresh();
+    if (from === 'voice') { /* tvData is fresh from the screen */ } else if (installed()) { readTv(); }
+  }
+
+  // An action through ctl.sh with a result line; `then` runs next on success.
+  function run(args, label, then, okText) {
+    if (busy) { return; }
+    busy = true;
+    setMsg(label || 'Working...', '');
+    ctl(args, function (r) {
+      busy = false;
+      if (r.ok && then) {
+        run(then, null, null, okText);
+        return;
+      }
+      if (r.ok && okText) { setMsg(okText, 'ok'); }
+      else { setMsg(lastLine(r.out) || r.err || (r.ok ? 'Done.' : 'Failed.'), r.ok ? '' : 'bad'); }
+      refresh();
+    });
+  }
+
+  function twoPress(id, args, label) {
+    if (armedBtn !== id) {
+      disarmAll();
+      armedBtn = id;
+      armToken++;
+      var token = armToken;
+      renderArmed();
+      setTimeout(function () { if (armToken === token && armedBtn === id) { armedBtn = null; renderArmed(); } }, ARM_MS);
+      return;
+    }
+    armedBtn = null;
+    armToken++;
+    renderArmed();
+    run(args, label);
+  }
+
+  // ---- compatibility report ------------------------------------------------------------
+
+  function drawQr(canvasId, url, ecc) {
+    var canvas = $(canvasId);
     var ctx = canvas.getContext('2d');
-    var qr = window.qrcodegen.QrCode.encodeText(url, window.qrcodegen.QrCode.Ecc.LOW);
-    var border = 4;
+    var qr = window.qrcodegen.QrCode.encodeText(url, ecc || window.qrcodegen.QrCode.Ecc.LOW);
+    var border = 2;
     var cells = qr.size + border * 2;
     var scale = Math.max(1, Math.floor(QR_SIZE / cells));
     var px = cells * scale;
     canvas.width = px;
     canvas.height = px;
-    canvas.style.width = px + 'px';
-    canvas.style.height = px + 'px';
+    canvas.style.width = QR_SIZE + 'px';
+    canvas.style.height = QR_SIZE + 'px';
     ctx.fillStyle = '#ffffff';
     ctx.fillRect(0, 0, px, px);
     ctx.fillStyle = '#000000';
@@ -246,96 +563,52 @@
     return qr.size;
   }
 
+  function clearQr(canvasId) {
+    var canvas = $(canvasId);
+    var ctx = canvas.getContext('2d');
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+  }
+
   function openReport() {
     if (busy) { return; }
     busy = true;
-    message('Building the report...');
+    setMsg('Building the report...', '');
     ctl('report --json', function (r) {
       busy = false;
-      var rep = null;
-      try { rep = JSON.parse(lastLine(r.out)); } catch (e) { rep = null; }
+      var rep = parseJsonLine(r.out);
       if (!rep) {
-        message(lastLine(r.out) || r.err || 'The report could not be built.');
+        setMsg(lastLine(r.out) || r.err || 'The report could not be built.', 'bad');
         return;
       }
-      message('');
-      reportOpen = true;
-      show('main', false);
-      show('report-view', true);
-      text($('report-error'), '');
-      text($('report-title'), rep.title || '');
-      text($('report-url'), rep.url || '');
-      text($('report-text'), rep.full || rep.short || '');
-      $('report-text').scrollTop = 0;
+      setMsg('', '');
+      text($('r-error'), '');
+      text($('r-title'), rep.title || '');
+      text($('r-url'), rep.url || '');
+      text($('r-text'), rep.full || rep.short || '');
+      $('r-text').scrollTop = 0;
       if (rep.error || !rep.url) {
-        text($('report-error'), 'The report was withheld: ' + (rep.error || 'no link') + '. See ctl.sh report over SSH.');
+        clearQr('r-qr');
+        text($('r-error'), 'The report was withheld: ' + (rep.error || 'no link') + '. See ctl.sh report over SSH.');
       } else {
-        try { drawQr(rep.url); } catch (e) { text($('report-error'), 'The QR code could not be drawn (' + e + '). Type the address instead.'); }
+        try { drawQr('r-qr', rep.url); } catch (e) { text($('r-error'), 'The QR code could not be drawn (' + e + '). Type the address instead.'); }
       }
-      $('r-back').focus();
+      go('report', 'r-back');
     });
   }
 
-  function closeReport() {
-    reportOpen = false;
-    show('report-view', false);
-    show('main', true);
-    focusFirst();
-    refresh();
-  }
-
-  // --- Voice and power screen ------------------------------------------------
+  // ---- Voice and power screen ------------------------------------------------------------
   // Design: docs/design/voice-and-power-screen.md and ADR 0008. The screen
   // reads `ctl.sh tv-settings --json` and changes one setting per press with
   // `ctl.sh set ...` (two presses for every LG change and for turning Keep
-  // listening on, one to turn it off). The matrix below is the only place that
-  // turns the facts into sentences; tests/app_matrix.js checks every cell.
-
-  var AR_MENU = 'Settings, General, Always Ready';
-  var HL_MENU = 'Settings, General, AI Service, Voice recognition settings, Hi LG';
-  var ARM_MS = 5000;
-  var REREAD_MS = 3000;
-
-  // What the remote's power button does, by Always Ready x "Keep listening".
-  // P1 off+normal, P2 on+normal, P3 off+keep, P4 on+keep, PX not known.
-  var POWER = {
-    P1: ['Power button: the TV goes to deep standby.', 'The satellite cannot hear until the TV is turned on.'],
-    P2: ['Power button: the TV goes to standby.', 'The satellite still hears you, but you will not hear its replies.'],
-    P3: ['Power button: the screen goes dark but the TV stays on.', 'The satellite hears you and replies. Press power again to turn the picture on.'],
-    P4: ['Power button: the screen goes dark but the TV stays on.', 'The satellite hears you and replies. Press power again to turn the picture on.'],
-    PX: ['Power button: not known.', 'The TV\'s settings could not be read. Press Refresh.']
-  };
-  var POWER_EXTRA = {
-    kill: 'Keep listening does nothing while the microphone is off with the kill switch.',
-    nowatch: 'Keep listening needs the power watch, which is off in the config.'
-  };
-
-  // The microphone line, first match wins (see outcome()).
-  var LISTEN = {
-    stopped: 'Listening now: no. The satellite is not running.',
-    kill: 'Listening now: no. The microphone is off (kill switch).',
-    muted: 'Listening now: no. The microphone is muted in Home Assistant.',
-    hilg: 'Listening now: no. The satellite cannot hear: LG\'s voice assistant has the microphone. Turn Hi LG off to use the satellite.',
-    busy: 'Listening now: no. Another program has the microphone.',
-    ok: 'Listening now: yes.',
-    closed: 'Listening now: no. The microphone is closed.',
-    unknown: 'Listening now: not known.'
-  };
-  var NOTE = {
-    hilgListening: 'Hi LG is on but this satellite has the microphone now; after a restart LG may take it. Turn Hi LG off to be sure.',
-    hilgOn: 'Hi LG is on. If the satellite cannot hear you, turn it off.',
-    others: 'Alexa/other hands-free is on: turn it off in LG\'s menu.',
-    unreadable: 'Always Ready or Hi LG could not be read, so the sentence above may be wrong.'
-  };
+  // listening on, one to turn it off). The texts come from voicepower.js.
 
   var VROWS = [
-    { id: 'ar', btn: 'v-row-ar', state: 'v-ar-state', label: 'Always Ready', menu: AR_MENU },
-    { id: 'hl', btn: 'v-row-hl', state: 'v-hl-state', label: 'Hi LG', menu: HL_MENU },
-    { id: 'keep', btn: 'v-row-keep', state: 'v-keep-state', label: 'Keep listening', menu: '' }
+    { id: 'ar', btn: 'v-row-ar', state: 'v-ar-state', sw: 'v-ar-sw', confirm: 'v-ar-confirm' },
+    { id: 'hl', btn: 'v-row-hl', state: 'v-hl-state', sw: 'v-hl-sw', confirm: 'v-hl-confirm' },
+    { id: 'keep', btn: 'v-row-keep', state: 'v-keep-state', sw: 'v-keep-sw', confirm: 'v-keep-confirm' }
   ];
-  var VFOCUS = ['v-row-ar', 'v-row-hl', 'v-row-keep', 'v-refresh', 'v-back'];
-  var AR_KNOWN = ['off', 'alwaysReady', 'allEnabled', 'none', 'lifeOnScreen'];
-
+  var voiceOpen = false;
   var vData = null;     // last tv-settings reply (null: not read or unreadable)
   var vLoaded = false;  // a read has finished at least once since the screen opened
   var vArmed = null;    // id of the row waiting for the second press
@@ -346,198 +619,7 @@
   var vMsg = '';
   var vMsgCls = '';
 
-  function parseJsonLine(out) {
-    var lines = (out || '').replace(/\s+$/, '').split('\n');
-    for (var i = lines.length - 1; i >= 0; i--) {
-      if (lines[i].charAt(0) === '{') {
-        try { return JSON.parse(lines[i]); } catch (e) { return null; }
-      }
-    }
-    return null;
-  }
-
-  // Always Ready as the TV reports it: kind is one of AR_KNOWN, 'other' or 'error'.
-  function arInfo(ar) {
-    ar = ar || {};
-    if (ar.state === 'error' || (!ar.state && !ar.raw)) { return { kind: 'error', raw: '', error: ar.error || '' }; }
-    var raw = ar.raw || '';
-    if (!raw && ar.state === 'off') { raw = 'off'; }
-    if (!raw && ar.state === 'on') { raw = ar.variant === 'wallpaper' ? 'allEnabled' : 'alwaysReady'; }
-    return { kind: AR_KNOWN.indexOf(raw) >= 0 ? raw : 'other', raw: raw, error: '' };
-  }
-
-  // Hi LG is the thinQ provider only (EXP-011: setActivation has no provider
-  // parameter). tv-settings reports state `on` when ANY provider is on, so the
-  // per-provider flags decide: thinq true is Hi LG on; amazon or dangbei true
-  // is the "other hands-free" note.
-  function hlInfo(hl) {
-    hl = hl || {};
-    var kind;
-    if (hl.state === 'error' || !hl.state) { kind = 'error'; }
-    else if (hl.thinq === true) { kind = 'on'; }
-    else if (hl.thinq === false) { kind = 'off'; }
-    else { kind = hl.state === 'on' || hl.state === 'off' ? hl.state : 'unknown'; }
-    return { kind: kind, others: hl.amazon === true || hl.dangbei === true, error: hl.error || '' };
-  }
-
-  function roInfo(ro) {
-    ro = ro || {};
-    var kind = ro.state === 'keep_listening' || ro.state === 'keep' ? 'keep' : (ro.state === 'normal' ? 'normal' : 'unknown');
-    return { kind: kind, noWatch: ro.active === false };
-  }
-
-  // The sentence: { cell, headline, detail, extra, listenCell, listening, notes }.
-  function outcome(s) {
-    s = s || {};
-    var ar = arInfo(s.always_ready);
-    var hl = hlInfo(s.hi_lg);
-    var ro = roInfo(s.remote_off);
-    var mic = s.mic || {};
-    var micState = ['listening', 'busy', 'muted', 'closed'].indexOf(mic.state) >= 0 ? mic.state : 'unknown';
-    var kill = mic.kill_switch === true || mic.state === 'kill';
-    var stopped = s.daemon_running === false;
-    var hlOn = hl.kind === 'on';
-
-    var arOn = ar.kind === 'alwaysReady' || ar.kind === 'allEnabled';
-    var arOff = ar.kind === 'off' || ar.kind === 'none';
-    var cell = 'PX';
-    var extra = '';
-    if ((arOn || arOff) && ro.kind !== 'unknown') {
-      // The kill switch (and a missing power watch) stop the daemon acting on a power-off.
-      var keep = ro.kind === 'keep' && !kill && !ro.noWatch;
-      if (ro.kind === 'keep' && kill) { extra = POWER_EXTRA.kill; }
-      else if (ro.kind === 'keep' && ro.noWatch) { extra = POWER_EXTRA.nowatch; }
-      cell = arOff ? (keep ? 'P3' : 'P1') : (keep ? 'P4' : 'P2');
-    }
-
-    var listenCell;
-    if (stopped) { listenCell = 'stopped'; }
-    else if (kill) { listenCell = 'kill'; }
-    else if (micState === 'muted') { listenCell = 'muted'; }
-    else if (micState === 'busy') { listenCell = hlOn ? 'hilg' : 'busy'; }
-    else if (micState === 'listening') { listenCell = 'ok'; }
-    else if (micState === 'closed') { listenCell = 'closed'; }
-    else { listenCell = 'unknown'; }
-
-    var notes = [];
-    if (hlOn && listenCell === 'ok') { notes.push(NOTE.hilgListening); }
-    else if (hlOn && (listenCell === 'closed' || listenCell === 'unknown')) { notes.push(NOTE.hilgOn); }
-    if (hl.others) { notes.push(NOTE.others); }
-    if (!(arOn || arOff) || hl.kind === 'error' || hl.kind === 'unknown') { notes.push(NOTE.unreadable); }
-
-    return { cell: cell, headline: POWER[cell][0], detail: POWER[cell][1], extra: extra,
-      listenCell: listenCell, listening: LISTEN[listenCell], notes: notes };
-  }
-
-  function wordOf(id, v) {
-    if (id === 'ar') {
-      if (v === 'on' || v === 'alwaysReady') { return 'On'; }
-      if (v === 'off') { return 'Off'; }
-      if (v === 'allEnabled') { return 'On, with wallpaper'; }
-      return v ? 'Not known (' + v + ')' : 'Not known';
-    }
-    if (v === 'on' || v === 'keep' || v === 'keep_listening') { return 'On'; }
-    if (v === 'off' || v === 'normal') { return 'Off'; }
-    return v ? 'Not known (' + v + ')' : 'Not known';
-  }
-
-  function confirmText(id, turningOn) {
-    if (id === 'ar') {
-      return turningOn
-        ? 'Turn on Always Ready? The TV then uses more power in standby (not measured). With "Keep listening" off, the satellite hears you after the power button but its replies are silent.'
-        : 'Turn off Always Ready? Without "Keep listening", the TV suspends after the power button and the satellite stops.';
-    }
-    if (id === 'hl') {
-      return turningOn
-        ? 'Turn on Hi LG? LG\'s assistant may take the microphone, so the satellite may not hear you. It did not while the satellite already had the microphone, but it can after a restart.'
-        : 'Turn off Hi LG? The TV stops answering "Hi LG". The satellite can use the microphone.';
-    }
-    return turningOn
-      ? 'Turn on Keep listening? After the power button the TV stays on with the screen dark. It uses more power than standby (not measured), LG\'s OLED care at power-off may not run, and the screen may flash briefly (not observed).'
-      : 'Keep listening is on. Press OK to turn it off. The power button then turns the TV off the normal way.';
-  }
-
-  // The three rows: { word, cls, checked, can, cmd, confirm, warn }.
-  function rowsModel(s) {
-    var loaded = !!s;
-    function wait() { return { word: 'Checking...', cls: 'muted', checked: 'false', can: false, cmd: '', confirm: '', warn: '' }; }
-    if (!loaded) { return [wait(), wait(), wait()]; }
-    var ar = arInfo(s.always_ready);
-    var hl = hlInfo(s.hi_lg);
-    var ro = roInfo(s.remote_off);
-    var a;
-    var h;
-    var k;
-    var menuNote = function (what, menu) { return what + ' Change it in LG\'s menu (' + menu + ').'; };
-
-    if (ar.kind === 'error') {
-      a = { word: 'Cannot read', cls: 'bad', checked: 'false', can: false, cmd: '', confirm: '',
-        warn: menuNote('Always Ready could not be read' + (ar.error ? ': ' + ar.error + '.' : '.'), AR_MENU) };
-    } else if (ar.kind === 'off') {
-      a = { word: 'Off', cls: '', checked: 'false', can: true, cmd: 'set always-ready on', confirm: confirmText('ar', true) };
-    } else if (ar.kind === 'alwaysReady') {
-      a = { word: 'On', cls: '', checked: 'true', can: true, cmd: 'set always-ready off', confirm: confirmText('ar', false) };
-    } else if (ar.kind === 'allEnabled') {
-      a = { word: wordOf('ar', 'allEnabled'), cls: 'warn', checked: 'true', can: false, cmd: '', confirm: '',
-        warn: menuNote('Always Ready is set to On, with wallpaper, which this app does not change.', AR_MENU) };
-    } else {
-      a = { word: wordOf('ar', ar.raw), cls: 'warn', checked: 'mixed', can: false, cmd: '', confirm: '',
-        warn: menuNote('Always Ready is set to ' + (ar.raw || 'a value this app does not know') + ', which this app does not change.', AR_MENU) };
-    }
-    if (a.can) { a.warn = a.confirm; a.confirm = a.confirm + ' Press OK again to confirm.'; }
-
-    if (hl.kind === 'on' || hl.kind === 'off') {
-      var hon = hl.kind === 'on';
-      h = { word: hon ? 'On' : 'Off', cls: hon ? 'warn' : '', checked: hon ? 'true' : 'false', can: true,
-        cmd: hon ? 'set hi-lg off' : 'set hi-lg on', confirm: confirmText('hl', !hon) };
-      h.warn = h.confirm;
-      h.confirm = h.confirm + ' Press OK again to confirm.';
-    } else {
-      h = { word: hl.kind === 'error' ? 'Cannot read' : 'Not known', cls: hl.kind === 'error' ? 'bad' : 'warn', checked: 'false',
-        can: false, cmd: '', confirm: '', warn: menuNote('Hi LG could not be read' + (hl.error ? ': ' + hl.error + '.' : '.'), HL_MENU) };
-    }
-
-    if (ro.kind === 'unknown') {
-      k = { word: 'Cannot read', cls: 'bad', checked: 'false', can: false, cmd: '', confirm: '', warn: 'Keep listening could not be read.' };
-    } else if (ro.kind === 'keep') {
-      k = { word: 'On', cls: 'warn', checked: 'true', can: true, cmd: 'set remote-off normal', confirm: '', warn: confirmText('keep', false) };
-    } else {
-      k = { word: 'Off', cls: '', checked: 'false', can: true, cmd: 'set remote-off keep', confirm: confirmText('keep', true) };
-      k.warn = k.confirm;
-      k.confirm = k.confirm + ' Press OK again to confirm.';
-    }
-    return [a, h, k];
-  }
-
-  // One line for the result of a `set` (the JSON line of ctl.sh), as [text, class].
-  function resultMessage(id, r, model) {
-    var row = VROWS[id === 'ar' ? 0 : (id === 'hl' ? 1 : 2)];
-    if (!r) { return ['Could not confirm the change of ' + row.label + '. Press Refresh to see what the TV reports.', 'bad']; }
-    var fix = row.menu ? ' You can also change it on the TV: ' + row.menu + '.' : '';
-    var why = r.error ? r.error : 'no reason given';
-    if (r.result === 'applied') {
-      if (id === 'keep' && wordOf(id, r.after) === 'Off') { return ['Done. The power button turns the TV off the normal way.', 'ok']; }
-      var tail = r.daemon === 'pending' ? ' The satellite has not applied it yet.'
-        : (r.daemon === 'not running' ? ' The satellite is not running; it applies this when it starts.' : '');
-      return [row.label + ' is now ' + wordOf(id, r.after) + '. Changed from ' + wordOf(id, r.before) + '.' + tail, 'ok'];
-    }
-    if (r.result === 'already') { return ['Already ' + wordOf(id, r.after || r.before) + '. Nothing changed.', 'ok']; }
-    if (r.result === 'mismatch') {
-      return ['The TV reports ' + wordOf(id, r.after) + ', not ' + wordOf(id, r.requested) + '. The change did not stick, or LG changed it back. It is ' +
-        wordOf(id, r.after) + ' now.', 'warn'];
-    }
-    if (r.result === 'refused') { return ['Could not change ' + row.label + ': ' + why + '.' + fix, 'bad']; }
-    return ['Could not change ' + row.label + ': ' + why + '. It is still ' + (model && model.word ? model.word : wordOf(id, r.before)) + '.' + fix, 'bad'];
-  }
-
-  // The kind of one row in a tv-settings reply (to see whether LG reverted a change).
-  function rowKind(id, d) {
-    if (id === 'ar') { return arInfo(d.always_ready).kind; }
-    if (id === 'hl') { return hlInfo(d.hi_lg).kind; }
-    return roInfo(d.remote_off).kind;
-  }
-
-  function vModels() { return rowsModel(vLoaded ? (vData || {}) : null); }
+  function vModels() { return VP.rows(vLoaded ? (vData || {}) : null); }
 
   function vFocusedRow() {
     for (var i = 0; i < VROWS.length; i++) { if (document.activeElement === $(VROWS[i].btn)) { return i; } }
@@ -546,10 +628,11 @@
 
   function renderVoice() {
     var m = vModels();
-    var o = vLoaded ? outcome(vData || {}) : null;
+    var o = vLoaded ? VP.outcome(vData || {}) : null;
     text($('v-headline'), o ? o.headline : 'Checking...');
     text($('v-detail'), o ? (o.detail + (o.extra ? ' ' + o.extra : '')) : '');
     text($('v-listening'), o ? o.listening : '');
+    $('v-listen-dot').className = 'dot' + (o ? ' ' + o.listenTone + (o.listenCell === 'ok' ? ' live' : '') : '');
     text($('v-notes'), o ? o.notes.join('\n') : '');
     for (var i = 0; i < VROWS.length; i++) {
       var r = VROWS[i];
@@ -558,21 +641,21 @@
       var busyRow = vPending === r.id;
       var inert = !m[i].can || !!vPending;
       text($(r.state), busyRow ? 'Changing...' : (armed ? 'Press OK again' : m[i].word));
-      $(r.state).className = 'v-state ' + (busyRow ? 'muted' : (armed ? 'armed' : m[i].cls));
-      b.className = 'vrow' + (armed ? ' armed' : '') + (inert ? ' disabled' : '');
+      $(r.state).className = 'vr-state ' + (busyRow ? 'muted' : (armed ? 'armed' : m[i].cls));
+      $(r.sw).className = 'sw' + (m[i].checked === 'true' ? ' on' : (m[i].checked === 'mixed' ? ' mixed' : '')) + (m[i].can ? '' : ' na');
+      b.className = 'vrow' + (armed ? ' armed' : '') + (inert ? ' is-disabled' : '');
       b.setAttribute('aria-checked', m[i].checked);
       b.setAttribute('aria-disabled', inert ? 'true' : 'false');
+      show(r.confirm, armed);
+      text($(r.confirm + '-text'), armed ? m[i].confirm : '');
     }
     var f = vFocusedRow();
-    var warn = '';
-    if (vArmed) { warn = m[vArmed === 'ar' ? 0 : (vArmed === 'hl' ? 1 : 2)].confirm; }
-    else if (f >= 0) { warn = m[f].warn; }
-    text($('v-warning'), warn);
+    text($('v-warning'), !vArmed && f >= 0 ? m[f].warn : (document.activeElement === $('v-refresh') && !vArmed ? 'Reads the TV settings again.' : ''));
     text($('v-message'), vMsg);
-    $('v-message').className = 'message ' + vMsgCls;
+    $('v-message').className = 'msg ' + vMsgCls;
   }
 
-  function disarm() {
+  function vDisarm() {
     if (!vArmed) { return; }
     vArmed = null;
     vArmToken++;
@@ -584,8 +667,9 @@
     vReading = true;
     ctl('tv-settings --json', function (r) {
       vReading = false;
-      if (!voiceOpen) { return; }
       var d = parseJsonLine(r.out);
+      if (d && typeof d === 'object') { tvData = d; }
+      if (!voiceOpen) { return; }
       vLoaded = true;
       if (d && typeof d === 'object') {
         vData = d;
@@ -610,8 +694,9 @@
       vData.hi_lg = { state: on || prev.amazon === true || prev.dangbei === true ? 'on' : 'off', thinq: on, amazon: prev.amazon, dangbei: prev.dangbei, error: '' };
     } else {
       var ro = vData.remote_off || {};
-      vData.remote_off = { state: wordOf('keep', after) === 'On' ? 'keep_listening' : 'normal', active: ro.active };
+      vData.remote_off = { state: VP.wordOf('keep', after) === 'On' ? 'keep_listening' : 'normal', active: ro.active };
     }
+    tvData = vData;
   }
 
   function doChange(id, model) {
@@ -625,13 +710,13 @@
       vPending = null;
       if (!voiceOpen) { return; }
       var res = parseJsonLine(r.out);
-      var m = resultMessage(id, res, model);
+      var m = VP.resultMessage(id, res, model);
       vMsg = m[0];
       vMsgCls = m[1];
       vExpect = null;
       if (res && res.after && (res.result === 'applied' || res.result === 'already' || res.result === 'mismatch')) {
         applyLocal(id, res.after);
-        if (vData) { vExpect = { id: id, kind: rowKind(id, vData) }; }
+        if (vData) { vExpect = { id: id, kind: VP.rowKind(id, vData) }; }
       }
       renderVoice();
       // One more read a little later catches LG (or another writer) changing it back.
@@ -639,10 +724,10 @@
         if (!voiceOpen || vPending || vArmed) { return; }
         readVoice(function (d) {
           if (!d || !vExpect || vExpect.id !== id) { return; }
-          var now = rowKind(id, d);
-          if (now !== vExpect.kind) {
-            var w = vModels()[id === 'ar' ? 0 : (id === 'hl' ? 1 : 2)].word;
-            vMsg = id === 'keep' ? 'Keep listening was changed to ' + w + ' by someone else.' : 'LG changed ' + VROWS[id === 'ar' ? 0 : 1].label + ' back to ' + w + '.';
+          var now2 = VP.rowKind(id, d);
+          if (now2 !== vExpect.kind) {
+            var w = vModels()[VP.rowIndex(id)].word;
+            vMsg = id === 'keep' ? 'Keep listening was changed to ' + w + ' by someone else.' : 'LG changed ' + VP.ROWS[VP.rowIndex(id)].label + ' back to ' + w + '.';
             vMsgCls = 'warn';
           }
           vExpect = null;
@@ -652,8 +737,8 @@
   }
 
   function pressRow(id) {
-    if (vPending) { return; }
-    var m = vModels()[id === 'ar' ? 0 : (id === 'hl' ? 1 : 2)];
+    if (vPending || overlayOpen()) { return; }
+    var m = vModels()[VP.rowIndex(id)];
     if (!m.can) { renderVoice(); return; }
     if (m.confirm && vArmed !== id) {
       vArmed = id;
@@ -661,14 +746,13 @@
       var token = vArmToken;
       vMsg = '';
       renderVoice();
-      setTimeout(function () { if (vArmToken === token && vArmed === id) { disarm(); } }, ARM_MS);
+      setTimeout(function () { if (vArmToken === token && vArmed === id) { vDisarm(); } }, ARM_MS);
       return;
     }
     doChange(id, m);
   }
 
   function openVoice() {
-    if (voiceOpen) { return; }
     voiceOpen = true;
     vData = null;
     vLoaded = false;
@@ -676,153 +760,414 @@
     vPending = null;
     vMsg = '';
     vMsgCls = '';
-    message('');
-    show('main', false);
-    show('voice-view', true);
-    renderVoice();
-    $('v-row-ar').focus();
+    go('voice', 'v-row-ar');
     renderVoice();
     readVoice(null);
   }
 
-  function closeVoice() {
-    voiceOpen = false;
-    vArmed = null;
-    vArmToken++;
-    show('voice-view', false);
-    show('main', true);
-    if (!$('b-voice').hidden) { $('b-voice').focus(); } else { focusFirst(); }
-    refresh();
+  // ---- phone setup (docs/design/phone-setup.md, ADR 0009) -----------------------------
+  // `setup start` starts the server; `setup status --json` is polled once a
+  // second from every screen while a session is starting, waiting or active
+  // (the poll is the heartbeat); `setup answer ID allow|refuse` answers the
+  // pending request; `setup stop` ends the session (Done).
+
+  var LIVE = { starting: true, waiting: true, active: true };
+  var setup = {
+    state: 'none', data: null, polling: false, pollFails: 0,
+    waitingSince: 0, expiresAt: 0, error: '', runningShown: false, seq: 0, appliedSeq: 0,
+    awaiting: false,         // a request was seen and its result is not shown yet (fast poll)
+    seenResult: undefined,   // id of the last `last_result` already shown (undefined: none seen yet)
+    overlayId: null, overlayEnds: 0, overlayPrevFocus: null, answered: {}
+  };
+
+  function setupLive() { return !!LIVE[setup.state]; }
+  function overlayOpen() { return !!setup.overlayId; }
+
+  function setupSessionText() {
+    var d = setup.data || {};
+    var left = setup.expiresAt ? fmt(setup.expiresAt - now()) : '';
+    if (setup.state === 'active') { return 'Phone ' + (VP.isIPv4(d.peer) ? d.peer : '') + (left ? ', ' + left + ' left' : ''); }
+    return left ? 'Code open, ' + left + ' left' : 'Code open';
   }
 
-  function voiceKey(ev) {
-    var k = ev.keyCode;
-    if (k === 27 || k === 8 || k === 461) { closeVoice(); ev.preventDefault(); return; }
-    if (k === 13) { return; } // OK: the button's click does the rest
-    if (k === 37 || k === 38 || k === 39 || k === 40) {
-      disarm();
-      var i = -1;
-      for (var j = 0; j < VFOCUS.length; j++) { if (document.activeElement === $(VFOCUS[j])) { i = j; } }
-      if (k === 37 || k === 38) { i = i <= 0 ? VFOCUS.length - 1 : i - 1; }
-      else { i = i < 0 || i >= VFOCUS.length - 1 ? 0 : i + 1; }
-      $(VFOCUS[i]).focus();
-      renderVoice();
-      ev.preventDefault();
+  function validPort(p) { return typeof p === 'number' && p % 1 === 0 && p > 0 && p < 65536; }
+  function validPath(p) { return typeof p === 'string' && /^\/s\/[A-Za-z0-9_-]{16,128}$/.test(p); }
+
+  // The QR URL: the app's own address plus the server's port and one-time
+  // path (design 5.4); '' when any part is missing or malformed. Never logged.
+  function setupUrl() {
+    var d = setup.data || {};
+    if (setup.state !== 'waiting' || !validPort(d.port) || !validPath(d.path) || !VP.isIPv4(tvAddress)) { return ''; }
+    return 'http://' + tvAddress + ':' + d.port + d.path;
+  }
+
+  // Replies of setup calls can cross (the first poll and a start): each call
+  // takes a sequence number and an older reply than the last applied is dropped.
+  function setupCall(args, done) {
+    var seq = ++setup.seq;
+    ctl(args, function (r) {
+      var fresh = seq > setup.appliedSeq;
+      if (fresh) { setup.appliedSeq = seq; }
+      done(r, fresh);
+    });
+  }
+
+  // Takes one state object from `setup start|status|stop` (schema 1).
+  function applySetup(d) {
+    if (!d || typeof d !== 'object' || typeof d.state !== 'string') { return; }
+    var prev = setup.state;
+    setup.data = d;
+    setup.state = d.state;
+    if (typeof d.expires_in_s === 'number') { setup.expiresAt = now() + d.expires_in_s * 1000; }
+    if (d.state === 'waiting' && prev !== 'waiting') { setup.waitingSince = now(); }
+    handleResult(d.last_result || null);
+    handlePending(d.pending || null);
+    if (!setupLive()) { setup.awaiting = false; }
+    if (d.state === 'ended' && LIVE[prev]) {
+      setMsg(VP.endedText(d.reason), d.reason === 'done' ? '' : 'warn');
+      setup.error = '';
+    }
+    if (setupLive()) { schedulePoll(); }
+    renderSetup();
+    renderHA();
+    renderChrome();
+  }
+
+  function handleResult(lr) {
+    var id = lr && typeof lr.id === 'string' ? lr.id : null;
+    if (setup.seenResult === undefined) { setup.seenResult = id; return; }
+    if (!id || id === setup.seenResult) { return; }
+    setup.seenResult = id;
+    setup.awaiting = false;
+    var t = VP.phoneResult(lr);
+    if (!t) { return; }
+    setMsg(t[0], t[1]);
+    if (voiceOpen) { vMsg = t[0]; vMsgCls = t[1]; }
+    // No extra `status --json` (about 950 ms per call on c3-a, EXP-012): the
+    // microphone switch is known from the result itself; the LG settings are
+    // read again because the screens show them.
+    var applied = lr.result === 'ok' || lr.result === 'applied';
+    if (lr.action === 'mic' && applied && st && (lr.verdict === 'allowed' || lr.verdict === 'auto')) {
+      st.mic_off = lr.value === 'off';
+      renderAll();
+    }
+    if (applied && (lr.action === 'always-ready' || lr.action === 'hi-lg' || lr.action === 'remote-off' || lr.action === 'mic')) {
+      if (voiceOpen) { readVoice(null); } else if (installed()) { readTv(); }
+    }
+  }
+
+  function handlePending(p) {
+    if (p && typeof p === 'object') { setup.awaiting = true; }
+    if (!p || typeof p !== 'object' || p.state !== 'pending' || p.confirm !== true) {
+      if (overlayOpen()) { closeOverlay(); }
+      if (p && typeof p === 'object' && p.state === 'running') {
+        var rt = VP.requestText(p.action, p.value);
+        if (rt && !setup.runningShown) { setMsg('From the phone: ' + rt.ask + '. Changing...', ''); }
+        setup.runningShown = true;
+      } else {
+        setup.runningShown = false;
+      }
       return;
     }
-    disarm();
+    setup.runningShown = false;
+    var id = p.id;
+    if (typeof id !== 'string' || !ID_RE.test(id) || setup.answered[id]) { return; }
+    var t = VP.requestText(p.action, p.value);
+    if (!t || !VP.isIPv4(p.peer)) {
+      // Not a request this app can put into words: refuse it without asking.
+      if (overlayOpen()) { closeOverlay(); }
+      setup.answered[id] = true;
+      setMsg('Refused a phone request this app does not know.', 'warn');
+      ctl('setup answer ' + id + ' refuse', function () {});
+      return;
+    }
+    var left = typeof p.timeout_in_s === 'number' && p.timeout_in_s >= 0 ? Math.min(p.timeout_in_s * 1000, REQUEST_MS) : REQUEST_MS;
+    if (setup.overlayId === id) {
+      setup.overlayEnds = Math.min(setup.overlayEnds, now() + left);
+      renderOverlay();
+      return;
+    }
+    if (overlayOpen()) { closeOverlay(); }
+    // The overlay wins over anything armed on the screen below.
+    disarmAll();
+    setup.overlayId = id;
+    setup.overlayEnds = now() + left;
+    setup.overlayPrevFocus = document.activeElement;
+    text($('m-from'), 'Phone ' + p.peer + ' wants to:');
+    text($('m-what'), t.ask);
+    text($('m-detail'), t.detail);
+    show('overlay', true);
+    renderOverlay();
+    renderChrome();
+    $('m-allow').focus();
   }
 
-  function initVoice() {
-    show('voice-view', false);
-    VROWS.forEach(function (r) {
-      $(r.btn).addEventListener('click', function () { pressRow(r.id); });
-    });
-    $('v-refresh').addEventListener('click', function () {
-      disarm();
-      if (vPending) { return; }
-      vMsg = '';
-      vMsgCls = '';
-      readVoice(null);
-    });
-    $('v-back').addEventListener('click', closeVoice);
+  function renderOverlay() {
+    if (!overlayOpen()) { return; }
+    text($('m-time'), fmt(setup.overlayEnds - now()));
   }
 
-  window.voicePower = { outcome: outcome, rows: rowsModel, resultMessage: resultMessage, POWER: POWER, LISTEN: LISTEN, NOTE: NOTE, POWER_EXTRA: POWER_EXTRA };
+  function closeOverlay() {
+    setup.overlayId = null;
+    show('overlay', false);
+    renderChrome();
+    var prev = setup.overlayPrevFocus;
+    setup.overlayPrevFocus = null;
+    if (prev && prev.focus && inLayer(prev)) { prev.focus(); } else { ensureFocus(FIRST[screen]); }
+  }
 
-  function refresh() {
-    ctl('status --json', function (r) {
-      var s = null;
-      var line = lastLine(r.out);
-      try { s = JSON.parse(line); } catch (e) { s = null; }
-      if (!s) {
-        text($('headline'), 'Cannot reach the Homebrew Channel');
-        text($('detail'), r.err || line || 'No answer from luna://org.webosbrew.hbchannel.service/exec.');
-        return;
-      }
-      render(s);
+  function answer(verdict) {
+    var id = setup.overlayId;
+    if (!id) { return; }
+    setup.answered[id] = true;
+    setup.awaiting = true;
+    closeOverlay();
+    setMsg(verdict === 'allow' ? 'Allowed. Changing...' : 'Refused the phone\'s request.', '');
+    ctl('setup answer ' + id + ' ' + verdict, function (r) {
+      if (!r.ok) { setMsg(lastLine(r.out) || r.err || 'The answer could not be sent.', 'bad'); }
     });
   }
 
-  function run(args, label, then) {
+  function schedulePoll() {
+    if (setup.polling) { return; }
+    setup.polling = true;
+    setTimeout(pollSetup, setup.awaiting || overlayOpen() ? SETUP_POLL_FAST_MS : SETUP_POLL_MS);
+  }
+
+  // While a poll is scheduled or in flight `polling` is true, so there is
+  // only ever one chain.
+  function pollSetup() {
+    if (setup.polling && !setupLive()) { setup.polling = false; return; } // ended or stopped meanwhile
+    setup.polling = true;
+    setupCall('setup status --json', function (r, fresh) {
+      setup.polling = false;
+      var d = parseJsonLine(r.out);
+      if (d && fresh) { setup.pollFails = 0; applySetup(d); }
+      else if (!d) { setup.pollFails++; }
+      if (setupLive()) { schedulePoll(); }
+    });
+  }
+
+  function startSetup() {
+    setup.error = '';
+    if (setupLive()) { go('setup', 'q-done'); return; }
     if (busy) { return; }
     busy = true;
-    message(label || ('Running ' + args + '...'));
-    ctl(args, function (r) {
+    setup.state = 'starting';
+    setup.data = null;
+    go('setup', 'q-done');
+    setupCall('setup start', function (r) {
       busy = false;
-      message(lastLine(r.out) || r.err || (r.ok ? 'done' : 'failed'));
-      if (r.ok && then) {
-        run(then, null, null);
-        return;
+      var d = parseJsonLine(r.out);
+      if (d && typeof d.state === 'string') {
+        applySetup(d);
+      } else {
+        setup.state = 'none';
+        setup.error = 'The phone setup could not start: ' + (lastLine(r.out) || r.err || 'no answer') + '.';
+        renderSetup();
+        renderChrome();
       }
-      refresh();
     });
   }
 
-  function onButton(btn) {
-    var args = btn.getAttribute('data-cmd');
-    if (args === '') { message(''); refresh(); return; }
-    if (args === 'report --json') { openReport(); return; }
-    if (args === 'voice') { openVoice(); return; }
-    if (btn.getAttribute('data-confirm') && !btn.armed) {
-      btn.armed = true;
-      btn.className = 'armed';
-      btn.setAttribute('data-label', btn.textContent);
-      text(btn, 'Press again to confirm');
-      setTimeout(function () {
-        btn.armed = false;
-        btn.className = '';
-        text(btn, btn.getAttribute('data-label'));
-      }, 5000);
+  function stopSetup(then) {
+    var wasLive = setupLive();
+    if (overlayOpen()) { closeOverlay(); }
+    if (!wasLive) { if (then) { then(); } return; }
+    setupCall('setup stop', function (r) {
+      var d = parseJsonLine(r.out);
+      setup.state = d && typeof d.state === 'string' ? d.state : 'none';
+      setup.data = d;
+      setMsg('The phone session ended.', '');
+      renderSetup();
+      renderHA();
+      renderChrome();
+      if (then) { then(); }
+    });
+  }
+
+  var drawnUrl = '';
+  function renderSetup() {
+    var d = setup.data || {};
+    var s = setup.state;
+    var waiting = s === 'waiting';
+    var active = s === 'active';
+    var url = setupUrl();
+    var hasQr = !!url;
+    if (hasQr && drawnUrl !== url) {
+      try { drawQr('q-qr', url, window.qrcodegen.QrCode.Ecc.MEDIUM); drawnUrl = url; } catch (e) { drawnUrl = ''; }
+    } else if (!hasQr && drawnUrl) {
+      clearQr('q-qr');
+      drawnUrl = '';
+    }
+    $('q-box').className = 'qr-wrap' + (active ? ' used' : (hasQr ? '' : ' empty'));
+    show('q-used', active);
+    var noQr = '';
+    if (waiting && !hasQr) {
+      noQr = VP.isIPv4(tvAddress) ? 'The code could not be made.' : 'This TV\'s address is not known, so there is no code.';
+    } else if (s === 'starting') { noQr = 'Starting...'; }
+    else if (!waiting && !active) { noQr = 'No code.'; }
+    show('q-noqr', !!noQr);
+    text($('q-noqr'), noQr);
+    show('q-urlbox', waiting);
+    text($('q-url'), hasQr ? url : (validPort(d.port) && validPath(d.path) ? 'port ' + d.port + ', path ' + d.path + ' on this TV\'s address' : ''));
+    show('q-count', waiting && !!setup.expiresAt);
+    text($('q-time'), fmt(setup.expiresAt - now()));
+    show('q-conn', active);
+    text($('q-conn'), active ? 'Phone ' + (VP.isIPv4(d.peer) ? d.peer : '') + ' connected. Session ends in ' + fmt(setup.expiresAt - now()) + '.' : '');
+    show('q-other', active && d.peer_other_subnet === true);
+    text($('q-other'), 'The phone connected from a different network (' + (VP.isIPv4(d.peer) ? d.peer : '?') + '). That is unusual: check who it is.');
+    var hint = waiting && setup.waitingSince && now() - setup.waitingSince >= SETUP_HINT_MS;
+    show('q-hint', !!hint);
+    text($('q-hint'), 'Nothing has opened the link yet. Your phone must be on the same network as this TV. A guest network, a different VLAN, a Wi-Fi "client isolation" setting, or a VPN on the phone will block it. This TV: ' +
+      (tvAddress || 'address not known') + (validPort(d.port) ? ' (port ' + d.port + ')' : '') + '.');
+    var line = '';
+    if (setup.error) { line = setup.error; }
+    else if (s === 'ended') { line = VP.endedText(d.reason); }
+    else if (s === 'none' && screen === 'setup') { line = 'No phone session.'; }
+    text($('q-state'), line);
+    $('q-state').className = 'state-line' + (setup.error ? ' bad-line' : '');
+    show('q-again', !LIVE[s]);
+    if (screen === 'setup') { ensureFocus('q-done'); }
+  }
+
+  // ---- input -----------------------------------------------------------------------------
+
+  var DIRS = { 37: 'left', 38: 'up', 39: 'right', 40: 'down' };
+  function isBack(k) { return k === 27 || k === 8 || k === 461; }
+
+  // Remote control: arrows move the focus, OK (Enter) presses the focused
+  // button (the browser turns it into a click), Back returns to Home.
+  document.addEventListener('keydown', function (ev) {
+    var k = ev.keyCode;
+    if (overlayOpen()) {
+      if (isBack(k)) { answer('refuse'); ev.preventDefault(); return; }
+      if (DIRS[k]) {
+        var n = nearest(document.activeElement && inLayer(document.activeElement) ? document.activeElement : $('m-allow'), focusables(), DIRS[k]);
+        if (n) { n.focus(); }
+        ev.preventDefault();
+      }
       return;
     }
-    run(args, null, btn.getAttribute('data-then'));
-  }
-
-  function visibleButtons() {
-    var all = $('actions').getElementsByTagName('button');
-    var out = [];
-    for (var i = 0; i < all.length; i++) { if (!all[i].hidden) { out.push(all[i]); } }
-    return out;
-  }
-
-  function focusFirst() {
-    var b = visibleButtons();
-    if (b.length && (document.activeElement === document.body || document.activeElement.hidden)) { b[0].focus(); }
-  }
-
-  // Remote control: arrow keys move between buttons, OK (Enter) presses.
-  document.addEventListener('keydown', function (ev) {
-    if (reportOpen) {
-      var box = $('report-text');
-      var kc = ev.keyCode;
-      if (kc === 38) { box.scrollTop = Math.max(0, box.scrollTop - 80); }
-      else if (kc === 40) { box.scrollTop += 80; }
-      else if (kc === 27 || kc === 8 || kc === 461) { closeReport(); }
-      else { return; }
+    if (screen === 'report' && (k === 38 || k === 40)) {
+      var box = $('r-text');
+      box.scrollTop = k === 38 ? Math.max(0, box.scrollTop - 80) : box.scrollTop + 80;
       ev.preventDefault();
       return;
     }
-    if (voiceOpen) { voiceKey(ev); return; }
-    var b = visibleButtons();
-    var i = b.indexOf(document.activeElement);
-    var k = ev.keyCode;
-    if (k === 37 || k === 38) { i = i <= 0 ? b.length - 1 : i - 1; }
-    else if (k === 39 || k === 40) { i = i < 0 || i >= b.length - 1 ? 0 : i + 1; }
-    else { return; }
-    if (b[i]) { b[i].focus(); }
-    ev.preventDefault();
+    if (isBack(k)) {
+      if (screen === 'home') { return; }
+      goHome();
+      ev.preventDefault();
+      return;
+    }
+    if (k === 13) { return; }
+    if (DIRS[k]) {
+      disarmAll();
+      var cur = document.activeElement;
+      if (!inLayer(cur)) { ensureFocus(FIRST[screen]); }
+      else {
+        var next = nearest(cur, focusables(), DIRS[k]);
+        if (next) { next.focus(); }
+      }
+      if (screen === 'voice') { renderVoice(); }
+      ev.preventDefault();
+      return;
+    }
+    disarmAll();
   });
 
-  var buttons = $('actions').getElementsByTagName('button');
-  for (var j = 0; j < buttons.length; j++) {
-    buttons[j].addEventListener('click', (function (btn) { return function () { onButton(btn); }; }(buttons[j])));
-    buttons[j].hidden = true;
+  function onClick(id, f) {
+    $(id).addEventListener('click', f);
+    // The pointer of the Magic Remote moves the focus like the arrows.
+    $(id).addEventListener('mouseover', function () { if (inLayer($(id))) { $(id).focus(); if (screen === 'voice') { renderVoice(); } } });
   }
-  show('b-refresh', true);
-  show('report-view', false);
-  $('r-back').addEventListener('click', closeReport);
-  initVoice();
+
+  onClick('h-notice-btn', function () {
+    var b = $('h-notice-btn');
+    var cmd = b.getAttribute('data-cmd');
+    if (cmd) { run(cmd, b.textContent + '...', b.getAttribute('data-then') || null); }
+  });
+  onClick('h-mic', function () {
+    if (!st) { return; }
+    if (st.mic_off) { run('mic on', 'Turning the microphone on...', null, 'Microphone on.'); }
+    else { run('mic off', 'Turning the microphone off...', null, 'Microphone off. The satellite cannot hear.'); }
+  });
+  onClick('h-voice', openVoice);
+  onClick('h-ha', function () { go('ha'); });
+  onClick('h-diag', function () { go('diag'); });
+
+  VROWS.forEach(function (r) { onClick(r.btn, function () { pressRow(r.id); }); });
+  onClick('v-refresh', function () {
+    vDisarm();
+    if (vPending) { return; }
+    vMsg = '';
+    vMsgCls = '';
+    readVoice(null);
+  });
+
+  onClick('a-pair', function () {
+    var w = st && /^[0-9]+$/.test(st.pairing_window_s || '') ? Math.round(+st.pairing_window_s / 60) : 10;
+    run('pair', 'Opening the pairing window...', null, 'Pairing is open for ' + w + ' minutes. Add this TV in Home Assistant now.');
+  });
+  onClick('a-phone', startSetup);
+  onClick('a-reset', function () { twoPress('a-reset', 'reset-pairing', 'Resetting the pairing...'); });
+  onClick('a-endphone', function () { stopSetup(null); });
+
+  onClick('q-done', function () { stopSetup(function () { go('ha', 'a-phone'); }); });
+  onClick('q-again', startSetup);
+
+  onClick('d-check', function () { run('selfcheck', 'Checking the microphone, about 10 seconds...'); });
+  onClick('d-report', openReport);
+  onClick('d-ack', function () { run('ack-firmware', 'Acknowledging the firmware...'); });
+  onClick('d-more', function () { go('more'); });
+  onClick('r-back', function () { go('diag', 'd-report'); });
+
+  onClick('x-stop', function () { run('stop', 'Stopping...'); });
+  onClick('x-start', function () { run('start', 'Starting...'); });
+  onClick('x-boot-on', function () { run('autostart on', 'Turning start at boot on...'); });
+  onClick('x-boot-off', function () { run('autostart off', 'Turning start at boot off...'); });
+  onClick('x-crash', function () { run('clear-crashloop', 'Clearing the marker...'); });
+  onClick('x-uninstall', function () { twoPress('x-uninstall', 'uninstall', 'Removing the service...'); });
+  onClick('x-purge', function () { twoPress('x-purge', 'purge', 'Removing the service and all data...'); });
+
+  onClick('m-allow', function () { answer('allow'); });
+  onClick('m-refuse', function () { answer('refuse'); });
+
+  // ---- clocks, refresh, start ----------------------------------------------------------
+
+  // The page is drawn for 1920x1080; scale it when the runtime is smaller.
+  function fit() {
+    var w = window.innerWidth || 1920;
+    var h = window.innerHeight || 1080;
+    var s = Math.min(w / 1920, h / 1080);
+    $('tv').style.transform = s > 0 && Math.abs(s - 1) > 0.01 ? 'scale(' + s + ')' : '';
+  }
+  if (window.addEventListener) { window.addEventListener('resize', fit); }
+  fit();
+
+  function clock() {
+    if (overlayOpen()) {
+      if (now() >= setup.overlayEnds) { answer('refuse'); setMsg('No answer on the TV: the phone\'s request was refused.', 'warn'); }
+      else { renderOverlay(); }
+    }
+    if (pairEnds && now() >= pairEnds) { pairEnds = 0; refresh(); }
+    if (screen === 'setup') { renderSetup(); }
+    if (screen === 'ha') { renderHA(); }
+    if (screen === 'home' && pairEnds) { renderHome(); }
+  }
+
+  // The 10 s refresh: on Voice and power a tv-settings read when nothing is
+  // pending or armed; nothing while the report is open; elsewhere the status
+  // (when no action runs), and on Home the TV settings every 3rd time.
+  function tick() {
+    if (screen === 'voice') { if (!vPending && !vArmed) { readVoice(null); } return; }
+    if (screen === 'report') { return; }
+    if (busy) { return; }
+    refresh();
+    refreshTicks++;
+    if (screen === 'home' && installed() && refreshTicks % HOME_TV_EVERY === 0) { readTv(); }
+  }
 
   function findAddress(idx) {
     if (idx >= CONN_SERVICES.length) { return; }
@@ -831,14 +1176,21 @@
       var w = r.wired || {};
       var f = r.wifi || {};
       tvAddress = (w.state === 'connected' && w.ipAddress) || (f.state === 'connected' && f.ipAddress) || w.ipAddress || f.ipAddress || '';
-      if (last) { render(last); }
+      renderAll();
     });
   }
 
+  for (var i = 0; i < SECTIONS.length; i++) { show(SECTIONS[i], SECTIONS[i] === 'home'); }
+  show('overlay', false);
+  renderAll();
+  renderVoice();
   findAddress(0);
   refresh();
-  setInterval(function () {
-    if (voiceOpen) { if (!vPending && !vArmed) { readVoice(null); } return; }
-    if (!busy && !reportOpen) { refresh(); }
-  }, 10000);
+  // A session may still run from before the app was closed and reopened.
+  pollSetup();
+  setInterval(tick, REFRESH_MS);
+  setInterval(clock, CLOCK_MS);
+
+  // For the host tests only (no effect on the TV).
+  window.voiceSatelliteApp = { nearest: nearest, FOCUS: FOCUS, SETUP_POLL_MS: SETUP_POLL_MS, SETUP_POLL_FAST_MS: SETUP_POLL_FAST_MS, REQUEST_MS: REQUEST_MS, allowed: allowed };
 }());

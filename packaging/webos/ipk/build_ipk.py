@@ -49,7 +49,7 @@ PAYLOAD_SCRIPTS = [
     "autostart.sh", "ctl.sh", "install.sh", "lib.sh", "rotate.sh", "start.sh",
     "status.sh", "stop.sh", "supervise.sh", "uninstall.sh",
 ]
-APP_FILES = ["index.html", "app.js", "style.css", "qrcodegen.js", "QRCODEGEN-LICENSE.txt"]
+APP_FILES = ["index.html", "app.js", "voicepower.js", "style.css", "qrcodegen.js", "QRCODEGEN-LICENSE.txt"]
 ID_RE = re.compile(r"^[a-z0-9][a-z0-9.+-]+$")  # LG appinfo.json rules; ares-cli's check
 VERSION_RE = re.compile(r"^(0|[1-9]\d{0,8})\.(0|[1-9]\d{0,8})\.(0|[1-9]\d{0,8})$")
 FORBIDDEN_PREFIXES = ("com.palm", "com.webos", "com.lge", "com.palmdts")
