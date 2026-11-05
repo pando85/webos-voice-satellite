@@ -12,7 +12,7 @@
 
 ## Decision
 
-1. **Option B is accepted (owner, 2026-11-05: "We don't want to use AirPlay. Go with plan B.").** Native ESPHome `media_player` playback in the satellite: HA sends `play_media` with a proxied URL, the satellite does a streaming fetch, `symphonia` decode and a second `pacat` stream, and ducks the music for the wake word, replies, announcements and the timer chime. It is built silently on the PC first, behind `[music] enabled = false` by default.
+1. **Option B is accepted (owner, 2026-11-05: "We don't want to use AirPlay. Go with plan B.").** Native ESPHome `media_player` playback in the satellite: HA sends `play_media` with a URL (HA's proxied URL, or, for Music Assistant, MA's own continuous stream, which bypasses the proxy), the satellite does a streaming fetch, `symphonia` decode and a second `pacat` stream, and ducks the music for the wake word, replies, announcements and the timer chime. It is built silently on the PC first, behind `[music] enabled = false` by default.
 2. **Option A (the TV's AirPlay receiver with Music Assistant) is rejected as a path for this feature. Reason: owner decision.** [EXP-008](../experiments/EXP-008-airplay-media.md) is not planned. A is kept in the design only as a rejected alternative.
 3. **Scope change.** The MVP non-goal "writing AirPlay or a music player" in requirements.md is **lifted for satellite music playback** by this ADR. It stays a non-goal to write AirPlay, a music library, a queue, a playlist, metadata or a UI, and to do gapless or multi-room playback. [requirements.md](../project/requirements.md) keeps the original wording visible and notes the change; F8 now targets B.
 4. **Sendspin (C) stays deferred** until it leaves preview; **LG app launching (D) stays with HA's webostv integration**, out of scope.
@@ -22,10 +22,16 @@
 
 - New `[music]` config section, a second advertised media format (`DEFAULT`, FLAC 48000 Hz stereo), new entity flags only when enabled, no change to the existing entity key or the announcement format.
 - Streaming fetch and decode in `webos-playback`; `symphonia` (MPL-2.0, already linked) stays unmodified, so the licence position in [packaging](../design/packaging.md) holds; no new crate is planned.
+- The entity offers `BROWSE_MEDIA` and handles `ENQUEUE` explicitly (refused); it does not offer mute.
 - Music near the mic depends on ducking and, for barge-in, on AEC; the owner may be asked to un-park AEC if the false-wake gate (G4) fails.
-- One-time proxy URLs mean a dropped stream is not resumed: the track ends and MA or HA decides.
+- HA's proxy URLs have no Range and a new request restarts the conversion, so a dropped stream is not resumed: the track ends and MA or HA decides. Music Assistant sends one endless stream and bypasses the proxy; the satellite must handle both.
+- The daemon fetches URLs as root from any host, so the plan makes fetch security (redirect limit, no downgrade, loopback, link-local and TV-local targets refused, plaintext sessions refused) and decoder robustness (`panic = "abort"`, fuzzing) preconditions of the daemon integration milestone.
 - Running a build on a TV and any sound test need the owner's authorization (AGENTS.md); the plan lists them in section J.
-- The existing line in AGENTS.md and README that treat AirPlay or Music Assistant as the music path are older than this decision; this ADR takes precedence for music.
+- `AGENTS.md` still says "Existing TV AirPlay receiver / Music Assistant is a candidate for music"; that line is older than this decision, is an owner edit and was not changed here. README and `docs/project/vision.md` were updated. This ADR takes precedence for music.
+
+## Review 2026-11-05
+
+An independent review found the first plan not ready; its findings (Music Assistant bypasses the proxy, proxy slot eviction, `ENQUEUE`, idle and cancel at the socket, decoder panics, fetch security, `BROWSE_MEDIA`, latency budget, EXP-015 privacy, an earlier real-HA smoke) were applied. See [design section L](../design/music-playback.md#l-review-2026-11-05). The decision itself (B accepted, A rejected) is unchanged.
 
 ## Alternatives considered
 
