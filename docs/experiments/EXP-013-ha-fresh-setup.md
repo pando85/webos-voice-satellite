@@ -1,6 +1,6 @@
 # EXP-013 — Fresh "add to Home Assistant" on c3-b, and what comes back
 
-**Status:** PLANNED (prepared 2026-11-05 with read-only Home Assistant access and no TV access; not run)
+**Status:** PART 1 DONE (agent steps A1 to A4, 2026-11-05); part 2 (owner steps O1 to O6, A5 to A8) pending
 **Date:** prepared 2026-11-05; run when c3-b is on and the owner is present
 **Device alias / model / firmware / webOS / architecture:** c3-b, LG `OLED55C36LC`, firmware `03.30.73`, webOS TV 8.3.0, aarch64 kernel with 32-bit userland, Homebrew Channel 0.7.2, Ethernet, ARC sound output (all from [P4 on c3-b](../discovery/c3-b/P4-permanent-install.md)). Satellite package on it now: **0.2.3**. Target package: **0.4.1**.
 **Power and playback state:** must be on and idle (`Active` or `Screen Saver`), nothing playing, nobody watching. The TV is the household's hall TV. LG hands-free ("Hi LG") is on as the household left it and is **not touched** (the microphone is busy, so no audio path is exercised; the test needs none).
@@ -89,7 +89,13 @@ Anything not run is `INCONCLUSIVE`, not `verified-on-target`.
 
 ## Observations and redacted evidence links
 
-Not run yet. Fill in: the owner's lifting message (date, time), 0.4.1 sha256, installer output (counts and lines only), times of each step, the state words (`key`, `pairing`, `ha.state`) at each step, the plan counts of A6, what A7 re-applied, the new entities of H7 by name, and the owner's remarks on the texts. Raw files stay private.
+**Part 1 (2026-11-05, agent steps A1 to A4).** The owner lifted the install-only rule for c3-b on 2026-11-05 (relayed by the coordinator in the task message; the time of day was not given). Target package is now **0.4.2** (not 0.4.1: it adds the clean-up guidance texts of `5d7320e`); sha256 `9db7038069790571d748276e8d7b37c27f5ebb9640a33d9f89dfafc28dd508d1`. Times are UTC.
+
+- **A1.** Baseline before the update (c3-b on, `Screen Saver`): 0.2.3 running, supervised, key `paired`, HA connected. "Before" snapshot: 36 entities, 10 exposed, 9 with aliases, device in the area Living Room, 0 labels; a dry-run restore against it said "Nothing to change".
+- **A2.** 0.4.2 installed over 0.2.3 at about 11:01 (details in [c3-b P4](../discovery/c3-b/P4-permanent-install.md)); config and key kept, HA reconnected in 4 s. **38 entities** now: the two new diagnostic text sensors "Always Ready" and "LG hands-free" (H7: created with the area name in the entity id, as the device already has the area; not exposed). A second snapshot (38 entities) was taken as the baseline for part 2; the dry run against the 36-entity one still said "Nothing to change". c3-a: 0.4.2 installed too, install only (see its P4).
+- **A3.** At 11:02:06 the agent deleted the c3-b entry with `DELETE /api/config/config_entries/entry/<id>` (answer `require_restart: false`) while HA was still connected.
+- **A4 (H1 verified-on-target).** Within 1 s the daemon logged `PAIRING CLEARED by the key holder ... stored key deleted ... unpaired, and the pairing window stays closed until it is opened locally`, then `HA disconnected`, `microphone closed, PCM released (not paired)`. `ctl.sh status --json` 6 s after the delete: `key` `cleared`, `pairing.open` false, `ha.state` `unpaired`, the daemon still running; `etc/pairing/` holds only `noise_psk.cleared`. In HA: the c3-b entry is gone from the ESPHome entries (the c3-a entry untouched) and the device is no longer found. H2 (HA could not connect) did **not** occur, so O0 is not needed. The key's `sha256` before the delete was not captured (wrong path in the command), so the "key changes" check of the table compares only against `cleared`.
+- Part 2 is waiting for the owner. Still to fill in: times of each step, the state words (`key`, `pairing`, `ha.state`) at each step, the plan counts of A6, what A7 re-applied, the new entities of H7 by name, and the owner's remarks on the texts. Raw files stay private.
 
 ## Conclusion and confidence
 

@@ -68,3 +68,11 @@ Rollback: `ctl.sh stop`; `ctl.sh autostart off`; `ctl.sh purge` and `make tv-rem
 - IR remote presses for a real suspend/resume and the remote power-off path on the installed daemon: deferred by the owner (2026-11-04), listed in the roadmap.
 - The Kiwi conversation agent (backlog #12) and the sound session are still open; nothing audible was run here.
 - The app UI on c3-b with this build was not opened.
+
+## Update to 0.4.2 (2026-11-05, for EXP-013)
+
+- **Approval:** the owner (2026-11-05) lifted the install-only rule on c3-b for [EXP-013](../../experiments/EXP-013-ha-fresh-setup.md): install, read-only baseline, snapshots, delete c3-b's Home Assistant ESPHome entry, key-state and log reads. No sound, no reboot, no power, screen, input, app, volume or LG setting change.
+- **Package:** `0.4.2`, the same ipk as on [c3-a](../c3-a/P4-permanent-install.md) (sha256 `9db7038069790571d748276e8d7b37c27f5ebb9640a33d9f89dfafc28dd508d1`), installed over **0.2.3** (the first update since 2026-11-04): `appinstall: install done`, copy removed, `ctl.sh install`: "keeping /var/lib/webos-satellite/etc/config.toml", config check ok (`encryption=pairing(paired)`, `music=[off]`), boot hook refreshed, `installed 0.4.2`, started. `ctl.sh status --json`: `installed_version` 0.4.2, running and supervised, autostart on, key `paired`, no crash loop. Home Assistant reconnected 4 s after the start with the stored key; self-check passed.
+- **Entities:** 36 before the update, **38 after** (H7 in EXP-013): two diagnostic text sensors that are new since 0.2.3, "Always Ready" and "LG hands-free" (both `Off` when read, not exposed to Assist). The dry-run restore against the 36-entity snapshot said "Nothing to change".
+- **Observation:** after the update the daemon logs `streaming mic audio to HA (wake word stage)` on c3-b and the "LG hands-free" sensor reads `Off`, so the microphone is not busy now (it was on 2026-11-04). The household setting was not touched by this run; when it changed is not known.
+- **Rollback:** install the 0.2.3 ipk and run `ctl.sh install` (`etc/` is kept).
