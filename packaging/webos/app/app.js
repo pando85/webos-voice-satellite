@@ -13,7 +13,7 @@
  *
  * Screens (design "Calm dark", 2026-11-05): Home, Voice and power, Home
  * Assistant (with the phone setup QR), Diagnostics (with Report
- * compatibility and More actions). Back always returns to Home. The arrow
+ * compatibility and More actions). Back returns to the parent screen, to Home from the others, and leaves the app from Home. The arrow
  * keys move the focus to the nearest element in that direction.
  */
 (function () {
@@ -480,7 +480,7 @@
     var ov = overlayOpen();
     text($('key-ok'), ov ? 'Allow' : 'Select');
     show('key-back-box', ov || screen !== 'home');
-    text($('key-back'), ov ? 'Refuse' : 'Home');
+    text($('key-back'), ov ? 'Refuse' : (PARENT[screen] ? PARENT_NAME[PARENT[screen][0]] : 'Home'));
     var live = setupLive();
     show('chip-phone', live);
     text($('chip-phone-text'), setup.state === 'active' ? 'Phone connected' : 'Phone code open');
@@ -1049,7 +1049,37 @@
   // ---- input -----------------------------------------------------------------------------
 
   var DIRS = { 37: 'left', 38: 'up', 39: 'right', 40: 'down' };
+  // Back. webOS TV (docs, "Back button": https://webostv.developer.lge.com/develop/guides/back-button):
+  // by default the runtime handles Back through the DOM history and returns to the
+  // launcher itself; an app that sets "disableBackHistoryAPI": true in appinfo.json
+  // (build_ipk.py writes it) gets a keydown with keyCode 461 (0x1CD) instead and
+  // decides. 27 (Escape) and 8 (Backspace) are only for testing in a desktop browser.
   function isBack(k) { return k === 27 || k === 8 || k === 461; }
+
+  // A sub-screen goes back to its parent (the breadcrumb), every other screen to Home.
+  var PARENT = { setup: ['ha', 'a-phone'], report: ['diag', 'd-report'], more: ['diag', 'd-more'] };
+  var PARENT_NAME = { ha: 'Home Assistant', diag: 'Diagnostics' };
+
+  // Back on Home leaves the app the documented way: webOS.platformBack() when
+  // webOSTV.js is loaded (this app does not ship it; webOS TV 6.0+ then asks whether
+  // to exit, 5.0 and lower open the launcher), else window.close(), which the same page
+  // documents for an app's own exit. Only the remote's key leaves, never Escape or
+  // Backspace. Not yet run on a TV (verified-on-target pending).
+  function leaveApp() {
+    try {
+      if (window.webOS && typeof window.webOS.platformBack === 'function') { window.webOS.platformBack(); return; }
+    } catch (e) { /* fall through to close */ }
+    if (typeof window.close === 'function') { window.close(); }
+  }
+
+  function goBack(k) {
+    if (screen === 'home') {
+      if (k === 461) { leaveApp(); }
+      return;
+    }
+    var p = PARENT[screen];
+    if (p) { go(p[0], p[1]); } else { goHome(); }
+  }
 
   // Remote control: arrows move the focus, OK (Enter) presses the focused
   // button (the browser turns it into a click), Back returns to Home.
@@ -1071,8 +1101,7 @@
       return;
     }
     if (isBack(k)) {
-      if (screen === 'home') { return; }
-      goHome();
+      goBack(k);
       ev.preventDefault();
       return;
     }

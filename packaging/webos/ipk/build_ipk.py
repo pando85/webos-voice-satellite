@@ -235,6 +235,10 @@ def build(args: argparse.Namespace) -> Path:
         "icon": "icon.png",
         "largeIcon": "largeIcon.png",
         "iconColor": "#1f6fb2",
+        # The app handles the remote's Back key itself (keyCode 461); without this
+        # the runtime does history.back() and closes the app from any screen.
+        # https://webostv.developer.lge.com/develop/guides/back-button
+        "disableBackHistoryAPI": True,
     }
     app: dict[str, tuple[bytes, int]] = {
         "appinfo.json": ((json.dumps(appinfo, indent=2) + "\n").encode(), 0o644),
@@ -357,6 +361,7 @@ def check(args: argparse.Namespace) -> None:
         need(key in appinfo, f"appinfo.json lacks {key}")
     need(appinfo.get("id") == app_id and appinfo.get("version") == version, "appinfo id/version differ from control")
     need(appinfo.get("type") == "web", "appinfo type is not web")
+    need(appinfo.get("disableBackHistoryAPI") is True, "appinfo.json lacks disableBackHistoryAPI: true (Back would close the app)")
     for key in ["main", "icon", "largeIcon"]:
         if key in appinfo:
             need(f"{appdir}/{appinfo[key]}" in data, f"appinfo {key} {appinfo[key]} missing")

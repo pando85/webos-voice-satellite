@@ -165,6 +165,9 @@ check "invalid version refused" '! python3 "$BUILD" build --no-elf-check --versi
 
 echo "== first install from the unpacked app =="
 unpack "$IPK1"
+check "appinfo.json sets disableBackHistoryAPI true (the app handles Back itself; the runtime would close it otherwise)" 'python3 -c "
+import json, sys
+sys.exit(0 if json.load(open(sys.argv[1]))[\"disableBackHistoryAPI\"] is True else 1)" "$APP/appinfo.json"'
 check "status before install: valid JSON, not installed" 'json "s[\"installed\"] is False and s[\"package_version\"]==\"0.0.1\""'
 $CTL install >"$T/out" 2>&1
 check "install: daemon, scripts, hook template, version, app-dir recorded" '[ -x "$S/bin/webos-satellite" ] && [ -f "$S/bin/ctl.sh" ] && [ -f "$S/bin/webos-satellite.hook" ] && [ "$(cat "$S/VERSION")" = 0.0.1 ] && [ "$(cat "$S/app-dir")" = "$APP" ]'

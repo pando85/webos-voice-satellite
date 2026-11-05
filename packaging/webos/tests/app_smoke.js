@@ -147,6 +147,28 @@ const refresh = async () => { const t = T.timers.filter((x) => x.live && x.inter
   await settle();
   check('Back returns to Home with the focus on the tile', !byId.home.hidden && byId.ha.hidden && doc.activeElement === byId['h-ha']);
 
+  // ---- Back routing (appinfo disableBackHistoryAPI: the app gets 461 and decides) ----
+  let closed = 0;
+  let platformBacks = 0;
+  T.window.close = () => { closed++; };
+  click('h-diag');
+  await settle();
+  click('d-more');
+  check('More actions opens; the Back hint names its parent', !byId.more.hidden && byId['key-back'].textContent === 'Diagnostics');
+  check('Back on a sub-screen is handled (preventDefault) and goes to its parent, not Home', key(461) === true
+    && !byId.diag.hidden && byId.more.hidden && byId.home.hidden && doc.activeElement === byId['d-more'] && byId['key-back'].textContent === 'Home');
+  key(461);
+  await settle();
+  check('Back on Diagnostics goes to Home', !byId.home.hidden && byId.diag.hidden && doc.activeElement === byId['h-diag'] && closed === 0);
+  check('Back on Home leaves the app with window.close() (no webOSTV.js shipped), and is handled', key(461) === true && closed === 1);
+  key(27);
+  key(8);
+  check('Escape and Backspace on Home (desktop testing) never close the app', closed === 1 && !byId.home.hidden);
+  T.window.webOS = { platformBack: () => { platformBacks++; } };
+  key(461);
+  check('with webOSTV.js loaded, Back on Home calls webOS.platformBack() instead of close', platformBacks === 1 && closed === 1);
+  delete T.window.webOS;
+
   // ---- Diagnostics, More actions, compatibility ----
   const compat = (o) => Object.assign({ schema: 1, compat_status: 'not verified', selfcheck: 'passed (peak -54 dBFS)', tv_model: 'OLED42C34LA',
     tv_firmware: '03.30.99', firmware_verified: false, firmware_changed: false, capture_problem: false, policy: 'warn', report_status: 'idle' }, o);
@@ -281,6 +303,10 @@ const refresh = async () => { const t = T.timers.filter((x) => x.live && x.inter
   check('poll: setup status --json every 2 s while waiting (EXP-012)', polls() === 3);
   key(461);
   await settle();
+  check('Back on the phone screen goes to its parent, Home Assistant, and leaves the session running', !byId.ha.hidden && byId.setup.hidden && doc.activeElement === byId['a-phone'] && !byId['chip-phone'].hidden);
+  key(461);
+  await settle();
+  check('Back on Home Assistant goes to Home', !byId.home.hidden && byId.ha.hidden && closed === 1);
   calls.length = 0;
   await step(4000);
   check('the poll goes on from Home (it is the heartbeat), the chip shows the session', polls() === 2 && !byId['chip-phone'].hidden);
@@ -371,7 +397,7 @@ const refresh = async () => { const t = T.timers.filter((x) => x.live && x.inter
     !byId.overlay.hidden && answers.length === n0 && execs().indexOf('setup answer 0badf00d allow') < 0);
   key(461);
   await settle();
-  check('Back refuses (and does not leave the screen)', answers[answers.length - 1] === '0badf00d refuse' && byId.overlay.hidden && !byId.home.hidden);
+  check('Back refuses (and does not leave the screen)', answers[answers.length - 1] === '0badf00d refuse' && byId.overlay.hidden && !byId.home.hidden && closed === 1);
   srv.s.pending = null;
   srv.s.last_result = { id: '0badf00d', action: 'always-ready', value: 'on', verdict: 'refused', result: '', error: '', peer: '192.0.2.77' };
   await step(2000);
