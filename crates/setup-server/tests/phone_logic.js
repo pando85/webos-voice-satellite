@@ -81,6 +81,24 @@ assert.match(v.mic.sub, /Off on this TV/);
 assert.strictEqual(v.cards.listen.value, 'No, microphone off');
 assert.deepStrictEqual([v.rows[2].action, v.rows[2].value], ['remote-off', 'normal']);
 
+// Keep listening on while Always Ready is off: the phone offers the same
+// Always Ready request as the switch; no hint otherwise
+s = state();
+v = phone.buildView(vp, s, false);
+assert.strictEqual(v.hint, null);
+s.tv.remote_off = { state: 'keep_listening', active: true };
+v = phone.buildView(vp, s, false);
+assert.deepStrictEqual(v.hint, { text: 'Works best with Always Ready on. Turn it on?', label: 'Turn on Always Ready',
+  action: 'always-ready', value: 'on', can: true });
+assert.strictEqual(phone.askText(vp, v.hint.action, v.hint.value), 'Turn Always Ready on');
+assert.strictEqual(phone.buildView(vp, s, true).hint.can, false);
+s.tv.always_ready = { state: 'on', raw: 'alwaysReady', error: '' };
+assert.strictEqual(phone.buildView(vp, s, false).hint, null);
+s.tv.always_ready = { state: 'on', raw: 'lifeOnScreen', error: '' };
+assert.strictEqual(phone.buildView(vp, s, false).hint, null);
+s = state({ tv: null, errors: { device: '', tv: 'timeout' } });
+assert.strictEqual(phone.buildView(vp, s, false).hint, null);
+
 // Always Ready in an unknown mode cannot be switched from the phone
 s = state();
 s.tv.always_ready = { state: 'on', raw: 'lifeOnScreen', error: '' };

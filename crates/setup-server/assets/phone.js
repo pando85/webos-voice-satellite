@@ -91,6 +91,12 @@
       });
     }
 
+    // Keep listening on, Always Ready off: offer to turn Always Ready on (the
+    // same request as the Always Ready switch, so the TV asks as usual).
+    var h = model ? vp.hint(model) : null;
+    var hint = h && rws[0].can
+      ? { text: h.text, label: h.label, action: h.action, value: h.value, can: !busy } : null;
+
     var vol = dev && typeof dev.reply_volume === 'number' ? dev.reply_volume : null;
     var warn = '';
     var errs = st.errors || {};
@@ -103,7 +109,7 @@
     return {
       cards: cards, ha: haView, warn: warn,
       out: { head: o.headline, detail: o.detail + (o.extra ? ' ' + o.extra : ''), listening: o.listening, notes: o.notes },
-      rows: rowViews,
+      rows: rowViews, hint: hint,
       mic: {
         known: micKnown, checked: micKnown && !kill, can: micKnown && !busy,
         sub: !known ? 'Checking...' : (!micKnown ? 'The microphone state could not be read.'
@@ -261,6 +267,22 @@
       host.appendChild(line);
       host.appendChild(note);
       rowEls[d.id] = { sub: sub, word: word, sw: sw, note: note };
+      if (d.id === 'keep') {
+        var hint = document.createElement('div');
+        hint.className = 'p-note p-hint';
+        hint.hidden = true;
+        var hintText = document.createElement('span');
+        var hintBtn = document.createElement('button');
+        hintBtn.type = 'button';
+        hintBtn.className = 'p-btn small';
+        hintBtn.addEventListener('click', function () {
+          if (view && view.hint && view.hint.can) { request(view.hint.action, view.hint.value); }
+        });
+        hint.appendChild(hintText);
+        hint.appendChild(hintBtn);
+        host.appendChild(hint);
+        rowEls.hint = { box: hint, text: hintText, btn: hintBtn };
+      }
       sw.addEventListener('click', function () {
         var r = view && view.rows.filter(function (x) { return x.id === d.id; })[0];
         if (r && r.can && r.value) { request(r.action, r.value); }
@@ -311,6 +333,12 @@
       show(e.note, !!r.note);
       text(e.note, r.note);
     });
+
+    var he = rowEls.hint;
+    show(he.box, !!view.hint);
+    text(he.text, view.hint ? view.hint.text + ' ' : '');
+    text(he.btn, view.hint ? view.hint.label : '');
+    he.btn.disabled = !view.hint || !view.hint.can;
 
     text($('mic-sub'), view.mic.sub);
     $('mic-sw').setAttribute('aria-checked', view.mic.checked ? 'true' : 'false');

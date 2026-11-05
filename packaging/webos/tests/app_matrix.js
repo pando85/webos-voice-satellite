@@ -22,7 +22,9 @@ const { check, done } = checker();
 // ---- Part 1: the matrix ----------------------------------------------------
 const P_DEEP = 'Power button: the TV goes to deep standby. The satellite cannot hear until the TV is turned on.';
 const P_STBY = 'Power button: the TV goes to standby. The satellite still hears you, but you will not hear its replies.';
-const P_KEEP = 'Power button: the screen goes dark but the TV stays on. The satellite hears you and replies. Press power again to turn the picture on.';
+const P_KEEP = 'Power button: the TV turns itself back on with the screen dark. About 5 to 6 seconds after the key. The satellite hears you and replies. Press power again to turn the picture on.';
+const P_KEEP_AR_OFF = 'Power button: the TV turns itself back on with the screen dark. About 5 to 6 seconds after the key. The satellite hears you and replies; press power again to turn the picture on. The TV may sometimes fall asleep instead, and the satellite then stops until the TV is turned on. Turn Always Ready on to avoid that.';
+const HINT_TEXT = 'Works best with Always Ready on. Turn it on?';
 const P_X = 'Power button: not known. The TV\'s settings could not be read. Press Refresh.';
 const L = {
   ok: 'Listening now: yes.',
@@ -60,10 +62,12 @@ const text = (o) => `${o.headline} ${o.detail}`;
 // Literal cells (the strings are the contract).
 check('P1 off + normal', text(VP.outcome(state({ ar: 'off', ro: 'normal' }))) === P_DEEP);
 check('P2 alwaysReady + normal', text(VP.outcome(state({ ar: 'alwaysReady', ro: 'normal' }))) === P_STBY);
-check('P3 off + keep', text(VP.outcome(state({ ar: 'off', ro: 'keep_listening' }))) === P_KEEP);
+check('P3 off + keep: may fall asleep, recommends Always Ready', text(VP.outcome(state({ ar: 'off', ro: 'keep_listening' }))) === P_KEEP_AR_OFF);
 check('P4 alwaysReady + keep', text(VP.outcome(state({ ar: 'alwaysReady', ro: 'keep_listening' }))) === P_KEEP);
 check('allEnabled behaves as on (P2, P4)', text(VP.outcome(state({ ar: 'allEnabled', ro: 'normal' }))) === P_STBY
   && text(VP.outcome(state({ ar: 'allEnabled', ro: 'keep_listening' }))) === P_KEEP);
+check('P3 and P4 differ; only P3 mentions falling asleep', VP.POWER.P3.detail !== VP.POWER.P4.detail && /fall asleep/.test(VP.POWER.P3.detail)
+  && !/fall asleep/.test(VP.POWER.P4.detail) && VP.POWER.P3.tone === 'warn' && VP.POWER.P4.tone === 'ok');
 check('none behaves as off (P1)', text(VP.outcome(state({ ar: 'none', ro: 'normal' }))) === P_DEEP);
 check('lifeOnScreen, an unread or unknown Always Ready: not known', ['lifeOnScreen', 'error', 'weird'].every((a) => text(VP.outcome(state({ ar: a }))) === P_X));
 check('Keep listening unreadable: not known', text(VP.outcome(Object.assign(state({}), { remote_off: { state: 'maybe' } }))) === P_X);
@@ -106,7 +110,7 @@ function oracle(o) {
   if (arK === 'x' || o.ro === 'maybe') power = P_X;
   else {
     const keep = o.ro === 'keep_listening' && !o.kill && o.active !== false;
-    power = arK === 'off' ? (keep ? P_KEEP : P_DEEP) : (keep ? P_KEEP : P_STBY);
+    power = arK === 'off' ? (keep ? P_KEEP_AR_OFF : P_DEEP) : (keep ? P_KEEP : P_STBY);
   }
   let line;
   if (o.running === false) line = L.stopped;
@@ -159,7 +163,7 @@ check('LISTEN: every cell has the full line, a shorter card form, a card detail 
   && Object.values(VP.LISTEN).every((l) => /^Listening now: /.test(l.full) && l.short && l.short.length < l.full.length && ['ok', 'warn', 'bad', 'idle'].includes(l.tone)));
 check('outcome carries the card forms of its cells', (() => {
   const o = VP.outcome(state({ ar: 'off', ro: 'keep_listening', mic: 'muted' }));
-  return o.powerShort === VP.POWER.P3.short && o.powerTone === 'ok' && o.listenShort === 'No, muted' && o.listenTone === 'warn' && o.listenDetail === 'Muted in Home Assistant.';
+  return o.powerShort === VP.POWER.P3.short && o.powerTone === 'warn' && o.listenShort === 'No, muted' && o.listenTone === 'warn' && o.listenDetail === 'Muted in Home Assistant.';
 })());
 check('Home Assistant card: key words, the pairing window wins, not installed', VP.haSummary({ installed: true, key: 'paired' }).short === 'Paired'
   && VP.haSummary({ installed: true, key: 'unpaired' }).tone === 'warn' && VP.haSummary({ installed: true, key: 'cleared' }).short === 'Unpaired by Home Assistant'
@@ -238,6 +242,25 @@ check('rows: Hi LG toggles thinQ with a confirm; unknown and error are not chang
   && !rows({ hl: 'error' })[1].can && rows({ hl: 'error' })[1].word === 'Cannot read' && !rows({ hl: 'unknown' })[1].can);
 check('rows: Keep listening on needs one press, off needs two', rows({ ro: 'keep_listening' })[2].cmd === 'set remote-off normal'
   && rows({ ro: 'keep_listening' })[2].confirm === '' && rows({ ro: 'normal' })[2].cmd === 'set remote-off keep' && !!rows({ ro: 'normal' })[2].confirm);
+// Keep listening wording and the Always Ready hint.
+const hint = (o) => VP.hint(state(o));
+const keepOn = rows({ ar: 'off', ro: 'normal' })[2].confirm;
+check('Keep listening confirm: what happens, and "works best with Always Ready on" only while Always Ready is not on',
+  /^Turn on Keep listening\? About 5 to 6 seconds after the power button the satellite turns the TV back on with the screen dark\./.test(keepOn)
+  && /You can talk to it and hear replies; press power again for the picture\./.test(keepOn) && / Works best with Always Ready on\. Press OK again to confirm\.$/.test(keepOn)
+  && !/Works best/.test(rows({ ar: 'alwaysReady', ro: 'normal' })[2].confirm) && !/Works best/.test(rows({ ar: 'allEnabled', ro: 'normal' })[2].confirm)
+  && /Works best with Always Ready on\.$/.test(VP.requestText('remote-off', 'keep').detail));
+check('Always Ready confirm texts explain the light standby and the 7 second margin', /light standby/.test(rows({ ar: 'off' })[0].warn)
+  && /you hear no replies/.test(rows({ ar: 'off' })[0].warn) && /within about 7 seconds/.test(rows({ ar: 'alwaysReady' })[0].warn)
+  && /sometimes fall asleep/.test(rows({ ar: 'alwaysReady' })[0].warn));
+check('hint: Keep listening on and in effect with Always Ready off', JSON.stringify(hint({ ar: 'off', ro: 'keep_listening' }))
+  === JSON.stringify({ text: HINT_TEXT, label: 'Turn on Always Ready', action: 'always-ready', value: 'on', cmd: 'set always-ready on' }));
+check('hint: none when Always Ready is on, Keep listening is off, unknown, killed, or not watching',
+  hint({ ar: 'alwaysReady', ro: 'keep_listening' }) === null && hint({ ar: 'off', ro: 'normal' }) === null
+  && hint({ ar: 'off', ro: 'weird' }) === null && hint({ ar: 'off', ro: 'keep_listening', kill: true }) === null
+  && hint({ ar: 'off', ro: 'keep_listening', active: false }) === null);
+check('hint: none when Always Ready cannot be changed (none, lifeOnScreen, allEnabled, unreadable) or nothing was read',
+  ['none', 'lifeOnScreen', 'allEnabled', 'error', 'weird'].every((a) => hint({ ar: a, ro: 'keep_listening' }) === null) && VP.hint(null) === null && VP.hint({}) === null);
 check('rows before the first read say Checking... and cannot be pressed', VP.rows(null).every((r) => r.word === 'Checking...' && !r.can));
 
 // ---- Part 2: the screen ----------------------------------------------------
@@ -257,6 +280,8 @@ const T = load({
   },
 });
 const { byId, doc, settle, advance, execs, key, click, calls } = T;
+const indexHtml = require('fs').readFileSync(require('path').join(__dirname, '..', 'app', 'index.html'), 'utf8');
+check('index.html row sub-lines are the voicepower.js ones', VP.ROWS.every((r) => indexHtml.indexOf('<span class="vr-sub">' + r.sub + '</span>') > 0));
 const CTL_ALLOWED = /^sh '\/media\/developer\/apps\/usr\/palm\/applications\/io\.github\.pando85\.voicesatellite\/payload\/ctl\.sh' (status --json|tv-settings --json|setup status --json|set always-ready (on|off)|set hi-lg (on|off)|set remote-off (normal|keep)) 2>&1$/;
 const press = async (id) => { click(id); await settle(); };
 const word = (r) => byId[`v-${r}-state`].textContent;
@@ -362,13 +387,57 @@ const nextTick = () => T.timers.filter((t) => t.live && t.interval && t.ms === 1
   check('turning Keep listening on needs a confirm', sets().length === 0 && /^Turn on Keep listening\?/.test(byId['v-keep-confirm-text'].textContent));
   await press('v-row-keep');
   check('second press sends set remote-off keep', sets().join() === 'set remote-off keep' && word('keep') === 'On'
-    && byId['v-message'].textContent === 'Keep listening is now On. Changed from Off.' && byId['v-headline'].textContent.indexOf('the screen goes dark') > 0);
+    && byId['v-message'].textContent === 'Keep listening is now On. Changed from Off.' && byId['v-headline'].textContent.indexOf('with the screen dark') > 0);
   calls.length = 0;
   fake.setReply = () => '{"schema":1,"setting":"remote-off","requested":"normal","before":"keep_listening","after":"normal","result":"applied","error":"","daemon":"applied"}\n';
   fake.tv = state({ ar: 'alwaysReady', ro: 'normal' });
   await press('v-row-keep');
   check('turning Keep listening off is one press', sets().join() === 'set remote-off normal' && word('keep') === 'Off'
     && byId['v-message'].textContent === 'Done. The power button turns the TV off the normal way.');
+
+  // The hint: Keep listening on and Always Ready off
+  fake.tv = state({ ar: 'off', ro: 'normal' });
+  await press('v-refresh');
+  check('hint hidden while Keep listening is off', byId['v-hint'].hidden && byId['v-hint-btn'].hidden);
+  fake.tv = state({ ar: 'alwaysReady', ro: 'keep_listening' });
+  await press('v-refresh');
+  check('hint hidden while Always Ready is on', byId['v-hint'].hidden && byId['v-hint-btn'].hidden);
+  fake.tv = state({ ar: 'lifeOnScreen', ro: 'keep_listening' });
+  await press('v-refresh');
+  check('hint hidden while Always Ready cannot be changed', byId['v-hint'].hidden && byId['v-hint-btn'].hidden);
+  fake.tv = state({ ar: 'off', ro: 'keep_listening' });
+  await press('v-refresh');
+  check('hint shown: text and a focusable action', !byId['v-hint'].hidden && !byId['v-hint-btn'].hidden
+    && byId['v-hint-text'].textContent === HINT_TEXT && byId['v-hint-btn'].textContent === 'Turn on Always Ready'
+    && /fall asleep/.test(byId['v-detail'].textContent));
+  byId['v-row-ar'].focus();
+  key(39);
+  check('Right from the rows reaches the hint action', doc.activeElement === byId['v-hint-btn']);
+  key(37);
+  check('Left from the hint action returns to a row', ['v-row-ar', 'v-row-hl', 'v-row-keep'].indexOf(doc.activeElement.id) >= 0);
+  byId['v-hint-btn'].focus();
+  calls.length = 0;
+  click('v-hint-btn');
+  await settle();
+  check('the hint arms the Always Ready change (two-press): nothing sent, confirm shown, focus on that row', sets().length === 0
+    && doc.activeElement === byId['v-row-ar'] && word('ar') === 'Press OK again' && /^Turn on Always Ready\?.* Press OK again to confirm\.$/.test(byId['v-ar-confirm-text'].textContent));
+  key(40);
+  check('a focus move disarms it as usual', word('ar') === 'Off' && sets().length === 0);
+  byId['v-hint-btn'].focus();
+  click('v-hint-btn');
+  fake.setReply = (c) => c === 'set always-ready on' ? '{"schema":1,"setting":"always-ready","requested":"on","before":"off","after":"on","result":"applied","error":""}\n' : 'unexpected ' + c;
+  fake.tv = state({ ar: 'alwaysReady', ro: 'keep_listening' });
+  await press('v-row-ar');
+  check('second OK sends set always-ready on and the hint goes away', sets().join() === 'set always-ready on'
+    && byId['v-hint'].hidden && byId['v-hint-btn'].hidden && word('ar') === 'On' && byId['v-headline'].textContent === VP.POWER.P4.headline);
+  fake.tv = state({ ar: 'off', ro: 'keep_listening' });
+  await press('v-refresh');
+  byId['v-hint-btn'].focus();
+  fake.tv = state({ ar: 'alwaysReady', ro: 'keep_listening' });
+  await press('v-refresh');
+  check('a hint that disappears under the focus hands the focus to a row', doc.activeElement !== byId['v-hint-btn'] && ['v-row-ar', 'v-row-hl', 'v-row-keep', 'v-refresh'].indexOf(doc.activeElement.id) >= 0);
+  fake.tv = state({ ar: 'alwaysReady', ro: 'normal' });
+  await press('v-refresh');
 
   // failed, refused, mismatch, already, unparsable
   const trial = async (id, reply, wantCmd) => {

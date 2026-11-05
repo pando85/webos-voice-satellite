@@ -38,10 +38,12 @@
       short: 'The TV goes to deep standby.', tone: 'idle' },
     P2: { headline: 'Power button: the TV goes to standby.', detail: 'The satellite still hears you, but you will not hear its replies.',
       short: 'The TV goes to standby.', tone: 'warn' },
-    P3: { headline: 'Power button: the screen goes dark but the TV stays on.', detail: 'The satellite hears you and replies. Press power again to turn the picture on.',
-      short: 'The screen goes dark, the TV stays on.', tone: 'ok' },
-    P4: { headline: 'Power button: the screen goes dark but the TV stays on.', detail: 'The satellite hears you and replies. Press power again to turn the picture on.',
-      short: 'The screen goes dark, the TV stays on.', tone: 'ok' },
+    P3: { headline: 'Power button: the TV turns itself back on with the screen dark.',
+      detail: 'About 5 to 6 seconds after the key. The satellite hears you and replies; press power again to turn the picture on. The TV may sometimes fall asleep instead, and the satellite then stops until the TV is turned on. Turn Always Ready on to avoid that.',
+      short: 'The TV turns back on, screen dark. May fall asleep.', tone: 'warn' },
+    P4: { headline: 'Power button: the TV turns itself back on with the screen dark.',
+      detail: 'About 5 to 6 seconds after the key. The satellite hears you and replies. Press power again to turn the picture on.',
+      short: 'The TV turns back on, screen dark.', tone: 'ok' },
     PX: { headline: 'Power button: not known.', detail: 'The TV\'s settings could not be read. Press Refresh.',
       short: 'Not known.', tone: 'bad' }
   };
@@ -73,12 +75,16 @@
   // The three rows of the Voice and power screen (and the phone page).
   var ROWS = [
     { id: 'ar', label: 'Always Ready', owner: 'LG', menu: AR_MENU, action: 'always-ready',
-      sub: 'Keeps the TV in standby for LG\'s own features. Uses more standby power.' },
+      sub: 'LG\'s setting. After the power button the TV waits in a light standby instead of suspending, so the satellite keeps hearing you. Uses more standby power.' },
     { id: 'hl', label: 'Hi LG', owner: 'LG', menu: HL_MENU, action: 'hi-lg',
       sub: 'LG\'s own voice assistant. When it is on, the satellite may not be able to use the microphone.' },
     { id: 'keep', label: 'Keep listening', owner: 'Satellite', menu: '', action: 'remote-off',
-      sub: 'A satellite setting. The TV stays on with the screen dark after the power button.' }
+      sub: 'A satellite setting. After the power button the satellite turns the TV back on with the screen dark. You can still talk to it and hear replies. Press power again for the picture.' }
   ];
+  // Shown while Keep listening is on and in effect but Always Ready is off
+  // (and changeable): see hint().
+  var HINT = { text: 'Works best with Always Ready on. Turn it on?', label: 'Turn on Always Ready' };
+  var KEEP_BEST = ' Works best with Always Ready on.';
   var CONFIRM_TAIL = ' Press OK again to confirm.';
 
   // Home Assistant pairing, by the `key` word of `ctl.sh status --json`.
@@ -228,11 +234,13 @@
     return v ? 'Not known (' + v + ')' : 'Not known';
   }
 
-  function confirmText(id, turningOn) {
+  // arOn: true when Always Ready is known to be on (the Keep listening text
+  // then leaves out the "works best" sentence).
+  function confirmText(id, turningOn, arOn) {
     if (id === 'ar') {
       return turningOn
-        ? 'Turn on Always Ready? The TV then uses more power in standby (not measured). With "Keep listening" off, the satellite hears you after the power button but its replies are silent.'
-        : 'Turn off Always Ready? Without "Keep listening", the TV suspends after the power button and the satellite stops.';
+        ? 'Turn on Always Ready? After the power button the TV waits in a light standby, so the satellite keeps hearing you. With "Keep listening" on, it reliably turns the TV back on, dark, to reply. With it off, you hear no replies. The TV uses more standby power (not measured).'
+        : 'Turn off Always Ready? Without "Keep listening", the TV suspends after the power button and the satellite stops. With it on, the satellite has to wake the TV within about 7 seconds, so the TV may sometimes fall asleep instead.';
     }
     if (id === 'hl') {
       return turningOn
@@ -240,7 +248,8 @@
         : 'Turn off Hi LG? The TV stops answering "Hi LG". The satellite can use the microphone.';
     }
     return turningOn
-      ? 'Turn on Keep listening? After the power button the TV stays on with the screen dark. It uses more power than standby (not measured), LG\'s OLED care at power-off may not run, and the screen may flash briefly (not observed).'
+      ? 'Turn on Keep listening? About 5 to 6 seconds after the power button the satellite turns the TV back on with the screen dark. You can talk to it and hear replies; press power again for the picture. It uses more power than standby (not measured), LG\'s OLED care at power-off may not run, and the screen may flash briefly (not observed).' +
+        (arOn === true ? '' : KEEP_BEST)
       : 'Keep listening is on. Press OK to turn it off. The power button then turns the TV off the normal way.';
   }
 
@@ -288,11 +297,28 @@
     } else if (ro.kind === 'keep') {
       k = { word: 'On', cls: 'warn', checked: 'true', can: true, cmd: 'set remote-off normal', confirm: '', warn: confirmText('keep', false) };
     } else {
-      k = { word: 'Off', cls: '', checked: 'false', can: true, cmd: 'set remote-off keep', confirm: confirmText('keep', true) };
+      k = { word: 'Off', cls: '', checked: 'false', can: true, cmd: 'set remote-off keep', confirm: confirmText('keep', true, ar.kind === 'alwaysReady' || ar.kind === 'allEnabled') };
       k.warn = k.confirm;
       k.confirm = k.confirm + CONFIRM_TAIL;
     }
     return [a, h, k];
+  }
+
+  // The hint under the Voice and power screen (and on the phone page): Keep
+  // listening is on and in effect (the daemon acts on it: no kill switch, a
+  // power watch) while Always Ready is off. Only for raw `off`: a value this app
+  // does not change (none, lifeOnScreen, allEnabled, unknown) gives no hint, since
+  // the button could not do what it says. The action is the normal two-press
+  // `set always-ready on`.
+  // { text, label, action, value, cmd } or null.
+  function hint(s) {
+    s = s || {};
+    var ar = arInfo(s.always_ready);
+    var ro = roInfo(s.remote_off);
+    var mic = s.mic || {};
+    var kill = mic.kill_switch === true || mic.state === 'kill';
+    if (ar.kind !== 'off' || ar.raw !== 'off' || ro.kind !== 'keep' || ro.noWatch || kill) { return null; }
+    return { text: HINT.text, label: HINT.label, action: 'always-ready', value: 'on', cmd: 'set always-ready on' };
   }
 
   // One line for the result of a `set` (the JSON line of ctl.sh), as [text, class].
@@ -461,7 +487,7 @@
 
   return {
     // matrix and rows (unchanged contract of 0.3.0, tables now with short forms)
-    outcome: outcome, rows: rows, resultMessage: resultMessage, confirmText: confirmText, wordOf: wordOf,
+    outcome: outcome, rows: rows, hint: hint, HINT: HINT, resultMessage: resultMessage, confirmText: confirmText, wordOf: wordOf,
     rowKind: rowKind, rowIndex: rowIndex, arInfo: arInfo, hlInfo: hlInfo, roInfo: roInfo,
     POWER: POWER, LISTEN: LISTEN, NOTE: NOTE, POWER_EXTRA: POWER_EXTRA, ROWS: ROWS,
     AR_MENU: AR_MENU, HL_MENU: HL_MENU, CONFIRM_TAIL: CONFIRM_TAIL,

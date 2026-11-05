@@ -62,7 +62,7 @@
           <button id="v-row-ar" class="vrow" role="switch" aria-checked="false">
             <span class="vr-label">Always Ready<span class="vr-tag">LG</span></span>
             <span id="v-ar-state" class="vr-state muted">Checking...</span><span id="v-ar-sw" class="sw na"></span>
-            <span class="vr-sub">Keeps the TV in standby for LG's own features. Uses more standby power.</span>
+            <span class="vr-sub">LG's setting. After the power button the TV waits in a light standby instead of suspending, so the satellite keeps hearing you. Uses more standby power.</span>
             <span id="v-ar-confirm" class="vr-confirm" hidden><span id="v-ar-confirm-text"></span><span class="bar"><i></i></span></span>
           </button>
           <button id="v-row-hl" class="vrow" role="switch" aria-checked="false">
@@ -74,7 +74,7 @@
           <button id="v-row-keep" class="vrow" role="switch" aria-checked="false">
             <span class="vr-label">Keep listening<span class="vr-tag">Satellite</span></span>
             <span id="v-keep-state" class="vr-state muted">Checking...</span><span id="v-keep-sw" class="sw na"></span>
-            <span class="vr-sub">A satellite setting. The TV stays on with the screen dark after the power button.</span>
+            <span class="vr-sub">A satellite setting. After the power button the satellite turns the TV back on with the screen dark. You can still talk to it and hear replies. Press power again for the picture.</span>
             <span id="v-keep-confirm" class="vr-confirm" hidden><span id="v-keep-confirm-text"></span><span class="bar"><i></i></span></span>
           </button>
           <div class="btnrow vfoot"><button id="v-refresh" class="btn">Refresh</button><p id="v-message" class="msg" aria-live="polite"></p></div>
@@ -86,6 +86,10 @@
             <div id="v-detail" class="oc-detail"></div>
             <div class="oc-listen"><span id="v-listen-dot" class="dot"></span><span id="v-listening"></span></div>
             <div id="v-notes" class="oc-notes"></div>
+          </div>
+          <div id="v-hint" class="vhint" hidden>
+            <p id="v-hint-text"></p>
+            <button id="v-hint-btn" class="btn" hidden>Turn on Always Ready</button>
           </div>
           <p id="v-warning" class="help"></p>
         </div>

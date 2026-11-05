@@ -148,7 +148,7 @@
 
   var FOCUS = {
     home: ['h-notice-btn', 'h-mic', 'h-voice', 'h-ha', 'h-diag'],
-    voice: ['v-row-ar', 'v-row-hl', 'v-row-keep', 'v-refresh'],
+    voice: ['v-row-ar', 'v-row-hl', 'v-row-keep', 'v-refresh', 'v-hint-btn'],
     ha: ['a-pair', 'a-phone', 'a-reset', 'a-endphone'],
     setup: ['q-done', 'q-again'],
     diag: ['d-check', 'd-report', 'd-ack', 'd-more'],
@@ -656,6 +656,14 @@
     text($('v-warning'), !vArmed && f >= 0 ? m[f].warn : (document.activeElement === $('v-refresh') && !vArmed ? 'Reads the TV settings again.' : ''));
     text($('v-message'), vMsg);
     $('v-message').className = 'msg ' + vMsgCls;
+    // Keep listening is on but Always Ready is off: offer to turn it on.
+    var hint = vLoaded && vData ? VP.hint(vData) : null;
+    var hintOn = !!hint && m[0].can;
+    show('v-hint', hintOn);
+    show('v-hint-btn', hintOn);
+    text($('v-hint-text'), hintOn ? hint.text : '');
+    text($('v-hint-btn'), hintOn ? hint.label : '');
+    if (!hintOn && document.activeElement === $('v-hint-btn')) { ensureFocus('v-row-keep'); }
   }
 
   function vDisarm() {
@@ -1142,6 +1150,13 @@
   onClick('h-diag', function () { go('diag'); });
 
   VROWS.forEach(function (r) { onClick(r.btn, function () { pressRow(r.id); }); });
+  // The hint arms the normal two-press Always Ready change: the focus moves to
+  // that row, which shows its confirm text; OK on the row sends the command.
+  onClick('v-hint-btn', function () {
+    if (vPending || overlayOpen()) { return; }
+    $('v-row-ar').focus();
+    pressRow('ar');
+  });
   onClick('v-refresh', function () {
     vDisarm();
     if (vPending) { return; }

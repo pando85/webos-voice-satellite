@@ -95,8 +95,11 @@ Short, plain, readable from the sofa at 22 px or larger. Strings are the contrac
 | --- | --- | --- |
 | P1 | `Power button: the TV goes to deep standby.` | `The satellite cannot hear until the TV is turned on.` |
 | P2 | `Power button: the TV goes to standby.` | `The satellite still hears you, but you will not hear its replies.` |
-| P3, P4 | `Power button: the screen goes dark but the TV stays on.` | `The satellite hears you and replies. Press power again to turn the picture on.` |
+| P3 (Always Ready off, Keep listening on) | `Power button: the TV turns itself back on with the screen dark.` | `About 5 to 6 seconds after the key. The satellite hears you and replies; press power again to turn the picture on. The TV may sometimes fall asleep instead, and the satellite then stops until the TV is turned on. Turn Always Ready on to avoid that.` |
+| P4 (Always Ready on, Keep listening on) | `Power button: the TV turns itself back on with the screen dark.` | `About 5 to 6 seconds after the key. The satellite hears you and replies. Press power again to turn the picture on.` |
 | PX | `Power button: not known.` | `The TV's settings could not be read. Press Refresh.` |
+
+(Card short forms: P3 `The TV turns back on, screen dark. May fall asleep.` (tone `warn`), P4 `The TV turns back on, screen dark.`. P3 differs from P4 because with Always Ready off LG starts a deep suspend about 7 s after the key and the satellite's wake (measured about 4.9 s on c3-b, [always-on 12](always-on.md)) has to land first: a margin of roughly 2 s, `verified-on-target` on c3-b only for the wake time, the occasional miss is a consequence of that margin, not an observed failure. With Always Ready on the TV first waits in `Active Standby`, so the wake always has time.)
 
 (Facts behind the short texts: P1 is `Active Standby` and then suspend 7 to 15 s after the key; P2 stays in `Active Standby`, replies silent, and the TV controls in Home Assistant are unavailable; P3 and P4 are the daemon's wake and darken. See 3.2.)
 
@@ -129,7 +132,9 @@ Row label and the state word shown at the right:
 | 2 | `Hi LG` | `On`, `Off` (both for thinQ), `Not known`, `Cannot read` (disabled, with the menu path) |
 | 3 | `Keep listening` | `On`, `Off`, `Cannot read` |
 
-Row sub-line (always visible, one line): row 1 `Keeps the TV in standby for LG's own features. Uses more standby power.`; row 2 `LG's own voice assistant. When it is on, the satellite may not be able to use the microphone.`; row 3 `A satellite setting. The TV stays on with the screen dark after the power button.`
+Row sub-line (always visible, in the row; the phone page drops the leading `A satellite setting. `): row 1 `LG's setting. After the power button the TV waits in a light standby instead of suspending, so the satellite keeps hearing you. Uses more standby power.`; row 2 `LG's own voice assistant. When it is on, the satellite may not be able to use the microphone.`; row 3 `A satellite setting. After the power button the satellite turns the TV back on with the screen dark. You can still talk to it and hear replies. Press power again for the picture.`
+
+**Hint** (0.4.1): while Keep listening is on and in effect (no kill switch, power watch on) and Always Ready's raw value is `off`, a box beside the warning area says `Works best with Always Ready on. Turn it on?` with a focusable button `Turn on Always Ready`. OK on the button moves the focus to the Always Ready row and arms the normal two-press change (the confirm text of that row; a second OK sends `set always-ready on`; any other key or focus move disarms, as for the row itself). No new `ctl.sh` command. It is hidden for every other state, in particular when Always Ready's raw value is `none`, `lifeOnScreen`, `allEnabled`, unknown or unreadable (the row cannot be changed, so the button could not do what it says). The phone page shows the same text under the Keep listening row with the button `Turn on Always Ready`, which sends the same request as the Always Ready switch (the TV asks as usual). Source: `hint()` in `voicepower.js`.
 
 ### 4.4 Warnings and confirm texts
 
@@ -137,11 +142,11 @@ Shown in the warning area while a row is focused, and as the confirm text after 
 
 | Change | Text (the confirm prompt ends with `Press OK again to confirm.`) |
 | --- | --- |
-| Always Ready off to on | `Turn on Always Ready? The TV then uses more power in standby (not measured). With "Keep listening" off, the satellite hears you after the power button but its replies are silent.` |
-| Always Ready on to off | `Turn off Always Ready? Without "Keep listening", the TV suspends after the power button and the satellite stops.` |
+| Always Ready off to on | `Turn on Always Ready? After the power button the TV waits in a light standby, so the satellite keeps hearing you. With "Keep listening" on, it reliably turns the TV back on, dark, to reply. With it off, you hear no replies. The TV uses more standby power (not measured).` |
+| Always Ready on to off | `Turn off Always Ready? Without "Keep listening", the TV suspends after the power button and the satellite stops. With it on, the satellite has to wake the TV within about 7 seconds, so the TV may sometimes fall asleep instead.` |
 | Hi LG off to on | `Turn on Hi LG? LG's assistant may take the microphone, so the satellite may not hear you. It did not while the satellite already had the microphone, but it can after a restart.` |
 | Hi LG on to off | `Turn off Hi LG? The TV stops answering "Hi LG". The satellite can use the microphone.` |
-| Keep listening off to on | `Turn on Keep listening? After the power button the TV stays on with the screen dark. It uses more power than standby (not measured), LG's OLED care at power-off may not run, and the screen may flash briefly (not observed).` |
+| Keep listening off to on | `Turn on Keep listening? About 5 to 6 seconds after the power button the satellite turns the TV back on with the screen dark. You can talk to it and hear replies; press power again for the picture. It uses more power than standby (not measured), LG's OLED care at power-off may not run, and the screen may flash briefly (not observed).` plus ` Works best with Always Ready on.` unless Always Ready is already on (`allEnabled` counts as on) |
 | Keep listening on to off | no confirm (one press); the focused row shows `Keep listening is on. Press OK to turn it off. The power button then turns the TV off the normal way.`; the result line is `Done. The power button turns the TV off the normal way.` |
 
 Result lines (one line under the rows, the app's existing `message` area):
@@ -165,13 +170,12 @@ Existing app (`packaging/webos/app/`, ES5, one `main`, a hidden `report-view` se
 ```
 Voice and power                                   (h1)
 +--------------------------------------------------------------+
-| Power button: the screen goes dark but the TV stays on.       |  headline, aria-live
-| The satellite hears you and replies. Press power again to     |  detail
-| turn the picture on.                                          |
+| Power button: the TV turns itself back on with the screen     |  headline, aria-live
+| dark. About 5 to 6 seconds after the key. The satellite ...   |  detail
 | Listening now: yes.                                           |
 +--------------------------------------------------------------+
 | [ Always Ready                               Off ]            |  row 1  (focus)
-|   Keeps the TV in standby for LG's own features. ...          |
+|   LG's setting. After the power button the TV waits ...       |
 | [ Hi LG                                      Off ]            |  row 2
 | [ Keep listening                              On ]            |  row 3
 +--------------------------------------------------------------+

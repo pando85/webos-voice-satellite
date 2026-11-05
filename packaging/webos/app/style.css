@@ -113,6 +113,9 @@ button { font: inherit; color: inherit; text-align: left; cursor: pointer; margi
 .oc-listen { font-size: 29px; display: flex; align-items: baseline; padding-top: 16px; margin-top: 16px; border-top: 2px solid var(--t-line); }
 .oc-listen .dot { margin-right: 16px; }
 .oc-notes { font-size: 25px; color: var(--t-warn); white-space: pre-line; margin-top: 12px; }
+.vhint { margin: 22px 0 0; padding: 20px 28px; border-radius: var(--t-radius); background: var(--t-card2); border: 2px solid var(--t-warn); }
+.vhint p { font-size: 28px; line-height: 1.35; margin: 0 0 16px; }
+.vhint .btn { margin-right: 0; }
 .help { font-size: 27px; color: var(--t-muted); line-height: 1.4; padding: 0 6px; margin: 28px 0 0; min-height: 120px; }
 
 /* buttons */
