@@ -398,7 +398,7 @@ async def run_ab(ctx):
             if not ctx.tv.wait_streaming(t_restart):
                 bnotes.append("no_streaming_after_restart")
                 log("WARNING: the satellite did not report streaming within 90 s")
-            if plan["arms"][blk["arm"]]["aec"] and cond["content"]:
+            if L.arm_aec_enabled(plan["arms"][blk["arm"]]["aec"]) and cond["content"]:
                 lock = ctx.tv.wait_lock(t_restart)
                 if lock is None:
                     bnotes.append("no_delay_lock")

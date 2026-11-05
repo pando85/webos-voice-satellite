@@ -126,8 +126,12 @@ class Plans(unittest.TestCase):
     def test_exp019_design(self):
         plan = L.load_plan(PLANS / "exp019-off-vs-bns.toml")
         self.assertEqual(set(plan["arms"]), {"OFF", "B+NS"})
-        self.assertEqual(plan["arms"]["OFF"]["aec"], "")
+        self.assertEqual(plan["arms"]["OFF"]["aec"], "[aec]\nenabled = false\n")
         self.assertIn("ns = true", plan["arms"]["B+NS"]["aec"])
+        # Since 0.4.3 a missing [aec] section is the B+NS default (on): OFF must say enabled = false.
+        self.assertFalse(L.arm_aec_enabled(plan["arms"]["OFF"]["aec"]))
+        self.assertTrue(L.arm_aec_enabled(plan["arms"]["B+NS"]["aec"]))
+        self.assertTrue(L.arm_aec_enabled(""))
         self.assertEqual({c["tv_volume"] for c in plan["conditions"].values()}, {10, 15})
         self.assertEqual({t["sink_pct"] for n, t in plan["talkers"].items() if n == "natural"}, {82})
         per = collections.Counter((b["condition"], b["arm"]) for b in plan["blocks"])

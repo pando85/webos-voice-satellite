@@ -737,9 +737,40 @@ pub(crate) enum AecOutputKind {
     Nearend,
 }
 
+/// The built-in `[aec.aec3]` overrides of the shipped "B + NS"
+/// configuration (owner decision 2026-11-05, docs/design/aec-frontend.md
+/// section 12). A user's `[aec.aec3]` table is merged over these key by key;
+/// AEC3's own values are `"linear_mix" = 0.0` and
+/// `"ep_strength.default_len" = 0.83`.
+pub(crate) const DEFAULT_AEC3: [(&str, f32); 2] =
+    [("linear_mix", 0.4), ("ep_strength.default_len", 0.0)];
+
+/// [`DEFAULT_AEC3`] as the `[aec.aec3]` table.
+pub(crate) fn default_aec3() -> std::collections::BTreeMap<String, f32> {
+    DEFAULT_AEC3
+        .iter()
+        .map(|&(k, v)| (k.to_owned(), v))
+        .collect()
+}
+
+/// `[aec.aec3]` from the file, merged over [`default_aec3`]: a key the file
+/// sets replaces the default, the other defaults stay.
+fn aec3_over_defaults<'de, D: Deserializer<'de>>(
+    d: D,
+) -> Result<std::collections::BTreeMap<String, f32>, D::Error> {
+    let mut t = default_aec3();
+    t.extend(std::collections::BTreeMap::<String, f32>::deserialize(d)?);
+    Ok(t)
+}
+
 /// `[aec]`: echo cancellation with the TV's output as the reference
 /// (docs/design/aec-frontend.md). The ALSA reference is opened on the mic's
 /// card (`mic.card_id`), matched by PCM id or name.
+///
+/// On by default since 0.4.3 with the "B + NS" configuration (owner
+/// decision 2026-11-05: stereo render, noise suppression, [`DEFAULT_AEC3`]);
+/// `enabled = false` turns it off. If the reference cannot be opened or
+/// fails, the mic runs without echo cancellation (logged).
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[allow(clippy::struct_excessive_bools)] // one bool per TOML switch
 #[serde(default, deny_unknown_fields)]
@@ -775,30 +806,31 @@ pub(crate) struct AecSection {
     /// Raw reference file for `mic.source = "file"` (read in lockstep with
     /// `mic.path`).
     pub(crate) reference_path: Option<PathBuf>,
-    /// `[aec.aec3]`: experimental AEC3 overrides, `"<parameter>" = value`
-    /// (names: `webos_dsp::Aec3Param`). Empty: AEC3's defaults.
+    /// `[aec.aec3]`: AEC3 overrides, `"<parameter>" = value` (names:
+    /// `webos_dsp::Aec3Param`), merged over [`DEFAULT_AEC3`].
+    #[serde(deserialize_with = "aec3_over_defaults")]
     pub(crate) aec3: std::collections::BTreeMap<String, f32>,
 }
 
 impl Default for AecSection {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             reference_pcm_id: "SoundEngineCapture".to_owned(),
             reference_format: RefFormat::S32Le,
             reference_channels: 2,
-            render_channels: 1,
+            render_channels: 2,
             output: AecOutputKind::Full,
             reference_rate: 48_000,
             reference_period_frames: 256,
             reference_buffer_frames: 8192,
             link: true,
             delay_ms: AecDelay::Auto,
-            ns: false,
+            ns: true,
             bypass_when_silent: false,
             reference_gain_db: 0.0,
             reference_path: None,
-            aec3: std::collections::BTreeMap::new(),
+            aec3: default_aec3(),
         }
     }
 }
@@ -1274,9 +1306,10 @@ impl Settings {
         if !(1..=8).contains(&a.reference_channels) {
             return Err(err("aec.reference_channels must be between 1 and 8"));
         }
-        if !(1..=webos_dsp::MAX_RENDER_CHANNELS).contains(&a.render_channels)
-            || a.render_channels > a.reference_channels
-        {
+        // More render than reference channels is not an error (the default
+        // stereo render with `reference_channels = 1`): the canceller then
+        // takes the downmix (warned).
+        if !(1..=webos_dsp::MAX_RENDER_CHANNELS).contains(&a.render_channels) {
             return Err(err(
                 "aec.render_channels must be 1 (downmix) or 2 (stereo, needs aec.reference_channels >= 2)",
             ));
@@ -1297,17 +1330,18 @@ impl Settings {
         if !a.reference_gain_db.is_finite() || !(-20.0..=40.0).contains(&a.reference_gain_db) {
             return Err(err("aec.reference_gain_db must be between -20 and 40"));
         }
-        if !a.enabled && (a.ns || a.bypass_when_silent || !a.aec3.is_empty()) {
-            return Err(err(
-                "aec.ns, aec.bypass_when_silent and [aec.aec3] need aec.enabled = true",
-            ));
-        }
-        if a.enabled && self.mic.source == MicSource::File && a.reference_path.is_none() {
-            return Err(err(
-                "aec.enabled with mic.source = \"file\" needs aec.reference_path",
-            ));
-        }
+        // With `enabled = false` the other keys (the B + NS defaults
+        // included) are ignored; a file mic without `reference_path` runs
+        // without the canceller. Both are warnings, not errors.
         Ok(())
+    }
+
+    /// Whether the echo canceller is set up at a microphone open:
+    /// `aec.enabled`, and for a file mic a `reference_path`. The reference
+    /// is opened only then; whether it opens is decided per open.
+    pub(crate) fn aec_active(&self) -> bool {
+        self.aec.enabled
+            && (self.mic.source == MicSource::Alsa || self.aec.reference_path.is_some())
     }
 
     /// Non-fatal findings about the configuration, for the startup log and
@@ -1375,13 +1409,36 @@ impl Settings {
                 w.push(format!("aec.reference_path {} does not exist", p.display()));
             }
         }
-        if self.aec.enabled && self.aec.ns {
+        w.extend(self.aec_warnings());
+        w.extend(self.tv_control_warnings());
+        w
+    }
+
+    /// Findings about `[aec]`.
+    fn aec_warnings(&self) -> Vec<String> {
+        let a = &self.aec;
+        let mut w = Vec::new();
+        if !a.enabled {
+            if a.bypass_when_silent || a.aec3 != default_aec3() {
+                w.push(
+                    "aec.bypass_when_silent and [aec.aec3] are ignored with aec.enabled = false"
+                        .to_owned(),
+                );
+            }
+            return w;
+        }
+        if self.mic.source == MicSource::File && a.reference_path.is_none() {
             w.push(
-                "aec.ns is on: noise suppression has been evaluated offline only, not on a TV"
+                "aec.enabled with mic.source = \"file\" and no aec.reference_path: running without echo cancellation"
                     .to_owned(),
             );
         }
-        w.extend(self.tv_control_warnings());
+        if a.render_channels > a.reference_channels {
+            w.push(format!(
+                "aec.render_channels = {} with aec.reference_channels = {}: the canceller takes the downmix",
+                a.render_channels, a.reference_channels
+            ));
+        }
         w
     }
 
@@ -1513,7 +1570,7 @@ impl Settings {
         webos_dsp::AecConfig {
             reference_rate: a.reference_rate,
             reference_channels: a.reference_channels,
-            render_channels: a.render_channels,
+            render_channels: a.render_channels.min(a.reference_channels).max(1),
             output: match a.output {
                 AecOutputKind::Full => webos_dsp::AecOutput::Full,
                 AecOutputKind::Linear => webos_dsp::AecOutput::Linear,
@@ -1629,7 +1686,9 @@ impl Settings {
             "PLAINTEXT".to_owned()
         };
         let a = &self.aec;
-        let aec = if a.enabled {
+        let aec = if a.enabled && !self.aec_active() {
+            "off (file mic without aec.reference_path)".to_owned()
+        } else if a.enabled {
             format!(
                 "on ref={} {}/{}ch/{}Hz render_ch={} output={} link={} delay_ms={} ns={} bypass={} ref_gain_db={}{}{}",
                 a.reference_pcm_id,
@@ -2011,7 +2070,8 @@ level = "debug"
     fn aec_section_defaults_parse_and_validate() {
         let base = Path::new("/cfg");
         let s = Settings::default();
-        assert!(!s.aec.enabled);
+        assert!(s.aec.enabled);
+        assert!(s.aec_active());
         assert_eq!(s.aec.reference_pcm_id, "SoundEngineCapture");
         assert_eq!(s.aec.delay_ms, AecDelay::Auto);
         let c = s.aec_config();
@@ -2023,7 +2083,7 @@ level = "debug"
                 c.ns,
                 c.bypass_when_silent
             ),
-            (48_000, 2, false, false)
+            (48_000, 2, true, false)
         );
         #[cfg(target_os = "linux")]
         assert_eq!(
@@ -2046,12 +2106,17 @@ level = "debug"
             "{}",
             s.summary()
         );
-        assert!(s.warnings().iter().any(|w| w.contains("aec.ns")));
+        // NS is no longer flagged as untested on a TV (EXP-018, EXP-021).
+        assert!(
+            s.warnings().iter().all(|w| !w.contains("aec.ns")),
+            "{:?}",
+            s.warnings()
+        );
         let s = Settings::from_toml("[aec]\ndelay_ms = 20\n", base).unwrap();
         assert_eq!(s.aec.delay_ms, AecDelay::Fixed(20.0));
-        assert_eq!(s.aec_config().render_channels, 1);
-        let s = Settings::from_toml("[aec]\nrender_channels = 2\n", base).unwrap();
         assert_eq!(s.aec_config().render_channels, 2);
+        let s = Settings::from_toml("[aec]\nrender_channels = 1\n", base).unwrap();
+        assert_eq!(s.aec_config().render_channels, 1);
         assert_eq!(s.aec_config().output, webos_dsp::AecOutput::Full);
         let s = Settings::from_toml("[aec]\noutput = \"linear\"\n", base).unwrap();
         assert_eq!(s.aec_config().output, webos_dsp::AecOutput::Linear);
@@ -2064,15 +2129,18 @@ level = "debug"
         assert_eq!(c.render_channels, 2);
         assert_eq!(c.aec3.get(webos_dsp::Aec3Param::LinearMix), Some(0.3));
         assert_eq!(c.aec3.get(webos_dsp::Aec3Param::DneSnrThreshold), Some(3.0));
-        assert!(Settings::default().aec_config().aec3.is_empty());
+        // The B + NS default not overridden here stays.
+        assert_eq!(c.aec3.get(webos_dsp::Aec3Param::EpDefaultLen), Some(0.0));
         assert!(
-            s.summary().contains("aec3={linear_mix=0.3,"),
+            s.summary()
+                .contains("aec3={ep_strength.default_len=0,linear_mix=0.3,"),
             "{}",
             s.summary()
         );
         let e = Settings::from_toml("[aec]\noutput = \"half\"\n", base).unwrap_err();
         assert!(e.0.contains("half"), "{e}");
-        assert!(Settings::default().summary().contains("aec=[off]"));
+        let off = Settings::from_toml("[aec]\nenabled = false\n", base).unwrap();
+        assert!(off.summary().contains("aec=[off]"));
         // Unknown words and keys are rejected with the key named.
         let e = Settings::from_toml("[aec]\ndelay_ms = \"soon\"\n", base).unwrap_err();
         assert!(e.0.contains("auto"), "{e}");
@@ -2096,10 +2164,6 @@ level = "debug"
             ("aec.reference_channels", |s| s.aec.reference_channels = 9),
             ("aec.render_channels", |s| s.aec.render_channels = 0),
             ("aec.render_channels", |s| s.aec.render_channels = 3),
-            ("aec.render_channels", |s| {
-                s.aec.reference_channels = 1;
-                s.aec.render_channels = 2;
-            }),
             ("aec.aec3", |s| {
                 s.aec.enabled = true;
                 s.aec.aec3.insert("nope".into(), 1.0);
@@ -2108,24 +2172,12 @@ level = "debug"
                 s.aec.enabled = true;
                 s.aec.aec3.insert("linear_mix".into(), 2.0);
             }),
-            ("aec.aec3", |s| {
-                s.aec.aec3.insert("linear_mix".into(), 0.3);
-            }),
             ("aec.reference_period_frames", |s| {
                 s.aec.reference_buffer_frames = 128;
             }),
             ("aec.delay_ms", |s| s.aec.delay_ms = AecDelay::Fixed(600.0)),
             ("aec.delay_ms", |s| s.aec.delay_ms = AecDelay::Fixed(-1.0)),
             ("aec.reference_gain_db", |s| s.aec.reference_gain_db = 41.0),
-            ("aec.ns", |s| s.aec.ns = true),
-            ("aec.bypass_when_silent", |s| {
-                s.aec.bypass_when_silent = true;
-            }),
-            ("aec.reference_path", |s| {
-                s.aec.enabled = true;
-                s.mic.source = MicSource::File;
-                s.mic.path = Some(PathBuf::from("m.raw"));
-            }),
         ];
         for (key, f) in cases {
             let mut bad = s.clone();
@@ -2139,6 +2191,39 @@ level = "debug"
         ok.aec.bypass_when_silent = true;
         ok.aec.delay_ms = AecDelay::Fixed(0.0);
         ok.validate().unwrap();
+        // More render than reference channels: the downmix, warned.
+        let mut mono_ref = s.clone();
+        mono_ref.aec.reference_channels = 1;
+        mono_ref.validate().unwrap();
+        assert_eq!(mono_ref.aec_config().render_channels, 1);
+        assert!(
+            mono_ref
+                .warnings()
+                .iter()
+                .any(|w| w.contains("aec.render_channels"))
+        );
+        // Off: the other keys are ignored, not rejected; tuning set while
+        // off is warned.
+        let mut off = s.clone();
+        off.aec.enabled = false;
+        off.validate().unwrap();
+        assert!(off.warnings().iter().all(|w| !w.contains("aec")));
+        off.aec.bypass_when_silent = true;
+        off.aec.aec3.insert("linear_mix".into(), 0.3);
+        off.validate().unwrap();
+        assert!(off.warnings().iter().any(|w| w.contains("ignored")));
+        // A file mic without a reference file: on, but no canceller (warned).
+        let mut file = s.clone();
+        file.mic.source = MicSource::File;
+        file.mic.path = Some(PathBuf::from("m.raw"));
+        file.validate().unwrap();
+        assert!(!file.aec_active());
+        assert!(
+            file.warnings()
+                .iter()
+                .any(|w| w.contains("no aec.reference_path"))
+        );
+        assert!(file.summary().contains("aec=[off (file mic"));
         // A file reference with the ALSA mic is ignored (warned).
         ok.aec.reference_path = Some(PathBuf::from("r.raw"));
         assert!(
@@ -2146,6 +2231,122 @@ level = "debug"
                 .iter()
                 .any(|w| w.contains("aec.reference_path is ignored"))
         );
+    }
+
+    /// The shipped default (owner decision 2026-11-05): AEC on with B + NS.
+    fn assert_b_plus_ns(s: &Settings) {
+        assert!(s.aec.enabled && s.aec_active());
+        let c = s.aec_config();
+        assert_eq!(c.render_channels, 2);
+        assert!(c.ns);
+        assert!(!c.bypass_when_silent);
+        assert_eq!(c.output, webos_dsp::AecOutput::Full);
+        assert_eq!(c.delay, webos_dsp::DelayMode::Auto);
+        assert_eq!(c.aec3.get(webos_dsp::Aec3Param::LinearMix), Some(0.4));
+        assert_eq!(c.aec3.get(webos_dsp::Aec3Param::EpDefaultLen), Some(0.0));
+        assert_eq!(c.aec3.iter().count(), 2);
+    }
+
+    #[test]
+    fn aec_defaults_to_b_plus_ns_without_a_section_or_keys() {
+        let base = Path::new("/cfg");
+        for text in [
+            "",
+            "[aec]\n",
+            "[aec]\nenabled = true\n",
+            "[aec.aec3]\n",
+            "[aec]\n[aec.aec3]\n",
+        ] {
+            let s = Settings::from_toml(text, base).unwrap();
+            assert_b_plus_ns(&s);
+            let mut v = s.clone();
+            v.device.allow_plaintext = true;
+            v.validate().unwrap();
+        }
+        assert_b_plus_ns(&Settings::default());
+        let s = Settings::default().summary();
+        assert!(
+            s.contains("aec=[on ref=SoundEngineCapture s32_le/2ch/48000Hz render_ch=2 output=full link=true delay_ms=auto ns=true bypass=false ref_gain_db=0 aec3={ep_strength.default_len=0,linear_mix=0.4}]"),
+            "{s}"
+        );
+        // The B + NS config the live A/B used, written out, is the default.
+        let explicit = Settings::from_toml(
+            "[aec]\nenabled = true\nrender_channels = 2\nns = true\n\n[aec.aec3]\n\"linear_mix\" = 0.4\n\"ep_strength.default_len\" = 0.0\n",
+            base,
+        )
+        .unwrap();
+        assert_eq!(explicit, Settings::from_toml("", base).unwrap());
+    }
+
+    #[test]
+    fn aec_enabled_false_turns_it_off_cleanly() {
+        let base = Path::new("/cfg");
+        let mut s = Settings::from_toml("[aec]\nenabled = false\n", base).unwrap();
+        s.device.allow_plaintext = true;
+        s.validate().unwrap();
+        assert!(!s.aec.enabled);
+        assert!(!s.aec_active());
+        assert!(s.summary().contains("aec=[off]"));
+        assert!(s.warnings().iter().all(|w| !w.contains("aec")));
+        // The B + NS keys written out next to enabled = false are accepted
+        // (a toggle that only flips `enabled`) and ignored.
+        let mut s = Settings::from_toml(
+            "[aec]\nenabled = false\nrender_channels = 2\nns = true\n[aec.aec3]\n\"linear_mix\" = 0.4\n",
+            base,
+        )
+        .unwrap();
+        s.device.allow_plaintext = true;
+        s.validate().unwrap();
+        assert!(!s.aec_active());
+        assert!(s.summary().contains("aec=[off]"));
+    }
+
+    #[test]
+    fn aec_partial_overrides_keep_the_other_defaults() {
+        let base = Path::new("/cfg");
+        let s = Settings::from_toml("[aec]\nns = false\n", base).unwrap();
+        let c = s.aec_config();
+        assert!(s.aec.enabled);
+        assert!(!c.ns);
+        assert_eq!(c.render_channels, 2);
+        assert_eq!(c.aec3.get(webos_dsp::Aec3Param::LinearMix), Some(0.4));
+
+        let s = Settings::from_toml("[aec]\nrender_channels = 1\nreference_gain_db = 6\n", base)
+            .unwrap();
+        let c = s.aec_config();
+        assert_eq!(c.render_channels, 1);
+        assert!(c.ns);
+        assert!((c.reference_gain_db - 6.0).abs() < f32::EPSILON);
+        assert_eq!(c.aec3.iter().count(), 2);
+
+        // One aec3 key: it replaces that default, the other default stays.
+        let s = Settings::from_toml("[aec.aec3]\n\"linear_mix\" = 0.25\n", base).unwrap();
+        let c = s.aec_config();
+        assert_eq!(c.aec3.get(webos_dsp::Aec3Param::LinearMix), Some(0.25));
+        assert_eq!(c.aec3.get(webos_dsp::Aec3Param::EpDefaultLen), Some(0.0));
+        assert!(c.ns && c.render_channels == 2);
+
+        // A new aec3 key is added to the defaults.
+        let s = Settings::from_toml("[aec.aec3]\n\"erle.min\" = 2.0\n", base).unwrap();
+        let c = s.aec_config();
+        assert_eq!(c.aec3.get(webos_dsp::Aec3Param::ErleMin), Some(2.0));
+        assert_eq!(c.aec3.iter().count(), 3);
+
+        // AEC3's own behaviour: its own values written out.
+        let s = Settings::from_toml(
+            "[aec]\nrender_channels = 1\nns = false\n[aec.aec3]\n\"linear_mix\" = 0.0\n\"ep_strength.default_len\" = 0.83\n",
+            base,
+        )
+        .unwrap();
+        let c = s.aec_config();
+        assert_eq!(c.aec3.get(webos_dsp::Aec3Param::LinearMix), Some(0.0));
+        assert_eq!(c.aec3.get(webos_dsp::Aec3Param::EpDefaultLen), Some(0.83));
+        assert!(!c.ns);
+
+        // An invalid override is still rejected, with the key named.
+        let mut s = Settings::from_toml("[aec.aec3]\n\"linear_mix\" = 2.0\n", base).unwrap();
+        s.device.allow_plaintext = true;
+        assert!(s.validate().unwrap_err().0.contains("aec.aec3"));
     }
 
     #[test]

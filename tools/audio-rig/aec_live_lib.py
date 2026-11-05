@@ -109,7 +109,8 @@ def parse_plan(raw, source="plan"):
 
 
 def validate_arm_snippet(text, name="arm"):
-    """An arm is only `[aec]` and `[aec.*]` tables (empty = no [aec] section = AEC off)."""
+    """An arm is only `[aec]` and `[aec.*]` tables (empty = no [aec] section = the satellite's built-in
+    default: B+NS on since 0.4.3, off before; write `enabled = false` for an OFF arm)."""
     if not text.strip():
         return ""
     try:
@@ -120,6 +121,14 @@ def validate_arm_snippet(text, name="arm"):
     if extra or "aec" not in d:
         raise PlanError(f"arm {name}: only [aec] / [aec.aec3] tables are allowed (found {sorted(set(d) - {'aec'}) or 'no [aec]'})")
     return text if text.endswith("\n") else text + "\n"
+
+
+def arm_aec_enabled(text):
+    """Whether an arm runs the canceller: its `[aec] enabled`, which defaults to true since 0.4.3
+    (B+NS), so an empty arm (no [aec] section) is on too."""
+    if not text.strip():
+        return True
+    return bool(tomllib.loads(text).get("aec", {}).get("enabled", True))
 
 
 def validate_plan(plan):
@@ -246,7 +255,7 @@ def format_schedule(plan, item_seconds=None):
     lines = [f"plan {plan['id']}: {plan['title']}", f"seed {plan['seed']}, log level {plan['log_level'] or '(unchanged)'}", ""]
     lines.append("arms:")
     for n, a in plan["arms"].items():
-        body = " ".join(l.strip() for l in a["aec"].splitlines() if l.strip()) or "(no [aec] section: AEC off)"
+        body = " ".join(l.strip() for l in a["aec"].splitlines() if l.strip()) or "(no [aec] section: the built-in default, B+NS since 0.4.3)"
         lines.append(f"  {n}: {body}")
     lines.append("conditions:")
     for n, c in plan["conditions"].items():
@@ -650,7 +659,7 @@ def trial_row(plan, run_id, rec, log_entries, block, skew_s=0.0):
             row["stt_match"], row["stt_wer"] = stt_scores(it, rec.get("stt_text"))
     else:
         notes.append("invalid")
-    if plan["arms"][rec["arm"]]["aec"]:
+    if arm_aec_enabled(plan["arms"][rec["arm"]]["aec"]):
         t_mid = rec["t_play"] + rec["lead_s"] + rec["sink_latency_s"] + it["duration_ms"] / 2000 + skew_s
         w = window_for(t_mid, log_entries)
         if w:

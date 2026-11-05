@@ -78,3 +78,23 @@ opt-level = 3
 
 [profile.dev]
 panic = "unwind"
+
+# The same DSP crates at opt-level 3 in the dev profile, which `cargo test`
+# uses: at opt-level 0 the AEC3/NS tests (webos-dsp, and the satellite's
+# capture tests that run the canceller) took minutes and many cores.
+[profile.dev.package.webos-dsp]
+opt-level = 3
+[profile.dev.package.sonora]
+opt-level = 3
+[profile.dev.package.sonora-aec3]
+opt-level = 3
+[profile.dev.package.sonora-ns]
+opt-level = 3
+[profile.dev.package.sonora-agc2]
+opt-level = 3
+[profile.dev.package.sonora-fft]
+opt-level = 3
+[profile.dev.package.sonora-simd]
+opt-level = 3
+[profile.dev.package.sonora-common-audio]
+opt-level = 3

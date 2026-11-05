@@ -160,7 +160,7 @@ Final data and control flow (new parts marked `*`):
    v
  PulseAudio mixes #1 + #2 (+ the TV program; it resamples a 44.1 kHz stream) -> TV sound engine -> speaker / ARC
 
- Mic path (unchanged): capture -> HPF and gain (AEC parked) -> ESPHome API -> HA wake word.
+ Mic path (unchanged): capture -> HPF, AEC (on by default since 0.4.3) and gain -> ESPHome API -> HA wake word.
  The mic hears the music; that is risk R1 and gate G4.
 ```
 
@@ -295,7 +295,7 @@ Common rules: c3-a first, c3-b only after c3-a and with the owner's agreement; o
 
 | # | Risk | Effect | Mitigation | Check |
 | --- | --- | --- | --- | --- |
-| R1 | **Music near the mic: false wakes, missed wake word, polluted STT.** The mic is near-raw and AEC is parked (`[aec] enabled = false`) | the assistant triggers on lyrics, "stop" fails at volume, bad STT after a wake | duck on wake; document the limit; `max_volume_percent` available; **gate G4**: measure, and if bad ask the owner to un-park AEC (backlog #1; the reference tap sees the music because both streams go through PulseAudio into the TV sound engine, verified for a `pacat` tone) | EXP-015 |
+| R1 | **Music near the mic: false wakes, missed wake word, polluted STT.** The mic is near-raw and AEC was parked when this was written (on by default with B + NS since 0.4.3, [ADR 0011](../decisions/0011-aec-on-by-default.md)) | the assistant triggers on lyrics, "stop" fails at volume, bad STT after a wake | duck on wake; document the limit; `max_volume_percent` available; **gate G4**: measure, and if bad ask the owner to un-park AEC (backlog #1; the reference tap sees the music because both streams go through PulseAudio into the TV sound engine, verified for a `pacat` tone) | EXP-015 |
 | R2 | **HA proxy URLs: no Range, restart on a second request, at most 2 conversions per device** (review); **Music Assistant bypasses the proxy** and sends an endless continuous stream | a dropped connection or a long pause loses the stream; an HA-side eviction (for example `assist_satellite.announce` with a media file and a chime) ends the music | never retry a URL (it would restart the track); report `idle` and let HA or MA decide; open and close every URL the satellite will not play (refused `ENQUEUE`, refused target, disabled music) so no slot stays held; document the announce limit; treat endless streams and close-ended bodies as normal | M1, M3a, M5 S11 to S13, M2b |
 | R3 | **CPU on the TV** (armv7 soft-float, opt-level `z`; the AEC stage cost 23 times the host on float DSP; MP3 is float-heavy) | mic or API starvation, watchdog stalls | FLAC integer decode, MP3 not advertised, **Q15 integer gain and ramps**, `opt-level = 3` for the decoder crates, WAV as a no-decode format, decode on its own named thread, optional lower priority | EXP-013 (per-thread CPU) |
 | R4 | **Memory under the 64 MiB RSS limit** (`limits.max_rss_mb`, daemon about 1.7 MB idle, verified on c3-a) and the watchdog | the watchdog exits with code 72 | fixed caps, 1 MiB of music buffers, bounded channels, no unbounded growth on endless streams; the second `pacat` is a child process outside the daemon's count (record it) | M3a memory test, EXP-013 |

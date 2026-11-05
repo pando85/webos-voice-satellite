@@ -43,7 +43,11 @@ sink_pct = 100               # the JBL's maximum with these files: -40.5 dBFS at
 label = "loud"
 
 [arms.OFF]
-aec = ""                     # no [aec] section: the canceller is off
+# Explicit since 0.4.3: without an [aec] section the satellite runs its built-in B+NS default.
+aec = """
+[aec]
+enabled = false
+"""
 note = "baseline"
 
 [arms."B+NS"]

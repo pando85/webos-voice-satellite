@@ -5,7 +5,11 @@
 //! mode: [`FilePair`] with `aec.reference_path`), and the front-end runs the
 //! echo canceller between its high-pass filter and its gain. A reference
 //! that cannot be opened or fails is logged and the mic runs without echo
-//! cancellation; it is retried at the next open of the microphone.
+//! cancellation; it is retried at the next open of the microphone. The
+//! reference never costs the microphone: if the mic fails to start together
+//! with the reference, the plain mic is opened instead, and after
+//! [`REF_STRIKES`] stream failures in a row with the reference open, the
+//! next open is without it (`[aec]` is on by default since 0.4.3).
 //!
 //! The thread always drains the ALSA source (so the ring buffer does not
 //! overrun) but forwards audio only while [`Shared::streaming`] is set, which
@@ -64,6 +68,10 @@ const RETRY_MAX: Duration = Duration::from_secs(30);
 pub(crate) const KILL_SWITCH_POLL: Duration = Duration::from_millis(250);
 /// A stream that ran this long resets the stream-error backoff.
 const STREAM_OK_AFTER: Duration = Duration::from_secs(60);
+/// Stream failures in a row with the echo reference open after which the
+/// next open is the plain microphone (the reference is tried again at the
+/// open after that).
+const REF_STRIKES: u32 = 2;
 /// Level statistics are logged at debug this often.
 const STATS_EVERY: Duration = Duration::from_secs(60);
 
@@ -132,7 +140,7 @@ struct AecSettings {
 
 impl CaptureSettings {
     pub(crate) fn from_settings(s: &Settings) -> Self {
-        let aec = s.aec.enabled.then(|| AecSettings {
+        let aec = s.aec_active().then(|| AecSettings {
             dsp: s.aec_config(),
             #[cfg(target_os = "linux")]
             reference: s.reference_config(),
@@ -377,7 +385,13 @@ fn sleep_unless_stopped(shared: &Shared, d: Duration) -> bool {
     false
 }
 
-fn open_source(cfg: &CaptureSettings) -> Result<Box<dyn AudioSource>, CaptureError> {
+/// Opens the source; `with_reference = false` opens the microphone without
+/// the echo reference even when `[aec]` is on.
+fn open_source(
+    cfg: &CaptureSettings,
+    with_reference: bool,
+) -> Result<Box<dyn AudioSource>, CaptureError> {
+    let aec = cfg.aec.as_ref().filter(|_| with_reference);
     match cfg.source {
         MicSource::File => {
             let path = cfg
@@ -387,9 +401,7 @@ fn open_source(cfg: &CaptureSettings) -> Result<Box<dyn AudioSource>, CaptureErr
             // Pacing is done here (with a clock that pauses while idle), not by
             // FileSource, so a paused file does not burst to catch up.
             let mic = FileSource::open(path, cfg.channels, cfg.rate)?;
-            let mut src: Box<dyn AudioSource> = match cfg
-                .aec
-                .as_ref()
+            let mut src: Box<dyn AudioSource> = match aec
                 .and_then(|a| a.path.as_ref().map(|p| (a, p)))
             {
                 Some((a, ref_path)) => {
@@ -426,17 +438,49 @@ fn open_source(cfg: &CaptureSettings) -> Result<Box<dyn AudioSource>, CaptureErr
             Ok(src)
         }
         #[cfg(target_os = "linux")]
-        MicSource::Alsa => match &cfg.aec {
-            Some(a) => Ok(Box::new(webos_capture::AlsaDuplex::open(
-                &cfg.alsa,
-                &a.reference,
-            )?)),
-            None => Ok(Box::new(webos_capture::AlsaCapture::open(&cfg.alsa)?)),
-        },
+        MicSource::Alsa => {
+            let plain = || -> Result<Box<dyn AudioSource>, CaptureError> {
+                Ok(Box::new(webos_capture::AlsaCapture::open(&cfg.alsa)?))
+            };
+            match aec {
+                Some(a) => with_plain_fallback(
+                    || -> Result<Box<dyn AudioSource>, CaptureError> {
+                        Ok(Box::new(webos_capture::AlsaDuplex::open(
+                            &cfg.alsa,
+                            &a.reference,
+                        )?))
+                    },
+                    plain,
+                ),
+                None => plain(),
+            }
+        }
         #[cfg(not(target_os = "linux"))]
         MicSource::Alsa => Err(CaptureError::Unsupported(
             "ALSA capture is only available on Linux".into(),
         )),
+    }
+}
+
+/// Opens the microphone with the echo reference (`duplex`); if that fails
+/// for a reason the plain microphone may not share (anything but busy or
+/// missing), opens the plain microphone (`plain`) instead, so the reference
+/// never costs the wake word stream. The reference is tried again at the
+/// next open.
+fn with_plain_fallback<S>(
+    duplex: impl FnOnce() -> Result<S, CaptureError>,
+    plain: impl FnOnce() -> Result<S, CaptureError>,
+) -> Result<S, CaptureError> {
+    match duplex() {
+        Ok(s) => Ok(s),
+        Err(e @ (CaptureError::MicBusy | CaptureError::DeviceNotFound(_))) => Err(e),
+        Err(e) => {
+            let s = plain()?;
+            log::warn!(
+                "aec: the microphone did not start with the echo reference ({e}); opened it alone, running WITHOUT echo cancellation (retried at the next microphone open)"
+            );
+            Ok(s)
+        }
     }
 }
 
@@ -655,6 +699,9 @@ fn run(
     let mut kill = KillSwitch::new(cfg.kill_switch.as_deref());
     let mut idle_reason: Option<&'static str> = None;
     let mut ind = Indicators::new(tx, shared);
+    // Open the next source without the echo reference (after REF_STRIKES
+    // stream failures with it).
+    let mut plain_next = false;
     while !shared.stop.load(Ordering::Relaxed) {
         let rerun = glue.as_mut().is_some_and(|g| g.poll_rerun(shared, false));
         if let Some(why) = unwanted(shared, &mut kill) {
@@ -697,7 +744,7 @@ fn run(
         // Wanted, so no gate holds the mic closed (it is closed right now).
         ind.listening(false);
         ind.muted(false);
-        let src = match open_source(cfg) {
+        let src = match open_source(cfg, !plain_next) {
             Ok(src) => src,
             Err(e) => {
                 shared
@@ -736,6 +783,8 @@ fn run(
         }
         failures = 0;
         busy_logged = false;
+        plain_next = false;
+        let had_reference = matches!(src.reference_state(), ReferenceState::Active { .. });
         let opened = Instant::now();
         let end = pump(cfg, src, shared, tx, &mut kill, &mut ind, &mut glue);
         // `pump` consumed and dropped the source: the PCM is closed now.
@@ -767,6 +816,12 @@ fn run(
             Err(e) => {
                 stream_errors = stream_errors.saturating_add(1);
                 let delay = backoff(stream_errors);
+                if had_reference && stream_errors >= REF_STRIKES {
+                    plain_next = true;
+                    log::warn!(
+                        "aec: the microphone failed {stream_errors} times in a row with the echo reference open; reopening it WITHOUT the reference (tried again at the open after)"
+                    );
+                }
                 match e {
                     CaptureError::Stalled(ms) => log::warn!(
                         "capture: no audio from the device for {ms} ms; closed it, reopening in {} s",
@@ -1379,6 +1434,12 @@ mod tests {
         let plain = stream_rms_db(&s);
         s.aec.enabled = true;
         s.aec.reference_path = Some(r);
+        // AEC3's own behaviour (mono render, no NS, no overrides): this
+        // checks the wiring, and the unoptimised test build of the B + NS
+        // default is too slow for the 20 s budget.
+        s.aec.render_channels = 1;
+        s.aec.ns = false;
+        s.aec.aec3.clear();
         let cancelled = stream_rms_db(&s);
         let _ = std::fs::remove_dir_all(&dir);
         // Echo at about -21 dBFS. This checks the wiring (the canceller is in
@@ -1409,6 +1470,148 @@ mod tests {
         let db = stream_rms_db(&s);
         let _ = std::fs::remove_dir_all(&dir);
         assert!(db > -30.0, "{db:.1}");
+    }
+
+    /// A mic that delivers silence, with a reference in a settable state
+    /// (what `AlsaDuplex` reports).
+    struct RefStateSource {
+        state: ReferenceState,
+    }
+
+    impl AudioSource for RefStateSource {
+        fn read(&mut self, out: &mut [i32]) -> Result<usize, CaptureError> {
+            out.fill(0);
+            Ok(out.len() / 2)
+        }
+        fn channels(&self) -> u16 {
+            2
+        }
+        fn rate(&self) -> u32 {
+            16_000
+        }
+        fn reference_format(&self) -> Option<webos_capture::StreamFormat> {
+            matches!(self.state, ReferenceState::Active { .. }).then_some(
+                webos_capture::StreamFormat {
+                    channels: 2,
+                    rate: 48_000,
+                },
+            )
+        }
+        fn take_reference(&mut self, out: &mut Vec<i32>) {
+            if matches!(self.state, ReferenceState::Active { .. }) {
+                out.extend(std::iter::repeat_n(0, 256 * 3 * 2));
+            }
+        }
+        fn reference_state(&self) -> ReferenceState {
+            self.state.clone()
+        }
+    }
+
+    #[test]
+    fn default_settings_set_up_b_plus_ns_and_disabled_keeps_the_reference_closed() {
+        let c = CaptureSettings::from_settings(&Settings::default());
+        let a = c.aec.as_ref().unwrap();
+        assert!(a.dsp.ns);
+        assert_eq!(a.dsp.render_channels, 2);
+        assert_eq!(a.dsp.aec3.get(webos_dsp::Aec3Param::LinearMix), Some(0.4));
+        assert_eq!(a.pcm_id, "SoundEngineCapture");
+        let mut s = Settings::default();
+        s.aec.enabled = false;
+        assert!(CaptureSettings::from_settings(&s).aec.is_none());
+        // A file mic without a reference file runs without the canceller.
+        s.aec.enabled = true;
+        s.mic.source = MicSource::File;
+        assert!(CaptureSettings::from_settings(&s).aec.is_none());
+    }
+
+    #[test]
+    fn unavailable_reference_builds_the_plain_frontend_and_audio_flows() {
+        let cfg = CaptureSettings::from_settings(&Settings::default());
+        let mut src = RefStateSource {
+            state: ReferenceState::Unavailable("busy".into()),
+        };
+        let mut fe = build_frontend(&cfg, &src, 16_000);
+        assert!(!fe.has_echo_canceller());
+        let mut feed = ReferenceFeed::new(&src, &fe);
+        let mut buf = vec![0_i32; READ_FRAMES * 2];
+        let mut mono = Vec::new();
+        let n = src.read(&mut buf).unwrap();
+        feed.feed(&mut src, &mut fe, cfg.frontend, 16_000);
+        fe.process(&buf[..n * 2], 2, &mut mono);
+        assert_eq!(mono.len(), READ_FRAMES);
+    }
+
+    #[test]
+    fn reference_lost_at_runtime_drops_the_canceller_and_audio_keeps_flowing() {
+        let cfg = CaptureSettings::from_settings(&Settings::default());
+        let mut src = RefStateSource {
+            state: ReferenceState::Active {
+                linked: true,
+                unlinked_reason: None,
+            },
+        };
+        let mut fe = build_frontend(&cfg, &src, 16_000);
+        assert!(fe.has_echo_canceller());
+        let mut feed = ReferenceFeed::new(&src, &fe);
+        let mut buf = vec![0_i32; READ_FRAMES * 2];
+        let mut mono = Vec::new();
+        let mut out = 0;
+        for i in 0..20 {
+            if i == 10 {
+                src.state = ReferenceState::Unavailable("read failed".into());
+            }
+            let n = src.read(&mut buf).unwrap();
+            feed.feed(&mut src, &mut fe, cfg.frontend, 16_000);
+            fe.process(&buf[..n * 2], 2, &mut mono);
+            out += mono.len();
+        }
+        assert!(!fe.has_echo_canceller());
+        assert!(!feed.on);
+        // The plain front-end has no framing delay; the canceller's first
+        // frames may be held back, the rest all comes out.
+        assert!(out >= 10 * READ_FRAMES, "{out}");
+    }
+
+    #[test]
+    fn mic_that_fails_with_the_reference_is_opened_alone() {
+        use std::cell::Cell;
+        // A start failure with the reference: the plain mic is opened.
+        let plain_called = Cell::new(false);
+        let r = with_plain_fallback(
+            || Err::<&str, _>(CaptureError::Unsupported("linked START".into())),
+            || {
+                plain_called.set(true);
+                Ok("plain")
+            },
+        );
+        assert_eq!(r.unwrap(), "plain");
+        assert!(plain_called.get());
+        // Busy or missing mic: the plain mic would fail the same way, the
+        // error goes to the caller's retry with backoff.
+        for e in [
+            CaptureError::MicBusy,
+            CaptureError::DeviceNotFound("no card".into()),
+        ] {
+            let plain_called = Cell::new(false);
+            let r = with_plain_fallback(
+                || Err::<&str, _>(e),
+                || {
+                    plain_called.set(true);
+                    Ok("plain")
+                },
+            );
+            assert!(r.is_err());
+            assert!(!plain_called.get());
+        }
+        // The duplex opens: no second open.
+        let r = with_plain_fallback(|| Ok("duplex"), || -> Result<&str, _> { unreachable!() });
+        assert_eq!(r.unwrap(), "duplex");
+        // Both fail: the plain mic's error.
+        let r = with_plain_fallback(
+            || Err::<&str, _>(CaptureError::Unsupported("x".into())),
+            || Err(CaptureError::Disconnected),
+        );
+        assert!(matches!(r, Err(CaptureError::Disconnected)));
     }
 
     #[test]

@@ -199,7 +199,7 @@ impl Compat {
             report_on: settings.report.enabled,
             dir: settings.report.dir_or_default(),
             self_check_on: settings.safety.self_check,
-            aec_on: settings.aec.enabled,
+            aec_on: settings.aec_active(),
             seen_file,
             strict: settings.safety.firmware_policy == crate::config::FirmwarePolicy::Strict,
             firmware,
@@ -677,6 +677,9 @@ mod tests {
 
     fn make(dir: &Path, fw: &str, model: Option<&str>) -> Compat {
         let mut s = Settings::default();
+        // No echo reference in these tests (C8 is covered by check_c8's
+        // table): AEC off, so C8 is skipped.
+        s.aec.enabled = false;
         s.report.dir = Some(dir.join("run"));
         s.safety.firmware_seen_file = Some(dir.join("firmware_seen"));
         let m = model.map_or(ModelState::NotRead, |m| ModelState::Known(m.to_owned()));

@@ -11,6 +11,11 @@
 # per arm (seed 18) and reversed in pass 2 (the explicit block list below is the order that was run),
 # then B+NS at C10 (both sets). Content restarted for every cell (`content_each_block`).
 #
+# Since 0.4.3 the satellite's built-in [aec] default is B+NS (on), and [aec.aec3] keys are merged over
+# it, so the arms below spell out every value that differs from it (EXP-018 ran 0.4.2, where a missing
+# key meant AEC3's own value): OFF is `enabled = false`, DEFAULT and B write out mono render, no NS
+# and AEC3's own `linear_mix` 0.0 / `ep_strength.default_len` 0.83 where they used them.
+#
 #   python3 tools/audio-rig/aec_live_ab.py tools/audio-rig/aec_plans/exp018.toml --dry-run
 
 [plan]
@@ -44,12 +49,21 @@ sink_pct = 100
 label = "loud"
 
 [arms.OFF]
-aec = ""
+aec = """
+[aec]
+enabled = false
+"""
 
 [arms.DEFAULT]
 aec = """
 [aec]
 enabled = true
+render_channels = 1
+ns = false
+
+[aec.aec3]
+"linear_mix" = 0.0
+"ep_strength.default_len" = 0.83
 """
 
 [arms.B]
@@ -57,6 +71,7 @@ aec = """
 [aec]
 enabled = true
 render_channels = 2
+ns = false
 
 [aec.aec3]
 "linear_mix" = 0.4

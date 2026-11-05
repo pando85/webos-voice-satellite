@@ -41,6 +41,12 @@ watch = true
 [log]
 level = "info"
 
+# Echo cancellation (removes the TV's own sound from the microphone) is on by
+# default since 0.4.3. To turn it off, uncomment both lines and restart
+# (ctl.sh restart). Every key: config/example.toml ([aec]).
+# [aec]
+# enabled = false
+
 [safety]
 # Kill switch (the app's "Microphone off"): the PCM stays closed while it
 # exists. Under /tmp it is cleared at reboot.
