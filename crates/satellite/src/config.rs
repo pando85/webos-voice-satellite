@@ -50,6 +50,8 @@ pub(crate) struct Settings {
     pub(crate) tv_control: TvControlSection,
     /// Compatibility report and self-check files.
     pub(crate) report: ReportSection,
+    /// Music on the satellite's media player (off by default; ADR 0010).
+    pub(crate) music: MusicSection,
 }
 
 /// How pipeline runs start.
@@ -801,6 +803,221 @@ impl Default for AecSection {
     }
 }
 
+/// Format advertised to HA's ffmpeg proxy for music (`[music] format`).
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum MusicFormat {
+    /// FLAC (default, design D10).
+    #[default]
+    Flac,
+    /// Uncompressed WAV (no decode cost, 1.5 Mbit/s at 48 kHz stereo).
+    Wav,
+}
+
+/// What the music does while a voice run, a reply, an announcement or the
+/// alarm is active (`[music] on_wake`).
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum OnWake {
+    /// Lower the music by `duck_db` (default, design D4).
+    #[default]
+    Duck,
+    /// Pause the music.
+    Pause,
+    /// Leave the music alone.
+    None,
+}
+
+/// `[music]`: music playback through the satellite's media player
+/// (docs/design/music-playback.md section C, defaults D1 to D14).
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct MusicSection {
+    /// Offer music to Home Assistant (flags 153093 or 1201669 instead of
+    /// 5124). Off by default (D7): the entity is exactly as without music.
+    pub(crate) enabled: bool,
+    /// Format HA's proxy converts music to (advertised only; playback
+    /// follows the stream header). MP3 is never advertised (D10).
+    pub(crate) format: MusicFormat,
+    /// Advertised sample rate (8000 to 96000).
+    pub(crate) rate: u32,
+    /// Advertised channel count (1 or 2).
+    pub(crate) channels: u16,
+    /// Offer `MEDIA_ANNOUNCE` (`play_media` with `announce: true`, D3).
+    pub(crate) announce: bool,
+    /// Accept a media URL from an unencrypted API session (D14; default off).
+    pub(crate) allow_plaintext: bool,
+    /// Behaviour while a voice run, reply, announcement or alarm is active.
+    pub(crate) on_wake: OnWake,
+    /// Duck depth in dB (-60 to 0).
+    pub(crate) duck_db: f32,
+    /// Time to reach `duck_db`, in ms.
+    pub(crate) duck_attack_ms: u32,
+    /// Time the duck is kept after the last source ended, in ms.
+    pub(crate) duck_hold_ms: u32,
+    /// Time to return to full level, in ms.
+    pub(crate) duck_release_ms: u32,
+    /// Music level trim on top of the shared volume, in dB (-60 to 12, D2).
+    pub(crate) gain_db: f32,
+    /// `pacat --latency-msec` of the music stream (0 omits the flag).
+    pub(crate) latency_msec: u32,
+    /// How far ahead of the clock music is written, in ms (20 to 1000).
+    pub(crate) write_ahead_ms: u32,
+    /// Highest reply volume (percent) applied to music (D11; 100 = no cap).
+    pub(crate) max_volume_percent: u8,
+    /// A stream that delivers no byte for this long ends the track (D11).
+    pub(crate) idle_timeout_s: u32,
+    /// A pause longer than this drops the stream (D8).
+    pub(crate) pause_timeout_s: u32,
+    /// Music keeps playing this long after Home Assistant disconnected, then
+    /// stops (D9). 0 stops at once.
+    pub(crate) disconnect_stop_s: u32,
+}
+
+impl Default for MusicSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            format: MusicFormat::Flac,
+            rate: 48_000,
+            channels: 2,
+            announce: true,
+            allow_plaintext: false,
+            on_wake: OnWake::Duck,
+            duck_db: -20.0,
+            duck_attack_ms: 50,
+            duck_hold_ms: 800,
+            duck_release_ms: 1000,
+            gain_db: 0.0,
+            latency_msec: 100,
+            write_ahead_ms: 60,
+            max_volume_percent: 100,
+            idle_timeout_s: 10,
+            pause_timeout_s: 600,
+            disconnect_stop_s: 60,
+        }
+    }
+}
+
+impl MusicSection {
+    /// The format word HA's proxy and Music Assistant see.
+    pub(crate) fn format_word(&self) -> &'static str {
+        match self.format {
+            MusicFormat::Flac => "flac",
+            MusicFormat::Wav => "wav",
+        }
+    }
+
+    /// The ESPHome API side (`Config::music`); `None` when music is off.
+    pub(crate) fn esphome(&self) -> Option<webos_esphome_api::MusicConfig> {
+        self.enabled.then(|| webos_esphome_api::MusicConfig {
+            format: webos_esphome_api::AudioFormat {
+                format: self.format_word().to_owned(),
+                sample_rate: self.rate,
+                num_channels: u32::from(self.channels),
+                sample_bytes: 2,
+            },
+            announce: self.announce,
+            allow_plaintext: self.allow_plaintext,
+        })
+    }
+
+    /// The engine side (`webos_playback::music::MusicConfig`).
+    pub(crate) fn engine(&self) -> webos_playback::music::MusicConfig {
+        use webos_playback::music::{DuckConfig, DuckMode, MusicConfig};
+        let ms = |v: u32| Duration::from_millis(u64::from(v));
+        MusicConfig {
+            duck: DuckConfig {
+                mode: match self.on_wake {
+                    OnWake::Duck => DuckMode::Duck,
+                    OnWake::Pause => DuckMode::Pause,
+                    OnWake::None => DuckMode::None,
+                },
+                duck_db: self.duck_db,
+                attack: ms(self.duck_attack_ms),
+                hold: ms(self.duck_hold_ms),
+                release: ms(self.duck_release_ms),
+            },
+            gain_db: self.gain_db,
+            write_ahead: ms(self.write_ahead_ms),
+            pause_timeout: Duration::from_secs(u64::from(self.pause_timeout_s)),
+            ..MusicConfig::default()
+        }
+    }
+
+    fn validate(&self) -> Result<(), ConfigError> {
+        if !(8_000..=96_000).contains(&self.rate) {
+            return Err(err("music.rate must be between 8000 and 96000"));
+        }
+        if !(1..=2).contains(&self.channels) {
+            return Err(err("music.channels must be 1 or 2"));
+        }
+        if !self.duck_db.is_finite() || !(-60.0..=0.0).contains(&self.duck_db) {
+            return Err(err("music.duck_db must be between -60 and 0"));
+        }
+        if !self.gain_db.is_finite() || !(-60.0..=12.0).contains(&self.gain_db) {
+            return Err(err("music.gain_db must be between -60 and 12"));
+        }
+        for (v, name) in [
+            (self.duck_attack_ms, "music.duck_attack_ms"),
+            (self.duck_hold_ms, "music.duck_hold_ms"),
+            (self.duck_release_ms, "music.duck_release_ms"),
+        ] {
+            if v > 10_000 {
+                return Err(err(format!("{name} must be between 0 and 10000")));
+            }
+        }
+        if self.latency_msec > MAX_LATENCY_MSEC {
+            return Err(err(format!(
+                "music.latency_msec must be between 0 (PulseAudio default) and {MAX_LATENCY_MSEC}"
+            )));
+        }
+        if !(20..=1000).contains(&self.write_ahead_ms) {
+            return Err(err("music.write_ahead_ms must be between 20 and 1000"));
+        }
+        if self.max_volume_percent > 100 {
+            return Err(err("music.max_volume_percent must be between 0 and 100"));
+        }
+        if !(1..=300).contains(&self.idle_timeout_s) {
+            return Err(err("music.idle_timeout_s must be between 1 and 300"));
+        }
+        if !(1..=86_400).contains(&self.pause_timeout_s) {
+            return Err(err("music.pause_timeout_s must be between 1 and 86400"));
+        }
+        if self.disconnect_stop_s > 86_400 {
+            return Err(err("music.disconnect_stop_s must be between 0 and 86400"));
+        }
+        Ok(())
+    }
+
+    /// The `[music]` part of the summary line.
+    fn summary(&self) -> String {
+        if !self.enabled {
+            return "off".to_owned();
+        }
+        format!(
+            "on format={} {}Hz/{}ch announce={} allow_plaintext={} on_wake={:?} duck_db={} attack/hold/release_ms={}/{}/{} gain_db={} latency_msec={} write_ahead_ms={} max_volume={}% idle_s={} pause_s={} disconnect_stop_s={}",
+            self.format_word(),
+            self.rate,
+            self.channels,
+            self.announce,
+            self.allow_plaintext,
+            self.on_wake,
+            self.duck_db,
+            self.duck_attack_ms,
+            self.duck_hold_ms,
+            self.duck_release_ms,
+            self.gain_db,
+            self.latency_msec,
+            self.write_ahead_ms,
+            self.max_volume_percent,
+            self.idle_timeout_s,
+            self.pause_timeout_s,
+            self.disconnect_stop_s,
+        )
+    }
+}
+
 /// ` aec3={name=value,...}` for the summary line (empty without overrides).
 fn aec3_summary(t: &std::collections::BTreeMap<String, f32>) -> String {
     if t.is_empty() {
@@ -1005,6 +1222,7 @@ impl Settings {
             ));
         }
         self.validate_aec()?;
+        self.music.validate()?;
         self.esphome_config()?
             .validate()
             .map_err(|e| err(format!("device: {e}")))?;
@@ -1260,6 +1478,7 @@ impl Settings {
                 }),
             mdns: d.mdns,
             voice_features: self.voice_features(),
+            music: self.music.esphome(),
             ..webos_esphome_api::Config::default()
         })
     }
@@ -1445,7 +1664,7 @@ impl Settings {
             "off".to_owned()
         };
         format!(
-            "name={} port={} voice_features={} mode={:?} encryption={encryption} mic=[{mic}] dsp=[{:?} gain_db={} hpf_hz={}] aec=[{aec}] sink=[{sink}] safety=[kill_switch={} mute_file={} firmware={fw}] limits=[nice={} nofile={} rss_mb={} capture_stall_s={} loop_stall_s={}] power=[watch={} remote_off={:?}(default) max_per_hour={} cooldown_s={}] tv_control=[{tv}]",
+            "name={} port={} voice_features={} mode={:?} encryption={encryption} mic=[{mic}] dsp=[{:?} gain_db={} hpf_hz={}] aec=[{aec}] sink=[{sink}] safety=[kill_switch={} mute_file={} firmware={fw}] limits=[nice={} nofile={} rss_mb={} capture_stall_s={} loop_stall_s={}] power=[watch={} remote_off={:?}(default) max_per_hour={} cooldown_s={}] tv_control=[{tv}] music=[{music}]",
             self.device.name,
             self.device.port,
             self.voice_features(),
@@ -1465,6 +1684,7 @@ impl Settings {
             self.power.max_actions_per_hour,
             self.power.cooldown_s,
             tv = self.tv_control_summary(),
+            music = self.music.summary(),
         )
     }
 
@@ -1525,6 +1745,10 @@ pub(crate) struct TestTriggers {
     pub(crate) ptt_every: Option<Duration>,
     /// Freeze a thread 5 s after startup, to exercise the watchdog.
     pub(crate) hang: Option<Hang>,
+    /// Let media fetches (music, TTS, announcements) reach loopback
+    /// addresses, so a PC test server on 127.0.0.1 can serve them. Every
+    /// other fetch target rule still applies. Never from the config file.
+    pub(crate) fetch_loopback: bool,
 }
 
 /// What the command line asks for.
@@ -1586,6 +1810,7 @@ test aids:
   --ptt-on-connect       start one push-to-talk run after HA connects
   --ptt-every SECS       start a push-to-talk run every SECS seconds
   --test-hang loop|capture  freeze that thread 5 s after start (watchdog test)
+  --test-fetch-loopback  let media fetches reach 127.0.0.1 (PC tests with a local server)
 
 signals: SIGUSR1 starts a push-to-talk run; SIGTERM/SIGINT stop.
 pairing files (in pairing.state_dir, checked every second, deleted when acted on):
@@ -1670,6 +1895,7 @@ pub(crate) fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Comm
             "--log-level" => value()?.clone_into(&mut settings.log.level),
             "--ptt-on-connect" => triggers.ptt_on_connect = true,
             "--test-hang" => triggers.hang = Some(parse_enum(flag, value()?)?),
+            "--test-fetch-loopback" => triggers.fetch_loopback = true,
             "--ptt-every" => {
                 let secs: f64 = parse_num(flag, value()?)?;
                 if !(secs.is_finite() && secs >= 1.0) {
@@ -2447,6 +2673,124 @@ level = "debug"
             parse_args(args(&["--self-test"])).unwrap(),
             Command::SelfTest
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn music_section_defaults_mapping_and_validation() {
+        let base = Path::new("/cfg");
+        // Off by default: no music on the API side, the entity is unchanged.
+        let s = Settings::from_toml("[device]\nallow_plaintext = true\n", base).unwrap();
+        s.validate().unwrap();
+        assert!(!s.music.enabled);
+        assert!(s.esphome_config().unwrap().music.is_none());
+        assert!(s.summary().contains("music=[off]"), "{}", s.summary());
+
+        let s = Settings::from_toml(
+            "[device]\nallow_plaintext = true\n[music]\nenabled = true\nformat = \"wav\"\nrate = 44100\nchannels = 1\nannounce = false\nallow_plaintext = true\non_wake = \"pause\"\nduck_db = -12\nduck_attack_ms = 20\nduck_hold_ms = 300\nduck_release_ms = 400\ngain_db = -3\nwrite_ahead_ms = 80\npause_timeout_s = 30\n",
+            base,
+        )
+        .unwrap();
+        s.validate().unwrap();
+        let api = s.esphome_config().unwrap().music.unwrap();
+        assert_eq!(api.format.format, "wav");
+        assert_eq!(
+            (
+                api.format.sample_rate,
+                api.format.num_channels,
+                api.format.sample_bytes
+            ),
+            (44_100, 1, 2)
+        );
+        assert!(!api.announce && api.allow_plaintext);
+        let e = s.music.engine();
+        assert_eq!(e.duck.mode, webos_playback::music::DuckMode::Pause);
+        assert_eq!(e.duck.duck_db, -12.0);
+        assert_eq!(e.duck.attack, Duration::from_millis(20));
+        assert_eq!(e.duck.hold, Duration::from_millis(300));
+        assert_eq!(e.duck.release, Duration::from_millis(400));
+        assert_eq!(e.gain_db, -3.0);
+        assert_eq!(e.write_ahead, Duration::from_millis(80));
+        assert_eq!(e.pause_timeout, Duration::from_secs(30));
+        assert!(s.summary().contains("music=[on format=wav 44100Hz/1ch"));
+
+        // The defaults of the plan (section C).
+        let d = MusicSection::default();
+        assert_eq!(
+            (
+                d.duck_db,
+                d.duck_attack_ms,
+                d.duck_hold_ms,
+                d.duck_release_ms
+            ),
+            (-20.0, 50, 800, 1000)
+        );
+        assert_eq!(
+            (
+                d.write_ahead_ms,
+                d.latency_msec,
+                d.idle_timeout_s,
+                d.pause_timeout_s
+            ),
+            (60, 100, 10, 600)
+        );
+        assert_eq!(d.disconnect_stop_s, 60);
+        assert!(d.announce && !d.allow_plaintext && d.on_wake == OnWake::Duck);
+
+        let mut ok = Settings::default();
+        ok.device.allow_plaintext = true;
+        ok.music.enabled = true;
+        ok.validate().unwrap();
+        let cases: [(Mutate, &str); 11] = [
+            (|s| s.music.rate = 4000, "music.rate"),
+            (|s| s.music.channels = 3, "music.channels"),
+            (|s| s.music.duck_db = 3.0, "music.duck_db"),
+            (|s| s.music.gain_db = f32::NAN, "music.gain_db"),
+            (
+                |s| s.music.duck_release_ms = 20_000,
+                "music.duck_release_ms",
+            ),
+            (|s| s.music.latency_msec = 20_000, "music.latency_msec"),
+            (|s| s.music.write_ahead_ms = 5, "music.write_ahead_ms"),
+            (
+                |s| s.music.max_volume_percent = 101,
+                "music.max_volume_percent",
+            ),
+            (|s| s.music.idle_timeout_s = 0, "music.idle_timeout_s"),
+            (|s| s.music.pause_timeout_s = 0, "music.pause_timeout_s"),
+            (
+                |s| s.music.disconnect_stop_s = 100_000,
+                "music.disconnect_stop_s",
+            ),
+        ];
+        for (mutate, key) in cases {
+            let mut bad = ok.clone();
+            mutate(&mut bad);
+            let e = bad.validate().unwrap_err();
+            assert!(e.0.contains(key), "{key}: {e}");
+        }
+        // MP3 is never advertised; unknown keys are rejected.
+        assert!(Settings::from_toml("[music]\nformat = \"mp3\"\n", base).is_err());
+        assert!(Settings::from_toml("[music]\nvolume = 3\n", base).is_err());
+    }
+
+    #[test]
+    fn fetch_loopback_is_a_cli_test_aid_only() {
+        let dir = std::env::temp_dir().join(format!("webos-sat-cli-fl-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("c.toml");
+        std::fs::write(&cfg, "[device]\nallow_plaintext = true\n").unwrap();
+        let cfg = cfg.to_string_lossy().into_owned();
+        let Command::Run(_, t) = parse_args(args(&["--config", &cfg])).unwrap() else {
+            panic!("expected Run");
+        };
+        assert!(!t.fetch_loopback);
+        let Command::Run(_, t) =
+            parse_args(args(&["--config", &cfg, "--test-fetch-loopback"])).unwrap()
+        else {
+            panic!("expected Run");
+        };
+        assert!(t.fetch_loopback);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

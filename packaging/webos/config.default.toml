@@ -69,3 +69,10 @@ enabled = true
 state_dir = "pairing"
 window_s = 600
 open_on_start = true
+
+[music]
+# Music from Home Assistant and Music Assistant on the satellite's media
+# player (experimental, not yet evaluated on a TV). Off: the media player
+# plays replies, announcements and the timer alarm only. Every key:
+# config/example.toml ([music]). Restart after a change.
+enabled = false

@@ -333,3 +333,53 @@ output = "full"
 # [aec.aec3]
 # "linear_mix" = 0.4                # blend of the linear output (0 to 1)
 # "ep_strength.default_len" = 0.0
+
+[music]
+# Music through the satellite's media player (ADR 0010; design:
+# docs/design/music-playback.md). Home Assistant (UI, scripts, automations)
+# and Music Assistant's "Home Assistant Media Players" provider send a stream
+# URL with play_media; the satellite fetches, decodes (FLAC, WAV, MP3, Ogg
+# Vorbis) and plays it through a second pacat stream ("music"), and ducks it
+# for the wake word, replies, announcements and the timer alarm. Off by
+# default and experimental: built and tested on a PC only, not yet evaluated
+# on a TV (CPU, mixing, false wakes). Changing it needs a restart; Home
+# Assistant reads the entity's features when it connects.
+enabled = false
+# Format HA's ffmpeg proxy converts music to: "flac" or "wav" (MP3 is never
+# advertised). rate (8000 to 96000) and channels (1 or 2) are advertised
+# too. Playback follows the stream's own header, whatever it is.
+format = "flac"
+rate = 48000
+channels = 2
+# Offer play_media with announce: true (plays over the ducked music on the
+# reply path; the music goes on).
+announce = true
+# Act on a media URL from an unencrypted API session. The daemon fetches
+# that URL, so the default refuses it.
+allow_plaintext = false
+# While a voice run, a reply, an announcement or the timer alarm is active:
+# "duck" (lower the music by duck_db), "pause" or "none".
+on_wake = "duck"
+duck_db = -20.0          # -60 to 0
+duck_attack_ms = 50      # time to reach duck_db
+duck_hold_ms = 800       # kept this long after the last source ended
+duck_release_ms = 1000   # back to full level over this
+# Music shares the reply volume (the media player's slider in HA, sink.gain
+# applies too); gain_db trims music against replies (-60 to 12).
+gain_db = 0.0
+# Highest reply volume (percent) used for music; 100 = no cap.
+max_volume_percent = 100
+# pacat --latency-msec of the music stream (0 = PulseAudio's default) and how
+# far ahead of the clock music is written: together they bound how late a
+# duck, a pause or a stop is heard.
+latency_msec = 100
+write_ahead_ms = 60
+# A stream that delivers no byte for this long ends the track (never retried).
+idle_timeout_s = 10
+# A pause longer than this drops the stream (the entity goes idle).
+pause_timeout_s = 600
+# After Home Assistant disconnects, music plays on for this long, then stops
+# (a reconnect in time keeps it). The TV going to Active Standby or suspending
+# always stops the music, and play_media is refused there; the satellite
+# never wakes the TV for music.
+disconnect_stop_s = 60

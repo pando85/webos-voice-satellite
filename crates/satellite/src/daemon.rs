@@ -27,7 +27,7 @@ use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
 use tokio::time::{Instant, MissedTickBehavior};
 use webos_esphome_api::{
-    AppCommand, AppEvent, PairingEvent, PipelineMode, Server, TimerEvent, TimerTable,
+    AppCommand, AppEvent, MusicCommand, PairingEvent, PipelineMode, Server, TimerEvent, TimerTable,
 };
 
 use crate::alarm::{self, Alarm, Phase, Step};
@@ -39,6 +39,7 @@ use crate::compat::{self, Compat, ModelState};
 use crate::config::{Hang, MicSource, Mode, RemoteOff, Settings, TestTriggers};
 use crate::darken::{self, Action, Darkener};
 use crate::firmware::{self, Model, Verdict};
+use crate::music::{End, Music};
 use crate::player::{Done, Kind, Player, redact_url};
 use crate::power::{self, PowerUpdate};
 use crate::selfcheck::Note;
@@ -236,7 +237,7 @@ fn finished(kind: Kind, success: bool) -> Option<AppCommand> {
     match kind {
         Kind::Tts => Some(AppCommand::PlaybackFinished { success }),
         Kind::Announce => Some(AppCommand::AnnounceFinished { success }),
-        Kind::Alarm => None,
+        Kind::MediaAnnounce | Kind::Alarm => None,
     }
 }
 
@@ -559,6 +560,8 @@ struct Daemon {
     compat_poll: u32,
     /// `run/voice.json`, written on change.
     voice_file: VoiceFile,
+    /// Music on the media player (`[music] enabled`).
+    music: Option<Music>,
 }
 
 impl Daemon {
@@ -687,6 +690,10 @@ impl Daemon {
             pairing_until: self.pairing_until_epoch(),
             ha,
             ha_since: self.ha_since,
+            music: Some(self.music.as_ref().map_or_else(
+                || crate::music::DISABLED_JSON.to_owned(),
+                |m| m.status_json(Instant::now()),
+            )),
         };
         self.voice_file.publish(Instant::now().into_std(), &status);
     }
@@ -988,6 +995,9 @@ impl Daemon {
                 self.publish_compat().await;
             }
         }
+        if let (Some(m), Some(_)) = (self.music.as_mut(), shown.state.as_ref()) {
+            m.on_power(&shown.state_key());
+        }
         if u.processing_key() == "PrepareResume" {
             self.on_resume("the TV reported Prepare Resume").await;
         }
@@ -1111,6 +1121,9 @@ impl Daemon {
             self.shared.xruns.load(Ordering::Relaxed)
         );
         self.send(AppCommand::Resumed).await;
+        if let Some(m) = self.music.as_mut() {
+            m.on_resume();
+        }
         let out = self.tv.as_mut().map(Tv::on_resume);
         if let Some(out) = out {
             self.apply_tv(out).await;
@@ -1250,10 +1263,16 @@ impl Daemon {
         match ev {
             AppEvent::HaConnected { client_info, peer } => {
                 self.connected = true;
+                if let Some(m) = self.music.as_mut() {
+                    m.on_ha(true, now);
+                }
                 log::info!("HA connected: {client_info} from {}", peer.ip());
             }
             AppEvent::HaDisconnected => {
                 self.connected = false;
+                if let Some(m) = self.music.as_mut() {
+                    m.on_ha(false, now);
+                }
                 self.in_run = false;
                 self.set_streaming(false);
                 log::warn!("HA disconnected");
@@ -1351,7 +1370,8 @@ impl Daemon {
                     self.send_finished(kind, false).await;
                 }
             }
-            AppEvent::MediaStop => self.stop_alarm("media player stop").await,
+            AppEvent::MediaStop => self.on_media_stop().await,
+            AppEvent::Music(cmd) => self.on_music(cmd).await,
             AppEvent::ButtonPressed { object_id } if object_id == alarm::STOP_BUTTON_ID => {
                 if self.alarm.phase() == Phase::Idle {
                     log::info!("stop timer alarm pressed; no alarm is ringing");
@@ -1399,6 +1419,68 @@ impl Daemon {
                 }
             }
             other => log::debug!("event {other:?}"),
+        }
+    }
+
+    /// HA's media player stop (design D5): a ringing timer alarm first, then
+    /// a `play_media` announcement, then the music.
+    async fn on_media_stop(&mut self) {
+        if self.alarm.phase() != Phase::Idle || self.music.is_none() {
+            self.stop_alarm("media player stop").await;
+        } else if self.player.current_kind() == Some(Kind::MediaAnnounce) {
+            log::info!("media player stop: the announcement stops, the music goes on");
+            self.player.stop();
+        } else if let Some(m) = self.music.as_mut() {
+            if !m.stop(End::Stopped) {
+                log::info!("media player stop: nothing is playing");
+            }
+        }
+    }
+
+    /// A music command from HA (only with `[music] enabled`).
+    async fn on_music(&mut self, cmd: MusicCommand) {
+        let Some(m) = self.music.as_mut() else {
+            return;
+        };
+        match cmd {
+            MusicCommand::Play {
+                url,
+                announce: false,
+            } => m.play(&url),
+            MusicCommand::Play {
+                url,
+                announce: true,
+            } => {
+                let shown = webos_playback::guard::redact_url(&url);
+                if let Some(why) = m.refusal() {
+                    log::info!("music: announcement {shown} refused: {why}; the URL is released");
+                    m.release(&url);
+                    return;
+                }
+                log::info!("music: announcement {shown} over the music (play_media, announce)");
+                let stopped = self.player.play_url(url, None, Kind::MediaAnnounce);
+                self.report_stopped(stopped).await;
+            }
+            MusicCommand::Pause => m.pause(),
+            MusicCommand::Resume => m.resume(),
+            MusicCommand::EnqueueRefused { url: Some(url) } => {
+                log::info!("music: enqueue refused (no queue here); releasing the URL");
+                m.release(&url);
+            }
+            MusicCommand::EnqueueRefused { url: None } => {
+                log::info!("music: enqueue refused (no queue here)");
+            }
+            other => log::debug!("music: command {other:?} ignored"),
+        }
+    }
+
+    /// After every event: the music's duck sources, shared volume,
+    /// disconnect deadline and state.
+    async fn sync_music(&mut self) {
+        let playing = self.player.current_kind();
+        if let Some(m) = self.music.as_mut() {
+            m.sync(self.in_run, playing, self.reply_volume, Instant::now())
+                .await;
         }
     }
 
@@ -1575,7 +1657,11 @@ pub(crate) async fn run(mut settings: Settings, triggers: TestTriggers) -> Resul
         server.local_addr().map_err(|e| e.to_string())?
     );
     log::info!("config: {}", settings.summary());
-    if triggers.ptt_on_connect || triggers.ptt_every.is_some() || triggers.hang.is_some() {
+    if triggers.ptt_on_connect
+        || triggers.ptt_every.is_some()
+        || triggers.hang.is_some()
+        || triggers.fetch_loopback
+    {
         log::warn!("test triggers enabled: {triggers:?}");
     }
 
@@ -1678,10 +1764,21 @@ pub(crate) async fn run(mut settings: Settings, triggers: TestTriggers) -> Resul
     let (power_tx, mut power_rx) = mpsc::unbounded_channel();
     let power_watch = luna.clone().map(|l| power::spawn(l, power_tx));
     let volume_gain = SharedGain::new(volume::gain_for(reply_volume));
+    let (music, mut music_rx) = match Music::start(
+        &settings.music,
+        &settings.sink,
+        triggers.fetch_loopback,
+        cmd_tx.clone(),
+    ) {
+        Some((m, rx)) => (Some(m), Some(rx)),
+        None => (None, None),
+    };
+    let mut player = Player::new(settings.sink.clone(), volume_gain.clone(), done_tx);
+    player.set_fetch_loopback(triggers.fetch_loopback);
     let mut d = Daemon {
         cmd_tx,
         shared: Arc::clone(&shared),
-        player: Player::new(settings.sink.clone(), volume_gain.clone(), done_tx),
+        player,
         runs: RunTracker::default(),
         connected: false,
         gate,
@@ -1727,6 +1824,7 @@ pub(crate) async fn run(mut settings: Settings, triggers: TestTriggers) -> Resul
         report_dir: settings.report.dir_or_default(),
         compat_poll: 0,
         voice_file: VoiceFile::new(&settings.report.dir_or_default()),
+        music,
     };
     d.publish_voice_status();
     d.publish_timers().await;
@@ -1788,6 +1886,11 @@ pub(crate) async fn run(mut settings: Settings, triggers: TestTriggers) -> Resul
                 }
             }
             Some(done) = done_rx.recv() => d.on_done(done).await,
+            Some(ev) = recv_opt(music_rx.as_mut()) => {
+                if let Some(m) = d.music.as_mut() {
+                    m.on_event(ev);
+                }
+            }
             Some(u) = power_rx.recv() => d.on_power(u).await,
             Some(m) = recv_opt(tv_rx.as_mut()) => d.on_tv_msg(m).await,
             Some(n) = notes_rx.recv() => d.on_note(n).await,
@@ -1833,6 +1936,7 @@ pub(crate) async fn run(mut settings: Settings, triggers: TestTriggers) -> Resul
                 d.ptt("--ptt-on-connect").await;
             }
         }
+        d.sync_music().await;
     }
 
     // Shutdown: stop streaming and playback (kills pacat), release the mic,
@@ -1846,6 +1950,9 @@ pub(crate) async fn run(mut settings: Settings, triggers: TestTriggers) -> Resul
         tv.shutdown().await;
     }
     d.set_streaming(false);
+    if let Some(m) = d.music.take() {
+        m.shutdown().await;
+    }
     d.player.shutdown().await;
     Daemon::log_line(d.runs.flush());
     shared.stop.store(true, Ordering::Relaxed);
@@ -2164,6 +2271,7 @@ mod tests {
             report_dir: dir.join("run"),
             compat_poll: 0,
             voice_file: VoiceFile::new(&dir.join("run")),
+            music: None,
         };
         (d, cmd_rx)
     }
@@ -2361,6 +2469,9 @@ mod tests {
         let since = |v: &str| -> u64 {
             v.split("\"ha_since\":")
                 .nth(1)
+                .unwrap()
+                .split(',')
+                .next()
                 .unwrap()
                 .trim_end_matches(['}', '\n'])
                 .parse()
@@ -2582,7 +2693,8 @@ esac
         let v = read(&dir);
         assert!(v.contains("\"mic\":\"listening\""), "{v}");
         assert!(v.contains("\"power_state\":\"Screen Off\""), "{v}");
-        // No identifier of any kind: only the eight documented keys.
+        // No identifier of any kind: only the documented keys (the music
+        // object is `{"enabled":false}` with music off).
         let parsed: Vec<&str> = v
             .trim_matches(|c| c == '{' || c == '}' || c == '\n')
             .split(',')
@@ -2598,9 +2710,11 @@ esac
                 "\"power_state\"",
                 "\"pairing_until\"",
                 "\"ha\"",
-                "\"ha_since\""
+                "\"ha_since\"",
+                "\"music\""
             ]
         );
+        assert!(v.contains(",\"music\":{\"enabled\":false}}"), "{v}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2629,5 +2743,261 @@ esac
         );
         // The timer alarm is local: HA is told nothing.
         assert_eq!(finished(Kind::Alarm, true), None);
+    }
+
+    // ---------------------------------------------------------------- music
+
+    type MusicRx = mpsc::UnboundedReceiver<webos_playback::music::MusicEvent>;
+
+    /// A test daemon with `[music] enabled`, the WAV sink for replies, the
+    /// alarm and music in `dir/wav`, and the player's reports kept.
+    fn music_daemon(
+        dir: &Path,
+    ) -> (
+        Daemon,
+        mpsc::Receiver<AppCommand>,
+        MusicRx,
+        mpsc::UnboundedReceiver<Done>,
+    ) {
+        let (mut d, cmd_rx) = test_daemon(dir, RemoteOff::Normal, false);
+        let wav = dir.join("wav");
+        std::fs::create_dir_all(&wav).unwrap();
+        let sink = crate::config::SinkSection {
+            kind: crate::config::SinkKind::Wav,
+            dir: wav,
+            ..crate::config::SinkSection::default()
+        };
+        let m = crate::config::MusicSection {
+            enabled: true,
+            disconnect_stop_s: 1,
+            ..crate::config::MusicSection::default()
+        };
+        let (music, music_rx) = Music::start(&m, &sink, false, d.cmd_tx.clone()).unwrap();
+        let (done_tx, done_rx) = mpsc::unbounded_channel();
+        d.player = Player::new(sink, d.volume_gain.clone(), done_tx);
+        d.music = Some(music);
+        d.alarm = Alarm::new(Duration::from_secs(30));
+        (d, cmd_rx, music_rx, done_rx)
+    }
+
+    /// Runs the parts of the daemon loop that music needs for `ms`.
+    async fn drive(
+        d: &mut Daemon,
+        music_rx: &mut MusicRx,
+        done_rx: &mut mpsc::UnboundedReceiver<Done>,
+        ms: u64,
+    ) {
+        let end = Instant::now() + Duration::from_millis(ms);
+        while Instant::now() < end {
+            tokio::select! {
+                Some(ev) = music_rx.recv() => d.music.as_mut().unwrap().on_event(ev),
+                Some(done) = done_rx.recv() => d.on_done(done).await,
+                () = tokio::time::sleep(Duration::from_millis(10)) => {}
+            }
+            d.sync_music().await;
+        }
+    }
+
+    fn music_states(rx: &mut mpsc::Receiver<AppCommand>) -> Vec<AppCommand> {
+        let mut v = Vec::new();
+        while let Ok(c) = rx.try_recv() {
+            if matches!(
+                c,
+                AppCommand::SetMusicState(_)
+                    | AppCommand::AnnounceFinished { .. }
+                    | AppCommand::PlaybackFinished { .. }
+            ) {
+                v.push(c);
+            }
+        }
+        v
+    }
+
+    /// A playing tone in the music slot (no network).
+    fn tone(d: &mut Daemon) {
+        let src = webos_playback::music::ToneSource::new(
+            48_000,
+            2,
+            webos_playback::music::Wave::Dc,
+            8_000,
+            Some(Duration::from_secs(20)),
+        );
+        d.music.as_mut().unwrap().play_test_source(Box::new(src));
+    }
+
+    #[tokio::test]
+    async fn media_stop_stops_the_alarm_first_then_the_music() {
+        use webos_esphome_api::MusicState as S;
+        let dir = test_dir("music-stop");
+        let (mut d, mut rx, mut mrx, mut drx) = music_daemon(&dir);
+        tone(&mut d);
+        drive(&mut d, &mut mrx, &mut drx, 100).await;
+        assert_eq!(
+            music_states(&mut rx),
+            vec![AppCommand::SetMusicState(S::Playing)]
+        );
+        d.on_event(AppEvent::Timer {
+            event: TimerEvent::Finished,
+            id: "t1".to_owned(),
+            name: String::new(),
+            total_seconds: 5,
+            seconds_left: 0,
+            is_active: false,
+        })
+        .await;
+        assert_ne!(d.alarm.phase(), Phase::Idle);
+        drive(&mut d, &mut mrx, &mut drx, 50).await;
+        // The chime ducks the music.
+        assert!(
+            d.music
+                .as_ref()
+                .unwrap()
+                .status_json(Instant::now())
+                .contains("\"ducked\":true")
+        );
+        // The first stop is for the alarm; the music goes on.
+        d.on_event(AppEvent::MediaStop).await;
+        drive(&mut d, &mut mrx, &mut drx, 100).await;
+        assert_eq!(d.alarm.phase(), Phase::Idle);
+        assert!(music_states(&mut rx).is_empty(), "music still playing");
+        // The second stops the music.
+        d.on_event(AppEvent::MediaStop).await;
+        drive(&mut d, &mut mrx, &mut drx, 100).await;
+        assert_eq!(
+            music_states(&mut rx),
+            vec![AppCommand::SetMusicState(S::Idle)]
+        );
+        // A third finds nothing to stop.
+        d.on_event(AppEvent::MediaStop).await;
+        d.music.take().unwrap().shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn active_standby_stops_the_music_and_refuses_play_media() {
+        use webos_esphome_api::MusicState as S;
+        let dir = test_dir("music-standby");
+        let (mut d, mut rx, mut mrx, mut drx) = music_daemon(&dir);
+        tone(&mut d);
+        drive(&mut d, &mut mrx, &mut drx, 100).await;
+        d.on_power(PowerUpdate {
+            state: Some("Active Standby".to_owned()),
+            processing: Some("Request Power Off".to_owned()),
+            ..PowerUpdate::default()
+        })
+        .await;
+        drive(&mut d, &mut mrx, &mut drx, 100).await;
+        assert_eq!(
+            music_states(&mut rx),
+            vec![
+                AppCommand::SetMusicState(S::Playing),
+                AppCommand::SetMusicState(S::Idle)
+            ]
+        );
+        // Refused there: play_media and an announcement (both only released).
+        for announce in [false, true] {
+            d.on_event(AppEvent::Music(MusicCommand::Play {
+                url: "http://192.0.2.7:9/api/esphome/ffmpeg_proxy/d/t.flac".to_owned(),
+                announce,
+            }))
+            .await;
+        }
+        assert!(d.player.current_kind().is_none());
+        drive(&mut d, &mut mrx, &mut drx, 100).await;
+        assert!(music_states(&mut rx).is_empty());
+        let v = d.music.as_ref().unwrap().status_json(Instant::now());
+        assert!(
+            v.contains("\"last_end\":\"standby\"") && v.contains("\"standby\":true"),
+            "{v}"
+        );
+        // Back to Active: accepted again (the mic mute does not matter).
+        d.on_power(PowerUpdate {
+            state: Some("Active".to_owned()),
+            ..PowerUpdate::default()
+        })
+        .await;
+        d.on_event(AppEvent::MuteChanged(true)).await;
+        tone(&mut d);
+        drive(&mut d, &mut mrx, &mut drx, 100).await;
+        assert_eq!(
+            music_states(&mut rx),
+            vec![AppCommand::SetMusicState(S::Playing)]
+        );
+        // A resume from suspend leaves the music stopped.
+        d.on_resume("test").await;
+        drive(&mut d, &mut mrx, &mut drx, 100).await;
+        assert_eq!(
+            music_states(&mut rx),
+            vec![AppCommand::SetMusicState(S::Idle)]
+        );
+        d.music.take().unwrap().shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn media_announce_ducks_and_tells_ha_no_announce_finished() {
+        let dir = test_dir("music-announce");
+        let (mut d, mut rx, mut mrx, mut drx) = music_daemon(&dir);
+        tone(&mut d);
+        drive(&mut d, &mut mrx, &mut drx, 100).await;
+        let _ = music_states(&mut rx);
+        // A loopback URL: the fetch guard refuses it, the announcement fails.
+        d.on_event(AppEvent::Music(MusicCommand::Play {
+            url: "http://127.0.0.1:9/api/tts_proxy/secret.flac".to_owned(),
+            announce: true,
+        }))
+        .await;
+        assert_eq!(d.player.current_kind(), Some(Kind::MediaAnnounce));
+        d.sync_music().await;
+        assert!(
+            d.music
+                .as_ref()
+                .unwrap()
+                .status_json(Instant::now())
+                .contains("\"ducked\":true")
+        );
+        drive(&mut d, &mut mrx, &mut drx, 300).await;
+        assert!(d.player.current_kind().is_none());
+        assert!(
+            music_states(&mut rx).is_empty(),
+            "no AnnounceFinished, the music state stays playing"
+        );
+        // A voice run ducks; its end releases after the hold.
+        d.on_event(AppEvent::WakeWordDetected).await;
+        d.sync_music().await;
+        assert!(
+            d.music
+                .as_ref()
+                .unwrap()
+                .status_json(Instant::now())
+                .contains("\"ducked\":true")
+        );
+        d.on_event(AppEvent::RunEnd).await;
+        drive(&mut d, &mut mrx, &mut drx, 900).await;
+        assert!(
+            d.music
+                .as_ref()
+                .unwrap()
+                .status_json(Instant::now())
+                .contains("\"ducked\":false")
+        );
+        // HA disconnect: the music plays on for disconnect_stop_s (1 s), then stops.
+        d.on_event(AppEvent::HaDisconnected).await;
+        drive(&mut d, &mut mrx, &mut drx, 500).await;
+        assert!(music_states(&mut rx).is_empty());
+        drive(&mut d, &mut mrx, &mut drx, 800).await;
+        assert_eq!(
+            music_states(&mut rx),
+            vec![AppCommand::SetMusicState(
+                webos_esphome_api::MusicState::Idle
+            )]
+        );
+        let v = d.music.as_ref().unwrap().status_json(Instant::now());
+        assert!(
+            v.contains("\"last_end\":\"ha_gone\"") && !v.contains("secret"),
+            "{v}"
+        );
+        d.music.take().unwrap().shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -22,6 +22,7 @@ mod darken;
 mod firmware;
 mod limits;
 mod logger;
+mod music;
 mod player;
 mod power;
 mod resume;

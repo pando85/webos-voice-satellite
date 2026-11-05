@@ -34,6 +34,10 @@ pub(crate) enum Kind {
     Tts,
     /// Announcement → `AnnounceFinished`.
     Announce,
+    /// `play_media` with `announce: true` on the music player (design D3):
+    /// played like an announcement, over the ducked music; HA is told
+    /// nothing (no voice announcement is running).
+    MediaAnnounce,
     /// The timer alarm chime: HA is told nothing.
     Alarm,
 }
@@ -154,6 +158,8 @@ pub(crate) struct Player {
     done_tx: mpsc::UnboundedSender<Done>,
     next_id: u64,
     current: Option<Active>,
+    /// Test aid (`--test-fetch-loopback`): URL media may come from 127.0.0.1.
+    fetch_loopback: bool,
 }
 
 /// Applies `gain` to s16le bytes (via [`Pcm::apply_gain`]) and returns the
@@ -214,7 +220,13 @@ impl Player {
             done_tx,
             next_id: 0,
             current: None,
+            fetch_loopback: false,
         }
+    }
+
+    /// Lets URL media reach loopback addresses (PC tests only).
+    pub(crate) fn set_fetch_loopback(&mut self, on: bool) {
+        self.fetch_loopback = on;
     }
 
     /// Whether something is playing (or streaming in).
@@ -340,12 +352,16 @@ impl Player {
         let cfg = self.cfg.clone();
         let gain = self.cfg.gain * self.volume.get();
         let done_tx = self.done_tx.clone();
+        let fetch = FetchConfig {
+            insecure_allow_loopback: self.fetch_loopback,
+            ..FetchConfig::default()
+        };
         let task = tokio::spawn(async move {
             let result = play_url_task(
                 &cfg,
+                &fetch,
                 gain,
-                id,
-                kind,
+                (id, kind),
                 &url,
                 preannounce.as_deref(),
                 cancel_rx,
@@ -573,6 +589,7 @@ fn url_sink(cfg: &SinkSection, gain: f32, id: u64, kind: Kind) -> (Box<dyn Sink>
             let prefix = match kind {
                 Kind::Tts => "reply-url",
                 Kind::Announce => "announce",
+                Kind::MediaAnnounce => "media-announce",
                 Kind::Alarm => "alarm",
             };
             let path = wav_path(&cfg.dir, prefix, id);
@@ -727,24 +744,23 @@ fn duration_bytes(d: Duration, rate: u32) -> usize {
 
 async fn play_url_task(
     cfg: &SinkSection,
+    fetch: &FetchConfig,
     gain: f32,
-    id: u64,
-    kind: Kind,
+    (id, kind): (u64, Kind),
     url: &str,
     preannounce: Option<&str>,
     mut cancel: oneshot::Receiver<()>,
 ) -> Result<PlayStats, String> {
     let (mut sink, file) = url_sink(cfg, gain, id, kind);
     let stop = sink.stop_handle();
-    let fetch = FetchConfig::default();
     let started = Instant::now();
     let play = async {
         if let Some(pre) = preannounce {
-            if let Err(e) = webos_playback::play_url(pre, &fetch, sink.as_mut()).await {
+            if let Err(e) = webos_playback::play_url(pre, fetch, sink.as_mut()).await {
                 log::warn!("player: pre-announcement {} failed: {e}", redact_url(pre));
             }
         }
-        webos_playback::play_url(url, &fetch, sink.as_mut()).await
+        webos_playback::play_url(url, fetch, sink.as_mut()).await
     };
     tokio::pin!(play);
     let res = tokio::select! {

@@ -91,13 +91,16 @@ pub(crate) struct VoiceStatus {
     /// When `ha` last changed, in seconds since the Unix epoch (the daemon's
     /// start for the first state). Written on a change only.
     pub(crate) ha_since: u64,
+    /// The `music` object (`crate::music`, design music-playback section K):
+    /// `{"enabled":false}` with music off. `None` leaves the key out.
+    pub(crate) music: Option<String>,
 }
 
 impl VoiceStatus {
     /// One JSON line (schema 1).
     pub(crate) fn to_json(&self) -> String {
         format!(
-            "{{\"schema\":1,\"mic\":{},\"remote_off\":{},\"remote_off_active\":{},\"power_state\":{},\"pairing_until\":{},\"ha\":{},\"ha_since\":{}}}\n",
+            "{{\"schema\":1,\"mic\":{},\"remote_off\":{},\"remote_off_active\":{},\"power_state\":{},\"pairing_until\":{},\"ha\":{},\"ha_since\":{}{}}}\n",
             json_str(self.mic.word()),
             json_str(darken::file_word(self.remote_off)),
             self.remote_off_active,
@@ -108,6 +111,9 @@ impl VoiceStatus {
                 .map_or_else(|| "null".to_owned(), |t| t.to_string()),
             json_str(self.ha.word()),
             self.ha_since,
+            self.music
+                .as_deref()
+                .map_or_else(String::new, |m| format!(",\"music\":{m}")),
         )
     }
 }
@@ -185,6 +191,7 @@ mod tests {
             pairing_until: None,
             ha: Ha::Connected,
             ha_since: 1_762_000_000,
+            music: None,
         }
     }
 
@@ -208,10 +215,18 @@ mod tests {
             pairing_until: Some(1_762_345_678),
             ha: Ha::Unpaired,
             ha_since: 5,
+            music: None,
         };
         assert_eq!(
             s.to_json(),
             "{\"schema\":1,\"mic\":\"busy\",\"remote_off\":\"normal\",\"remote_off_active\":false,\"power_state\":null,\"pairing_until\":1762345678,\"ha\":\"unpaired\",\"ha_since\":5}\n"
+        );
+        // The music block (design music-playback section K) goes last.
+        let mut m = status(Mic::Listening);
+        m.music = Some("{\"enabled\":false}".to_owned());
+        assert!(
+            m.to_json()
+                .ends_with(",\"ha_since\":1762000000,\"music\":{\"enabled\":false}}\n")
         );
         for (m, w) in [(Mic::Muted, "muted"), (Mic::Closed, "closed")] {
             assert!(status(m).to_json().contains(&format!("\"mic\":\"{w}\"")));
