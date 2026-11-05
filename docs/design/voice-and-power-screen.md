@@ -357,7 +357,7 @@ Cost: two short `luna-send` calls a minute, far below the 5 to 10 s polls the co
 ## 9. Open questions
 
 1. After EXP-011 (answered: values, payloads, no provider parameter, one microphone first opener wins): still open are whether LG reverts a value by itself, a menu change showing in the getters and the reverse, an on-screen prompt after `setActivation true`, the getters in `Active Standby`, `subscribe`, whether Amazon or Dangbei hands-free can be switched at all, whether Hi LG's own wake word works while the satellite holds the microphone, whether Hi LG off releases a PCM LG already holds, and the c3-b read-only part.
-2. Whether luna calls for these services need a pseudo-terminal from `ctl.sh` (the daemon runs them on one): `ctl.sh` tries a plain pipe first and falls back to python3's pty (section 6); check once on the TV through the app's `exec`.
+2. **Answered on c3-a (0.3.0):** the calls for these services work over a plain pipe, also through the app's `exec`; the pty fallback is not needed there (and c3-a's python3 has no `pty` module, fixed to `os.openpty`). Open for c3-b and other TVs.
 3. c3-a: is Keep listening, with the daemon already installed there, observed once with a person present (needed for the P3 and P4 labels on c3-a)?
 4. The real IR remote and wake and darken; the panel flash by eye; the power draw of `Screen Off` and Always Ready (a plug meter): these keep the cost lines of 4.4 as "not measured" and "not observed".
 5. N-hilg-on now says what was seen (EXP-011, c3-a): Hi LG on with the satellite listening. Whether it should stay a permanent line or appear only once, is for the owner after seeing the screen.
