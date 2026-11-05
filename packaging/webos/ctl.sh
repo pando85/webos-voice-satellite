@@ -32,6 +32,14 @@
 #                     report (run/report.*), or builds a static one
 #   selfcheck         re-run the microphone self-check (daemon running)
 #   ack-firmware      acknowledge a firmware change (clears the warning)
+#   tv-settings [--json]
+#                     read Always Ready, LG hands-free (Hi LG), the remote
+#                     power-off setting and the microphone state (read only)
+#   set always-ready on|off | hi-lg on|off | remote-off normal|keep
+#                     change one setting on an explicit request: the two LG
+#                     settings are written once, read back and logged to
+#                     etc/tv-settings.log (ADR 0008); remote-off is the
+#                     satellite's own setting. The daemon never does this
 #   reset-pairing     forget the stored key and open the window
 #   clear-crashloop   delete DIR/crashloop after fixing the cause
 #   uninstall         delete the boot hook, stop, delete the daemon; KEEP
@@ -41,7 +49,9 @@
 #
 # DIR is /var/lib/webos-satellite. Environment (tests, other layouts):
 # WEBOS_SAT_PREFIX (DIR), WEBOS_SAT_INITD (default /var/lib/webosbrew/init.d),
-# WEBOS_SAT_LOCK, WEBOS_SAT_ALLOW_NONROOT=1 (skip the root check).
+# WEBOS_SAT_LOCK, WEBOS_SAT_ALLOW_NONROOT=1 (skip the root check),
+# WEBOS_SAT_LUNA_SEND (default luna-send), WEBOS_SAT_SETTLE (seconds before a
+# read-back, default 0.5).
 # Exit status: 0 done, 1 failed (message on stderr), 2 usage.
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
@@ -49,7 +59,7 @@ here=$(cd "$(dirname "$0")" && pwd)
 . "$here/lib.sh"
 
 usage() {
-    sed -n '2,45p' "$0" >&2
+    sed -n '2,55p' "$0" >&2
     exit 2
 }
 
@@ -473,6 +483,421 @@ cmd_status() {
     printf ']}\n'
 }
 
+# --- tv-settings and set (docs/design/voice-and-power-screen.md, section 6) ---
+
+LUNA=${WEBOS_SAT_LUNA_SEND:-luna-send}
+HISTORY=$P/etc/tv-settings.log
+HISTORY_MAX=200
+LUNA_MODE= # plain | pty, found by the first successful read
+LUNA_REPLY=
+LUNA_ERR=
+
+# Runs one luna call on a pseudo-terminal: luna-send printed nothing over a
+# pipe for the audio methods (docs/design/tv-control.md section 5), and the
+# daemon runs its calls on a pty. python3 is on the TVs (c3-a record); a TV
+# without it gets the plain pipe only.
+# argv: timeout seconds, then the command.
+PTY_PY='import os, pty, select, subprocess, sys, time
+end = time.time() + float(sys.argv[1])
+m, s = pty.openpty()
+p = subprocess.Popen(sys.argv[2:], stdin=s, stdout=s, stderr=s, close_fds=True)
+os.close(s)
+out = b""
+while time.time() < end and len(out) < 65536:
+    r = select.select([m], [], [], 0.3)[0]
+    if r:
+        try:
+            d = os.read(m, 4096)
+        except OSError:
+            break
+        if not d:
+            break
+        out += d
+    elif p.poll() is not None:
+        break
+if p.poll() is None:
+    p.kill()
+p.wait()
+sys.stdout.buffer.write(out)'
+
+luna_raw() { # MODE URI PAYLOAD
+    case $1 in
+    pty) python3 -c "$PTY_PY" 6 "$LUNA" -n 1 -w 3000 "$2" "$3" 2>/dev/null ;;
+    *)
+        if command -v timeout >/dev/null 2>&1; then
+            timeout 6 "$LUNA" -n 1 -w 3000 "$2" "$3" </dev/null 2>/dev/null
+        else
+            "$LUNA" -n 1 -w 3000 "$2" "$3" </dev/null 2>/dev/null
+        fi
+        ;;
+    esac
+}
+
+# One luna call. Sets LUNA_REPLY (one line, from the first brace) and
+# LUNA_ERR; returns 0 when the TV answered returnValue true. Only the error
+# code and text of a failure are kept, never a reply body.
+luna_call() { # URI PAYLOAD
+    LUNA_REPLY=
+    LUNA_ERR=
+    raw=
+    if [ -n "$LUNA_MODE" ]; then
+        raw=$(luna_raw "$LUNA_MODE" "$1" "$2") || raw=
+    else
+        raw=$(luna_raw plain "$1" "$2") || raw=
+        case $raw in
+        *'{'*) LUNA_MODE=plain ;;
+        *)
+            if command -v python3 >/dev/null 2>&1; then
+                raw=$(luna_raw pty "$1" "$2") || raw=
+                case $raw in *'{'*) LUNA_MODE=pty ;; esac
+            fi
+            ;;
+        esac
+    fi
+    LUNA_REPLY=$(printf '%s' "$raw" | tr -d '\r\n' | sed 's/^[^{]*//')
+    case $LUNA_REPLY in
+    '') LUNA_ERR=timeout; return 1 ;;
+    '{'*) ;;
+    *) LUNA_ERR="bad reply"; return 1 ;;
+    esac
+    case $LUNA_REPLY in
+    *'"returnValue"'*[:]*true*) return 0 ;;
+    esac
+    code=$(printf '%s' "$LUNA_REPLY" | sed -n 's/.*"errorCode"[[:space:]]*:[[:space:]]*\(-\{0,1\}[0-9]*\).*/\1/p')
+    text=$(printf '%s' "$LUNA_REPLY" | sed -n 's/.*"errorText"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' |
+        tr -c 'A-Za-z0-9 ._:-' '?' | cut -c1-80)
+    LUNA_ERR=${text:-${code:+error $code}}
+    LUNA_ERR=${LUNA_ERR:-failed}
+    return 1
+}
+
+# The luna-send binary exists and the caller may use it; prints a reason if not.
+luna_unavailable() {
+    if [ "$(id -u)" != 0 ] && [ "${WEBOS_SAT_ALLOW_NONROOT:-}" != 1 ]; then
+        echo "not root"
+    elif ! command -v "$LUNA" >/dev/null 2>&1; then
+        echo "no luna-send"
+    fi
+}
+
+# Reads Always Ready: sets AR_STATE (off|on|unknown|error), AR_RAW, AR_ERR.
+read_always_ready() {
+    AR_STATE=error
+    AR_RAW=
+    AR_ERR=
+    if luna_call luna://com.webos.settingsservice/getSystemSettings \
+        '{"category":"general","keys":["lifeOnScreenMode"]}'; then
+        AR_RAW=$(printf '%s' "$LUNA_REPLY" |
+            sed -n 's/.*"lifeOnScreenMode"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | tr -c 'A-Za-z0-9\n' '?' | cut -c1-24)
+        case $AR_RAW in
+        off) AR_STATE=off ;;
+        alwaysReady) AR_STATE=on ;;
+        '') AR_ERR="no value in the reply" ;;
+        *) AR_STATE=unknown ;;
+        esac
+    else
+        AR_ERR=$LUNA_ERR
+    fi
+}
+
+# settingStatus of one provider object of a getActivation reply; the top
+# level when $2 is empty. Prints true, false or nothing.
+hl_flag() { # REPLY PROVIDER
+    if [ -n "$2" ]; then
+        body=$(printf '%s' "$1" | sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*{\\([^}]*\\)}.*/\\1/p")
+    else
+        body=$(printf '%s' "$1" | sed 's/"[A-Za-z]*"[[:space:]]*:[[:space:]]*{[^}]*}//g')
+    fi
+    printf '%s' "$body" | sed -n 's/.*"settingStatus"[[:space:]]*:[[:space:]]*\(true\|false\).*/\1/p'
+}
+
+# Reads LG hands-free: sets HL_STATE (off|on|error), HL_THINQ, HL_AMAZON,
+# HL_DANGBEI (true|false|null), HL_ERR. `on` is any provider on; the toggle
+# of the app addresses thinQ only (EXP-011).
+read_hi_lg() {
+    HL_STATE=error
+    HL_THINQ=null
+    HL_AMAZON=null
+    HL_DANGBEI=null
+    HL_ERR=
+    if luna_call luna://com.webos.service.voiceinput/setting/getActivation '{}'; then
+        HL_THINQ=$(hl_flag "$LUNA_REPLY" thinQ)
+        HL_AMAZON=$(hl_flag "$LUNA_REPLY" amazon)
+        HL_DANGBEI=$(hl_flag "$LUNA_REPLY" dangbei)
+        [ -n "$HL_THINQ" ] || HL_THINQ=$(hl_flag "$LUNA_REPLY" '')
+        HL_THINQ=${HL_THINQ:-null}
+        HL_AMAZON=${HL_AMAZON:-null}
+        HL_DANGBEI=${HL_DANGBEI:-null}
+        if [ "$HL_THINQ" = null ]; then
+            HL_ERR="no settingStatus in the reply"
+        elif [ "$HL_THINQ" = true ] || [ "$HL_AMAZON" = true ] || [ "$HL_DANGBEI" = true ]; then
+            HL_STATE=on
+        else
+            HL_STATE=off
+        fi
+    else
+        HL_ERR=$LUNA_ERR
+    fi
+}
+
+utc_now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+# The last applied change in the history file, as JSON or null.
+last_change_json() {
+    [ -f "$HISTORY" ] || { printf null; return 0; }
+    l=$(grep ' result .*outcome=applied' "$HISTORY" 2>/dev/null | tail -n 1) || l=
+    [ -n "$l" ] || { printf null; return 0; }
+    at=${l%% *}
+    from=
+    to=
+    st=$(printf '%s' "$l" | cut -d' ' -f2)
+    # shellcheck disable=SC2086
+    for w in $l; do
+        case $w in
+        from=*) from=${w#from=} ;;
+        to=*) to=${w#to=} ;;
+        esac
+    done
+    printf '{"setting":%s,"from":%s,"to":%s,"at":%s}' "$(json_str "$st")" "$(json_str "$from")" "$(json_str "$to")" "$(json_str "$at")"
+}
+
+# run/voice.json (written by the daemon); a missing or old (60 s) file is unknown.
+voice_field() { # KEY (string or bool value)
+    sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\"\\{0,1\\}\\([A-Za-z_ ]*\\)\"\\{0,1\\}[,}].*/\\1/p" "$RUN_DIR/voice.json" 2>/dev/null | head -n 1
+}
+
+voice_fresh() {
+    [ -f "$RUN_DIR/voice.json" ] || return 1
+    mt=$(stat -c %Y "$RUN_DIR/voice.json" 2>/dev/null) || return 1
+    now=$(date +%s)
+    case $mt$now in *[!0-9]*) return 1 ;; esac
+    [ $((now - mt)) -le 60 ]
+}
+
+remote_off_word() {
+    w=$(sed -n '1{s/[^a-z_]//g;p;}' "$P/etc/remote_off" 2>/dev/null || true)
+    case $w in keep_listening) echo keep_listening ;; *) echo normal ;; esac
+}
+
+cmd_tv_settings() {
+    case ${1:-} in '' | --json) ;; *) usage ;; esac
+    [ $# -le 1 ] || usage
+    installed || die "not installed (ctl.sh install)"
+    why=$(luna_unavailable)
+    if [ -n "$why" ]; then
+        AR_STATE=error
+        AR_RAW=
+        AR_ERR=$why
+        HL_STATE=error
+        HL_THINQ=null
+        HL_AMAZON=null
+        HL_DANGBEI=null
+        HL_ERR=$why
+        luna=false
+    else
+        luna=true
+        read_always_ready
+        read_hi_lg
+    fi
+    ro=$(remote_off_word)
+    mic=unknown
+    ro_active=null
+    pstate=null
+    if voice_fresh; then
+        m=$(voice_field mic)
+        case $m in listening | busy | muted | closed) mic=$m ;; esac
+        a=$(voice_field remote_off_active)
+        case $a in true | false) ro_active=$a ;; esac
+        ps=$(voice_field power_state)
+        case $ps in '' | null) ;; *) pstate=$(json_str "$ps") ;; esac
+    fi
+    running || ro_active=null
+    mic_kill=false
+    [ ! -e "$KILL_SWITCH_DEFAULT" ] || mic_kill=true
+    if [ "$mic_kill" = true ] && [ "$mic" = unknown ]; then mic=muted; fi
+    printf '{"schema":1,"luna":%s,"daemon_running":%s,' "$luna" "$(json_bool running)"
+    printf '"always_ready":{"state":%s,"raw":%s,"error":%s},' "$(json_str "$AR_STATE")" "$(json_str "$AR_RAW")" "$(json_str "$AR_ERR")"
+    printf '"hi_lg":{"state":%s,"thinq":%s,"amazon":%s,"dangbei":%s,"error":%s},' "$(json_str "$HL_STATE")" "$HL_THINQ" "$HL_AMAZON" "$HL_DANGBEI" "$(json_str "$HL_ERR")"
+    printf '"remote_off":{"state":%s,"active":%s},' "$(json_str "$ro")" "$ro_active"
+    printf '"mic":{"state":%s,"kill_switch":%s},' "$(json_str "$mic")" "$mic_kill"
+    printf '"power_state":%s,"last_change":%s}\n' "$pstate" "$(last_change_json)"
+}
+
+# Appends one line to the history file (mode 0600, capped); fails when it cannot.
+history_add() {
+    mkdir -p "$P/etc" 2>/dev/null || return 1
+    (
+        umask 077
+        printf '%s %s\n' "$(utc_now)" "$1" >>"$HISTORY"
+    ) || return 1
+    chmod 600 "$HISTORY" 2>/dev/null || true
+    n=$(wc -l <"$HISTORY" 2>/dev/null | tr -d ' ') || return 0
+    case $n in '' | *[!0-9]*) return 0 ;; esac
+    if [ "$n" -gt "$HISTORY_MAX" ]; then
+        (
+            umask 077
+            tail -n "$HISTORY_MAX" "$HISTORY" >"$HISTORY.new.$$" && mv -f "$HISTORY.new.$$" "$HISTORY"
+        ) || rm -f "$HISTORY.new.$$"
+    fi
+    return 0
+}
+
+# Prints the result of a set, on stdout as JSON and on stderr as a sentence.
+set_emit() { # SETTING REQUESTED BEFORE AFTER RESULT ERROR
+    printf '{"schema":1,"setting":%s,"requested":%s,"before":%s,"after":%s,"result":%s,"error":%s}\n' \
+        "$(json_str "$1")" "$(json_str "$2")" "$(json_str "$3")" "$(json_str "$4")" "$(json_str "$5")" "$(json_str "$6")"
+    case $5 in
+    applied) echo "$1 is now $4 (was $3)" >&2 ;;
+    already) echo "$1 is already $4; nothing changed" >&2 ;;
+    mismatch) echo "$1: the TV reports $4, not $2; the change did not stick" >&2 ;;
+    *) echo "$1: $5${6:+: $6} (the TV holds ${4:-$3})" >&2 ;;
+    esac
+    case $5 in applied | already) return 0 ;; *) return 1 ;; esac
+}
+
+settle() { sleep "${WEBOS_SAT_SETTLE:-0.5}" 2>/dev/null || sleep 1; }
+
+# set always-ready|hi-lg on|off
+cmd_set_lg() { # SETTING REQUESTED
+    st=$1
+    want=$2
+    installed || die "not installed (ctl.sh install)"
+    why=$(luna_unavailable)
+    [ -z "$why" ] || { set_emit "$st" "$want" "" "" refused "$why"; return; }
+    locked
+    case $st in
+    always-ready) read_always_ready; before=$AR_STATE; berr=$AR_ERR; braw=$AR_RAW ;;
+    hi-lg) read_hi_lg; before=$HL_STATE; berr=$HL_ERR; braw= ;;
+    esac
+    if [ "$before" = error ]; then
+        set_emit "$st" "$want" "" "" refused "${berr:-cannot read}"
+        return
+    fi
+    if [ "$st" = hi-lg ]; then
+        before=off
+        [ "$HL_THINQ" != true ] || before=on
+    fi
+    if [ "$before" = unknown ]; then
+        set_emit "$st" "$want" "" "$braw" refused "unknown value"
+        return
+    fi
+    if [ "$before" = "$want" ]; then
+        set_emit "$st" "$want" "$before" "$before" already ""
+        return
+    fi
+    history_add "$st request from=$before to=$want source=ctl" ||
+        { set_emit "$st" "$want" "$before" "$before" refused "cannot write $HISTORY"; return; }
+    wrote=
+    case $st in
+    always-ready)
+        v=off
+        [ "$want" != on ] || v=alwaysReady
+        luna_call luna://com.webos.settingsservice/setSystemSettings \
+            "{\"category\":\"general\",\"settings\":{\"lifeOnScreenMode\":\"$v\"}}" || wrote=$LUNA_ERR
+        ;;
+    hi-lg)
+        v=false
+        [ "$want" != on ] || v=true
+        luna_call luna://com.webos.service.voiceinput/setting/setActivation \
+            "{\"settingStatus\":$v}" || wrote=$LUNA_ERR
+        ;;
+    esac
+    settle
+    after=
+    aerr=
+    case $st in
+    always-ready)
+        read_always_ready
+        case $AR_STATE in error) aerr=$AR_ERR ;; *) after=$AR_STATE ;; esac
+        [ "$AR_STATE" != unknown ] || after=$AR_RAW
+        ;;
+    hi-lg)
+        read_hi_lg
+        case $HL_STATE in error) aerr=$HL_ERR ;; *) after=off; [ "$HL_THINQ" != true ] || after=on ;; esac
+        ;;
+    esac
+    if [ -n "$wrote" ]; then
+        res=failed
+        err=$wrote
+    elif [ -n "$aerr" ]; then
+        res=failed
+        err="read-back: $aerr"
+    elif [ "$after" = "$want" ]; then
+        res=applied
+        err=
+    else
+        res=mismatch
+        err=
+    fi
+    history_add "$st result from=$before to=$want read=${after:-unknown} outcome=$res" || true
+    if [ "$res" = applied ] && [ -d "$RUN_DIR" ] && running; then
+        : >"$RUN_DIR/lg-settings-refresh" 2>/dev/null || true
+    fi
+    set_emit "$st" "$want" "$before" "$after" "$res" "$err"
+}
+
+# set remote-off normal|keep: the satellite's own setting; no luna.
+cmd_set_remote_off() {
+    case $1 in
+    normal) word=normal ;;
+    keep) word=keep_listening ;;
+    *) usage ;;
+    esac
+    installed || die "not installed (ctl.sh install)"
+    locked
+    f=$(cfg_value remote_off_file)
+    f=${f:-remote_off}
+    case $f in /*) ;; *) f=$P/etc/$f ;; esac
+    before=normal
+    [ "$(sed -n '1{s/[^a-z_]//g;p;}' "$f" 2>/dev/null || true)" != keep_listening ] || before=keep_listening
+    mkdir -p "$(dirname "$f")"
+    if echo "$word" >"$f.new.$$" && mv -f "$f.new.$$" "$f"; then
+        :
+    else
+        rm -f "$f.new.$$"
+        printf '{"schema":1,"setting":"remote-off","requested":%s,"before":%s,"after":%s,"result":"failed","error":"cannot write the file","daemon":"unknown"}\n' \
+            "$(json_str "$word")" "$(json_str "$before")" "$(json_str "$before")"
+        return 1
+    fi
+    history_add "remote-off result from=$before to=$word read=$word outcome=applied" || true
+    d="not running"
+    mkdir -p "$RUN_DIR"
+    : >"$RUN_DIR/remote-off-reload"
+    if running; then
+        d=pending
+        i=0
+        while [ "$i" -lt 6 ]; do
+            if [ ! -e "$RUN_DIR/remote-off-reload" ]; then
+                d=applied
+                break
+            fi
+            sleep 0.5 2>/dev/null || sleep 1
+            i=$((i + 1))
+        done
+    fi
+    printf '{"schema":1,"setting":"remote-off","requested":%s,"before":%s,"after":%s,"result":"applied","error":"","daemon":%s}\n' \
+        "$(json_str "$word")" "$(json_str "$before")" "$(json_str "$word")" "$(json_str "$d")"
+    echo "remote-off is now $word (daemon: $d)" >&2
+}
+
+cmd_set() {
+    [ $# -eq 2 ] || usage
+    case "$1 $2" in
+    "always-ready on" | "always-ready off" | "hi-lg on" | "hi-lg off")
+        if [ "$(id -u)" != 0 ] && [ "${WEBOS_SAT_ALLOW_NONROOT:-}" != 1 ]; then
+            set_emit "$1" "$2" "" "" refused "not root"
+            return
+        fi
+        cmd_set_lg "$1" "$2"
+        ;;
+    "remote-off normal" | "remote-off keep")
+        need_root
+        cmd_set_remote_off "$2"
+        ;;
+    *) usage ;;
+    esac
+}
+
 [ $# -ge 1 ] || usage
 cmd=$1
 shift
@@ -496,6 +921,8 @@ reset-pairing) [ $# -eq 0 ] || usage; cmd_trigger reset-pairing ;;
 report) cmd_report "$@" ;;
 selfcheck) [ $# -eq 0 ] || usage; cmd_selfcheck ;;
 ack-firmware) [ $# -eq 0 ] || usage; cmd_ack_firmware ;;
+tv-settings) cmd_tv_settings "$@" ;;
+set) cmd_set "$@" ;;
 clear-crashloop) [ $# -eq 0 ] || usage; need_root; rm -f "$CRASHLOOP"; note "crash-loop marker removed" ;;
 uninstall) [ $# -eq 0 ] || usage; cmd_uninstall ;;
 purge) [ $# -eq 0 ] || usage; cmd_purge ;;
