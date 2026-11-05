@@ -495,11 +495,12 @@ LUNA_ERR=
 # Runs one luna call on a pseudo-terminal: luna-send printed nothing over a
 # pipe for the audio methods (docs/design/tv-control.md section 5), and the
 # daemon runs its calls on a pty. python3 is on the TVs (c3-a record); a TV
-# without it gets the plain pipe only.
+# without it gets the plain pipe only. os.openpty, not the pty module: c3-a's
+# python3 3.8 has no pty module (P4, 0.3.0) but has os.openpty.
 # argv: timeout seconds, then the command.
-PTY_PY='import os, pty, select, subprocess, sys, time
+PTY_PY='import os, select, subprocess, sys, time
 end = time.time() + float(sys.argv[1])
-m, s = pty.openpty()
+m, s = os.openpty()
 p = subprocess.Popen(sys.argv[2:], stdin=s, stdout=s, stderr=s, close_fds=True)
 os.close(s)
 out = b""

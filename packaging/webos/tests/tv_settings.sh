@@ -160,6 +160,14 @@ out=$(ctl tv-settings --json)
 if command -v python3 >/dev/null 2>&1; then
     check "luna-send that prints only on a terminal: read through a pty" 'echo "$out" | grep -q "\"always_ready\":{\"state\":\"off\"" && echo "$out" | grep -q "\"hi_lg\":{\"state\":\"off\""'
 fi
+# c3-a's python3 3.8 has no pty module (P4, 0.3.0): the fallback must work without it
+mkdir -p "$T/nopty"
+printf 'import sys\nsys.modules["pty"] = None\n' >"$T/nopty/sitecustomize.py"
+if command -v python3 >/dev/null 2>&1; then
+    out=$(PYTHONPATH=$T/nopty ctl tv-settings --json)
+    check "pty fallback with a python3 whose pty module is missing (as on c3-a)" 'echo "$out" | grep -q "\"always_ready\":{\"state\":\"off\"" && echo "$out" | grep -q "\"hi_lg\":{\"state\":\"off\""'
+fi
+check "PTY_PY does not use the pty module" '! sed -n "/^PTY_PY=/,/^sys.stdout/p" "$PKG/ctl.sh" | grep -q "pty\\.\|import.*pty"'
 rm -f "$F/needs_tty"
 
 echo "== set always-ready / hi-lg =="
