@@ -18,6 +18,10 @@ core.*
 .env
 .env.*
 !.env.example
+# Exception: synthetic sine-tone fixtures made by
+# crates/playback/tests/fixtures/generate.sh (no recordings).
+!crates/playback/tests/fixtures/tone-*.wav
+!crates/playback/tests/fixtures/tone-*.flac
 # Tooling
 __pycache__/
 .pytest_cache/

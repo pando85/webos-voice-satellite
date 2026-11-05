@@ -6,6 +6,8 @@
 //! [`play_url`] runs all four and reports per-stage timings.
 //!
 //! The [`music`] module is the music engine (second `pacat`, gain, ducking, pacer).
+//! [`stream`] is the music source: a streaming fetch and an incremental
+//! decoder on two named threads, for bodies of unknown or endless length.
 //!
 //! Everything is pure Rust except the external `pacat` process, so the crate
 //! builds as a static musl binary for the TV.
@@ -18,6 +20,7 @@ mod fetch;
 mod pcm;
 mod resample;
 mod sink;
+pub mod stream;
 
 use std::time::{Duration, Instant};
 

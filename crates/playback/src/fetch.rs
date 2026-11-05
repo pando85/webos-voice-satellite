@@ -75,7 +75,7 @@ pub async fn fetch_with_meta(url: &str, cfg: &FetchConfig) -> Result<Fetched, Pl
         .map_err(|e| PlaybackError::Http(format!("fetch task failed: {e}")))?
 }
 
-fn check_scheme(url: &str) -> Result<(), PlaybackError> {
+pub(crate) fn check_scheme(url: &str) -> Result<(), PlaybackError> {
     let lower = url.get(..8).unwrap_or(url).to_ascii_lowercase();
     if lower.starts_with("http://") || lower.starts_with("https://") {
         Ok(())
@@ -100,15 +100,23 @@ fn load_ca_file(path: &PathBuf) -> Result<Vec<Certificate<'static>>, PlaybackErr
     Ok(certs)
 }
 
-fn fetch_blocking(url: &str, cfg: &FetchConfig) -> Result<Fetched, PlaybackError> {
+/// TLS settings shared by [`fetch`] and the music stream: rustls with the
+/// bundled Mozilla roots, or only the certificates in `ca_file`. Validation
+/// is always on.
+pub(crate) fn tls_config(ca_file: Option<&PathBuf>) -> Result<TlsConfig, PlaybackError> {
     let mut tls = TlsConfig::builder();
-    if let Some(path) = &cfg.ca_file {
+    if let Some(path) = ca_file {
         tls = tls.root_certs(RootCerts::Specific(Arc::new(load_ca_file(path)?)));
     }
+    Ok(tls.build())
+}
+
+fn fetch_blocking(url: &str, cfg: &FetchConfig) -> Result<Fetched, PlaybackError> {
+    let tls = tls_config(cfg.ca_file.as_ref())?;
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(cfg.timeout))
         .timeout_connect(Some(cfg.connect_timeout))
-        .tls_config(tls.build())
+        .tls_config(tls)
         .user_agent("webos-voice-satellite")
         .build()
         .into();
@@ -136,7 +144,7 @@ fn fetch_blocking(url: &str, cfg: &FetchConfig) -> Result<Fetched, PlaybackError
     })
 }
 
-fn map_err(e: ureq::Error) -> PlaybackError {
+pub(crate) fn map_err(e: ureq::Error) -> PlaybackError {
     match e {
         ureq::Error::StatusCode(s) => PlaybackError::Status(s),
         ureq::Error::Timeout(_) => PlaybackError::Timeout,

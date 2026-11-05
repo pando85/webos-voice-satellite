@@ -9,7 +9,10 @@ publish.workspace = true
 
 [dependencies]
 # Pure-Rust HTTP(S) client: rustls (ring) + bundled webpki roots, no system libs.
-ureq = { version = "3.5", default-features = false, features = ["rustls"] }
+# Pinned: the music stream relies on 3.5.0 behaviour (timeout_per_read as a
+# socket read timeout, Agent::shutdown interrupting blocked reads) and on the
+# unversioned connector API. Re-check src/stream before bumping.
+ureq = { version = "=3.5.0", default-features = false, features = ["rustls"] }
 # Pure-Rust decoders. MPL-2.0 (file-level copyleft, fine for static linking).
 symphonia = { version = "0.6", default-features = false, features = ["mp3", "flac", "wav", "pcm", "ogg", "vorbis"] }
 tokio = { version = "1", default-features = false, features = ["rt", "process", "io-util", "time", "sync", "macros"] }

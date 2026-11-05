@@ -41,7 +41,14 @@ pub enum PlaybackError {
     /// The sink did not finish within the expected duration plus a margin.
     #[error("playback timed out after {0:?}")]
     PlayTimeout(Duration),
-    /// Playback was cancelled through a `StopHandle`.
+    /// A music stream received no byte for this long (socket read timeout).
+    #[error("stream stalled: no data for {0:?}")]
+    IdleTimeout(Duration),
+    /// The body ended before its declared `Content-Length` (or inside a
+    /// chunk of a chunked body).
+    #[error("stream ended before its declared length")]
+    EndedEarly,
+    /// Playback was cancelled through a `StopHandle` or a stream `Canceller`.
     #[error("playback cancelled")]
     Cancelled,
     /// Local I/O error (CA file, WAV output).
