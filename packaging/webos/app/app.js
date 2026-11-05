@@ -344,7 +344,7 @@
       setCard('h-listen', s && !known ? 'No' : 'Checking', s && !known ? 'The satellite is not set up.' : '', 'idle', false);
       setCard('h-power', s && !known ? 'Not known' : 'Checking', '', 'idle', false);
     }
-    var h = VP.haSummary(s || {});
+    var h = VP.haCard(s || {});
     setCard('h-ha', s ? h.short : 'Checking', s ? haDetail(h) : '', s ? h.tone : 'idle', false);
 
     // the chip in the top bar
@@ -399,7 +399,7 @@
     var live = setupLive();
     show('a-endphone', live);
     text($('a-phone-t'), live ? 'Show the phone code' : 'Set up with your phone');
-    text($('a-phone-sub'), live ? (setup.state === 'active' ? 'A phone is connected' : 'The code is still open') : 'Shows a code to scan');
+    text($('a-phone-sub'), live ? (setup.state === 'active' ? 'A phone is connected' : 'The code is still open') : (setup.unavailable ? 'Not available in this version' : 'Shows a code to scan'));
     $('a-phone').className = 'act' + ($('a-pair').hidden ? ' lead' : '');
     text($('a-endphone-sub'), setupSessionText());
     renderArmed();
@@ -950,6 +950,7 @@
 
   function startSetup() {
     setup.error = '';
+    setup.unavailable = false;
     if (setupLive()) { go('setup', 'q-done'); return; }
     if (busy) { return; }
     busy = true;
@@ -963,7 +964,14 @@
         applySetup(d);
       } else {
         setup.state = 'none';
-        setup.error = 'The phone setup could not start: ' + (lastLine(r.out) || r.err || 'no answer') + '.';
+        var why = lastLine(r.out) || r.err || 'no answer';
+        // This version has no setup server (an ipk built without it): say so plainly.
+        if (/setup server is missing/.test(why)) {
+          setup.unavailable = true;
+          setup.error = VP.SETUP_UNAVAILABLE + '.';
+        } else {
+          setup.error = 'The phone setup could not start: ' + why + '.';
+        }
         renderSetup();
         renderChrome();
       }
@@ -1027,7 +1035,7 @@
     else if (s === 'none' && screen === 'setup') { line = 'No phone session.'; }
     text($('q-state'), line);
     $('q-state').className = 'state-line' + (setup.error ? ' bad-line' : '');
-    show('q-again', !LIVE[s]);
+    show('q-again', !LIVE[s] && !setup.unavailable);
     if (screen === 'setup') { ensureFocus('q-done'); }
   }
 

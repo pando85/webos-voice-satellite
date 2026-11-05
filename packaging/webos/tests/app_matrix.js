@@ -167,6 +167,21 @@ check('Home Assistant card: key words, the pairing window wins, not installed', 
   && VP.haSummary({ installed: true, key: 'unpaired', pairing: { open: true, ends_in_s: 300 } }).pairingLeftS === 300
   && VP.haSummary({ installed: true, key: 'unpaired', pairing: { open: false, ends_in_s: null } }).key === 'unpaired'
   && VP.haSummary({ installed: false }).short === 'Not set up' && VP.haSummary({ installed: true, key: 'weird' }).key === 'none');
+check('Home Assistant Home card: connected, disconnected, unpaired, unknown from ha.state; short and full wording; pairing and not installed win', (() => {
+  const c = (ha, x) => VP.haCard(Object.assign({ installed: true, key: 'paired', ha: ha }, x));
+  const words = Object.keys(VP.HA_CONN);
+  return words.join() === 'connected,disconnected,unpaired,unknown'
+    && words.every((w) => VP.HA_CONN[w].short && VP.HA_CONN[w].full && VP.HA_CONN[w].short.length < VP.HA_CONN[w].full.length && ['ok', 'warn', 'idle'].includes(VP.HA_CONN[w].tone))
+    && c({ state: 'connected', since_s: 5 }).short === 'Connected' && c({ state: 'connected', since_s: 5 }).tone === 'ok'
+    && c({ state: 'disconnected', since_s: 5 }).short === 'Disconnected' && c({ state: 'disconnected', since_s: 5 }).tone === 'warn'
+    && c({ state: 'unpaired', since_s: null }).short === 'Not paired'
+    && c({ state: 'unknown', since_s: null }).short === 'Not known' && c(undefined).key === 'unknown' && c(null).key === 'unknown'
+    && c({ state: 'weird' }).key === 'unknown' && c('connected').key === 'unknown'
+    && c({ state: 'connected' }, { pairing: { open: true, ends_in_s: 120 } }).key === 'pairing'
+    && c({ state: 'connected' }, { pairing: { open: true, ends_in_s: 120 } }).pairingLeftS === 120
+    && VP.haCard({ installed: false, ha: { state: 'connected' } }).short === 'Not set up'
+    && VP.haCard({}).key === 'notinstalled';
+})());
 check('firmware card: capture beats changed beats the status word; the reason goes into the full text', (() => {
   const c = (x) => VP.compat({ installed: true, compat: Object.assign({ compat_status: 'not verified', selfcheck: 'passed' }, x) });
   return c({ capture_problem: true, firmware_changed: true, selfcheck: 'failed: no audio' }).name === 'capture'

@@ -93,7 +93,30 @@
     pairing: { short: 'Waiting for pairing', full: 'Add this TV in Home Assistant now, with the address and port below.', tone: 'accent' },
     notinstalled: { short: 'Not set up', full: 'Set up the satellite first.', tone: 'idle' }
   };
+  // The API connection, by `ha.state` of `ctl.sh status --json` (daemon 0.3.1+,
+  // run/voice.json). short: the Home card value; full: the card detail.
+  var HA_CONN = {
+    connected: { short: 'Connected', full: 'Home Assistant is connected to this TV.', tone: 'ok' },
+    disconnected: { short: 'Disconnected', full: 'Home Assistant is not connected now. It reconnects by itself.', tone: 'warn' },
+    unpaired: { short: 'Not paired', full: 'Open Home Assistant here and start pairing.', tone: 'warn' },
+    unknown: { short: 'Not known', full: 'The connection is not known now: the satellite is stopped or has not reported yet.', tone: 'idle' }
+  };
+  var SETUP_UNAVAILABLE = 'Phone setup is not available in this version';
   var HA_STEPS = 'In Home Assistant: Settings, Devices & services, Add integration, ESPHome. Enter the address and the port. No key to type: Home Assistant sets it while pairing is open.';
+
+  // The Home card for Home Assistant: the connection (`ha.state`), with an open
+  // pairing window and a missing setup winning over it. Not the key word (that
+  // is haSummary, for the Home Assistant screen).
+  // { key, short, full, tone, pairingLeftS }; key is one of HA_CONN, 'pairing' or 'notinstalled'.
+  function haCard(st) {
+    st = st || {};
+    var s = haSummary(st);
+    if (s.key === 'pairing' || s.key === 'notinstalled') { return s; }
+    var ha = st.ha && typeof st.ha === 'object' ? st.ha.state : '';
+    var name = HA_CONN[ha] ? ha : 'unknown';
+    var e = HA_CONN[name];
+    return { key: name, short: e.short, full: e.full, tone: e.tone, pairingLeftS: null };
+  }
 
   // Firmware compatibility (the `compat` object of `ctl.sh status --json`).
   // tag: the Diagnostics label; short: the Home notice; full: Diagnostics.
@@ -443,7 +466,7 @@
     POWER: POWER, LISTEN: LISTEN, NOTE: NOTE, POWER_EXTRA: POWER_EXTRA, ROWS: ROWS,
     AR_MENU: AR_MENU, HL_MENU: HL_MENU, CONFIRM_TAIL: CONFIRM_TAIL,
     // cards
-    haSummary: haSummary, compat: compat, KEY: KEY, COMPAT: COMPAT, HA_STEPS: HA_STEPS,
+    haSummary: haSummary, haCard: haCard, SETUP_UNAVAILABLE: SETUP_UNAVAILABLE, HA_CONN: HA_CONN, compat: compat, KEY: KEY, COMPAT: COMPAT, HA_STEPS: HA_STEPS,
     // phone requests
     requestText: requestText, phoneResult: phoneResult, endedText: endedText, isIPv4: isIPv4,
     REQUEST: REQUEST, ENDED: ENDED

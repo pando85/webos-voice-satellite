@@ -22,6 +22,7 @@ const cp = require('child_process');
 const { load, checker, APP } = require('./app_fake.js');
 
 const { check, done } = checker();
+const VP = require('../app/voicepower.js');
 
 const REPORT_URL = 'https://github.com/pando85/webos-voice-satellite/issues/new?template=compatibility-report.yml&title='
   + encodeURIComponent('[Compat] OLED42C34LA fw 03.30.74: works') + '&report=' + encodeURIComponent(
@@ -92,8 +93,22 @@ const refresh = async () => { const t = T.timers.filter((x) => x.live && x.inter
   status = Object.assign({}, status, { update_pending: false, installed_version: '0.0.2' });
   await refresh();
   check('Home cards: listening, Home Assistant, power button', byId['h-listen-value'].textContent === 'Yes'
-    && byId['h-ha-value'].textContent === 'Not paired' && byId['h-power-value'].textContent === 'The TV goes to deep standby.'
+    && byId['h-ha-value'].textContent === 'Not known' && byId['h-power-value'].textContent === 'The TV goes to deep standby.'
     && /tone-ok/.test(byId['h-listen-card'].className) && /live/.test(byId['h-listen-dot'].className));
+  const haCard = async (ha, extra) => {
+    status = Object.assign({}, status, { ha: ha, pairing: undefined }, extra || {});
+    await refresh();
+    return byId['h-ha-value'].textContent + '|' + /tone-(\w+)/.exec(byId['h-ha-card'].className)[1] + '|' + byId['h-ha-detail'].textContent;
+  };
+  check('Home Assistant card: no ha object (older daemon) is Not known', (await haCard(undefined)) === 'Not known|idle|' + VP.HA_CONN.unknown.full);
+  check('Home Assistant card: connected', (await haCard({ state: 'connected', since_s: 30 })) === 'Connected|ok|' + VP.HA_CONN.connected.full);
+  check('Home Assistant card: disconnected', (await haCard({ state: 'disconnected', since_s: 30 })) === 'Disconnected|warn|' + VP.HA_CONN.disconnected.full);
+  check('Home Assistant card: unpaired', (await haCard({ state: 'unpaired', since_s: 30 })) === 'Not paired|warn|' + VP.HA_CONN.unpaired.full);
+  check('Home Assistant card: an open pairing window wins and counts down', /^Waiting for pairing\|accent\|Add it in Home Assistant\. \d+:\d\d left\.$/.test(
+    await haCard({ state: 'unpaired', since_s: 30 }, { pairing: { open: true, ends_in_s: 300 } })));
+  check('Home Assistant card: back to the connection when the window closes', (await haCard({ state: 'connected', since_s: 3 }, { pairing: { open: false, ends_in_s: null } })) === 'Connected|ok|' + VP.HA_CONN.connected.full);
+  status = Object.assign({}, status, { ha: undefined, pairing: undefined });
+  await refresh();
   check('four tiles', ['h-mic', 'h-voice', 'h-ha', 'h-diag'].every((id) => !byId[id].hidden) && byId['h-mic-pill'].textContent === 'On');
   byId['h-mic'].focus();
   key(39); const r1 = doc.activeElement.id; key(39); const r2 = doc.activeElement.id; key(39); const r3 = doc.activeElement.id; key(39); const r4 = doc.activeElement.id;
@@ -426,14 +441,33 @@ const refresh = async () => { const t = T.timers.filter((x) => x.live && x.inter
   check('Done on an ended session needs no command', execs().length === 0 && !byId.ha.hidden);
 
   // ---- start fails; no address ----
-  srv.startFails = 'the setup server is missing: /var/lib/webos-satellite/bin/webos-satellite-setup (reinstall the package)';
+  srv.startFails = 'cannot create /tmp/webos-satellite-setup';
   click('a-phone');
   await settle();
-  check('a failed start says why and offers Start again', /^The phone setup could not start: ctl\.sh: the setup server is missing/.test(byId['q-state'].textContent)
+  check('a failed start says why and offers Start again', /^The phone setup could not start: ctl\.sh: cannot create/.test(byId['q-state'].textContent)
     && !byId['q-again'].hidden && byId['q-urlbox'].hidden);
   srv.startFails = '';
   click('q-done');
   await settle();
+  // An ipk built without the server: the same refusal, shown as a plain sentence, no raw error, no Start again.
+  srv.startFails = 'the setup server is missing: /var/lib/webos-satellite/bin/webos-satellite-setup (reinstall the package)';
+  click('a-phone');
+  await settle();
+  check('a missing setup server says "Phone setup is not available in this version", not the raw error', byId['q-state'].textContent === 'Phone setup is not available in this version.'
+    && !/ctl\.sh|webos-satellite-setup|reinstall/.test(byId['q-state'].textContent) && /bad-line/.test(byId['q-state'].className) && byId['q-again'].hidden
+    && byId['q-urlbox'].hidden && !T.timers.some((t) => t.live && t.ms === 2000));
+  click('q-done');
+  await settle();
+  check('Home Assistant screen: the phone action says it is not available, Home Assistant stays usable', byId['a-phone-sub'].textContent === 'Not available in this version'
+    && !byId['a-phone'].hidden && byId['chip-phone'].hidden);
+  srv.startFails = '';
+  click('a-phone');
+  await settle();
+  check('the next press tries again (the package may have been reinstalled) and works', !byId.setup.hidden && byId['q-url'].textContent === setupUrl
+    && byId['a-phone-sub'].textContent !== 'Not available in this version');
+  click('q-done');
+  await settle();
+  srv.s = Object.assign({}, NONE);
 
   // ---- not root ----
   status = Object.assign({}, status, { uid: 1000 });
