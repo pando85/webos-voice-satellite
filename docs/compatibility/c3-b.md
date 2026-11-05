@@ -37,6 +37,7 @@
 | Audible replies at reply volume 40 %, TV volume 12 on ARC: announcements, timer chime, stop (button, media player), 20 s cap, queueing with announcements | `Screen Saver` | PASS (2026-11-04): announcement start 0.3 to 1.1 s, no hang with the mic streaming; chime with the HA finish; stops within 0.2 s; level before the TV volume about -46 dBFS mean, -30 dBFS peak; 0 false wakes from our own sound in one session | P4 sound session 2 |
 | Spanish TV commands through HA's built-in agent: screen off and on, mute on and off | `Screen Saver`, `Active` | PASS (read back with luna, restored) | P4 sound session 2 |
 | TV control: settled `Active Standby` (B11), power-off with content playing (B10), the TV speaker output (A5), a connected HDMI source, volume and mute with content | | NOT TESTED (B10, B11 and A5 not authorized or unsafe without remote access) | EXP-010 |
+| Always Ready (`lifeOnScreenMode`) and LG hands-free (`getActivation`) read-only check through luna (EXP-011) | suspended | NOT RUN (2026-11-05): the TV was unreachable (`No route to host`, HA entities `unavailable`); not woken. c3-a result: [EXP-011](../experiments/EXP-011-lg-settings-toggle.md) | EXP-011 |
 
 ## Notes and redacted evidence
 
