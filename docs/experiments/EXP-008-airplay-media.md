@@ -1,6 +1,6 @@
 # EXP-008 — AirPlay / Music Assistant integration
 
-**Status:** PLANNED · **Risk:** reversible normal media playback
+**Status:** NOT PLANNED (owner decision 2026-11-05: AirPlay is not used for music, [ADR 0010](../decisions/0010-music-playback.md); the text below is kept as the record) · **Risk:** reversible normal media playback
 
 **Question:** Does Music Assistant work with the TV's existing AirPlay 2 receiver for music, including volume, resume and screen-off behavior?
 

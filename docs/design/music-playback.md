@@ -1,20 +1,298 @@
-# Music playback through the Home Assistant integration
+# Music playback through the satellite's Home Assistant media player
 
-- **Status:** design proposal, **nothing built, nothing run on a TV**. The owner decision is open ([ADR 0010](../decisions/0010-music-playback.md), Proposed). Written 2026-11-05.
+- **Status:** **plan accepted in principle, nothing built, nothing run on a TV.** The owner decided on 2026-11-05: "We don't want to use AirPlay. Go with plan B." Option B (native ESPHome `media_player` playback in the satellite) is accepted in [ADR 0010](../decisions/0010-music-playback.md). The defaults in [section C](#c-proposed-defaults-owner-to-confirm) are **proposals the owner has not yet confirmed**. Written 2026-11-05.
 - **Owner question (2026-11-05):** "Could we design music playback through the HA integration?"
-- **Today:** the satellite's `media_player` (object id `media_player`, feature flags 5124 = `STOP` + `VOLUME_STEP` + `VOLUME_SET`) plays only assistant replies, announcements and the timer chime, through `pacat` to PulseAudio and the TV speaker or ARC. The "TV" media player ([ADR 0007](../decisions/0007-tv-media-player.md), flags 1420) is control only. [requirements.md](../project/requirements.md) lists "writing AirPlay or a music player" as an MVP non-goal; [backlog #5](../project/backlog.md#5-music-via-the-tvs-airplay-2-receiver-and-music-assistant) plans the TV's own AirPlay receiver plus Music Assistant ([EXP-008](../experiments/EXP-008-airplay-media.md), not run; requirement F8 pending).
-- **Related:** [AEC front-end](aec-frontend.md), [always-on](always-on.md), [ESPHome API crate](../development/esphome-api.md), [research 06 media](../research/06-media.md), [AGENTS.md](../../AGENTS.md).
+- **Today:** the satellite's `media_player` (object id `media_player`, feature flags 5124 = `STOP` + `VOLUME_STEP` + `VOLUME_SET`) plays only assistant replies, announcements and the timer chime, through `pacat` to PulseAudio and the TV speaker or ARC. The "TV" media player ([ADR 0007](../decisions/0007-tv-media-player.md), flags 1420) is control only.
+- **Related:** [requirements F8](../project/requirements.md), [backlog #5](../project/backlog.md#5-music-playback-through-the-satellites-esphome-media_player), [AEC front-end](aec-frontend.md), [always-on](always-on.md), [ESPHome API crate](../development/esphome-api.md), [research 06 media](../research/06-media.md), [AGENTS.md](../../AGENTS.md).
 
-Labels follow AGENTS.md: **documented** (vendor docs or source read), **observed-on-other-device**, **hypothesis**, **verified-on-target** (c3-a, LG C3, webOS TV 8.3.0, firmware 03.30.74, or c3-b where named), **verified-on-host** (unit tests or PC runs). "Source reading" means the file was read on 2026-11-05 from the `dev` branch on GitHub (not the exact HA 2026.10.4 tag unless said), so line-level details can drift.
+The document has two parts. **Part I (sections A to K) is the plan** to review and execute. **Part II (sections 1 to 9) is the analysis** the plan rests on (evidence, options, details), kept as background; where Part I and Part II differ, Part I wins. Part II still names the option letters A to D: A = the TV's AirPlay 2 receiver with Music Assistant, **B = native playback in the satellite (chosen)**, C = Sendspin, D = LG apps through webostv.
 
-## 1. Short answer
+Labels follow AGENTS.md: **documented** (vendor docs or source read), **observed-on-other-device**, **hypothesis**, **verified-on-target** (c3-a, LG C3, webOS TV 8.3.0, firmware 03.30.74, or c3-b where named), **verified-on-host** (unit tests or PC runs). "Source reading" means the file was read on 2026-11-05 from the `dev` branch on GitHub (not the exact HA 2026.10.4 tag unless said), so line-level details can drift. Code facts below were read from this repository on 2026-11-05 (the `crates/` paths are given so a reviewer can check them).
 
-Yes. There are two realistic routes, and they can coexist:
+# Part I. Plan
 
-- **A. Use what the TV already has** (AirPlay 2 receiver driven by Music Assistant). No satellite code. Whether it works on this TV is unknown ([EXP-008](../experiments/EXP-008-airplay-media.md)); several of the things we would want (volume, standby, ducking) are decided by LG, not by us.
-- **B. Play music inside the satellite** through the same ESPHome `media_player` entity that Home Assistant and Music Assistant already know how to drive (`play_media` with a URL). HA's ESPHome integration converts any source to the one format the device advertises with its ffmpeg proxy, so the satellite needs a **streaming** fetch plus the decoders it already links (FLAC, MP3, WAV through `symphonia`), and a second `pacat` stream. This is the route that lets the satellite **duck or pause music for the wake word, replies, announcements and timers**.
+## A. Goal, non-goals, decision
 
-Recommendation ([section 8](#8-recommendation-and-staged-plan)): run the no-code experiment A first (it is cheap and may be enough), and **plan B as the target** for owners who want music that cooperates with voice. Do not start with Sendspin (C) or webostv app launching (D).
+**Goal.** Home Assistant (UI, scripts, automations, and Music Assistant through its "Home Assistant Media Players" provider) can play a music URL on the TV speaker through the **satellite's existing `media_player` entity**, using the same protocol ESPHome speaker devices use: HA sends `play_media` with a URL, HA's ffmpeg proxy converts it to the one format the device advertises, and the satellite fetches, decodes and plays it. While music plays, the satellite **ducks it for the wake word, replies, announcements and the timer chime**, so the voice assistant stays usable.
+
+**Decision (owner, 2026-11-05).** B is accepted. AirPlay (A, including [EXP-008](../experiments/EXP-008-airplay-media.md)) is **rejected as a path for this feature, reason: owner decision**; C (Sendspin) stays deferred, D (LG apps through webostv) stays out of scope. The MVP non-goal "writing AirPlay or a music player" is lifted for satellite music playback by ADR 0010 (see [requirements](../project/requirements.md); the original wording stays visible there).
+
+**Non-goals (stay non-goals).**
+
+- No music library, queue, playlist, search, metadata, artwork, seek, next/previous, shuffle, repeat or UI in the satellite. The ESPHome API has none of them (documented, Part II section 2); Music Assistant or HA own them.
+- No gapless playback in the first version (a gap between tracks is accepted), no multi-room sync (that is Sendspin, C), no crossfade.
+- No decoding beyond what `symphonia` already links (FLAC, MP3, WAV, Ogg Vorbis). The format HA's proxy converts to is fixed by what the satellite advertises (one format).
+- No change to the TV's own volume, mute, input or sound mode, and no LG private interface. The satellite does not wake the TV for music (default D6).
+- No change to the reply, announcement and timer behaviour when `[music] enabled = false` (the default).
+
+## B. What HA and Music Assistant see
+
+**Entity.** The existing satellite `media_player` (object id `media_player`, key and entity id unchanged). No third media player is added (default D1). The "TV" media player of ADR 0007 is untouched.
+
+**Feature flags** (`MediaPlayerEntityFeature` bits, `crates/esphome-api/src/entities.rs`):
+
+| Setting | Flags | Value |
+| --- | --- | --- |
+| `[music] enabled = false` (default, today) | `STOP` 4096, `VOLUME_SET` 4, `VOLUME_STEP` 1024 | **5124**, unchanged |
+| enabled | adds `PLAY_MEDIA` 512, `PAUSE` 1, `PLAY` 16384 | **22021** |
+| enabled and `announce = true` (default) | adds `MEDIA_ANNOUNCE` 1048576 | **1070597** |
+
+Not offered: `VOLUME_MUTE` (it would sit next to the "Mute microphone" switch and confuse; volume 0 is silence), `MEDIA_ENQUEUE`, `BROWSE_MEDIA`, `TURN_ON`/`TURN_OFF` (the "TV" player owns them), seek, next, previous, shuffle, repeat (not in the API). Whether HA adds its own browse support for a `PLAY_MEDIA` entity is a hypothesis to read in the HA source at M2.
+
+**Supported formats** (`supported_formats`, in this order): the existing `ANNOUNCEMENT` entry (`flac`, 22050 Hz, 1 channel, 2 bytes; unchanged, because HA takes the TTS format from the first `ANNOUNCEMENT` entry, ADR 0007) and a new `DEFAULT` entry (`flac`, 48000 Hz, 2 channels, 2 bytes; configurable). HA's proxy converts every `play_media` URL to the first `DEFAULT` entry, or to the first `ANNOUNCEMENT` entry when `announce` is true (documented, Part II section 2).
+
+**States.** `idle` (nothing), `playing` (music producing audio, **also while ducked**, and while a reply or announcement plays, as today: the existing `Announcing` state is already sent as `playing`), `paused`. The API has no error state: a failed or ended stream returns to `idle` and the reason is in the satellite log. No title, artist, position or duration is reported (the API has none); Music Assistant's own entity carries them.
+
+**Volume.** One volume, 0 to 100 %, shared by replies and music (default D2). It uses the existing decibel taper (100 % is 0 dB, each percent below is 0.5 dB, `crates/satellite/src/volume.rs`) and the existing stored value. The TV's own volume is not touched. HA's volume buttons and sentences move this one slider.
+
+**Commands HA can send and what happens:**
+
+| HA service | Result |
+| --- | --- |
+| `media_player.play_media` (URL or `media-source://`) | replaces the current music; `playing` when the first audio is queued; `idle` when it ends |
+| `play_media` with `announce: true` (needs `MEDIA_ANNOUNCE`) | plays over the music on the reply path with the music ducked; music not interrupted; the entity stays `playing` |
+| `media_pause` / `media_play` | pause and resume the music (resume only while the stream is still held; see D8) |
+| `media_stop` | stops a ringing timer alarm first, otherwise stops the music (default D5) |
+| `volume_set`, `volume_up`, `volume_down` | the shared volume |
+| enqueue, seek, next, previous, mute | not offered; HA does not send them |
+
+**What Music Assistant sees (hypothesis, EXP-016 checks it).** With its Home Assistant provider, MA lists the satellite's HA entity as a player and calls `media_player.play_media` with an MA stream URL; HA proxies it like any URL. MA gets only state and volume back, no position, so it tracks progress itself and moves on when the state returns to `idle`. Because there is no seek and no enqueue, a gap between tracks is expected. HA shows two players for the device if MA wraps it (the raw one and MA's); the docs tell users to use MA's for music.
+
+## C. Proposed defaults (owner to confirm)
+
+Every row is a **proposed default, owner to confirm**. Each is a config value or a small code switch, so a different answer changes little. The first three affect M2 and must be confirmed before it starts.
+
+| # | Question | Proposed default (owner to confirm) | Reason |
+| --- | --- | --- | --- |
+| D1 | One entity or a separate "Music" player | **Extend the existing `media_player`** with a media pipeline and an announcement path | It is how ESPHome speaker players are modelled and what HA and Music Assistant expect for ESPHome satellites; HA picks the TTS format from the same entity; no third media player, no new entity key. Fallback if rejected: a separate `music_player` entity (a new key, its own volume), about one extra day in M2 |
+| D2 | Volume model | **One shared volume** for replies and music, same taper, plus `[music] gain_db = 0` trim | Matches the ESPHome model and HA's volume sentences; the TV volume sets the room level. A separate music volume is the fallback |
+| D3 | `MEDIA_ANNOUNCE` | **Offer it** (`[music] announce = true`) | ESPHome speaker players take TTS and announcements this way (`tts.speak`, `announce: true`); costs one event type and a `Kind` that sends no `AnnounceFinished` |
+| D4 | Wake word while music plays | **Duck** by `-20 dB`, attack 200 ms, hold until the run ends, release over 1000 ms after a further 800 ms hold; `on_wake = "pause"` and `"none"` available | Duck keeps the one-time proxy stream alive (pause can lose it, D8) and avoids a hard gap; -20 dB is ESPHome's documented example; values are untested here and EXP-014 and EXP-015 set the final numbers |
+| D5 | Replies, announcements, alarm | **Duck** the same way (never pause); the alarm chime also ducks. `STOP` stops a ringing alarm first, then the music | A reply or chime must be heard over music; a stop meant for the alarm must not kill the user's playlist |
+| D6 | Power states | **Play what the TV lets through, never wake the TV.** In `Active Standby` (LG silences the output, verified for a tone on c3-b) the satellite still plays and logs one warning; in `Suspend` nothing runs | Truthful and simple; an opt-in "wake the TV for music" is a follow-up owner decision (it lights the room) |
+| D7 | `[music] enabled` | **false** until gates G2 to G6 pass and the owner signs off | Reversible, and the entity flags (5124) stay exactly as today when off |
+| D8 | Pause | Pause stops reading; the connection is held up to `pause_timeout_s = 600`, then the stream is dropped and the entity goes `idle`. No retry of the proxy URL, ever | The URL is one-time and has no Range; a second request restarts the track (documented). Whether HA's proxy survives a pause is measured in EXP-016 |
+| D9 | HA disconnect during music | **Keep playing up to `disconnect_stop_s = 60`**, then stop | A stream nobody can stop from HA should not run forever; short Wi-Fi drops must not cut the song |
+| D10 | Format | **FLAC, 48000 Hz, 2 channels, 16 bit**; `wav` and `mp3` selectable in `[music] format` | The TV's output side runs at 48 kHz, FLAC is integer-only and cheapest of the compressed formats; EXP-013 decides FLAC against WAV (no decode, 1.5 Mbit/s) on measured CPU |
+| D11 | Caps | `max_volume_percent = 100` (no cap), `idle_timeout_s = 10` (a stalled proxy ends the track), buffers at most 1 MiB total | No invented cap before measuring; the stall and memory bounds are safety rules |
+| D12 | Enqueue and gapless | **Not offered / accepted gap** in this version | The API has no queue; revisit after EXP-016 shows what MA does at track ends |
+
+Sketch of the config section (names are proposals; the daemon rejects unknown keys like the other sections):
+
+```toml
+[music]
+enabled = false          # D7
+format = "flac"          # D10: flac | wav | mp3
+rate = 48000
+channels = 2
+announce = true          # D3
+on_wake = "duck"         # D4: duck | pause | none
+duck_db = -20
+duck_attack_ms = 200
+duck_hold_ms = 800
+duck_release_ms = 1000
+gain_db = 0              # D2
+max_volume_percent = 100 # D11
+idle_timeout_s = 10      # D11
+pause_timeout_s = 600    # D8
+disconnect_stop_s = 60   # D9
+```
+
+## D. Architecture
+
+Final data and control flow (new parts marked `*`):
+
+```text
+ Home Assistant UI / scripts / Music Assistant (HA Media Players provider)
+   |  media_player.play_media(satellite entity, URL or media-source, announce?)
+   v
+ HA esphome integration: resolves media-source; if the device lists supported_formats,
+   replaces the URL by a one-time proxy URL (ffmpeg -> first DEFAULT format, or first
+   ANNOUNCEMENT format when announce is true):
+   http(s)://HA/api/esphome/ffmpeg_proxy/<device>/<random>.flac   (no Range, chunked)
+   |  MediaPlayerCommandRequest{command | volume | media_url | announcement}
+   |  (the existing encrypted API connection)
+   v
+ crates/esphome-api   server.rs  satellite_media_player_command   [changed]
+   |     AppEvent::PlayMedia{url, announcement}*  MediaPause*  MediaPlay*  MediaStop  VolumeChanged
+   |     AppCommand::SetMusicState*  ---> merged with the voice state into MediaPlayerStateResponse
+   v
+ crates/satellite   daemon.rs  (one event loop; owns everything below)         [changed]
+   |
+   |-- Player (existing)  replies, announcements, alarm        ----------------------> pacat #1 "tts-reply"
+   |      Kind::MediaAnnounce*  (announce:true; plays like Announce, sends no AnnounceFinished)
+   |
+   |-- MusicPlayer*  music.rs
+   |     fetch thread (ureq, read-idle timeout, no body cap)
+   |        -> compressed ring, about 512 KiB
+   |        -> decode thread (symphonia, non-seekable) -> 20 ms s16 chunks, bounded (about 1 s)
+   |        -> async music task: gain = sink.gain * volume * duck, written at most 150 ms ahead of
+   |           the clock (like the alarm chime), underrun -> silence + counter  ----> pacat #2 "music"
+   |
+   |-- DuckController*  duck.rs   inputs: wake/run active, reply or announce playing, alarm ringing,
+   |                              pause command; output: target dB with attack, hold, release
+   v
+ PulseAudio mixes #1 + #2 (+ the TV program) -> TV sound engine -> TV speaker / ARC
+
+ Mic path (unchanged): capture -> HPF and gain (AEC parked) -> ESPHome API -> HA wake word.
+ The mic hears the music; that is risk R1 and gate G4.
+```
+
+**Event order for "alexa, what time is it" during music:** HA sends `VoiceAssistantWakeWordEnd` (existing, becomes `AppEvent::WakeWordDetected`) -> duck to -20 dB; STT; intent; TTS reply on pacat #1 at the reply volume; `RunEnd` (and, for `continue_conversation`, the run that follows) -> hold 800 ms -> release over 1000 ms. An announcement or the alarm chime takes the same duck and releases after the last of them ends. The duck is applied in the music task at write time and the writes stay about 150 ms ahead of the clock, so the audible lag is that plus `sink.latency_msec` (hypothesis; measured in EXP-014). Without the 150 ms pacing the Linux pipe buffer (64 KiB, about 340 ms of 48 kHz stereo) would add its delay.
+
+**Component list** (paths read on 2026-11-05):
+
+| Component | New or changed | Role |
+| --- | --- | --- |
+| `crates/esphome-api/src/config.rs` | changed | `Config::music` (format, announce flag), validation (format flac/wav/mp3, rate 8000 to 96000, 1 or 2 channels) |
+| `crates/esphome-api/src/entities.rs` | changed | flags 22021 / 1070597 when enabled, second `supported_formats` entry, state merge (voice state and music state) |
+| `crates/esphome-api/src/server.rs` | changed | `satellite_media_player_command`: `media_url`, `announcement`, `PAUSE`, `PLAY`; today only `STOP` and volume are handled |
+| `crates/esphome-api/src/app.rs` | changed | new `AppEvent::PlayMedia`, `MediaPause`, `MediaPlay`; new `AppCommand::SetMusicState` (the enums are `#[non_exhaustive]`) |
+| `crates/esphome-api/examples/fake_device.rs` | changed | a `--music` switch so the Python fake HA can test the entity |
+| `crates/playback/src/stream.rs` | **new** | `fetch_stream` (blocking reader on its own thread, idle timeout, no body cap, same TLS rules and redaction as `fetch.rs`) and `StreamDecoder` (non-seekable symphonia, bounded stages, chunk channel, cancel) |
+| `crates/playback/src/{lib,error}.rs` | changed | exports, new error cases (idle timeout, stream ended early) |
+| `crates/playback/tests/` | changed | streaming tests with a local HTTP server and synthetic fixtures |
+| `crates/satellite/src/music.rs` | **new** | `MusicPlayer`: one music slot, second `pacat` (reusing `pacat_named_args`), pacing, pause, resume, stop, state, stats, wav and null sinks for tests |
+| `crates/satellite/src/duck.rs` | **new** | pure state machine from sources to a target gain with ramps (unit-testable without audio) |
+| `crates/satellite/src/player.rs` | changed | `Kind::MediaAnnounce`; export `gain_s16le`, `pacat_named_args` to `music.rs`; the alarm still owns the single reply slot |
+| `crates/satellite/src/daemon.rs` | changed | route the new events, feed the duck sources (`WakeWordDetected`, `RunEnd`, `Announce`, TTS stream start, alarm start and stop), `STOP` order, HA-disconnect and `Resumed` rules, state publication, shutdown |
+| `crates/satellite/src/config.rs` | changed | `[music]` section, defaults, validation |
+| `Cargo.toml` (workspace) | changed | `[profile.release.package.symphonia*] opt-level = 3` if EXP-013 needs it (as for `webos-dsp`) |
+| `tools/esphome-fake-ha/` | changed, **new `fake_proxy.py`** | HA's ffmpeg proxy and `play_media` behaviour, scenarios (section F) |
+| `packaging/webos/` | changed | config template with `[music]` (commented, disabled) |
+| docs: `docs/development/esphome-api.md`, `docs/compatibility/c3-a.md`, user docs | changed | entity flags, config, limits, results scoped to model, firmware and power state |
+
+No new third-party crate is planned (std threads, `ureq`, `symphonia` already in `crates/playback`). `symphonia` is MPL-2.0, already linked and unmodified, which the project's GPL-3.0-or-later position already covers ([packaging section 8.1](packaging.md)). If M3 finds that `symphonia` cannot probe a non-seekable FLAC or an unknown-length WAV, the fallback is a small pure-Rust FLAC decoder crate (`claxon`, Apache-2.0, hypothesis, check the licence then); that is a decision for M3, not now.
+
+## E. Milestones
+
+Sizes are rough estimates of production code plus tests, not measurements. "PC" means no TV, no sound. Every milestone ends green on `cargo fmt --check`, `cargo clippy --workspace --all-targets`, `cargo test --workspace`, `sh -n tools/probe/probe.sh` and `python3 tools/check_docs.py`, and gets a `code-review` pass before it is merged.
+
+| Milestone | Scope and files | Acceptance (what proves it on the PC) | Depends on / parallel | Size | Risks |
+| --- | --- | --- | --- | --- | --- |
+| **M1 Fake-HA music harness** | `tools/esphome-fake-ha/fake_proxy.py` (new), helpers in `fake_ha.py`: emulate HA's `play_media` and ffmpeg proxy (section F); Python unit tests for the proxy | proxy test: one-time URL, second GET kills the first conversion and restarts from the start, chunks of 2048 bytes, no `Content-Length`, no Range (a `Range` header is ignored, full 200), the format and rate in the URL are what ffmpeg produced (checked with `ffprobe`); `tools/esphome-fake-ha/run.sh --device-only` unchanged and green | none; **parallel with M2, M3** | S (about 400 lines Python) | the emulator drifts from HA's real proxy: re-read `ffmpeg_proxy.py` at the start and note the HA version; EXP-016 is the real check |
+| **M2 Entity and commands** | `esphome-api` `config.rs`, `entities.rs`, `server.rs`, `app.rs`, `fake_device` | unit tests: flags 5124 off, 22021 and 1070597 on; `supported_formats` list; every command (`play_media` URL, announce, `PAUSE`, `PLAY`, `STOP`, volume) becomes the right event; unadvertised commands (enqueue, mute) are ignored and the state is echoed; media URL still ignored when music is off (existing test kept); state merge matrix (announcing, music playing, paused, idle); config validation. Fake-HA scenario with aioesphomeapi 46.6.0: the entity shows the flags and formats, commands reach `fake_device`'s event log | needs D1, D3 confirmed; **parallel with M1, M3** | M (about 500 lines) | HA's reaction to changed flags (an existing device) is only checkable on a real HA, EXP-016 |
+| **M3 Streaming playback** | `crates/playback/src/stream.rs` and tests | with a local HTTP server and synthetic fixtures (tone and noise as FLAC, MP3, WAV, generated by a documented script, ours): (1) decode equals the reference PCM (RMS error under a set bound; bit-exact for FLAC and WAV); (2) chunked body without length plays; (3) truncated stream ends with an error, not a hang; (4) a stalled stream ends within `idle_timeout + 1 s`; (5) a 1 GiB generated WAV streams with resident memory growth under 3 MiB; (6) backpressure: a slow consumer bounds what the server could send; (7) cancel joins both threads within 1 s; (8) mid-stream format change ends with an error; (9) redirect from `https` to `http` is refused; TLS validation and `ca_file` reuse the existing tests; (10) no URL in any error text. Run the test binary for armv7 under qemu as the playback tests do now | none; **parallel with M1, M2**; freeze the `MusicStream` interface (chunk type, cancel, stats) first so M4 can start | M (about 700 lines plus fixtures) | `symphonia` and non-seekable FLAC or unknown-length WAV (fallback in section D); decode thread starving the main loop (an option: lower its priority) |
+| **M4 MusicPlayer and duck engine** | `music.rs`, `duck.rs`, `player.rs` exports | unit tests with a fake `pacat` (the pattern in `player.rs` tests) and `tokio::time::pause`: written bytes equal input times `sink.gain * volume * duck` (DC test signal); ramp reaches `duck_db` within `attack` plus one chunk and returns within `release`; several duck sources hold until the last one ends; pause writes nothing and resume continues with no lost or repeated sample; stop leaves no `pacat`; writes never run more than 150 ms ahead; underrun writes silence and counts it; `sink.gain = 0` writes only zeros; a **streaming** wav file sink for music (the reply path's `stream_wav` buffers the whole playback in memory and writes the file at the end, which is wrong for a long track and for a stop in the middle), paced in real time so envelopes are testable; pause timeout; shutdown | the `MusicStream` interface from M3 (can use a fake stream); **parallel with M3 after the interface freeze** | M (about 600 lines) | PulseAudio buffering (hypothesis) shows only on the TV (EXP-014); duck arithmetic in `f32` on soft-float armv7 (cost measured in EXP-013) |
+| **M5 Daemon integration, config, PC end to end** | `daemon.rs`, `satellite/config.rs`, `player.rs` (`Kind::MediaAnnounce`), packaging template | daemon unit tests for routing, `STOP` order, HA-disconnect and `Resumed` rules, mic mute not affecting music, volume sharing, log redaction (no URL in any line); config parse, defaults and validation. **End to end with the real daemon**, a file microphone, the wav sink, the Python fake HA and `fake_proxy.py`: S1 play, finish, `idle`; S2 pause, play, stop; S3 volume change while playing; S4 `announce` over music (music ducked and restored, entity stays `playing`, no stray announce-finished); S5 voice run during music (wake word, STT, TTS, run end: duck then release, envelope check on the wav); S6 continue-conversation keeps the duck; S7 timer alarm over music, `STOP` stops the alarm first; S8 proxy stall and early close end the track and report `idle`, with no retry of the URL; S9 HA disconnect: plays on, stops after `disconnect_stop_s`; S10 `[music] enabled = false`: flags 5124 and a media URL ignored | M2, M3, M4 (M1 for the e2e) | M to L (about 600 lines plus Python scenarios) | the existing wav sink neither paces nor streams (`stream_wav` collects all chunks, then writes); M4 adds both for music; the e2e then runs in real time (a few minutes) |
+| **M6 On the TV, silent** | build for armv7, install on c3-a (silent), run EXP-013 and the silent part of EXP-016 | thresholds in section G; results in `docs/compatibility/c3-a.md` scoped to model, firmware, power state, with redacted evidence; rollback documented | M5, **owner authorization to run a binary on a TV** | S for the code, a session for the runs | CPU or memory over the limit leads to a format change (WAV) or an opt-level change, not abandonment |
+| **M7 On the TV, audible, and docs** | EXP-014, EXP-015, remaining EXP-016, user docs, HA text, compatibility record, backlog and requirements F8 update; the default decision | gates G3 to G6 decided and recorded; docs let another owner enable `[music]` | M6, **sound authorization**, a consented session for EXP-015, Music Assistant if the owner has it | S for code (tuning), several sessions for the runs | the false-wake result may require the parked AEC (gate G4) |
+| **M8 Later (backlog, not planned)** | next-track prefetch or a session-long `pacat` for a smaller gap, `on_wake = "pause"` refinement, wake-the-TV option, Sendspin revisit | each needs its own note | after G6 | n/a | n/a |
+
+Rough total: about 1.8 to 2.5 kLOC of production Rust, about the same again in Rust tests, and about 500 lines of Python. M1, M2, M3 run in parallel; M4 joins after the M3 interface freeze; M5 is the join point.
+
+## F. What the fake HA must emulate
+
+Behaviours of HA's ESPHome integration (documented, source reading, Part II section 2) that `tools/esphome-fake-ha/` must reproduce; re-read `media_player.py` and `ffmpeg_proxy.py` when M1 starts and record the commit read.
+
+1. **Format negotiation.** HA reads `supported_formats`, takes the first `DEFAULT` entry for `play_media` or the first `ANNOUNCEMENT` entry when `announce` is true, and builds the proxy URL with that format, rate and channels. The fake asserts the satellite lists exactly one entry per purpose it intends and picks accordingly.
+2. **The proxy.** URL `/api/esphome/ffmpeg_proxy/{device_id}/{random}.{format}`; a real `ffmpeg -i SRC -f FORMAT -ar RATE -ac CH -sample_fmt s16 -map_metadata -1 -vn pipe:` (ffmpeg is installed on the PC); plain 200, chunked body in 2048-byte chunks, no `Content-Length`, no Range; **one-time**: a second GET of the same URL kills the running conversion and starts over from the beginning; at most 2 conversions per device (behaviour on the third to be read from the source); ffmpeg blocks when the client is slow (pipe backpressure); no auth beyond the random id. HTTPS variant with a private CA for the `ca_file` path.
+3. **Commands.** `media_player_command` with `media_url`, `announcement`, `PAUSE`, `PLAY`, `STOP`, volume set, volume up and down; commands HA would not send for unadvertised features are also sent once, to prove the satellite ignores them.
+4. **Announce while music plays.** `announce: true` with an `ANNOUNCEMENT`-format proxy URL while a `DEFAULT` stream is running.
+5. **Voice run while music plays.** `VoiceAssistantRequest`, wake-word end, STT, TTS (stream and URL mode), run end, with and without `continue_conversation`.
+6. **Failures.** A proxy that stalls, closes early, returns 404 or 500, serves an unexpected format, or serves a very long stream; HA disconnect and reconnect during playback.
+7. **State view.** What HA would show from `MediaPlayerStateResponse`: the five states HA 2026.10.4 maps (idle, playing, paused, on, off); `announcing` is never sent.
+
+## G. On-target experiments
+
+IDs follow the next free numbers in [the experiments index](../experiments/README.md): **EXP-012 is reserved by [ADR 0009](../decisions/0009-phone-setup-web-server.md) (another session)**, so this plan claims **EXP-013 to EXP-016**. Each gets a file from [TEMPLATE.md](../experiments/TEMPLATE.md) (prerequisites, steps, expected signals, failure interpretation, rollback) **when its milestone starts**; if the numbers are taken by then, renumber and fix the links here. The old placeholders M-E1 to M-E5 in Part II map to EXP-013, 014, 014, 015, 016. EXP-008 (AirPlay) is **not planned** (owner decision).
+
+Common rules: c3-a first, c3-b only after c3-a and with the owner's agreement; one device, firmware and power state per result; negative and inconclusive results are recorded as such; no raw dumps, audio or identifiers committed; the build is installed with the normal procedure and rolled back to the previous version afterwards; music playback is never left running unattended.
+
+| ID | Question and measures | Authorization | Pass / fail (proposed thresholds, owner to confirm) | Rollback |
+| --- | --- | --- | --- | --- |
+| **EXP-013** Music engine resources, silent | With `sink.gain = 0` and a 10 minute FLAC (and WAV, MP3) from the PC through the proxy emulator: CPU of the daemon and decode thread (`/proc/<pid>/stat` deltas) for the armv7 build, RSS of the daemon and of `pacat` #2 (`ps`), underruns per 10 min, network rate, mic-stream dropouts compared with a no-music baseline, behaviour when the proxy closes mid-stream, a 10 minute pause, HA disconnect, and the remote's power key (`Screen Off`, `Active Standby`) and a suspend and resume (stream dropped cleanly, no orphan `pacat`) | run a build on c3-a (AGENTS.md); **no sound** (zero bytes only) | **Pass:** decode CPU at most 5 % of one core; daemon RSS at most 8 MiB (limit 64); `pacat` #2 RSS recorded; 0 underruns in 10 min; no mic dropouts beyond baseline; clean end in every failure case. **Amber:** 5 to 15 % CPU: try `opt-level = 3` for the decoder crates, then WAV. **Fail:** over 15 % CPU after both, or any mic dropout: stop and reopen ADR 0010 | stop playback, set `[music] enabled = false`, reinstall the previous version; confirm RSS and capture back to baseline |
+| **EXP-014** Audible mix and ducking | Quiet owner-chosen track at a low TV volume: do pacat #1 and #2 mix (reply and chime over music); duck depth, attack and release as measured at the SoundEngineCapture tap (local recording, deleted afterwards); pause and resume latency; behaviour with HDMI or app content playing; TV volume, mute and sound mode unchanged; `Active`, `Screen Saver`, `Screen Off`, `Active Standby` (compare with [always-on](always-on.md): silent expected) | **sound authorization**: volume ceiling, times, who is present, tracks | **Pass:** the two streams mix; duck at least 15 dB reached within 300 ms of the wake event and restored within 1.5 s after the run; reply intelligible over the duck (owner listening, yes or no); pause audible within 500 ms; TV settings unchanged; no glitches in the TV program. **Fail:** PulseAudio does not mix two clients on this TV: redesign as an in-process mix into one `pacat` (gate G3) | stop, disable `[music]`, restore TV volume if touched |
+| **EXP-015** Wake and barge-in with music | Per [P2 corpus](../experiments/P2-corpus.md) statistics (counts with exact Poisson 95 % intervals, rule of three for zero, never "0 per hour"): false wakes of `alexa` per hour with music at the owner's typical TV volume and at one louder volume, a 1 hour screen each, then a 3 hour soak at the typical volume if the screen shows at most 1; "alexa, stop" and "alexa, what time is it" success over music (at least 10 trials per volume, Wilson interval); STT word error after a wake with `duck` against `pause`; each with `[aec] enabled` false and, if the owner un-parks it, true. Detection counts come from HA's pipeline logs (the rig's `ha_assist_watch.py`), not from recording the room | **sound authorization** and a **consented** session (voices in the room; stimulus playback of the existing corpus phrases, never ambient recording); long runs are unattended-listening, so the owner chooses time and place | **Pass (G4):** 0 false wakes in at least 3 h at the typical volume (bound at most 1 per hour) and "stop" success at least 80 % at the typical volume. **Amber:** 1 to 3 per hour or 50 to 80 %: enable only with documented limits and ask the owner to un-park AEC. **Fail:** over 3 per hour or under 50 %: AEC is a prerequisite for enabling music by default | stop playback; no recordings are kept |
+| **EXP-016** Real HA and Music Assistant path | On the owner's HA 2026.10.4, silent (`sink.gain = 0`) on c3-a: `media_player.play_media` from the UI and a script with a URL and a `media-source://`; the proxy URL shape; end state `idle`; `announce: true`; pause then resume after 1 and 10 minutes (does the proxy keep the stream); stop; volume sentences ("turn up the volume") when music plays (which entity answers; ADR 0007's hypothesis that `playing` players win); whether HA picks up a changed `[music] enabled` flag set without removing the device; if Music Assistant is available: does its Home Assistant provider list the entity, how it starts and sequences tracks, the gap at a track end, what it does without seek or enqueue | run a build on c3-a, HA and (optional) Music Assistant access; **no sound** | **Pass:** play, finish, pause, stop and volume work from HA; flags change is picked up (or the needed step is documented); the proxy behaves as documented. **Inconclusive** is allowed for the MA part if MA is unavailable or does not list the entity (record it; the direct HA path still stands). **Fail:** HA never sends `play_media` or never picks the `DEFAULT` format: re-read the HA source and the fake, fix M2 | disable `[music]`, restart so HA sees flags 5124 again |
+
+## H. Risks and mitigations
+
+| # | Risk | Effect | Mitigation | Check |
+| --- | --- | --- | --- | --- |
+| R1 | **Music near the mic: false wakes, missed wake word, polluted STT.** The mic is near-raw and AEC is parked (`[aec] enabled = false`) | the assistant triggers on lyrics, "stop" fails at volume, bad STT after a wake | duck on wake; document the limit; `max_volume_percent` available; **gate G4**: measure, and if bad ask the owner to un-park AEC (backlog #1; the reference tap sees the music because both streams go through PulseAudio into the TV sound engine, verified for a `pacat` tone) | EXP-015 |
+| R2 | **One-time proxy URL, no Range, no resume** (documented) | a dropped connection or a long pause loses the track | never retry the URL (it would restart the track); report `idle` and let HA or MA decide; `pause_timeout_s`; prefer duck over pause | M3 tests, EXP-016 |
+| R3 | **CPU on the TV** (armv7 soft-float, opt-level `z`; the AEC stage cost 23 times the host on float DSP) | mic or API starvation, watchdog stalls | FLAC integer decode, `opt-level = 3` for the decoder crates, WAV as a no-decode format, decode on its own thread, optional lower priority | EXP-013 thresholds |
+| R4 | **Memory under the 64 MiB RSS limit** (`limits.max_rss_mb`, daemon about 1.7 MB idle, verified on c3-a) and the watchdog | the watchdog exits with code 72 | fixed caps, 1 MiB of music buffers, bounded channels, no unbounded growth; the second `pacat` is a child process outside the daemon's count (record it) | M3 memory test, EXP-013 |
+| R5 | **PulseAudio mixing with the TV program and with reply `pacat`** | music replaces or distorts instead of mixing | a tone and the HDMI program already mix in the TV's taps (verified); EXP-014 checks two `pacat` clients; fallback: in-process mix into one `pacat` | EXP-014, gate G3 |
+| R6 | **Standby silence** (`Active Standby` silences the output, `Suspend` stops everything; verified on c3-b) | music "plays" with no sound | play what the TV lets through and log it, never wake the TV (D6); the `tv_power_state` sensor lets HA scripts react | EXP-013, EXP-014 |
+| R7 | **Duck lag from buffering** (pipe 64 KiB, `pacat` latency) | the first words of a command still hear music | writes at most 150 ms ahead of the clock; `sink.latency_msec` as for replies | EXP-014 |
+| R8 | **Licensing** of the decoder against GPL-3.0-or-later | a compliance problem | `symphonia` is MPL-2.0, already linked, kept unmodified and named in the notices ([packaging section 8.1](packaging.md)); no new crate planned; any new decoder crate gets a licence check in its milestone | M3 review |
+| R9 | **Binary size** (AEC cost about 400 KiB) | the package grows | expected under 100 KiB (hypothesis); measure the stripped armv7 binary before and after M3 and M5; investigate above 150 KiB | M3, M5 |
+| R10 | **HA behaviour not in the sources read** (flags pickup, proxy limits, volume intents with several players, `announce`) | surprises on the real HA | M1 re-reads the source; EXP-016 on the owner's HA before the default flips | EXP-016 |
+| R11 | **Privacy and secrets.** The proxy URL is a bearer token; ambient audio must not be logged | a leak in logs or reports | `redact_url` on every log line, no titles or URLs in HA-visible text, no new data sent to HA beyond the state, mic mute does not touch music but the "Listening" state stays truthful | M3 and M5 tests |
+| R12 | **Suspend or Wi-Fi drop leaves a dead stream** | a hung music task and a `pacat` child | `AppCommand::Resumed` and the idle timeout end the stream; shutdown kills `pacat` | M5, EXP-013 |
+
+## I. Decision gates
+
+| Gate | When | Rule | If it fails |
+| --- | --- | --- | --- |
+| **G0** Defaults | before M2 (D1, D3), before M4 (D4 to D9) | the owner confirms or changes section C | change the config values; D1 fallback adds a new entity |
+| **G1** PC complete | end of M5 | all M1 to M5 acceptance green, review done | fix before any TV run |
+| **G2** Resources | after EXP-013 | CPU, RSS, underruns, mic dropouts within thresholds | `opt-level = 3`, then WAV, then stop and reopen the ADR |
+| **G3** Mixing | after EXP-014 | PulseAudio mixes two clients; duck and pause latencies within thresholds | in-process mixer into one `pacat` (extra milestone) before anything else |
+| **G4** False wakes | after EXP-015 | **if false wakes exceed 3 per hour at the owner's typical volume, or "stop" success is under 50 %, un-park AEC (backlog #1) before enabling music by default**; 1 to 3 per hour or 50 to 80 %: allowed with documented limits and an owner request to un-park AEC | keep `enabled = false` by default and ship as experimental |
+| **G5** Real HA | after EXP-016 | the direct HA path works on 2026.10.4; MA result recorded | fix M2 or the fake; document what MA can and cannot do |
+| **G6** Default | after G2 to G5 | the owner decides whether `[music] enabled` becomes true by default and whether the feature leaves "experimental" | stays false |
+
+The thresholds in G2, G4 and the experiments are proposals set before any measurement; the owner confirms or changes them at G0.
+
+## J. Owner actions and when
+
+| When | Action |
+| --- | --- |
+| Now (G0) | Confirm or change D1 to D12; confirm the proposed thresholds in section G; note that AGENTS.md still says "Existing TV AirPlay receiver / Music Assistant is a candidate for music" (not edited here, it is a project instruction file) |
+| Before M6 | **Authorize running a built binary on c3-a** for a silent music run (`[music] enabled = true`, `sink.gain = 0`); say whether the routine version deploy authorization already covers it, and whether c3-b joins later |
+| Before M6 | Say whether **Music Assistant** is available on the HA instance (and which provider the satellite should appear under); without it EXP-016 covers only the direct HA path |
+| Before M6 | A media source HA can serve to the satellite for the silent run (a local file or a radio stream); HA needs ffmpeg for the proxy (HA OS has it) |
+| Before M7 | **Sound authorization** for EXP-014 and EXP-015: TV volume ceiling, dates, who is present, the tracks to use; **consent** of anyone whose voice is in the room for EXP-015; the owner's "typical volume" |
+| At G4 | Decide whether to un-park the AEC front-end for music |
+| At G6 | Decide the default of `[music] enabled` and the "experimental" label |
+
+## K. UI/UX integration (later)
+
+**Handoff for the TV app and phone setup redesign (another session, [voice-and-power screen](voice-and-power-screen.md), [ADR 0009](../decisions/0009-phone-setup-web-server.md)). This plan designs no screens, menus or layouts.** It only lists what the backend will offer so the redesign can use it. Everything here is a **proposal**, nothing is implemented, and the names are not final until the redesign agrees them. The channels already exist: `ctl.sh status --json`, the daemon's `run/voice.json` status file (schema 1, written atomically, rewritten on change plus a 30 s keep-alive) and `ctl.sh set ...` for the satellite's own settings (the `reply-volume` pattern: write a file under `etc/`, the daemon picks it up).
+
+**Settings the UI may expose** (config keys from section C; none is needed to use music from HA):
+
+| Setting | Config key | How a change would be applied | Via |
+| --- | --- | --- | --- |
+| Music on or off | `[music] enabled` | needs a daemon restart or reconnect, because HA reads the entity flags (5124 or 22021) when it connects; same class as other settings that change the entity list | `ctl.sh set music on\|off` (proposed) |
+| Duck mode on wake | `[music] on_wake` (`duck`, `pause`, `none`) | picked up by the running daemon within a second | `ctl.sh set music-on-wake MODE` (proposed) |
+| Duck depth | `[music] duck_db` (default -20) | same | `ctl.sh set music-duck-db N` (proposed) |
+| Music level trim | `[music] gain_db` | same | `ctl.sh set music-gain-db N` (proposed) |
+
+The shared volume is already the existing `reply-volume` setting (`ctl.sh set reply-volume N`, `reply_volume` in `status --json`); there is no separate music volume (default D2). Attack, hold and release times, format, rate, timeouts and `max_volume_percent` stay config-file only.
+
+**Status fields the UI may show** (all read-only; **no URL, title, artist or any content name is ever carried**, see R11):
+
+| Field | Meaning | Carried in |
+| --- | --- | --- |
+| `music.enabled` | `[music] enabled` of the running daemon | `status --json` (`music_enabled`) and `run/voice.json` |
+| `music.state` | `idle`, `playing` or `paused` (the state HA also sees) | `run/voice.json`, `status --json` under `music` |
+| `music.ducked` | true while a duck is held, with `music.duck_db` the current depth | `run/voice.json` |
+| `music.format` | the format in use, for example `flac 48000 Hz 2 ch` | `run/voice.json` |
+| `music.source` | where the play command came from, only as a class (`ha`), never an address or name | `run/voice.json` |
+| `music.last_end` | how the last track ended: `ended`, `stopped`, `error`, `idle_timeout`, `ha_gone` | `run/voice.json` |
+| `music.underruns` | counter since the daemon started | `run/voice.json`, also in the compatibility report counters |
+
+The `run/voice.json` rules from the voice screen design apply unchanged (written only on change, keep-alive, deleted on a clean shutdown, stale after 60 s means unknown). The music block is optional; an older daemon omits it and the UI must treat it as "music not available". `ctl.sh report` gets the music counters and the `[music] enabled` value only, with the same redaction as today.
+
+---
+
+# Part II. Background analysis
+
+The material below is the analysis written before the owner decision. It is kept as evidence and detail. **Option A (AirPlay) was rejected by the owner on 2026-11-05**, so its text is history, not a plan. The placeholder experiment names M-E1 to M-E5 are now EXP-013 to EXP-016 (section G), the old milestones M1 to M6 are replaced by section E, and sections 7 to 9 below are superseded.
+
+## 1. Short answer (historical)
+
+When the question was asked there were two realistic routes:
+
+- **A. Use what the TV already has** (AirPlay 2 receiver driven by Music Assistant). No satellite code; LG decides volume, standby and ducking. **Rejected by the owner (2026-11-05).**
+- **B. Play music inside the satellite** through the same ESPHome `media_player` entity that Home Assistant and Music Assistant already know how to drive (`play_media` with a URL). HA's ESPHome integration converts any source to the one format the device advertises with its ffmpeg proxy, so the satellite needs a **streaming** fetch plus the decoders it already links (FLAC, MP3, WAV through `symphonia`), and a second `pacat` stream. This is the route that lets the satellite **duck or pause music for the wake word, replies, announcements and timers**. **Chosen.**
+
+Sendspin (C) and webostv app launching (D) were never recommended and stay out.
+
 
 ## 2. Evidence base
 
@@ -42,6 +320,8 @@ Recommendation ([section 8](#8-recommendation-and-staged-plan)): run the no-code
 ## 3. Options
 
 ### 3.A The TV's AirPlay 2 receiver, driven by Music Assistant
+
+> **Rejected by the owner on 2026-11-05 ("We don't want to use AirPlay").** Kept as the record of what was considered and why it was a candidate. [EXP-008](../experiments/EXP-008-airplay-media.md) is not planned. Text below is history.
 
 ```text
  Music Assistant server (HA add-on or container)
@@ -152,15 +432,15 @@ If the owner's HA has **no ffmpeg** reachable by the esphome integration, the pr
 
 ### 4.3 Decode and buffer
 
-- `symphonia` is already in the tree (**MPL-2.0**, [packaging section 8.1](packaging.md): section 3.3 of the MPL allows combining with GPL-3.0-or-later code; file-level copyleft applies to the unmodified crates; keep them unmodified and named in the notices). Formats already enabled: mp3, flac, wav, pcm, ogg, vorbis; **no AAC or ALAC feature is on** (adding `aac` or `alac` is a feature flag in `symphonia` 0.6, hypothesis, and not needed behind the proxy). Binary size: the decoders are already linked for TTS; streaming adds code, not codecs (expected tens of KiB, hypothesis, measure at M2).
+- `symphonia` is already in the tree (**MPL-2.0**, [packaging section 8.1](packaging.md): section 3.3 of the MPL allows combining with GPL-3.0-or-later code; file-level copyleft applies to the unmodified crates; keep them unmodified and named in the notices). Formats already enabled: mp3, flac, wav, pcm, ogg, vorbis; **no AAC or ALAC feature is on** (adding `aac` or `alac` is a feature flag in `symphonia` 0.6, hypothesis, and not needed behind the proxy). Binary size: the decoders are already linked for TTS; streaming adds code, not codecs (expected tens of KiB, hypothesis, measure at M3 and M5).
 - Streaming decode: a `MediaSource` over the fetch reader (`Read` only, `is_seekable() = false`), packets decoded on a dedicated thread into **interleaved s16 chunks** (for example 20 ms) sent to the async side through a bounded channel. Format changes mid-stream (rate or channels) end the track with an error, as `decode` does today.
 - **Buffering.** Two stages with fixed caps: compressed read-ahead about 512 KiB (FLAC at 48 kHz stereo is roughly 0.6 to 1.0 Mbit/s, so 4 to 7 s; hypothesis, level and ratio vary), and decoded PCM about 1 s (192 KB at 48 kHz stereo s16). Start playing after about 1 s of PCM is ready. ESPHome's default is 1,000,000 bytes per pipeline (documented); we target **at most 1 MiB of music buffers in total**, far below the 64 MiB ceiling. Underrun: write silence to keep `pacat` fed, count it, and log once.
-- **CPU.** Unknown on the TV. The AEC numbers show the armv7 build costs 23 times the host on float DSP; FLAC is integer and should be far cheaper, but this is a **hypothesis**. Build `symphonia` with `opt-level = 3` through `[profile.release.package.*]` as done for `webos-dsp` (a size cost of tens of KiB). M-E1 measures it with `sink.gain = 0` (silent).
+- **CPU.** Unknown on the TV. The AEC numbers show the armv7 build costs 23 times the host on float DSP; FLAC is integer and should be far cheaper, but this is a **hypothesis**. Build `symphonia` with `opt-level = 3` through `[profile.release.package.*]` as done for `webos-dsp` (a size cost of tens of KiB). EXP-013 measures it with `sink.gain = 0` (silent).
 
 ### 4.4 Output
 
 - **No resampling in the satellite for the proxied path**: the stream is already at the advertised rate; `pacat --rate=48000 --channels=2 --format=s16le --raw --stream-name=music` is started once per track (or once per session) with `--latency-msec` as for replies ([config](../development/esphome-api.md)). A direct URL with another rate or channel count is passed to `pacat` as its own native format (as the TTS stream does) and PulseAudio converts; no change to `resample.rs` is needed (it stays whole-buffer for announcements).
-- A **second `pacat` process** for music next to the reply `pacat` (the existing code starts one process per playback, `kill_on_drop`). PulseAudio mixes them (standard behaviour, **hypothesis on this TV**; M-E2 checks it with a quiet tone and a reply). Extra memory is the child's own RSS (unmeasured; it does not count toward the daemon's RSS ceiling, which reads the daemon process only).
+- A **second `pacat` process** for music next to the reply `pacat` (the existing code starts one process per playback, `kill_on_drop`). PulseAudio mixes them (standard behaviour, **hypothesis on this TV**; EXP-014 checks it with a quiet tone and a reply). Extra memory is the child's own RSS (unmeasured; it does not count toward the daemon's RSS ceiling, which reads the daemon process only).
 - Gain: the same software gain path as replies, `sink.gain` times a volume, plus a **duck factor** ramped per chunk. `sink.gain = 0` writes only zeros, so every TV test of the engine can run silent.
 
 ### 4.5 Semantics of the commands HA can send
@@ -196,10 +476,10 @@ The satellite streams the mic **continuously** to HA, where `alexa` is detected 
 
 ### 5.2 What B can do, in order of value
 
-1. **Duck or pause on the wake word.** The satellite learns of the wake from HA's `WakeWordEnd` event (the daemon already turns it into `AppEvent::WakeWordDetected`, see `voice.rs`). Duck the music (ESPHome's own example: 20 dB, ramped; documented) at that event, hold the duck during STT, intent and the spoken reply, restore about 1 s after `RunEnd` (and after a continued conversation ends). Latency: the event arrives after HA has heard the wake word, so the first words of the command still carry music; **pausing** is cleaner for STT than ducking and costs a gap. Config `[music] on_wake = "duck" | "pause" | "none"`, default `duck` with `duck_db = -20` (values to be tuned by M-E4, not measured).
+1. **Duck or pause on the wake word.** The satellite learns of the wake from HA's `WakeWordEnd` event (the daemon already turns it into `AppEvent::WakeWordDetected`, see `voice.rs`). Duck the music (ESPHome's own example: 20 dB, ramped; documented) at that event, hold the duck during STT, intent and the spoken reply, restore about 1 s after `RunEnd` (and after a continued conversation ends). Latency: the event arrives after HA has heard the wake word, so the first words of the command still carry music; **pausing** is cleaner for STT than ducking and costs a gap. Config `[music] on_wake = "duck" | "pause" | "none"`, default `duck` with `duck_db = -20` (values to be tuned by EXP-015, not measured).
 2. **Duck for replies, announcements and the timer chime** (the reply slot is active): same duck, restore when the reply ends. If the chime rings, keep ducked until it stops.
 3. **Barge-in "stop"**: "alexa, stop" while music plays at normal volume needs the wake word to survive the music. Without AEC it will often fail at higher volumes; with the reference tap it should work (AEC measured 15 to 22 dB ERLE on host with TV and `pacat` content, [AEC](aec-frontend.md); **not measured with music on the TV**). Also add the button entity and the media player `STOP`/`PAUSE` as non-voice stops.
-4. **AEC dependency.** The reference tap (SoundEngineCapture) sees both the music and the replies, since both go through PulseAudio into the TV's sound engine (verified-on-target for a `pacat` tone). So B and A both benefit from AEC; B additionally knows the exact stream and could later feed the reference directly. **Recommendation:** ship music with AEC off but document the limit, run M-E4 to measure false wakes and barge-in with and without AEC, and **ask the owner to un-park AEC (backlog #1) if M-E4 is bad**. Do not change the parked status here.
+4. **AEC dependency.** The reference tap (SoundEngineCapture) sees both the music and the replies, since both go through PulseAudio into the TV's sound engine (verified-on-target for a `pacat` tone). So B and A both benefit from AEC; B additionally knows the exact stream and could later feed the reference directly. **Recommendation:** ship music with AEC off but document the limit, run EXP-015 to measure false wakes and barge-in with and without AEC, and **ask the owner to un-park AEC (backlog #1) if EXP-015 is bad**. Do not change the parked status here.
 5. **Microphone mute and music.** The "Mute microphone" switch mutes capture only; music keeps playing. A "Listening" state with music playing should still be truthful (the mic is on).
 6. **Safety and privacy.** Music playback adds no capture and no new data to HA beyond the state. The URLs are bearer tokens: redact them in logs and in HA-visible text (existing `redact_url`); never log titles from ambient audio (none are read).
 
@@ -223,14 +503,16 @@ On `play_media` while `Active Standby` or the screen dark, the first version onl
 | Item | Budget | Note |
 | --- | --- | --- |
 | Music buffers | at most 1 MiB resident (section 4.3) | 64 MiB RSS ceiling, current RSS about 1.7 MB (verified-on-target) |
-| Decoder state | under 1 MiB (FLAC frames, hypothesis) | measure at M2 |
-| Music thread CPU | target under 5 % of one core at 48 kHz stereo FLAC | **hypothesis**; M-E1 measures with `sink.gain = 0` |
+| Decoder state | under 1 MiB (FLAC frames, hypothesis) | measure at M3 and M5 |
+| Music thread CPU | target under 5 % of one core at 48 kHz stereo FLAC | **hypothesis**; EXP-013 measures with `sink.gain = 0` |
 | Second `pacat` | its own RSS, outside the daemon's ceiling | measure |
 | Network | one TCP stream, FLAC about 0.6 to 1.0 Mbit/s plus the API connection | hypothesis |
 | Watchdog | the loop-stall and RSS watchdogs apply unchanged; the music thread must never block the main loop (bounded channels, no unbounded buffering) | design rule |
 | Binary size | unknown; expect under 100 KiB (hypothesis; AEC cost 400 KiB) | measure |
 
 ## 6. Comparison
+
+Column A is kept for history (rejected by the owner); B was chosen.
 
 | | A. AirPlay 2 + MA | B. Native `media_player` | C. Sendspin | D. webostv app launch |
 | --- | --- | --- | --- | --- |
@@ -248,39 +530,21 @@ On `play_media` while `Active Standby` or the screen dark, the first version onl
 
 ## 7. Non-goal and scope
 
-The MVP non-goal "writing AirPlay or a music player" in [requirements.md](../project/requirements.md) stays as written. B is **not** a music player in the usual sense (no library, queue or UI); it is the transport half of ESPHome's `media_player` that HA and MA drive. Whether that is still a non-goal is the owner's decision ([ADR 0010](../decisions/0010-music-playback.md)).
+The MVP non-goal "writing AirPlay or a music player" in [requirements.md](../project/requirements.md) was **lifted for satellite music playback by [ADR 0010](../decisions/0010-music-playback.md) on 2026-11-05** (owner decision). B is still **not** a music player in the usual sense (no library, queue or UI); it is the transport half of ESPHome's `media_player` that HA and MA drive. The non-goal stays for AirPlay, a library, a queue and a UI. See section A.
 
 ## 8. Recommendation and staged plan
 
-**Recommendation.** (1) Run EXP-008 (A) first: it costs no code, it answers requirement F8 for this TV and it sets the baseline B has to beat (ducking, standby, one entity). (2) **Adopt B as the target design**, behind `[music] enabled = false` by default, if the owner accepts the scope. Build it silently on the PC first (M1 to M4); nothing needs the TV until M5. (3) Do not build C now; revisit it when Sendspin leaves preview and the owner has several Sendspin players. (4) Leave D to HA's webostv integration.
-
-### Staged plan
-
-| Step | What | Where it runs | Sound / TV |
-| --- | --- | --- | --- |
-| **0** EXP-008 | AirPlay with MA (section 3.A list). Part 1 (mDNS browse, MA player list) is read-only and silent; the playback parts need the owner present and a sound authorization. Scope the record to model, firmware and power state in [compatibility](../compatibility/README.md). | owner's MA, TV | sound authorization for 0.3 to 0.8 |
-| **M1** | ESPHome crate: optional music features. With `[music] enabled`, advertise `PLAY_MEDIA`, `PAUSE`, `PLAY` (and `MEDIA_ANNOUNCE` if chosen) and a second `DEFAULT` supported format (FLAC 48000 2 ch 2 bytes); new `AppEvent::PlayMedia { url, announcement }` and pause/play commands; flags stay 5124 when disabled (non-breaking); key and entity id unchanged; fake-HA (aioesphomeapi) tests that check the entity info, the commands and that a media URL still reaches nothing when disabled. | PC | none |
-| **M2** | `webos-playback`: `fetch_stream` (idle timeout, no body cap, TLS as now, redaction) and a streaming symphonia pipeline with bounded stages and a PCM chunk channel; tests with a local HTTP server (FLAC, MP3, WAV, truncated, slow, stalled, redirect to http, huge, format change), plus an armv7 qemu run. | PC | none |
-| **M3** | Satellite `MusicPlayer` slot beside `Player`: second `pacat` (named args), gain and duck ramps, pause, resume, stop, end of stream, error, volume; state to HA; unit tests with a fake `pacat` as for replies; `sink.gain = 0` writes zeros. | PC | none |
-| **M4** | Interplay: duck or pause on `WakeWordDetected`, reply, announcement, alarm; restore after `RunEnd` (continue-conversation aware); `STOP` rules (music first, then alarm); config validation (`[music]` section, `max_volume_percent`, `on_wake`, `duck_db`, `pause_timeout_s`); watchdog and log redaction checks; fake-HA end-to-end with a synthetic FLAC server. | PC | none |
-| **M5** | On-TV, silent: install the build, play a 5 to 10 minute FLAC with `sink.gain = 0`; record CPU, RSS (daemon and `pacat`), network, buffer underruns, behaviour across the TV's power states and an HA disconnect. Needs **owner authorization to run a binary on a TV** (AGENTS.md). | c3-a, then c3-b | none (zero bytes) |
-| **M6** | On-TV, audible: M-E2 and M-E3 below, then the docs, HA UX text and the compatibility record. | c3-a | owner authorization for sound |
-
-### Experiments needed on the target (all need owner authorization; IDs to be assigned when written)
-
-- **M-E1 resource, silent:** streaming decode and buffers at `sink.gain = 0` (CPU of a 1.4 GHz A76 core in the armv7 build and the aarch64 build, RSS, bytes on the wire, underruns, behaviour when HA closes the stream). Expected signal: under 5 % of one core and under 2 MiB of music RSS; failure means opt-level or format change, not abandonment.
-- **M-E2 audible mix:** a quiet owner-chosen track at a low TV volume, a reply and the timer chime during it, ducking depth and ramp, pause and resume latency, one run per power state (`Active`, `Screen Saver`, `Screen Off`, `Active Standby`). Compare with EXP-008 results for A.
-- **M-E3 mix with TV content:** music while an HDMI source or app plays (it mixes, because `pacat` and the program both reach the sound engine, verified for a tone). Check that the TV's own volume, mute and sound mode stay consistent.
-- **M-E4 wake and barge-in with music (needs a consented corpus, [P2 corpus](../experiments/P2-corpus.md) style):** false accepts per hour of `alexa` with music at three volumes, "alexa, stop" success with and without AEC (`[aec] enabled`), STT word error after a wake with `duck` versus `pause`. This also feeds the open decision on un-parking AEC.
-- **M-E5 HA and MA path on the owner's HA 2026.10.4:** `media_player.play_media` from the HA UI, a script, MA's Home Assistant provider and (if used) `music_assistant.play_media`, confirming the proxy URL shape, that MA lists the entity, how MA sequences tracks and whether a gap appears. This is the check for the **hypothesis that MA drives ESPHome media players through the HA provider**.
+**Superseded** by the owner decision and by sections A to K above. The earlier recommendation (run EXP-008 first, then B) is void: EXP-008 is not planned. The earlier staged plan M1 to M6 is replaced by the milestones in section E, and the earlier experiment placeholders by EXP-013 to EXP-016 in section G.
 
 ## 9. Open questions for the owner
 
-1. **Scope:** is B (the satellite as an ESPHome music transport, no library or UI) acceptable under "do not write a music player", or does the non-goal stand and A remain the only path? ([ADR 0010](../decisions/0010-music-playback.md).)
-2. **One entity or a third:** extend `media_player` (one volume for replies and music, like ESPHome) or add a separate "Music" player with its own volume (safer for the existing reply volume, one more entity)?
-3. **Announcements over music:** offer `MEDIA_ANNOUNCE` (HA and MA could then send announcements through the media player) or keep announcements on the existing `Announce` path only?
-4. **Wake behaviour:** default `duck` (-20 dB) or `pause` when the wake word is heard? Is a short pause acceptable?
-5. **Standby:** play only what the TV lets through, or also an opt-in "wake the TV to play music"?
-6. **AEC:** if M-E4 shows false wakes or failed "stop" with music, un-park AEC (backlog #1) for music?
-7. **Sound authorization** for EXP-008 and M-E2 to M-E4 (volume limits, times, who is present), and **authorization to run a built binary on c3-a** for M5.
-8. **Does the owner already use Music Assistant**, and which provider would the satellite appear under (Home Assistant Media Players)? This decides whether B has any consumer on day one.
+Answered by the owner on 2026-11-05 (question 1) or given **proposed defaults, owner to confirm** in section C (the rest):
+
+1. Scope: B accepted; AirPlay rejected (owner).
+2. One entity or a third: D1, one entity.
+3. Announcements over music: D3, offer `MEDIA_ANNOUNCE`.
+4. Wake behaviour: D4, duck at -20 dB.
+5. Standby: D6, play what the TV lets through, never wake it.
+6. AEC: gate G4 after EXP-015.
+7. Sound and binary authorizations: section J.
+8. Music Assistant availability: section J.

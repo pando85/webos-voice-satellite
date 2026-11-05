@@ -1,5 +1,7 @@
 # Music and existing media integration
 
+> **Update 2026-11-05:** the owner decided on native ESPHome `media_player` playback in the satellite and rejected AirPlay ([ADR 0010](../decisions/0010-music-playback.md), [design](../design/music-playback.md)). The text below is the earlier research, kept as background; AirPlay evidence stays labelled as not device-verified.
+
 ## Core questions
 
 Should music run via LG's existing AirPlay 2 receiver, Music Assistant, DLNA, or in-daemon playback? Can playback operate with screen off and remain controlled by HA?

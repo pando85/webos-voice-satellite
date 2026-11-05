@@ -20,10 +20,12 @@ All experiments start from a **read-only** baseline. The user must explicitly ap
 | [EXP-005](EXP-005-native-playback.md) | TTS and native audio mixing | F4 |
 | [EXP-006](EXP-006-aec-reference.md) | Echo reference and AEC feasibility | F5 |
 | [EXP-007](EXP-007-assist-pipeline.md) | Wake word and Assist roundtrip | F3 |
-| [EXP-008](EXP-008-airplay-media.md) | Music Assistant and AirPlay | F8 |
+| [EXP-008](EXP-008-airplay-media.md) | Music Assistant and AirPlay. **Not planned** (owner decision 2026-11-05, [ADR 0010](../decisions/0010-music-playback.md)) | F8 |
 | [EXP-009](EXP-009-ipk-install-update.md) | App package install, update, autostart and removal | Phase 3 / 5 |
 | [EXP-010](EXP-010-tv-control-setters.md) | TV control setters (screen, volume, mute, input, app, power) on c3-b; Part A run 2026-11-04 (passed, A5 skipped), Part B not run | Backlog #11 |
 | [EXP-011](EXP-011-lg-settings-toggle.md) | Read and toggle Always Ready (`lifeOnScreenMode`) and LG hands-free (`setActivation`) through luna; c3-a run 2026-11-05 (passed), c3-b not reachable | TV-app settings screen |
 | [P2-corpus](P2-corpus.md) | Phase 2 test corpus and metric definitions | Phase 2 |
 | [P2-aec-offline-ab](P2-aec-offline-ab.md) | Offline A/B of echo cancellation, gain and NS for wake word and STT over TV content (semi-synthetic) | Phase 2 / F5 |
 | [P2-aec-tuning](P2-aec-tuning.md) | Offline AEC3 tuning (suppressor, echo model, `linear_mix`, stereo render, NS/RNNoise/AGC) and wake threshold/trigger-level sweep, voice-split held-out (semi-synthetic) | Phase 2 / F5 (parked) |
+
+**Reserved IDs:** EXP-012 is reserved by [ADR 0009](../decisions/0009-phone-setup-web-server.md) (phone setup probe). EXP-013 to EXP-016 are claimed by the [music playback plan](../design/music-playback.md#g-on-target-experiments) (resources, audible mix, wake and barge-in with music, real HA and Music Assistant path); each file is written when its milestone starts, and the IDs are renumbered there if they are taken by then.

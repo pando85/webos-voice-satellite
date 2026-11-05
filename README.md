@@ -13,7 +13,7 @@ An experimental, local-first Home Assistant voice satellite for **rooted LG webO
 - Responses using the TV's native audio stack without disrupting normal TV playback when supported.
 - Operation with the screen off if technically feasible and power-efficient.
 - Support multiple LG models/firmware versions through capability discovery, not hard-coded ALSA card numbers.
-- Optional music integration through existing receivers (AirPlay/other supported players), not a bespoke music engine.
+- Optional music playback through the satellite's Home Assistant media player (owner decision 2026-11-05, [ADR 0010](docs/decisions/0010-music-playback.md); design only, not built). AirPlay is not used.
 
 ## Boundaries
 

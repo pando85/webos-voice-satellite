@@ -22,6 +22,8 @@ Daemon boundaries: capture, optional preprocessing, wake/activation, transport, 
 
 ## Why music is separate
 
+> **Superseded for music (2026-11-05):** the owner chose native playback in the satellite and rejected AirPlay ([ADR 0010](../decisions/0010-music-playback.md)). The music plane in the diagram above is therefore not the plan; the text below is the earlier reasoning, kept for history.
+
 The TV already has media receivers, audio decoders, and source policies. Implementing AirPlay, a music library, or a mixer inside the daemon would duplicate functionality. Use AirPlay/Music Assistant as a **candidate media integration**; avoid using it for quick TTS while another TV app is playing.
 
 ## Unsettled decisions

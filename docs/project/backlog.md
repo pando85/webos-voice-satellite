@@ -61,13 +61,13 @@ Items not in the ranked list stay in the backlog without a priority or a phase: 
 - **Dependencies:** D5 and D4 results, a verified public interface for ducking and toasts (no private Luna endpoints assumed, see [AGENTS.md](../../AGENTS.md)), Home Assistant satellite arbitration features.
 - **Evidence needed:** which interfaces are exposed on commercial webOS (webOS OSE docs are not proof), behaviour per app and input, power draw in screen-off mode.
 
-## 5. Music via the TV's AirPlay 2 receiver and Music Assistant
+## 5. Music playback through the satellite's ESPHome media_player
 
-- **Status:** not prioritized (2026-11-02). **Design proposal 2026-11-05:** [music playback](../design/music-playback.md) compares this route (option A, run [EXP-008](../experiments/EXP-008-airplay-media.md) first) with native playback in the satellite through the ESPHome `media_player` (option B, target if the owner accepts the scope), Sendspin and LG app launching; owner decision pending in [ADR 0010](../decisions/0010-music-playback.md) (Proposed).
-- **Why:** music should use the receiver the TV already ships, separate from conversational TTS ([research 06](../research/06-media.md), [EXP-008](../experiments/EXP-008-airplay-media.md)).
-- **Approach options:** Home Assistant to Music Assistant to the TV's AirPlay receiver; test coexistence with the satellite's playback path.
-- **Dependencies:** Phase 2 playback behaviour, TV input and app state handling.
-- **Evidence needed:** AirPlay 2 receiver presence and behaviour on c3-a, and how it interacts with TV audio sources and voice replies.
+- **Status:** **accepted by the owner on 2026-11-05** ("We don't want to use AirPlay. Go with plan B."), recorded in [ADR 0010](../decisions/0010-music-playback.md); design and plan only, nothing built or run on a TV. The MVP non-goal "writing AirPlay or a music player" is lifted for this feature ([requirements](requirements.md), F8). Plan with defaults to confirm, architecture, milestones M1 to M8, experiments EXP-013 to EXP-016, risks, gates and owner actions: [music playback](../design/music-playback.md).
+- **Why:** HA, scripts and Music Assistant can play music on the TV speaker through the same `media_player` entity ESPHome speakers use, and the satellite can duck the music for the wake word, replies, announcements and the timer chime, which no receiver on the TV can do.
+- **Approach:** option B of the design. HA's ffmpeg proxy converts to one advertised format (proposed FLAC, 48 kHz, stereo); the satellite fetches the stream, decodes it with `symphonia` and plays it through a second `pacat`; behind `[music] enabled = false` until the gates pass. **Rejected:** AirPlay with Music Assistant (owner decision; [EXP-008](../experiments/EXP-008-airplay-media.md) not planned). **Deferred:** Sendspin. **Out of scope:** LG apps through webostv.
+- **Dependencies:** the AEC front-end (item 1, parked) if the false-wake gate G4 fails; owner authorization to run a build on a TV and for sound tests; Music Assistant availability for the optional MA part of EXP-016. The UI settings and status fields are a handoff to the TV app redesign (design section K).
+- **Evidence needed:** CPU, memory and underruns of the decode on c3-a (EXP-013), mixing and ducking audible (EXP-014), false wakes and barge-in with music (EXP-015), the real HA and Music Assistant path (EXP-016).
 
 ## 6. Observability
 
