@@ -1136,16 +1136,25 @@ cmd_setup_start() {
         (umask 077 && : >"$SETUP_LOG")
     fi
     # Own session, no inherited descriptors (a Homebrew Channel exec waits for
-    # them), no stdin, the server's own log. The environment names only the
-    # session directory and the install directory.
+    # them), no stdin, the server's own log. The environment is empty except
+    # for the session directory, the install directory and a fixed PATH
+    # (env -i): nothing from the caller (a Homebrew Channel exec, a shell)
+    # reaches the server or the root commands it starts. Tools are named by
+    # their full path where found; env runs the command itself (no fork), so
+    # $! is the server's pid.
     close_inherited_fds "$0"
+    sbin=nohup
+    if command -v nohup >/dev/null 2>&1; then sbin=$(command -v nohup); fi
+    ssid=
+    if [ -n "$SETSID" ]; then
+        ssid=$SETSID
+        if command -v "$SETSID" >/dev/null 2>&1; then ssid=$(command -v "$SETSID"); fi
+    fi
     (
         umask 077
-        unset WEBOS_SAT_LOCK_HELD
-        WEBOS_SAT_SETUP_DIR=$SETUP_DIR WEBOS_SAT_PREFIX=$P
-        export WEBOS_SAT_SETUP_DIR WEBOS_SAT_PREFIX
-        # shellcheck disable=SC2086 # $SETSID is empty or one word
-        $SETSID nohup "$SETUP_BIN" --ctl "$P/bin/ctl.sh" </dev/null >>"$SETUP_LOG" 2>&1 &
+        # shellcheck disable=SC2086 # $ssid is empty or one word
+        env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin WEBOS_SAT_SETUP_DIR="$SETUP_DIR" WEBOS_SAT_PREFIX="$P" \
+            $ssid "$sbin" "$SETUP_BIN" --ctl "$P/bin/ctl.sh" </dev/null >>"$SETUP_LOG" 2>&1 &
         echo $! >"$SETUP_PID"
     )
     i=0

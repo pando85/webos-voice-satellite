@@ -35,7 +35,7 @@ Severity: High (root or TV control without the OK), Medium (a guarantee of the d
 | --- | --- | --- | --- |
 | SR-01 | Low | The 3 s write limit applied to each `write` call, not to the whole response | **fixed** |
 | SR-02 | Low | The session directory's safety depended on an unchecked parent (`/tmp` sticky) | **fixed** (fails closed) |
-| SR-03 | Low | The state refresh runs `ctl.sh status --json` and `tv-settings --json` about every 4 to 15 s for the whole active session | open (owner) |
+| SR-03 | Low | The state refresh runs `ctl.sh status --json` and `tv-settings --json` about every 4 to 15 s for the whole active session | **fixed** (2026-11-05: only while `/api/state` is polled, at least 5 s apart) |
 | SR-04 | Low | Any LAN host can end a session or keep the one connection slot busy | accepted (design) |
 | SR-05 | Info | `answer.json` is read, then unlinked: a second answer in between would be lost | accepted |
 | SR-06 | Info | The log is opened following symbolic links, and a pre-existing file's mode is not tightened | accepted |
@@ -72,7 +72,7 @@ On a non-sticky, world-writable parent, a non-root process on the TV could swap 
 
 The check is stricter than before. If the TV's `/tmp` is not 1777, the server will not start (item C4).
 
-### SR-03: the refresh cost during a session (Low, open)
+### SR-03: the refresh cost during a session (Low, fixed)
 
 The worker refreshes the status mirror whenever the cache is 3 s old. A refresh is `ctl.sh status --json`, about 950 ms and 0.57 CPU-seconds per call on c3-a according to [EXP-012](../experiments/EXP-012-phone-setup-probe.md), plus `ctl.sh tv-settings --json`, which makes luna calls and was not measured.
 
@@ -80,7 +80,7 @@ The worker refreshes the status mirror whenever the cache is 3 s old. A refresh 
 - **Hidden page:** the refresh also continues while the phone page is hidden. The page stops polling then, so the session ends only at the 180 s idle limit.
 - **Not an amplifier:** a phone cannot raise the rate. Actions are serialized and a refresh follows each one.
 - **Recommendation:** refresh only while `/api/state` was asked for in the last 10 s or so, and measure the session cost in EXP-012 Part B.
-- **Why not changed:** this changes the behaviour of the design (section 8.4: every 3 s), so it is left to the owner.
+- **Fix (owner request, 2026-11-05):** the refresh runs only while a phone has a session and `/api/state` was asked for in the last 10 s (the use of the token counts), at least 5 s after the previous refresh ended (2 s after an action). Tests: `session::tests::no_refresh_runs_while_the_page_is_not_polling`, `refreshing_stops_ten_seconds_after_the_last_poll_and_keeps_its_interval`, `the_refresh_after_an_action_waits_for_the_floor`. The cost of an idle session on c3-a is measured in EXP-012 Part B.
 
 ### SR-04: denial of service by any LAN host (Low, accepted)
 
@@ -194,12 +194,12 @@ These are availability problems only, and part of the design's choices.
 `ctl.sh` was not changed by this review. Items C2 to C5 should be settled before a test on the TV.
 
 - **C1 (resolved):** when the review started, `main` had neither `setup` nor `set reply-volume`, so no session could start. P3 landed in `47b9288`.
-- **C2:** `setup start` passes its whole inherited environment to the server; its comment says only the session and install directories. The server forwards only its allow-list to its children, but `WEBOS_SAT_LUNA_SEND`, `WEBOS_SAT_INITD`, `WEBOS_SAT_LOCK`, `WEBOS_SAT_ALLOW_NONROOT` and `WEBOS_SAT_SETTLE` from the exec environment would still reach the root commands. The trust is equal today, because the exec caller is root. Still, start the server with `env -i PATH=… WEBOS_SAT_SETUP_DIR=… WEBOS_SAT_PREFIX=…` and have the tests add their variables explicitly, so that the comment holds.
+- **C2 (fixed 2026-11-05):** `setup start` now runs the server with `env -i` and only `PATH`, `WEBOS_SAT_PREFIX` and `WEBOS_SAT_SETUP_DIR`; tested with hostile variables in the caller's environment. Was: `setup start` passes its whole inherited environment to the server; its comment says only the session and install directories. The server forwards only its allow-list to its children, but `WEBOS_SAT_LUNA_SEND`, `WEBOS_SAT_INITD`, `WEBOS_SAT_LOCK`, `WEBOS_SAT_ALLOW_NONROOT` and `WEBOS_SAT_SETTLE` from the exec environment would still reach the root commands. The trust is equal today, because the exec caller is root. Still, start the server with `env -i PATH=… WEBOS_SAT_SETUP_DIR=… WEBOS_SAT_PREFIX=…` and have the tests add their variables explicitly, so that the comment holds.
 - **C3:** `setup.pid` is the `$!` of `$SETSID nohup …`. `setsid` forks when its caller leads a process group (util-linux and BusyBox). `setup.pid` would then name a process that exits at once: `setup start` would report a failure, and `stop_setup_server` would remove the directory, which ends the server. That fails safe, but would make the feature unusable. Verify on c3-a that `/proc/$(cat setup.pid)/cmdline` is the server itself.
 - **C4:** `/tmp` must be 1777 and owned by root on the TV: `setup start` (`rm -rf` then `mkdir -m 700`) and the server (SR-02, now enforced) rely on it. Record `stat -c '%a %U' /tmp` in EXP-012 Part B.
 - **C5:** the heartbeat is `: >heartbeat` on an empty file. Linux updates the mtime on an `O_TRUNC` open, but the server's host tests use `touch` and `set_modified`. Check on c3-a that two `setup status` calls 1 s apart change the mtime; otherwise every session ends as `app-gone` after 15 s.
 - **C6:** `setup start` in the moment between the server writing `ended` and its exit fails with "already active". Benign: the app can retry.
-- **C7:** keep the invariant that none of the commands the server runs (`status --json`, `tv-settings --json`, `set …`, `mic`, `pair`) reaches `stop_daemon` or `stop_setup_server`; otherwise the server would end itself in the middle of an action. That is true today, and a packaging test could pin it.
+- **C7 (pinned 2026-11-05):** `packaging/webos/tests/no_self_stop.py`, run by `tests/setup.sh`, follows every function that `set`, `mic`, `pair`, `status` and `tv-settings` call and fails if one reaches `stop_daemon`, `stop_setup_server` or the stop, start, install, uninstall or purge code (with positive controls). The invariant: keep the invariant that none of the commands the server runs (`status --json`, `tv-settings --json`, `set …`, `mic`, `pair`) reaches `stop_daemon` or `stop_setup_server`; otherwise the server would end itself in the middle of an action. That is true today, and a packaging test could pin it.
 - **Checked and fine:**
   - `setup answer` validates the id (eight lowercase hex characters) and the verdict before `need_root`, and writes atomically under `umask 077`;
   - `set reply-volume` accepts exactly `0|[1-9]|[1-9][0-9]|100`, like the server;

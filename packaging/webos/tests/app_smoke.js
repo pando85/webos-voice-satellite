@@ -309,6 +309,13 @@ const refresh = async () => { const t = T.timers.filter((x) => x.live && x.inter
   srv.s.peer_other_subnet = false;
 
   // ---- the confirmation overlay ----
+  {
+    // Never an automatic allow: the only code that answers allow is the click of the Allow button.
+    const src = fs.readFileSync(path.join(APP, 'app.js'), 'utf8');
+    const calls_ = src.match(/answer\('allow'\)/g) || [];
+    check('the app code answers allow in exactly one place, the click of the Allow button', calls_.length === 1 && /onClick\('m-allow', function \(\) \{ answer\('allow'\); \}\);/.test(src)
+      && (src.match(/setup answer ' \+ id \+ ' refuse'/g) || []).length === 1);
+  }
   const pend = (id, action, value, o) => Object.assign({ id, action, value, peer: '192.0.2.77', state: 'pending', confirm: true, timeout_in_s: 60 }, o || {});
   key(461); await settle();
   click('h-voice'); await settle();
@@ -353,8 +360,15 @@ const refresh = async () => { const t = T.timers.filter((x) => x.live && x.inter
   // Back refuses
   key(461); await settle();
   srv.s.pending = pend('0badf00d', 'always-ready', 'on');
-  await step(2000);
+  // Up to the moment the overlay opens, in 100 ms steps (so that "just opened" is exact).
+  for (let i = 0; i < 100 && byId.overlay.hidden; i++) { advance(100); await settle(); }
   check('second request: overlay', !byId.overlay.hidden && byId['m-what'].textContent === 'turn Always Ready on');
+  const n0 = answers.length;
+  ok();
+  advance(500);
+  ok();
+  check('OK in the first 700 ms after the overlay opens does not allow (a held or double press); the overlay stays, nothing was answered',
+    !byId.overlay.hidden && answers.length === n0 && execs().indexOf('setup answer 0badf00d allow') < 0);
   key(461);
   await settle();
   check('Back refuses (and does not leave the screen)', answers[answers.length - 1] === '0badf00d refuse' && byId.overlay.hidden && !byId.home.hidden);

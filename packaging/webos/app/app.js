@@ -49,6 +49,9 @@
   var SETUP_POLL_FAST_MS = 1000;
   var SETUP_HINT_MS = 45000;   // "nothing has opened the link" hint (design 5.3)
   var REQUEST_MS = 60000;      // a phone request is refused after this (design 7)
+  // OK is ignored for this long after the overlay opens: a press (or a held
+  // key) meant for the screen below must not allow a phone's request.
+  var ALLOW_GUARD_MS = 700;
   var CLOCK_MS = 1000;         // countdown texts
 
   var appDir = decodeURIComponent(window.location.pathname.replace(/\/[^\/]*$/, ''));
@@ -777,7 +780,7 @@
     waitingSince: 0, expiresAt: 0, error: '', runningShown: false, seq: 0, appliedSeq: 0,
     awaiting: false,         // a request was seen and its result is not shown yet (fast poll)
     seenResult: undefined,   // id of the last `last_result` already shown (undefined: none seen yet)
-    overlayId: null, overlayEnds: 0, overlayPrevFocus: null, answered: {}
+    overlayId: null, overlayEnds: 0, overlayShownAt: 0, overlayPrevFocus: null, answered: {}
   };
 
   function setupLive() { return !!LIVE[setup.state]; }
@@ -892,6 +895,7 @@
     disarmAll();
     setup.overlayId = id;
     setup.overlayEnds = now() + left;
+    setup.overlayShownAt = now();
     setup.overlayPrevFocus = document.activeElement;
     text($('m-from'), 'Phone ' + p.peer + ' wants to:');
     text($('m-what'), t.ask);
@@ -919,6 +923,9 @@
   function answer(verdict) {
     var id = setup.overlayId;
     if (!id) { return; }
+    // Only a deliberate OK allows: never by itself, never at the moment the
+    // overlay opens. Refusing is always possible.
+    if (verdict !== 'refuse' && (verdict !== 'allow' || now() - setup.overlayShownAt < ALLOW_GUARD_MS)) { return; }
     setup.answered[id] = true;
     setup.awaiting = true;
     closeOverlay();

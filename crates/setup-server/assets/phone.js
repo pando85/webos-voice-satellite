@@ -13,7 +13,7 @@
   'use strict';
 
   var MY_HA = 'https://my.home-assistant.io/redirect/config_flow_start/?domain=esphome';
-  var STATE_MS = 3000;     // the server refreshes its cache every 3 s
+  var STATE_MS = 3000;     // the server refreshes its cache every 5 s, only while this page polls (SR-03)
   var ACTION_MS = 1000;    // while a request waits for the TV
   var GIVE_UP_AFTER = 3;   // failed polls in a row before the session counts as gone
 

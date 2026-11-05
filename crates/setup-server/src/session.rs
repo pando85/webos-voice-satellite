@@ -37,7 +37,15 @@ pub(crate) struct Timing {
     pub(crate) app_gone: Duration,
     pub(crate) request_timeout: Duration,
     pub(crate) cooldown: Duration,
+    /// Pause between two periodic state refreshes (SR-03), counted from the
+    /// end of the previous one.
     pub(crate) refresh: Duration,
+    /// The shortest pause before the refresh that follows an action.
+    pub(crate) refresh_floor: Duration,
+    /// The state is refreshed only while `/api/state` was asked for within
+    /// this time (or the token was just used): a hidden or closed phone page
+    /// costs the TV nothing (SR-03).
+    pub(crate) poll_window: Duration,
 }
 
 impl Default for Timing {
@@ -49,7 +57,9 @@ impl Default for Timing {
             app_gone: Duration::from_secs(8),
             request_timeout: Duration::from_secs(60),
             cooldown: Duration::from_secs(3),
-            refresh: Duration::from_secs(3),
+            refresh: Duration::from_secs(5),
+            refresh_floor: Duration::from_secs(2),
+            poll_window: Duration::from_secs(10),
         }
     }
 }
@@ -215,6 +225,9 @@ pub(crate) struct Core {
     total: u32,
     mirror: Mirror,
     refresh_due: bool,
+    /// The last time the phone page asked for `/api/state` (or the token was
+    /// used): the state refresh runs only within `poll_window` of it.
+    polled: Option<Instant>,
     queued: Option<Job>,
     worker_busy: bool,
     end: Option<EndReason>,
@@ -255,6 +268,7 @@ impl Core {
             total: 0,
             mirror: Mirror::default(),
             refresh_due: false,
+            polled: None,
             queued: None,
             worker_busy: false,
             end: None,
@@ -531,10 +545,13 @@ impl Core {
                     "idle_timeout_s": self.t.idle.as_secs(),
                 }),
             ),
-            Route::ApiState => Response::json(
-                200,
-                &self.mirror.to_json(&self.pending_json(now, false), now),
-            ),
+            Route::ApiState => {
+                self.polled = Some(now);
+                Response::json(
+                    200,
+                    &self.mirror.to_json(&self.pending_json(now, false), now),
+                )
+            }
             Route::Actions => self.post_action(peer, req, now),
             Route::Action(id) => self.action_state(id, now),
             Route::End => self.post_end(peer, req, now),
@@ -599,6 +616,7 @@ impl Core {
                 last_request: now,
             });
             self.refresh_due = true;
+            self.polled = Some(now);
             self.dirty = true;
             self.log.push(format!("token consumed peer={peer}"));
             return self.redirect(now, true);
@@ -817,15 +835,28 @@ impl Core {
     }
 
     /// The next job for an idle worker: an approved action first, then a
-    /// state refresh (at once after the token and each action, then every
-    /// `refresh` interval while a phone has a session).
+    /// state refresh. A refresh runs only while a phone has a session **and**
+    /// the page is polling (`/api/state` within `poll_window`, SR-03): at once
+    /// after the token, one `refresh_floor` after an action, and otherwise
+    /// every `refresh` interval. Without a poll nothing runs, so a hidden or
+    /// closed page costs no CPU (a refresh is `ctl.sh status --json` and
+    /// `tv-settings --json`, about 0.6 CPU-seconds on c3-a).
     pub(crate) fn next_job(&mut self, now: Instant) -> Option<Job> {
         if self.worker_busy || self.end.is_some() {
             return None;
         }
         let job = self.queued.take().or_else(|| {
+            let polling = self
+                .polled
+                .is_some_and(|p| now.saturating_duration_since(p) <= self.t.poll_window);
             let due = self.session.is_some()
-                && (self.refresh_due || self.mirror.age(now).is_none_or(|a| a >= self.t.refresh));
+                && polling
+                && match self.mirror.age(now) {
+                    None => true,
+                    Some(a) => {
+                        a >= self.t.refresh || (self.refresh_due && a >= self.t.refresh_floor)
+                    }
+                };
             due.then(|| {
                 self.refresh_due = false;
                 Job::Refresh
@@ -1743,19 +1774,136 @@ pub(crate) mod tests {
         );
     }
 
+    fn done_refresh(t: &mut T) {
+        let now = t.now;
+        t.core.on_job_done(
+            JobDone::Refresh {
+                device: Ok(br#"{"installed":true,"running":true,"key":"paired"}"#.to_vec()),
+                tv: Ok(br#"{"luna":true,"always_ready":{"raw":"off"}}"#.to_vec()),
+            },
+            now,
+        );
+    }
+
     #[test]
     fn refreshes_follow_the_interval_only_with_a_session() {
         let mut t = T::new();
+        t.at(0);
         assert!(t.core.next_job(t.now).is_none());
         t.login();
+        // The token counts as a poll; the interval is 5 s from the first refresh.
+        t.at(1_000);
+        t.authed("/api/state");
+        t.at(4_900);
+        t.authed("/api/state");
         assert!(t.core.next_job(t.now).is_none());
-        t.at(2_900);
-        assert!(t.core.next_job(t.now).is_none());
-        t.at(3_000);
+        t.at(5_000);
         assert!(matches!(t.core.next_job(t.now), Some(Job::Refresh)));
         assert!(t.core.next_job(t.now).is_none());
         let v = body_json(&t.authed("/api/state"));
         assert_eq!(v["device"]["port"], 6053);
-        assert_eq!(v["age_s"], 3.0);
+        assert_eq!(v["age_s"], 5.0);
+    }
+
+    /// SR-03: no `/api/state` request, no refresh. A hidden or closed phone
+    /// page must not cost the TV `ctl.sh status` and `tv-settings` runs.
+    #[test]
+    fn no_refresh_runs_while_the_page_is_not_polling() {
+        let mut t = T::new();
+        t.login();
+        let mut jobs = 0;
+        // 120 s with no poll after the token: nothing is started, ever.
+        for s in 1..=120 {
+            t.at(s * 1000);
+            if t.core.next_job(t.now).is_some() {
+                jobs += 1;
+                t.core.on_job_done(
+                    JobDone::Refresh {
+                        device: Ok(b"{}".to_vec()),
+                        tv: Ok(b"{}".to_vec()),
+                    },
+                    t.now,
+                );
+            }
+        }
+        // The token counts as a poll, so the first 10 s may hold the
+        // refreshes at 5 s and 10 s (login() already took the first one at
+        // 0 s); after that nothing.
+        assert!(jobs <= 2, "{jobs} refreshes without a poll");
+        let later = jobs;
+        t.at(121_000);
+        assert!(t.core.next_job(t.now).is_none());
+        // A poll wakes it up at once (the cache is old).
+        t.authed("/api/state");
+        assert!(matches!(t.core.next_job(t.now), Some(Job::Refresh)));
+        t.core.on_job_done(
+            JobDone::Refresh {
+                device: Ok(b"{}".to_vec()),
+                tv: Ok(b"{}".to_vec()),
+            },
+            t.now,
+        );
+        assert_eq!(later, jobs);
+    }
+
+    #[test]
+    fn refreshing_stops_ten_seconds_after_the_last_poll_and_keeps_its_interval() {
+        let mut t = T::new();
+        t.login();
+        let mut started = Vec::new();
+        t.at(60_000);
+        t.authed("/api/state"); // the last poll, at 60 s
+        for ms in (60_000..=80_000).step_by(100) {
+            t.at(ms);
+            if t.core.next_job(t.now).is_some() {
+                started.push(ms);
+                done_refresh(&mut t);
+            }
+        }
+        // At 60 s at once (the cache is 60 s old), then every 5 s while the
+        // window (10 s) lasts: 60, 65, 70; nothing after 70 s.
+        assert_eq!(started, vec![60_000, 65_000, 70_000], "{started:?}");
+        // With a poll every 3 s (the page) it keeps going, at 5 s intervals.
+        let mut t = T::new();
+        t.login();
+        let mut started = Vec::new();
+        for ms in (100..=31_000).step_by(100) {
+            t.at(ms);
+            if ms % 3_000 == 0 {
+                t.authed("/api/state");
+            }
+            if t.core.next_job(t.now).is_some() {
+                started.push(ms);
+                done_refresh(&mut t);
+            }
+        }
+        assert!(started.len() >= 5 && started.len() <= 6, "{started:?}");
+        for w in started.windows(2) {
+            assert!(w[1] - w[0] >= 5_000, "{started:?}");
+        }
+    }
+
+    #[test]
+    fn the_refresh_after_an_action_waits_for_the_floor() {
+        let mut t = T::new();
+        t.login();
+        t.at(20_000);
+        t.authed("/api/state");
+        // The cache is 20 s old: due. Take it, mark it done at 20 s.
+        assert!(matches!(t.core.next_job(t.now), Some(Job::Refresh)));
+        done_refresh(&mut t);
+        // An action result sets refresh_due; it may not run within 2 s.
+        t.core.refresh_due = true;
+        t.at(21_000);
+        t.authed("/api/state");
+        assert!(t.core.next_job(t.now).is_none());
+        t.at(22_000);
+        t.authed("/api/state");
+        assert!(matches!(t.core.next_job(t.now), Some(Job::Refresh)));
+        // And one more only after the interval.
+        done_refresh(&mut t);
+        t.at(24_900);
+        t.authed("/api/state");
+        assert!(t.core.next_job(t.now).is_none());
     }
 }

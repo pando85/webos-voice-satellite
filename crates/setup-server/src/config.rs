@@ -28,7 +28,7 @@ state is in DIR/state.json.
 Test switches (each may only shorten the design value):
   --lifetime-s N (600)  --idle-s N (180)  --heartbeat-grace-s N (15)
   --request-timeout-s N (60)  --command-timeout-s N (25)  --cooldown-s N (3)
-  --refresh-s N (3)  --allow-loopback (accept 127.0.0.0/8 peers)
+  --refresh-s N (5)  --poll-window-s N (10)  --allow-loopback (accept 127.0.0.0/8 peers)
 ";
 
 pub(crate) const DEFAULT_PREFIX: &str = "/var/lib/webos-satellite";
@@ -118,7 +118,8 @@ pub(crate) fn parse(
             "--request-timeout-s" => t.request_timeout = secs(&v, 1, 60, &a)?,
             "--command-timeout-s" => command_timeout = secs(&v, 1, 25, &a)?,
             "--cooldown-s" => t.cooldown = secs(&v, 0, 3, &a)?,
-            "--refresh-s" => t.refresh = secs(&v, 1, 3, &a)?,
+            "--refresh-s" => t.refresh = secs(&v, 1, 5, &a)?,
+            "--poll-window-s" => t.poll_window = secs(&v, 1, 10, &a)?,
             _ => return Err(format!("unknown option {a}")),
         }
     }

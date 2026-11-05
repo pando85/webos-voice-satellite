@@ -50,7 +50,9 @@ write_fake() {
 # Records its arguments and environment names, writes state.json like the
 # real server (waiting, a made-up one-time path), consumes answer.json unless
 # \$FAKE_DIR/noconsume exists.
-F=\${FAKE_DIR:?}
+# The server starts with an empty environment (env -i): it finds the test
+# directory next to the prefix, not through a variable.
+F=\$(dirname "\${WEBOS_SAT_PREFIX:?}")/fake
 D=\${WEBOS_SAT_SETUP_DIR:?}
 echo "\$*" >"\$F/argv"
 env | sed -n 's/=.*//p' | sort >"\$F/envnames"
@@ -115,6 +117,13 @@ check "start: exit 0, one JSON line, schema 1, waiting, port and path" '[ "$rc" 
 check "start: one server, pid file, directory mode 0700, heartbeat file" '[ "$(servers)" = 1 ] && [ -n "$(setup_pid)" ] && kill -0 "$(setup_pid)" && [ "$(stat -c %a "$D")" = 700 ] && [ -e "$D/heartbeat" ]'
 check "start: the server got only --ctl <install>/bin/ctl.sh as arguments" '[ "$(cat "$F/argv")" = "--ctl $P/bin/ctl.sh" ]'
 check "start: the server gets the session and install directories and no token variable (WEBOS_SAT_* names only)" 'grep -q "^WEBOS_SAT_SETUP_DIR$" "$F/envnames" && grep -q "^WEBOS_SAT_PREFIX$" "$F/envnames" && ! grep -i "^WEBOS_SAT.*\(token\|secret\|psk\)" "$F/envnames"'
+check "start (C2): the server's environment is only PATH, WEBOS_SAT_PREFIX and WEBOS_SAT_SETUP_DIR (shell bookkeeping aside)" '[ -z "$(grep -vx "PATH\|WEBOS_SAT_PREFIX\|WEBOS_SAT_SETUP_DIR\|PWD\|OLDPWD\|SHLVL\|_" "$F/envnames")" ] && grep -qx PATH "$F/envnames"'
+# The same, with hostile variables in the caller's environment.
+ctl setup stop >/dev/null 2>&1
+WEBOS_SAT_LUNA_SEND=/bin/evil WEBOS_SAT_INITD=/x WEBOS_SAT_SETTLE=0 WEBOS_SAT_ALLOW_NONROOT=1 WEBOS_SAT_LOCK_HELD=1 SOME_SECRET=hunter2 LD_PRELOAD=/nonexistent.so \
+    ctl setup start >/dev/null 2>&1
+check "start (C2): WEBOS_SAT_LUNA_SEND, _INITD, _SETTLE, _ALLOW_NONROOT, _LOCK_HELD, LD_PRELOAD and other variables of the caller do not reach the server" '[ -z "$(grep -vx "PATH\|WEBOS_SAT_PREFIX\|WEBOS_SAT_SETUP_DIR\|PWD\|OLDPWD\|SHLVL\|_" "$F/envnames")" ] && ! tr "\0" "\n" <"/proc/$(setup_pid)/environ" | grep -q "LUNA_SEND\|INITD\|SETTLE\|ALLOW_NONROOT\|SOME_SECRET\|LD_PRELOAD\|LOCK_HELD" && tr "\0" "\n" <"/proc/$(setup_pid)/environ" | grep -qx "PATH=/usr/sbin:/usr/bin:/sbin:/bin"'
+pid=$(setup_pid)
 pid=$(setup_pid)
 check "the one-time path is in no argument, no environment, no log and not on the install directory" '! tr "\0" " " </proc/$pid/cmdline | grep -q "$MARK" && ! tr "\0" " " </proc/$pid/environ | grep -q "$MARK" && ! cat "$T/err" "$P/log/setup.log" 2>/dev/null | grep -q "$MARK" && ! grep -rl "$MARK" "$P/etc" "$P/run" "$P/log" >/dev/null 2>&1'
 out2=$(ctl setup start 2>/dev/null) && rc=0 || rc=$?
@@ -267,6 +276,11 @@ echo "== never started by the boot hook, autostart or ctl.sh start =="
 check "the hook template, autostart.sh, start.sh and supervise.sh do not mention the setup server" '! grep -il "setup" "$PKG/init.d/webos-satellite" "$PKG/autostart.sh" "$PKG/start.sh" "$PKG/supervise.sh"'
 check "ctl.sh start and restart never call the setup start" '! sed -n "/^cmd_start()/,/^}/p" "$PKG/ctl.sh" | grep -q "setup" && ! sed -n "/^restart)/,/;;/p" "$PKG/ctl.sh" | grep -q "setup start\|cmd_setup"'
 check "only the setup dispatch calls cmd_setup_start" '[ "$(grep -c "cmd_setup_start" "$PKG/ctl.sh")" -eq 2 ]'
+
+echo "== the commands the server runs never end a session (review C7) =="
+python3 "$HERE/no_self_stop.py" "$PKG/ctl.sh" "$PKG/lib.sh" >"$T/c7.out" 2>&1 && rc=0 || rc=$?
+check "set, mic, pair, status and tv-settings (with every function they call) never reach stop_daemon, stop_setup_server, stop, start, install, uninstall or purge; the checker sees them in cmd_stop and cmd_setup_stop" '[ "$rc" -eq 0 ] && grep -q "^cmd_set: " "$T/c7.out" && grep -q "^cmd_tv_settings: " "$T/c7.out"'
+[ "$rc" -eq 0 ] || cat "$T/c7.out"
 
 echo "== stop, uninstall and purge end a session =="
 ctl setup start >/dev/null 2>&1
