@@ -77,5 +77,5 @@ Playback stopped; the original `config.toml` copied back (md5 `cd688f93...` equa
 ## Follow-ups / unresolved questions
 
 - Standby entry with `pacat` #2 open (needs the owner's go-ahead for a power-state change).
-- The reply-path buffering (about 0.65 MiB per second of reply audio) and whether to stream-decode replies, or at least cap the reply length, before enabling `announce`.
+- The reply-path buffering (about 0.65 MiB per second of reply audio) and whether to stream-decode replies, or at least cap the reply length, before enabling `announce`. **Fixed on the PC on 2026-11-05 (verified-on-host, not yet on c3-a):** replies and announcements are now streamed (see the M5 and M7 notes in the [design](../design/music-playback.md#e-milestones)); on the host a 120 s announcement grows the process by 0.8 MiB (the same as a 30 s one) against 74.6 MiB with the old whole-file path. The on-target re-measure (this file's method, an 18 s and a long announcement) is pending the next deploy.
 - A baseline of the daemon's RSS over days with music enabled (heap kept at about 6.2 MiB after the first long reply).

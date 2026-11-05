@@ -671,3 +671,107 @@ async fn guarded_fetch_limits_redirects_and_checks_every_hop() {
     let (url, _) = serve_head(redirect(&target)).await;
     assert_eq!(fetch(&url, &local()).await.unwrap(), wav_bytes(&src));
 }
+
+// ------------------------------------------------- streamed play_url (replies)
+
+#[tokio::test]
+async fn streamed_play_url_writes_exactly_what_the_whole_file_pipeline_did() {
+    // 3 s of 22.05 kHz mono (the satellite's announcement format) to a
+    // 44.1 kHz stereo pacat with gain 0.5: byte for byte the old output.
+    let src = sine(22_050, 1, 440.0, 3.0);
+    let body = wav_bytes(&src);
+    let url = serve("200 OK", "audio/wav", body.clone()).await;
+    let dir = tmp_dir("stream-exact");
+    let out = dir.join("captured.raw");
+    let bin = fake_pacat(&dir, &format!("cat > {}", out.display()));
+    let mut sink = pacat_with(|s| {
+        s.binary = bin;
+        s.gain = 0.5;
+    });
+    let t = play_url(&url, &local(), &mut sink).await.unwrap();
+    let mut expect = resample(&decode(&body, Some("wav")).unwrap(), 44_100, 2);
+    expect.apply_gain(0.5);
+    let raw = std::fs::read(&out).unwrap();
+    assert_eq!(raw.len(), expect.samples.len() * 2);
+    assert!(raw == expect.to_s16le_bytes(), "streamed output differs");
+    assert_eq!(t.bytes, body.len());
+    assert!((t.audio.as_secs_f64() - 3.0).abs() < 0.001, "{:?}", t.audio);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn streamed_play_url_stop_cancels_and_kills_pacat() {
+    let url = serve(
+        "200 OK",
+        "audio/wav",
+        wav_bytes(&sine(22_050, 1, 440.0, 30.0)),
+    )
+    .await;
+    let dir = tmp_dir("stream-stop");
+    let pidf = dir.join("pid");
+    // A pacat that never reads: the pipe fills and the writes wait.
+    let bin = fake_pacat(
+        &dir,
+        &format!("echo $$ > {}\nexec sleep 30", pidf.display()),
+    );
+    let mut sink = pacat_with(|s| {
+        s.binary = bin;
+    });
+    let handle = sink.stop_handle();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        handle.stop();
+    });
+    let started = std::time::Instant::now();
+    let err = play_url(&url, &local(), &mut sink).await.unwrap_err();
+    assert!(matches!(err, PlaybackError::Cancelled), "{err:?}");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        started.elapsed()
+    );
+    let pid: u32 = std::fs::read_to_string(&pidf)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!pid_alive(pid), "child {pid} still alive");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn streamed_play_url_keeps_the_body_cap_and_opens_nothing_on_errors() {
+    let url = serve(
+        "200 OK",
+        "audio/wav",
+        wav_bytes(&sine(22_050, 1, 440.0, 1.0)),
+    )
+    .await;
+    let small = FetchConfig {
+        max_bytes: 1000,
+        ..local()
+    };
+    let mut sink = NullSink::default();
+    let err = play_url(&url, &small, &mut sink).await.unwrap_err();
+    assert!(
+        matches!(err, PlaybackError::TooLarge { limit: 1000 }),
+        "{err:?}"
+    );
+    assert_eq!(sink.plays, 0, "refused before any audio");
+
+    let nf = serve("404 Not Found", "text/plain", b"nope".to_vec()).await;
+    let err = play_url(&nf, &local(), &mut sink).await.unwrap_err();
+    assert!(matches!(err, PlaybackError::Status(404)), "{err:?}");
+    // Loopback without the test aid: refused by the guard.
+    let err = play_url(&url, &FetchConfig::default(), &mut sink)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, PlaybackError::TargetRefused(_)), "{err:?}");
+    assert_eq!(sink.plays, 0);
+
+    // A good one counts once, with every frame.
+    play_url(&url, &local(), &mut sink).await.unwrap();
+    assert_eq!(sink.plays, 1);
+    assert_eq!(sink.frames, 44_100);
+}

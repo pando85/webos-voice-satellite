@@ -274,6 +274,37 @@ def write_chime(path: str) -> None:
             struct.pack("<h", int(3000 * math.sin(2 * math.pi * 660 * n / 16000))) for n in range(4800)))
 
 
+def write_long_announcement(path: str, seconds: int) -> None:
+    """`seconds` of a 440 Hz tone, 22.05 kHz mono (the announcement format)."""
+    one = b"".join(struct.pack("<h", int(4000 * math.sin(2 * math.pi * 441 * n / 22050)))
+                   for n in range(22050))
+    with wave.open(path, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(22050)
+        for _ in range(seconds):
+            w.writeframes(one)
+
+
+def proc_kib(pid: int, field: str) -> int:
+    """A `kB` field of /proc/<pid>/status (VmRSS, VmHWM)."""
+    with open(f"/proc/{pid}/status") as f:
+        for line in f:
+            if line.startswith(field + ":"):
+                return int(line.split()[1])
+    raise KeyError(field)
+
+
+def reset_peak(pid: int) -> bool:
+    """Resets VmHWM to the current RSS (Linux: 5 into clear_refs)."""
+    try:
+        with open(f"/proc/{pid}/clear_refs", "w") as f:
+            f.write("5")
+        return True
+    except OSError:
+        return False
+
+
 class QuietHandler(http.server.SimpleHTTPRequestHandler):
     def log_message(self, *args) -> None:  # noqa: D102
         pass
@@ -375,6 +406,33 @@ level = "info"
             check(f"BM13 announcement {n} re-arms the wake word", bool(flags & USE_WAKE_WORD))
         check("BM14 10 announcements in a row: wake word back within 1.5 s each time, no failed run logged",
               worst < 1.5 and "run failed" not in sat.text(), f"worst {worst:.2f} s")
+
+        # A 120 s announcement is streamed (fetch, decode, convert and write
+        # chunk by chunk): the daemon's peak RSS must not grow with its length.
+        # Until 0.4.1 it was held whole, about 0.65 MiB per second of audio
+        # (c3-a), so 120 s would have added about 75 MiB.
+        write_long_announcement(os.path.join(tmp, "long.wav"), 120)
+        long_url = f"http://127.0.0.1:{srv.server_address[1]}/long.wav"
+        pid = sat.proc.pid
+        rss_before = proc_kib(pid, "VmRSS")
+        hwm_before = proc_kib(pid, "VmHWM")
+        reset = reset_peak(pid)
+        ha.event(Ev.VOICE_ASSISTANT_RUN_END)
+        t = time.monotonic()
+        res = await ha.announce_like_ha(long_url, "hola", timeout=90)
+        took = time.monotonic() - t
+        hwm = proc_kib(pid, "VmHWM")
+        growth = hwm - (rss_before if reset else hwm_before)
+        files = [f for f in os.listdir(os.path.join(tmp, "wav-busy")) if f.startswith("announce-")]
+        sizes = [os.path.getsize(os.path.join(tmp, "wav-busy", f)) for f in files]
+        want = 44 + 120 * 44100 * 4
+        check("BM16 a 120 s announcement completes, all of it written (44.1 kHz stereo wav)",
+              res is not None and res.success is True and want in sizes, f"{res} in {took:.1f} s, sizes {sorted(sizes)[-3:]}")
+        check("BM17 the 120 s announcement grows the daemon's peak RSS by less than 12 MiB (streamed)",
+              growth < 12 * 1024,
+              f"RSS before {rss_before} KiB, peak after {hwm} KiB, growth {growth} KiB (peak reset: {reset})")
+        print(f"   BM17 memory: RSS before {rss_before} KiB, peak during the 120 s announcement {hwm} KiB, "
+              f"growth {growth} KiB (peak reset: {reset}), took {took:.1f} s")
 
         sat.proc.send_signal(signal.SIGTERM)
         rc = await asyncio.wait_for(sat.proc.wait(), 5)

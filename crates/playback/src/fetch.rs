@@ -27,17 +27,20 @@ pub const DEFAULT_MAX_BYTES: u64 = 10 * 1024 * 1024;
 /// Settings for [`fetch`].
 #[derive(Debug, Clone)]
 pub struct FetchConfig {
-    /// Overall deadline for the whole request including the body.
+    /// Overall deadline for the whole request including the body ([`fetch`]).
+    /// For a streamed [`crate::play_url`]: the deadline for the response
+    /// headers and for each socket read (see [`FetchConfig::reply_stream`]).
     pub timeout: Duration,
     /// Deadline for establishing the TCP connection.
     pub connect_timeout: Duration,
-    /// Maximum accepted body size in bytes.
+    /// Maximum accepted body size in bytes (also for a streamed reply).
     pub max_bytes: u64,
     /// PEM file with trust anchors that **replaces** the bundled Mozilla roots
     /// (for a private CA in front of HA). `None` uses the bundled roots.
     pub ca_file: Option<PathBuf>,
     /// Apply the fetch target rules of [`crate::guard`] (default `true`).
-    /// `false` keeps ureq's own redirect handling and no address checks.
+    /// `false` keeps ureq's own redirect handling and no address checks
+    /// (only for [`fetch`]; a streamed [`crate::play_url`] is always guarded).
     pub guarded: bool,
     /// Redirects followed at most when [`Self::guarded`] (3).
     pub max_redirects: u8,
@@ -57,6 +60,43 @@ impl Default for FetchConfig {
             guarded: true,
             max_redirects: 3,
             insecure_allow_loopback: false,
+        }
+    }
+}
+
+/// Name of the thread that reads a reply's socket ([`crate::play_url`]).
+pub const REPLY_FETCH_THREAD_NAME: &str = "reply-fetch";
+/// Name of the thread that decodes a reply.
+pub const REPLY_DECODE_THREAD_NAME: &str = "reply-decode";
+/// Compressed bytes buffered ahead of the decoder for a reply (the same as
+/// music). A typical reply (FLAC 22.05 kHz mono, about 25 KB/s) fits whole,
+/// so HA's connection is released at once; a longer one is read as it plays.
+pub const REPLY_RING_BYTES: usize = 512 * 1024;
+
+impl FetchConfig {
+    /// The settings [`crate::play_url`] streams a reply with: the same
+    /// target rules (with [`OwnAddrs::Skip`]), CA file, redirect limit and
+    /// body cap ([`Self::max_bytes`], a larger `Content-Length` is refused
+    /// before any audio). [`Self::connect_timeout`] bounds DNS and the
+    /// connect, [`Self::timeout`] the wait for the response headers and
+    /// **each** socket read (there is no deadline for the whole body, which
+    /// arrives as fast as it plays once the buffers are full).
+    /// [`Self::guarded`] does not apply: a streamed reply is always guarded.
+    #[must_use]
+    pub fn reply_stream(&self) -> crate::stream::StreamConfig {
+        crate::stream::StreamConfig {
+            connect_timeout: self.connect_timeout,
+            response_timeout: self.timeout,
+            idle_timeout: self.timeout,
+            ca_file: self.ca_file.clone(),
+            ring_bytes: REPLY_RING_BYTES,
+            queue_ms: 1000,
+            chunk_ms: 100,
+            max_redirects: self.max_redirects,
+            insecure_allow_loopback: self.insecure_allow_loopback,
+            on_unknown_own_addrs: OwnAddrs::Skip,
+            max_body_bytes: Some(self.max_bytes),
+            thread_names: (REPLY_FETCH_THREAD_NAME, REPLY_DECODE_THREAD_NAME),
         }
     }
 }

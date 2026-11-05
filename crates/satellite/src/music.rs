@@ -44,7 +44,7 @@ use webos_playback::music::{
 };
 use webos_playback::stream::{self, StreamConfig};
 
-use crate::config::{MusicSection, SinkKind, SinkSection};
+use crate::config::{MusicSection, OnWake, SinkKind, SinkSection};
 use crate::player::Kind;
 use crate::volume;
 
@@ -206,8 +206,15 @@ pub(crate) struct Music {
     ducks: [bool; 4],
     /// When the last duck source ended (the duck is held after it).
     duck_ended: Option<Instant>,
+    /// Rate limit of the duck log lines: window start and lines in it.
+    duck_log: (Instant, u32),
     last_end: Option<End>,
 }
+
+/// At most this many duck begin and end lines at `info` per window.
+const DUCK_LOG_BURST: u32 = 20;
+/// The window of [`DUCK_LOG_BURST`].
+const DUCK_LOG_WINDOW: Duration = Duration::from_secs(60);
 
 const DUCK_SOURCES: [DuckSource; 4] = [
     DuckSource::WakeWord,
@@ -255,6 +262,7 @@ impl Music {
                 stop_at: None,
                 ducks: [false; 4],
                 duck_ended: None,
+                duck_log: (Instant::now(), 0),
                 last_end: None,
             },
             events,
@@ -474,13 +482,16 @@ impl Music {
             playing == Some(Kind::Alarm),
         ];
         let was_ducked = self.ducks.iter().any(|&d| d);
+        let (mut began, mut ended) = (None, None);
         for ((have, want), source) in self.ducks.iter_mut().zip(want).zip(DUCK_SOURCES) {
             if *have != want {
                 *have = want;
                 if want {
                     self.engine.duck_begin(source);
+                    began.get_or_insert(source);
                 } else {
                     self.engine.duck_end(source);
+                    ended = Some(source);
                 }
                 log::debug!(
                     "music: duck source {source:?} {}",
@@ -488,8 +499,25 @@ impl Music {
                 );
             }
         }
-        if was_ducked && !self.ducks.iter().any(|&d| d) {
+        let is_ducked = self.ducks.iter().any(|&d| d);
+        if was_ducked && !is_ducked {
             self.duck_ended = Some(now);
+        }
+        if !was_ducked && is_ducked {
+            if let Some(source) = began {
+                let depth = self.duck_depth();
+                self.log_duck(now, format_args!("music: duck begin ({source:?}, {depth})"));
+            }
+        } else if was_ducked && !is_ducked {
+            if let Some(source) = ended {
+                let (hold, release) = (self.cfg.duck_hold_ms, self.cfg.duck_release_ms);
+                self.log_duck(
+                    now,
+                    format_args!(
+                        "music: duck end ({source:?}; released after {hold} ms over {release} ms)"
+                    ),
+                );
+            }
         }
 
         let gain = self.sink_gain * volume::gain_for(reply_volume.min(self.cfg.max_volume_percent));
@@ -538,6 +566,43 @@ impl Music {
         } else {
             music
         }
+    }
+
+    /// What a duck does to the music, for the log (`on_wake` applies to
+    /// every source).
+    fn duck_depth(&self) -> String {
+        match self.cfg.on_wake {
+            OnWake::Duck => format!("{} dB", self.cfg.duck_db),
+            OnWake::Pause => "pause".to_owned(),
+            OnWake::None => "no change".to_owned(),
+        }
+    }
+
+    /// A duck begin or end line (no URL, title or address): `info` while a
+    /// track is loaded, `debug` otherwise, and at most
+    /// [`DUCK_LOG_BURST`] `info` lines per [`DUCK_LOG_WINDOW`].
+    fn log_duck(&mut self, now: Instant, line: std::fmt::Arguments<'_>) {
+        if self.current.is_none() {
+            log::debug!("{line} (no music)");
+            return;
+        }
+        let (start, count) = &mut self.duck_log;
+        if now.saturating_duration_since(*start) >= DUCK_LOG_WINDOW {
+            *start = now;
+            *count = 0;
+        }
+        *count = count.saturating_add(1);
+        if *count <= DUCK_LOG_BURST {
+            log::info!("{line}");
+            return;
+        }
+        if *count == DUCK_LOG_BURST + 1 {
+            log::info!(
+                "music: more than {DUCK_LOG_BURST} duck changes in {} s; further ones at debug level for now",
+                DUCK_LOG_WINDOW.as_secs()
+            );
+        }
+        log::debug!("{line}");
     }
 
     /// The duck is held: a source is active, or the last one ended less than

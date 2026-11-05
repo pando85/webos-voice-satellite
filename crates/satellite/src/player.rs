@@ -12,6 +12,13 @@
 //! affects a reply that is playing; URL media takes the gain at its start.
 //! With `sink.gain = 0` every byte written is zero: that is how silent tests
 //! on c3-a work, because `pacat --volume` is ignored there.
+//!
+//! URL media is streamed too ([`webos_playback::play_url`]): fetched,
+//! decoded, converted to `sink.rate`/`sink.channels` and written chunk by
+//! chunk, with bounded buffers (about 1 MiB whatever its length). Until
+//! 0.4.1 a URL was downloaded, decoded and converted whole, about 0.65 MiB of
+//! heap per second of audio on c3-a, so a reply of about 90 s would have
+//! passed the 64 MiB RSS ceiling.
 
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -22,7 +29,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncWriteExt as _;
 use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot};
-use webos_playback::{FetchConfig, NullSink, PacatSink, Pcm, Sink, SinkFormat, WavFileSink};
+use webos_playback::{
+    FetchConfig, NullSink, PacatSink, Pcm, PlaybackError, Sink, SinkFormat, WavFileSink,
+};
 
 use crate::config::{SinkKind, SinkSection};
 use crate::volume::SharedGain;
@@ -754,10 +763,15 @@ async fn play_url_task(
     let (mut sink, file) = url_sink(cfg, gain, id, kind);
     let stop = sink.stop_handle();
     let started = Instant::now();
+    // Both are streamed (fetch, decode and `pacat` overlap, with bounded
+    // buffers), so a long announcement does not grow the daemon's memory.
     let play = async {
         if let Some(pre) = preannounce {
-            if let Err(e) = webos_playback::play_url(pre, fetch, sink.as_mut()).await {
-                log::warn!("player: pre-announcement {} failed: {e}", redact_url(pre));
+            match webos_playback::play_url(pre, fetch, sink.as_mut()).await {
+                Ok(_) => {}
+                // A stop during the pre-announcement also skips the message.
+                Err(PlaybackError::Cancelled) => return Err(PlaybackError::Cancelled),
+                Err(e) => log::warn!("player: pre-announcement {} failed: {e}", redact_url(pre)),
             }
         }
         webos_playback::play_url(url, fetch, sink.as_mut()).await
@@ -774,7 +788,7 @@ async fn play_url_task(
     match res {
         Ok(t) => {
             log::debug!(
-                "player: {} fetched {} bytes in {} ms, decode {} ms, resample {} ms, play {} ms (total {} ms)",
+                "player: {} streamed {} bytes: first audio after {} ms, waiting for audio {} ms, resample {} ms, sink {} ms (total {} ms)",
                 redact_url(url),
                 t.bytes,
                 t.fetch.as_millis(),

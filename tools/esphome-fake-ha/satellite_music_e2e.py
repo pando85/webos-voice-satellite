@@ -320,6 +320,11 @@ async def scenario_music(binary: str, tmp: str) -> None:
             check("S4a the entity stays playing (no idle), HA gets no announce-finished",
                   states_since(ha, mark) == [PLAYING] and ha.announce_finished.empty(),
                   f"states={states_since(ha, mark)}")
+            log = sat.text()
+            check("S4b duck begin and end logged at info (source and depth, no URL)",
+                  "music: duck begin (Announcement, -20 dB)" in log
+                  and "music: duck end (Announcement; released after 800 ms over 1000 ms)" in log,
+                  "\n".join(l for l in log.splitlines() if "duck" in l)[-400:])
 
             # ---- S5 a voice run during music: wake word duck timing, reply, run end, release
             while not ha.stops.empty():

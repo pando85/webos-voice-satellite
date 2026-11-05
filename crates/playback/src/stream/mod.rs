@@ -49,6 +49,12 @@
 //!   `https` to `http`, no loopback, link-local or own-device address
 //!   (checked after DNS on the address connected to), header and URL caps.
 //!   A refusal is [`PlaybackError::TargetRefused`] and nothing is fetched.
+//!
+//! The same module streams replies and announcements ([`crate::play_url`]):
+//! [`StreamConfig`] then names the threads `reply-fetch` and `reply-decode`,
+//! caps the body ([`StreamConfig::max_body_bytes`]) and skips only the
+//! own-address rule when the interfaces cannot be listed
+//! ([`StreamConfig::on_unknown_own_addrs`]), as the whole-file fetch did.
 
 mod buffers;
 mod decoder;
@@ -109,6 +115,15 @@ pub struct StreamConfig {
     /// (127.0.0.0/8, `::1`) so a local test server can be used; every other
     /// rule of [`crate::guard`] still applies.
     pub insecure_allow_loopback: bool,
+    /// What the guard does when this device's addresses cannot be listed
+    /// ([`OwnAddrs::Refuse`] for music, [`OwnAddrs::Skip`] for replies).
+    pub on_unknown_own_addrs: OwnAddrs,
+    /// Largest body accepted: a larger `Content-Length` is refused before
+    /// any byte is read, a longer body without one ends the stream with
+    /// [`PlaybackError::TooLarge`]. `None` (music): no limit.
+    pub max_body_bytes: Option<u64>,
+    /// Names of the fetch and the decode thread.
+    pub thread_names: (&'static str, &'static str),
 }
 
 impl Default for StreamConfig {
@@ -123,6 +138,9 @@ impl Default for StreamConfig {
             chunk_ms: 20,
             max_redirects: 3,
             insecure_allow_loopback: false,
+            on_unknown_own_addrs: OwnAddrs::Refuse,
+            max_body_bytes: None,
+            thread_names: (FETCH_THREAD_NAME, DECODE_THREAD_NAME),
         }
     }
 }
@@ -357,13 +375,13 @@ pub fn open(url: &str, cfg: &StreamConfig) -> Result<MusicStream, PlaybackError>
     let (s, u, c) = (Arc::clone(&shared), url.to_owned(), cfg.clone());
     stream.threads.push(
         std::thread::Builder::new()
-            .name(FETCH_THREAD_NAME.into())
+            .name(cfg.thread_names.0.into())
             .spawn(move || fetch_main(&s, &u, &c))?,
     );
     let (s, c) = (Arc::clone(&shared), cfg.clone());
     stream.threads.push(
         std::thread::Builder::new()
-            .name(DECODE_THREAD_NAME.into())
+            .name(cfg.thread_names.1.into())
             .spawn(move || decode_main(&s, &c, ext_hint))?,
     );
     Ok(stream)
@@ -407,7 +425,7 @@ fn build_agent(
     let connector = ()
         .chain(GuardConnector {
             allow_loopback: cfg.insecure_allow_loopback,
-            on_unknown: OwnAddrs::Refuse,
+            on_unknown: cfg.on_unknown_own_addrs,
             refused: Arc::clone(refused),
         })
         .chain(TcpConnector::default())
@@ -453,8 +471,19 @@ fn fetch_body(shared: &Shared, url: &str, cfg: &StreamConfig) -> Result<(), Play
         .and_then(|v| v.to_str().ok())
         .map(|v| v.split(';').next().unwrap_or(v).trim().to_ascii_lowercase());
     *lock(&shared.content_type) = content_type;
+    if let Some(limit) = cfg.max_body_bytes {
+        let declared = resp
+            .headers()
+            .get("content-length")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<u64>().ok());
+        if declared.is_some_and(|n| n > limit) {
+            return Err(PlaybackError::TooLarge { limit });
+        }
+    }
     let mut reader = resp.into_body().into_with_config().limit(u64::MAX).reader();
     let mut buf = vec![0u8; READ_BUF];
+    let mut total: u64 = 0;
     loop {
         let n = match reader.read(&mut buf) {
             Ok(n) => n,
@@ -465,6 +494,10 @@ fn fetch_body(shared: &Shared, url: &str, cfg: &StreamConfig) -> Result<(), Play
             return Ok(());
         }
         shared.bytes_received.fetch_add(n as u64, Ordering::Relaxed);
+        total += n as u64;
+        if let Some(limit) = cfg.max_body_bytes.filter(|&l| total > l) {
+            return Err(PlaybackError::TooLarge { limit });
+        }
         if !shared.ring.write(&buf[..n]) {
             return Err(PlaybackError::Cancelled);
         }
