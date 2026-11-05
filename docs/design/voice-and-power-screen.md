@@ -1,6 +1,6 @@
 # Voice and power screen in the TV app
 
-- **Status:** design, accepted by the owner on 2026-11-05 ([ADR 0008](../decisions/0008-user-initiated-lg-settings.md)); the luna call shapes below are `verified-on-target` on **c3-a** by [EXP-011](../experiments/EXP-011-lg-settings-toggle.md) (2026-11-05, firmware `03.30.74`; c3-b was not reachable, so its read-only part is not run). Implementation: V3 (daemon) and V2 (`ctl.sh`, host-tested with a fake `luna-send`) are written; the app and the rest are not.
+- **Status:** design, accepted by the owner on 2026-11-05 ([ADR 0008](../decisions/0008-user-initiated-lg-settings.md)); the luna call shapes below are `verified-on-target` on **c3-a** by [EXP-011](../experiments/EXP-011-lg-settings-toggle.md) (2026-11-05, firmware `03.30.74`; c3-b was not reachable, so its read-only part is not run). Implementation: V2 (`ctl.sh`, host-tested with a fake `luna-send`), V3 (daemon) and V4 (the app, commit `85aeb35`) are written; the rest is not. **The strings in section 4 are copied from `packaging/webos/app/app.js` (exported as `window.voicePower`), which is the source of truth; `tests/app_matrix.js` checks them.**
 - **Date:** 2026-11-05. TV facts are `verified-on-target` for **c3-b** (LG C3 55", webOS TV 8.3.0, firmware `03.30.73`) unless a label says otherwise; c3-a (`03.30.74`) is a different unit and mostly untested for this ([c3-b record](../compatibility/c3-b.md), [c3-a record](../compatibility/c3-a.md)).
 - **Related:** [always-on design](always-on.md) (sections 1, 11 to 13), [TV control](tv-control.md), [install and configuration UX](install-and-config-ux.md), [packaging](packaging.md), [ADR 0005](../decisions/0005-tv-control-entities.md), [ADR 0008](../decisions/0008-user-initiated-lg-settings.md), backlog [#14](../project/backlog.md#14-voice-and-power-screen-in-the-tv-app).
 
@@ -10,7 +10,7 @@ A "Voice and power" screen in the existing status app (`packaging/webos/app/`) w
 
 | # | Toggle | Kind | Stored in | Written by |
 | --- | --- | --- | --- | --- |
-| 1 | **Always Ready** | LG setting `general/lifeOnScreenMode`; the TV lists five values (`none`, `off`, `lifeOnScreen`, `alwaysReady`, `allEnabled`); the app reads all and writes only `off` and `alwaysReady`; the toggle is enabled only while the value is one of those two, otherwise the raw word is shown and the TV's menu is named | the TV (settingsservice) | the app, on a press, through `ctl.sh set always-ready` |
+| 1 | **Always Ready** | LG setting `general/lifeOnScreenMode`; the TV lists five values (`none`, `off`, `lifeOnScreen`, `alwaysReady`, `allEnabled`); the app reads all and writes only `off` and `alwaysReady`; the toggle is enabled only while the value is one of those two, otherwise the row is disabled and the TV's menu is named | the TV (settingsservice) | the app, on a press, through `ctl.sh set always-ready` |
 | 2 | **LG hands-free "Hi LG"** | LG setting through `voiceinput/setting/getActivation` and `setActivation {"settingStatus":...}` | the TV (voiceinput) | the app, on a press, through `ctl.sh set hi-lg` |
 | 3 | **Keep listening after the power button** | the satellite's own HA select "When the TV is turned off with the remote" (`remote_power_off`): "Turn off normally" or "Keep listening (screen off)" | `etc/remote_off` (word `normal` or `keep_listening`) | the app through `ctl.sh set remote-off`, or HA's select |
 
@@ -46,10 +46,10 @@ Labels as in [AGENTS.md](../../AGENTS.md). Everything below the table is design.
 
 ### 3.1 Inputs
 
-- **AR**: Always Ready, from the raw `lifeOnScreenMode` word in `tv-settings`: `off` (raw `off`), `on` (raw `alwaysReady`, or `allEnabled`: the behaviour of the power button was the same on c3-b, `verified-on-target`, but the toggle does not change that value), `unknown` (`none`, `lifeOnScreen` or any other word: the sentence says "not known" and the row shows the raw word), `error` (not readable). The JSON `state` is `unknown` for `allEnabled` as well; the app derives AR from `raw` for the sentence only.
-- **HL**: Hi LG, from `getActivation`: `on` when **any** provider (`thinQ`, `amazon`, `dangbei`) reports `settingStatus true`, `off` when all report false, `error` when not readable. The **toggle** shows and changes thinQ only (`hi_lg.thinq`); when `amazon` or `dangbei` is on, the row shows `Off` or `On` for thinQ and adds the line N-other-handsfree.
+- **AR**: Always Ready, from the raw `lifeOnScreenMode` word in `tv-settings` (the app reads `always_ready.raw`; the JSON `state` is informational): **off** = raw `off` or `none`, **on** = raw `alwaysReady` or `allEnabled` (the power button behaved the same with both on c3-b, `verified-on-target`), **not known** = any other raw word (for example `lifeOnScreen`) or unreadable (PX, and the note X-unknown). The **toggle** is a separate question: it is enabled only while the raw word is `off` or `alwaysReady`. `allEnabled` shows `On, with wallpaper` (disabled), any other word `Not known (<raw>)` (disabled), both naming LG's menu.
+- **HL**: Hi LG, from `getActivation`: `on` when **any** provider (`thinQ`, `amazon`, `dangbei`) reports `settingStatus true`, `off` when all report false, `error` when not readable. The app reads `hi_lg.thinq`, `amazon` and `dangbei`: the **toggle** shows and changes thinQ only (`thinq true` is Hi LG on); when `amazon` or `dangbei` is true the screen adds the line N-other-handsfree. HL for the notes below is `on` only when thinQ is on.
 - **RO**: `etc/remote_off`: `normal` or `keep_listening`.
-- **MIC**: from the daemon's status file `run/voice.json` and the kill-switch file: `listening`, `busy`, `muted` (HA's mute switch or a gate), `kill` (kill switch file present), `closed` (other), `unknown`; plus `running` (daemon alive).
+- **MIC**: from the daemon's status file `run/voice.json` and the kill-switch file: `listening`, `busy`, `muted` (HA's mute switch or a gate), `closed` (other), `unknown`; the kill switch comes from `mic.kill_switch`; plus `running` (daemon alive).
 
 ### 3.2 Power cell: what the remote's power button does
 
@@ -74,15 +74,16 @@ Evaluated top to bottom; the first match wins.
 | 1 | daemon not running or not installed | **L-stopped** |
 | 2 | MIC = `kill` | **L-kill** |
 | 3 | MIC = `muted` | **L-muted** |
-| 4 | MIC = `busy`, or (HL = `on` and MIC is not `listening`) | **L-hilg** when HL = `on`, else **L-busy** |
+| 4 | MIC = `busy` | **L-hilg** when HL = `on`, else **L-busy** |
 | 5 | MIC = `listening` | **L-ok** |
-| 6 | anything else | **L-unknown** |
+| 6 | MIC = `closed` | **L-closed** |
+| 7 | anything else | **L-unknown** |
 
-The observed MIC state wins over the setting: if HL is `on` but MIC is `listening`, the screen shows L-ok and adds the line **N-hilg-on**. This state is real, not hypothetical: EXP-011 held Hi LG on for 193 s with the satellite listening on c3-a ("one microphone, first opener wins"). What happens after a restart or a reboot (LG's service may open the PCM first, as on c3-b) is a hypothesis, which is why the line warns instead of reassuring. With HL `on` and MIC `busy` the satellite cannot hear (L-hilg). Whether turning Hi LG off releases a PCM that LG's service already holds is **not tested**; the text does not promise it, the daemon keeps retrying a busy PCM.
+The observed MIC state wins over the setting. With HL `on` and MIC `listening` the screen shows L-ok and adds **N-hilg-listening**; with HL `on` and MIC `closed` or unknown it adds **N-hilg-on** instead. The first state is real, not hypothetical: EXP-011 held Hi LG on for 193 s with the satellite listening on c3-a ("one microphone, first opener wins"). What happens after a restart or a reboot (LG's service may open the PCM first, as on c3-b) is a hypothesis, which is why the line warns instead of reassuring. With HL `on` and MIC `busy` the satellite cannot hear (L-hilg). Whether turning Hi LG off releases a PCM that LG's service already holds is **not tested**; the text does not promise it, the daemon keeps retrying a busy PCM.
 
 ### 3.4 Sentence
 
-`sentence = headline(P) + " " + detail(P)`, then a new line with the listening line. The headline is the large text, the detail the normal text. A cell with PX shows only X-unknown and no claim about the power button.
+`sentence = headline(P) + " " + detail(P)`, then a new line with the listening line. The headline is the large text, the detail the normal text. A cell with PX shows the PX headline and detail and the note X-unknown, and no claim about the power button.
 
 ## 4. User-facing strings (English, exact)
 
@@ -92,26 +93,30 @@ Short, plain, readable from the sofa at 22 px or larger. Strings are the contrac
 
 | Cell | Headline | Detail |
 | --- | --- | --- |
-| P1 | `Power button: the TV goes to standby.` | `About 10 seconds later the TV suspends and the satellite stops. It cannot hear you until the TV is turned on.` |
-| P2 | `Power button: the TV rests in standby.` | `The satellite keeps listening, but its spoken replies are silent in standby. Its TV controls in Home Assistant are unavailable until the TV is turned on.` |
-| P3, P4 | `Power button: the screen goes dark and the TV keeps listening.` | `The TV stays on with the screen dark, hears you and answers out loud. Press the power button again to light the screen.` |
+| P1 | `Power button: the TV goes to deep standby.` | `The satellite cannot hear until the TV is turned on.` |
+| P2 | `Power button: the TV goes to standby.` | `The satellite still hears you, but you will not hear its replies.` |
+| P3, P4 | `Power button: the screen goes dark but the TV stays on.` | `The satellite hears you and replies. Press power again to turn the picture on.` |
 | PX | `Power button: not known.` | `The TV's settings could not be read. Press Refresh.` |
 
-With the kill switch on, the power line is the P1 or P2 text for the current AR, followed by `Keep listening does nothing while the microphone is off with the kill switch.` when RO = `keep_listening`.
+(Facts behind the short texts: P1 is `Active Standby` and then suspend 7 to 15 s after the key; P2 stays in `Active Standby`, replies silent, and the TV controls in Home Assistant are unavailable; P3 and P4 are the daemon's wake and darken. See 3.2.)
+
+With the kill switch on, or with `remote_off.active` false (no power watch), "Keep listening" does nothing, so the cell is the P1 or P2 one for the current AR and the detail is followed by `Keep listening does nothing while the microphone is off with the kill switch.` (kill switch) or `Keep listening needs the power watch, which is off in the config.` (no power watch), when RO = `keep_listening`.
 
 ### 4.2 Listening line
 
 | Cell | Text |
 | --- | --- |
 | L-ok | `Listening now: yes.` |
-| L-hilg | `Listening now: no. LG's assistant (Hi LG) has the microphone. Turn Hi LG off to use the satellite.` |
+| L-hilg | `Listening now: no. The satellite cannot hear: LG's voice assistant has the microphone. Turn Hi LG off to use the satellite.` |
 | L-busy | `Listening now: no. Another program has the microphone.` |
 | L-muted | `Listening now: no. The microphone is muted in Home Assistant.` |
 | L-kill | `Listening now: no. The microphone is off (kill switch).` |
 | L-stopped | `Listening now: no. The satellite is not running.` |
+| L-closed | `Listening now: no. The microphone is closed.` |
 | L-unknown | `Listening now: not known.` |
-| N-hilg-on (extra line; HL = `on` and MIC = `listening`) | `Hi LG is on but this satellite has the microphone now. After a restart LG may take it and the satellite will not hear. Turn Hi LG off to be sure.` |
-| N-other-handsfree (extra line; `hi_lg.amazon` or `hi_lg.dangbei` true) | `Alexa or another hands-free assistant is on. Turn it off in LG's menu; the satellite cannot change it.` |
+| N-hilg-listening (extra line; HL = `on` and MIC = `listening`) | `Hi LG is on but this satellite has the microphone now; after a restart LG may take it. Turn Hi LG off to be sure.` |
+| N-hilg-on (extra line; HL = `on` and MIC = `closed` or unknown) | `Hi LG is on. If the satellite cannot hear you, turn it off.` |
+| N-other-handsfree (extra line; `hi_lg.amazon` or `hi_lg.dangbei` true) | `Alexa/other hands-free is on: turn it off in LG's menu.` |
 | X-unknown (extra) | `Always Ready or Hi LG could not be read, so the sentence above may be wrong.` |
 
 ### 4.3 Toggle rows
@@ -120,11 +125,11 @@ Row label and the state word shown at the right:
 
 | Row | Label | State words |
 | --- | --- | --- |
-| 1 | `Always Ready (LG setting)` | `On` (raw `alwaysReady`), `Off`, `Other: <raw>` (any other word, for example `allEnabled`; the toggle is disabled and the warning area says `Always Ready is set to <raw>. Change it in LG's menu: Settings, General, Always Ready.`), `Cannot read` |
-| 2 | `Hi LG hands-free (LG setting)` | `On`, `Off` (both for thinQ), `Cannot read` |
-| 3 | `Keep listening after the power button` | `On`, `Off` |
+| 1 | `Always Ready` | `On` (raw `alwaysReady`), `Off`, `On, with wallpaper` (raw `allEnabled`, disabled), `Not known (<raw>)` (any other word, disabled), `Not known`, `Cannot read`; the disabled rows say `Always Ready is set to <what>, which this app does not change. Change it in LG's menu (Settings, General, Always Ready).` |
+| 2 | `Hi LG` | `On`, `Off` (both for thinQ), `Not known`, `Cannot read` (disabled, with the menu path) |
+| 3 | `Keep listening` | `On`, `Off`, `Cannot read` |
 
-Row sub-line (always visible, one line): row 1 `Keeps the TV in standby for LG's own features. Uses more standby power.`; row 2 `LG's own voice assistant. When it is on, the satellite cannot use the microphone.`; row 3 `A satellite setting. The TV stays on with the screen dark after the power button.`
+Row sub-line (always visible, one line): row 1 `Keeps the TV in standby for LG's own features. Uses more standby power.`; row 2 `LG's own voice assistant. When it is on, the satellite may not be able to use the microphone.`; row 3 `A satellite setting. The TV stays on with the screen dark after the power button.`
 
 ### 4.4 Warnings and confirm texts
 
@@ -134,20 +139,20 @@ Shown in the warning area while a row is focused, and as the confirm text after 
 | --- | --- |
 | Always Ready off to on | `Turn on Always Ready? The TV then uses more power in standby (not measured). With "Keep listening" off, the satellite hears you after the power button but its replies are silent.` |
 | Always Ready on to off | `Turn off Always Ready? Without "Keep listening", the TV suspends after the power button and the satellite stops.` |
-| Hi LG off to on | `Turn on Hi LG? The TV then answers "Hi LG". The satellite keeps the microphone while it is running, but after a restart LG may take it first and the satellite will not hear you.` |
+| Hi LG off to on | `Turn on Hi LG? LG's assistant may take the microphone, so the satellite may not hear you. It did not while the satellite already had the microphone, but it can after a restart.` |
 | Hi LG on to off | `Turn off Hi LG? The TV stops answering "Hi LG". The satellite can use the microphone.` |
 | Keep listening off to on | `Turn on Keep listening? After the power button the TV stays on with the screen dark. It uses more power than standby (not measured), LG's OLED care at power-off may not run, and the screen may flash briefly (not observed).` |
-| Keep listening on to off | no confirm (one press): `Done. The power button turns the TV off the normal way.` |
+| Keep listening on to off | no confirm (one press); the focused row shows `Keep listening is on. Press OK to turn it off. The power button then turns the TV off the normal way.`; the result line is `Done. The power button turns the TV off the normal way.` |
 
 Result lines (one line under the rows, the app's existing `message` area):
 
 | Result | Text |
 | --- | --- |
-| applied | `Always Ready is now On. Changed from Off at <time>.` (likewise for Hi LG, Keep listening) |
+| applied | `Always Ready is now On. Changed from Off.` (likewise for Hi LG and Keep listening; no time is shown). With the daemon not applying yet it adds `The satellite has not applied it yet.` (`daemon` `pending`) or `The satellite is not running; it applies this when it starts.` (`not running`) |
 | already | `Already On. Nothing changed.` |
-| failed | `Could not change Always Ready: <reason>. It is still <value>. You can also change it on the TV: Settings, General, ...` |
+| failed, refused | `Could not change Always Ready: <reason>. It is still <value>. You can also change it on the TV: <menu path>.` (refused has no `It is still` part) |
 | mismatch | `The TV reports <x>, not <y>. The change did not stick, or LG changed it back. It is <x> now.` |
-| cannot read | `Could not read Always Ready: <reason>.` |
+| cannot read | `Could not read the TV settings: <reason>.` and the rows show `Cannot read` |
 
 `<reason>` is the luna `errorText` (a TV message such as `not exist`) or a fixed word from `ctl.sh` (`timeout`, `no luna-send`, `not root`, `unknown value`). Menu paths for the failed and unknown cases: Always Ready: `Settings, General, Always Ready` (the path is from the TV's UI strings in [always-on](always-on.md); EXP-011 was luna only and did **not** look at the menu, so it is not verified on screen); Hi LG: `Settings, General, AI Service, Voice recognition settings, Hi LG` (the household's way, [P4](../discovery/c3-b/P4-sound-session.md#state-found-and-the-hi-lg-change)).
 
@@ -158,15 +163,15 @@ Existing app (`packaging/webos/app/`, ES5, one `main`, a hidden `report-view` se
 ```
 Voice and power                                   (h1)
 +--------------------------------------------------------------+
-| Power button: the screen goes dark and the TV keeps listening.|  headline, aria-live
-| The TV stays on with the screen dark, hears you and answers   |  detail
-| out loud. Press the power button again to light the screen.   |
+| Power button: the screen goes dark but the TV stays on.       |  headline, aria-live
+| The satellite hears you and replies. Press power again to     |  detail
+| turn the picture on.                                          |
 | Listening now: yes.                                           |
 +--------------------------------------------------------------+
-| [ Always Ready (LG setting)                  Off ]            |  row 1  (focus)
+| [ Always Ready                               Off ]            |  row 1  (focus)
 |   Keeps the TV in standby for LG's own features. ...          |
-| [ Hi LG hands-free (LG setting)              Off ]            |  row 2
-| [ Keep listening after the power button       On ]            |  row 3
+| [ Hi LG                                      Off ]            |  row 2
+| [ Keep listening                              On ]            |  row 3
 +--------------------------------------------------------------+
 | warning area: text for the focused row, or the confirm prompt |
 | message line: result of the last change                       |
@@ -187,10 +192,10 @@ Voice and power                                   (h1)
 | pending | `Changing...` | muted | nothing |
 | failed (command error, state unchanged) | the old value plus the result line | `bad` on the message line | arm again |
 | mismatch (read-back differs from the request) | the value the TV reports, result line `mismatch` | `warn` | arm again; the screen keeps showing what the TV reports |
-| other (Always Ready raw word other than `off` and `alwaysReady`) | `Other: <raw>` | `warn` | nothing (the row is disabled); the warning area shows `Always Ready is set to <raw>. Change it in LG's menu: Settings, General, Always Ready.` (decision 8 of ADR 0008) |
-| unavailable (cannot read: no luna-send, timeout, not root) | `Cannot read` | `bad` | nothing |
+| not changeable (Always Ready raw word other than `off` and `alwaysReady`) | `On, with wallpaper` for `allEnabled`, else `Not known (<raw>)` | `warn` | nothing (the row is disabled); the warning area names LG's menu (decision 8 of ADR 0008) |
+| unavailable (the read failed: no luna-send, timeout, not root, no reply) | `Cannot read` on every row | `bad` | nothing; the sentence is PX with the note X-unknown |
 
-**Refresh.** On open: one `tv-settings --json` (rows show `Checking...`). While the screen is open: every 10 seconds when nothing is pending or armed (the main screen's refresh is paused, as for the report). After a successful `set`: the command's own read-back is shown at once, plus one more `tv-settings --json` 3 seconds later to catch an LG-side revert (a revert shows as a mismatch line: `LG changed Always Ready back to Off.`). The Refresh button forces a read. Leaving the screen resumes the main refresh. A row whose read returns `error` keeps showing its last good value with `Cannot read` until a read succeeds.
+**Refresh.** On open: one `tv-settings --json` (rows show `Checking...`). While the screen is open: every 10 seconds when nothing is pending or armed (the main screen's refresh is paused, as for the report). After a successful `set`: the command's own read-back is shown at once, plus one more `tv-settings --json` 3 seconds later to catch an LG-side revert (a revert shows as the mismatch line of 4.4). The Refresh button forces a read. Leaving the screen resumes the main refresh. **Simplification as built:** a failed read does not keep the last good values; every row shows `Cannot read` and the sentence is the not-known one until a read succeeds.
 
 **Sentence refresh.** The sentence is recomputed on every read (matrix in section 3, one function `outcome(state)` in `app.js`, exported to the host test the way `app_smoke.js` already loads the app).
 
@@ -228,6 +233,7 @@ All need root (as the other commands; `WEBOS_SAT_ALLOW_NONROOT=1` for tests) and
 ```
 
 - `luna`: `luna-send` exists and the caller is root; false makes both LG states `error` with `error` `no luna-send` or `not root`.
+- **What the app parses (V4, `app.js`):** `daemon_running`, `always_ready.raw` (and `error`; `state` is read only to tell `error` and as a fallback when `raw` is empty), `hi_lg.thinq`, `amazon`, `dangbei`, `state` and `error`, `remote_off.state` and `active`, `mic.state` and `kill_switch`. Everything else is informational. The app derives its Always Ready cell from `raw`, so `allEnabled` counts as on and `none` as off there.
 - `always_ready.state`: `off` (raw `off`) | `on` (raw `alwaysReady`) | `unknown` (any other raw word: `none`, `lifeOnScreen`, `allEnabled`, anything) | `error`; `raw` is the TV's word, limited to letters and digits and 24 characters, empty on error. The getter is `luna://com.webos.settingsservice/getSystemSettings {"category":"general","keys":["lifeOnScreenMode"]}` (read-only; `verified-on-target` on c3-a, reply `settings.lifeOnScreenMode`). `alwaysready/aod/getStatus` is **not** used (it stays `none` whatever the setting is).
 - `hi_lg.state`: `on` when any provider's `settingStatus` is true, `off` when none is, `error` when unreadable. `thinq`, `amazon`, `dangbei`: that provider's `settingStatus` (`true`, `false`, or `null` when the reply has no such object). The getter is `luna://com.webos.service.voiceinput/setting/getActivation {}` (the schema accepts only `{}` or `{"subscribe":true}`); if the reply has no `thinQ` object, the top-level `settingStatus` stands in for `thinq`. No trigger word, locale or other field is copied.
 - `remote_off.state`: the stored word; `active` is the daemon's report (false when the power watch is off, so keep listening cannot act), null when the daemon is not running.
