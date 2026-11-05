@@ -165,7 +165,9 @@ impl Server {
     fn login(&self) -> (String, String) {
         let path = self.state()["path"].as_str().unwrap().to_owned();
         let r = self.get(&path, None);
-        assert_eq!(r.status, 302);
+        // A page that moves on to `/` by itself (not a 302), section 8.3.
+        assert_eq!(r.status, 200);
+        assert!(r.header("location").is_none());
         let set = r.header("set-cookie").unwrap();
         let cookie = set
             .strip_prefix("sat_session=")
@@ -477,11 +479,79 @@ fn stop_is_immediate_even_with_a_slow_client() {
     assert!(s.port_closed());
 }
 
+/// A TLS ClientHello (a phone browser trying `https://` first) and a
+/// prefetch of the QR link neither end the session nor use the token; the
+/// token's answer is a page whose own navigation carries the cookie.
+#[test]
+fn tls_hellos_and_prefetches_end_nothing() {
+    let s = Server::start(&[]);
+    let hello: &[u8] = &[
+        0x16, 0x03, 0x01, 0x00, 0x2f, 0x01, 0x00, 0x00, 0x2b, 0x03, 0x03, 0, 0, 0, 0,
+    ];
+    let tls = |n: usize| {
+        for _ in 0..n {
+            let mut c = TcpStream::connect(("127.0.0.1", s.port)).unwrap();
+            c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            c.write_all(hello).unwrap();
+            let mut out = Vec::new();
+            let _ = c.read_to_end(&mut out);
+            assert!(out.is_empty(), "no HTTP answer to TLS");
+        }
+    };
+    tls(5);
+    let path = s.state()["path"].as_str().unwrap().to_owned();
+    for h in ["Sec-Purpose: prefetch;prerender", "Purpose: prefetch"] {
+        let r =
+            s.raw(format!("GET {path} HTTP/1.1\r\nHost: {}\r\n{h}\r\n\r\n", s.host()).as_bytes());
+        assert_eq!(r.status, 503);
+        assert!(r.header("set-cookie").is_none());
+    }
+    assert_eq!(s.state()["state"], "waiting");
+    let r = s.raw(
+        format!(
+            "GET {path} HTTP/1.1\r\nHost: {}\r\nSec-Fetch-Site: none\r\nUser-Agent: Mozilla/5.0 (Linux; Android 15) Chrome/141.0 Mobile Safari/537.36\r\n\r\n",
+            s.host()
+        )
+        .as_bytes(),
+    );
+    assert_eq!(r.status, 200);
+    assert!(r.header("set-cookie").unwrap().contains("SameSite=Strict"));
+    assert!(r.header("content-security-policy").is_some());
+    let body = String::from_utf8_lossy(&r.body).into_owned();
+    assert!(
+        body.contains(r#"<meta http-equiv="refresh" content="0; url=/">"#),
+        "{body}"
+    );
+    s.wait_for("active", || s.state()["state"] == "active");
+    tls(25);
+    // No cookie on `/`: refused, logged with the reason, not an end.
+    assert_eq!(s.get("/", None).status, 403);
+    assert_eq!(s.state()["state"], "active");
+    let log = s.log();
+    assert!(log.contains("rejected tls peer=127.0.0.1"), "{log}");
+    assert!(
+        log.contains("rejected prefetch token peer=127.0.0.1"),
+        "{log}"
+    );
+    assert!(
+        log.contains("token consumed peer=127.0.0.1 site=none browser=chrome"),
+        "{log}"
+    );
+    assert!(
+        log.contains("rejected no-cookie page peer=127.0.0.1 site=absent browser=absent"),
+        "{log}"
+    );
+    assert!(
+        !log.contains("/s/") && !log.contains(path.trim_start_matches("/s/")),
+        "{log}"
+    );
+}
+
 #[test]
 fn three_parse_errors_before_the_token_end_it() {
     let mut s = Server::start(&[]);
     for (i, junk) in [
-        &b"\x16\x03\x01\x00"[..],
+        &b"\x00\x01\x02\x03"[..],
         b"GET /\n\n",
         b"BREW / HTTP/1.0\r\n\r\n",
     ]

@@ -141,7 +141,13 @@ struct Session {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AuthFail {
+    /// No phone has a session (the token was not used yet).
+    NoSession,
+    /// The request carried no `Cookie` header at all.
     NoCookie,
+    /// A `Cookie` header without `sat_session` (the browser has other
+    /// cookies for this address, but not ours).
+    NoSessionCookie,
     Wrong,
     WrongPeer,
 }
@@ -383,6 +389,14 @@ impl Core {
         self.bad(now);
     }
 
+    /// A TLS handshake on the plain-HTTP port: closed without a reply. It is
+    /// neither a parse error nor a bad request, so it never ends a session: a
+    /// phone browser trying `https://` first (an HTTPS upgrade) sends one
+    /// before it falls back to `http://` (section 6.4).
+    pub(crate) fn on_tls(&mut self, peer: Ipv4Addr) {
+        self.log.push(format!("rejected tls peer={peer}"));
+    }
+
     pub(crate) fn on_parse_error(
         &mut self,
         peer: Ipv4Addr,
@@ -492,12 +506,18 @@ impl Core {
         }
         if let Err(why) = auth {
             let word = match why {
-                AuthFail::NoCookie => "no-session",
+                AuthFail::NoSession => "no-session",
+                AuthFail::NoCookie => "no-cookie",
+                AuthFail::NoSessionCookie => "no-session-cookie",
                 AuthFail::Wrong => "wrong-session",
                 AuthFail::WrongPeer => "wrong-peer",
             };
-            self.log
-                .push(format!("rejected {word} {} peer={peer}", route.name()));
+            self.log.push(format!(
+                "rejected {word} {} peer={peer} site={} browser={}",
+                route.name(),
+                req.fetch_site(),
+                req.browser()
+            ));
             self.bad(now);
             return if route == Route::Page {
                 Response::html(403, assets::NO_SESSION_PAGE)
@@ -560,7 +580,7 @@ impl Core {
     }
 
     fn authenticate(&self, peer: Ipv4Addr, req: &Request) -> Result<(), AuthFail> {
-        let s = self.session.as_ref().ok_or(AuthFail::NoCookie)?;
+        let s = self.session.as_ref().ok_or(AuthFail::NoSession)?;
         let header = req.cookie.as_deref().ok_or(AuthFail::NoCookie)?;
         let mut found = None;
         for part in header.split(';') {
@@ -575,7 +595,7 @@ impl Core {
                 found = Some(v);
             }
         }
-        let v = found.ok_or(AuthFail::NoCookie)?;
+        let v = found.ok_or(AuthFail::NoSessionCookie)?;
         if !ct_eq(v.as_bytes(), self.cookie.as_bytes()) {
             return Err(AuthFail::Wrong);
         }
@@ -608,6 +628,13 @@ impl Core {
             self.bad(now);
             return Response::error(404, "not_found", "Not found.");
         }
+        if req.prefetch {
+            // A speculative load (a browser's prefetch, a link preview) must
+            // not use the one-time token: refused, not counted as bad.
+            self.log
+                .push(format!("rejected prefetch token peer={peer}"));
+            return Response::error(503, "prefetch", "Open the link to continue.");
+        }
         if self.session.is_none() {
             let other = peer.octets()[..3] != local.ip().octets()[..3];
             self.session = Some(Session {
@@ -618,27 +645,35 @@ impl Core {
             self.refresh_due = true;
             self.polled = Some(now);
             self.dirty = true;
-            self.log.push(format!("token consumed peer={peer}"));
-            return self.redirect(now, true);
+            self.log.push(format!(
+                "token consumed peer={peer} site={} browser={}",
+                req.fetch_site(),
+                req.browser()
+            ));
+            return self.continue_page(now);
         }
         if auth.is_ok() {
             // The same phone opened the link again (history, tab restore).
             if let Some(s) = self.session.as_mut() {
                 s.last_request = now;
             }
-            return self.redirect(now, false);
+            return Response::empty(302).header("Location", "/".to_owned());
         }
         self.log.push(format!("rejected token-used peer={peer}"));
         self.bad(now);
         Response::html(410, assets::LINK_USED_PAGE)
     }
 
-    fn redirect(&self, now: Instant, cookie: bool) -> Response {
-        let r = Response::empty(302).header("Location", "/".to_owned());
-        if !cookie {
-            return r;
-        }
-        r.header(
+    /// The answer to the token: the cookie and a page that moves on to `/`
+    /// itself (a meta refresh and a link), not a `302`. A phone that opens
+    /// the QR link from another app (the camera, a scanner) loads it in a
+    /// cross-site context: Chrome and Firefox on Android then store the
+    /// `SameSite=Strict` cookie but do not send it on the redirect, nor on a
+    /// reload of that page (seen on c3-a, 2026-11-05: every `GET /` after the
+    /// token came without a cookie). A navigation that this page starts is
+    /// same-origin, so the cookie goes with it.
+    fn continue_page(&self, now: Instant) -> Response {
+        Response::html(200, assets::CONTINUE_PAGE).header(
             "Set-Cookie",
             format!(
                 "{COOKIE}={}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}",
@@ -1018,7 +1053,7 @@ pub(crate) mod tests {
 
     fn req(raw: &str) -> Request {
         match parse(raw.as_bytes()) {
-            Ok(Parsed::Done(r)) => r,
+            Ok(Parsed::Done(r)) => *r,
             other => panic!("{other:?}"),
         }
     }
@@ -1084,7 +1119,7 @@ pub(crate) mod tests {
         fn login(&mut self) {
             let p = self.path();
             let r = self.get(&p, "");
-            assert_eq!(r.status, 302);
+            assert_eq!(r.status, 200);
             // A first refresh, as the worker would deliver it.
             assert!(matches!(self.core.next_job(self.now), Some(Job::Refresh)));
             self.core.on_job_done(
@@ -1146,9 +1181,17 @@ pub(crate) mod tests {
         assert_eq!(state["state"], "waiting");
         assert_eq!(state["path"].as_str().map(str::len), Some(46));
         let p = t.path();
-        let r = t.get(&p, "");
-        assert_eq!(r.status, 302);
-        assert_eq!(r.header_value("Location"), Some("/"));
+        let r = t.get(&p, "Sec-Fetch-Site: none\r\nUser-Agent: Mozilla/5.0 (Linux; Android 15) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Mobile Safari/537.36\r\n");
+        // Not a 302: a page that moves on to `/` itself, so that a phone that
+        // opened the link from another app sends the Strict cookie.
+        assert_eq!(r.status, 200);
+        assert_eq!(r.header_value("Location"), None);
+        let body = String::from_utf8_lossy(&r.body).into_owned();
+        assert!(
+            body.contains(r#"<meta http-equiv="refresh" content="0; url=/">"#),
+            "{body}"
+        );
+        assert!(body.contains(r#"<a href="/">"#), "{body}");
         let c = r.header_value("Set-Cookie").expect("cookie").to_owned();
         for flag in [
             "; Path=/",
@@ -1165,8 +1208,16 @@ pub(crate) mod tests {
         assert_eq!(state["peer"], "192.168.1.23");
         assert_eq!(state["peer_other_subnet"], false);
         assert!(!state.to_string().contains(&t.core.token));
-        // A second use without the cookie, from anyone: 410.
-        assert_eq!(t.get(&p, "").status, 410);
+        let log = t.core.take_log().join("\n");
+        assert!(
+            log.contains("token consumed peer=192.168.1.23 site=none browser=chrome"),
+            "{log}"
+        );
+        // A second use without the cookie, from anyone: 410, with a link to
+        // `/` for the phone that has the cookie.
+        let r = t.get(&p, "");
+        assert_eq!(r.status, 410);
+        assert!(String::from_utf8_lossy(&r.body).contains(r#"<a href="/">"#));
         assert_eq!(
             t.send_from(OTHER, &format!("GET {p} HTTP/1.1\r\nHost: {HOST}\r\n\r\n"))
                 .status,
@@ -1210,7 +1261,7 @@ pub(crate) mod tests {
             405
         );
         assert_eq!(t.core.state_json(t.now)["state"], "waiting");
-        assert_eq!(t.get(&p, "").status, 302);
+        assert_eq!(t.get(&p, "").status, 200);
     }
 
     #[test]
@@ -1221,7 +1272,7 @@ pub(crate) mod tests {
             Ipv4Addr::new(10, 0, 2, 5),
             &format!("GET {p} HTTP/1.1\r\nHost: {HOST}\r\n\r\n"),
         );
-        assert_eq!(r.status, 302);
+        assert_eq!(r.status, 200);
         assert_eq!(t.core.state_json(t.now)["peer_other_subnet"], true);
     }
 
@@ -1426,6 +1477,110 @@ pub(crate) mod tests {
         assert_eq!(s["reason"], "too-many-bad-requests");
         assert!(s.get("path").is_none());
         assert_eq!(t.get("/", "").status, 503);
+    }
+
+    #[test]
+    fn a_prefetch_never_uses_the_token_and_is_not_a_bad_request() {
+        let mut t = T::new();
+        let p = t.path();
+        let mut ms = 0;
+        for h in [
+            "Sec-Purpose: prefetch",
+            "Sec-Purpose: prefetch;prerender",
+            "Purpose: prefetch",
+            "X-Purpose: preview",
+            "X-Moz: prefetch",
+        ] {
+            // More than the bad-request budget, spread out below the rate limit.
+            for _ in 0..5 {
+                ms += 100;
+                t.at(ms);
+                let r = t.get(&p, &format!("{h}\r\n"));
+                assert_eq!(r.status, 503, "{h}");
+                assert_eq!(r.header_value("Set-Cookie"), None);
+            }
+        }
+        assert_eq!(t.core.ended(), None);
+        assert_eq!(t.core.state_json(t.now)["state"], "waiting");
+        let log = t.core.take_log();
+        assert_eq!(
+            log.iter()
+                .filter(|l| l.starts_with("rejected prefetch token peer="))
+                .count(),
+            25,
+            "{log:?}"
+        );
+        assert!(
+            !log.iter().any(|l| l.starts_with("token consumed")),
+            "{log:?}"
+        );
+        // The real navigation then uses it.
+        assert_eq!(t.get(&p, "").status, 200);
+        assert_eq!(t.core.state_json(t.now)["state"], "active");
+        // A prefetch after the token was used neither ends nor reaches 410.
+        assert_eq!(t.get(&p, "Sec-Purpose: prefetch\r\n").status, 503);
+        assert_eq!(t.core.ended(), None);
+        t.assert_no_secret_logged();
+    }
+
+    #[test]
+    fn a_tls_hello_ends_nothing_and_counts_nothing() {
+        let mut t = T::new();
+        for _ in 0..(MAX_BAD + MAX_PARSE_BEFORE_TOKEN) {
+            t.core.on_tls(PHONE);
+        }
+        assert_eq!(t.core.ended(), None);
+        t.login();
+        for _ in 0..=MAX_BAD {
+            t.core.on_tls(PHONE);
+        }
+        assert_eq!(t.core.ended(), None);
+        assert_eq!(t.authed("/api/state").status, 200);
+        assert!(
+            t.core
+                .take_log()
+                .iter()
+                .any(|l| l == "rejected tls peer=192.168.1.23")
+        );
+    }
+
+    #[test]
+    fn a_page_without_the_cookie_logs_why() {
+        let mut t = T::new();
+        let ua =
+            "User-Agent: Mozilla/5.0 (Android 15; Mobile; rv:144.0) Gecko/144.0 Firefox/144.0\r\n";
+        assert_eq!(t.get("/", ua).status, 403);
+        t.login();
+        let _ = t.core.take_log();
+        // The c3-a case: the phone used the token, then came back with no
+        // cookie at all.
+        let r = t.get("/", &format!("{ua}Sec-Fetch-Site: none\r\n"));
+        assert_eq!(r.status, 403);
+        let body = String::from_utf8_lossy(&r.body).into_owned();
+        assert!(
+            body.contains(r#"<a href="/">"#) && body.contains("QR code"),
+            "{body}"
+        );
+        assert_eq!(t.get("/", "Cookie: other=1\r\n").status, 403);
+        let c = t.cookie();
+        assert_eq!(
+            t.send_from(
+                OTHER,
+                &format!("GET / HTTP/1.1\r\nHost: {HOST}\r\nCookie: sat_session={c}\r\n\r\n")
+            )
+            .status,
+            403
+        );
+        let log = t.core.take_log();
+        assert_eq!(
+            log,
+            [
+                "rejected no-cookie page peer=192.168.1.23 site=none browser=firefox",
+                "rejected no-session-cookie page peer=192.168.1.23 site=absent browser=absent",
+                &format!("rejected wrong-peer page peer={OTHER} site=absent browser=absent"),
+            ]
+        );
+        assert_eq!(t.authed("/").status, 200);
     }
 
     #[test]

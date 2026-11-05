@@ -55,7 +55,65 @@ pub(crate) struct Request {
     pub(crate) origin: Option<String>,
     pub(crate) sec_fetch_site: Option<String>,
     pub(crate) csrf: Option<String>,
+    /// The browser family of the first `User-Agent` (a fixed word for the
+    /// log; the header text itself is not kept).
+    pub(crate) browser: &'static str,
+    /// A speculative load (`Sec-Purpose: prefetch…`, `Purpose: prefetch`,
+    /// `X-Purpose: preview`, `X-Moz: prefetch`): it must not use the token.
+    pub(crate) prefetch: bool,
     pub(crate) body: Vec<u8>,
+}
+
+impl Request {
+    /// `Sec-Fetch-Site` as a fixed word for the log.
+    pub(crate) fn fetch_site(&self) -> &'static str {
+        match self.sec_fetch_site.as_deref() {
+            None => "absent",
+            Some("none") => "none",
+            Some("same-origin") => "same-origin",
+            Some("same-site") => "same-site",
+            Some("cross-site") => "cross-site",
+            Some(_) => "other",
+        }
+    }
+
+    pub(crate) fn browser(&self) -> &'static str {
+        self.browser
+    }
+}
+
+/// The browser family from `User-Agent` as a fixed word for the log (no
+/// version, no device): enough to tell a scanner app's web view from a
+/// browser when a phone has no session.
+fn browser_family(ua: &str) -> &'static str {
+    let has = |s: &str| ua.contains(s);
+    if has("; wv)") || has("; wv;") {
+        "android-webview"
+    } else if has("SamsungBrowser/") {
+        "samsung"
+    } else if has("FxiOS/") || has("Firefox/") {
+        "firefox"
+    } else if has("EdgA/") || has("EdgiOS/") || has("Edg/") {
+        "edge"
+    } else if has("OPR/") || has("OPT/") || has("OPiOS/") {
+        "opera"
+    } else if has("GSA/") {
+        "google-app"
+    } else if has("CriOS/") || has("Chrome/") {
+        "chrome"
+    } else if has("iPhone") || has("iPad") {
+        if has("Safari/") {
+            "safari"
+        } else {
+            "ios-webview"
+        }
+    } else if has("Safari/") {
+        "safari"
+    } else if has("curl/") {
+        "curl"
+    } else {
+        "other"
+    }
 }
 
 // The target (the token on the first request), the cookie and the CSRF header
@@ -67,6 +125,7 @@ impl fmt::Debug for Request {
             .field("target_len", &self.target.len())
             .field("cookie", &self.cookie.is_some())
             .field("csrf", &self.csrf.is_some())
+            .field("prefetch", &self.prefetch)
             .field("body_len", &self.body.len())
             .finish_non_exhaustive()
     }
@@ -118,7 +177,7 @@ impl ParseError {
 #[derive(Debug)]
 pub(crate) enum Parsed {
     Incomplete,
-    Done(Request),
+    Done(Box<Request>),
 }
 
 /// Parses `buf`, everything received so far on the connection.
@@ -143,7 +202,7 @@ pub(crate) fn parse(buf: &[u8]) -> Result<Parsed, ParseError> {
         return Err(ParseError::Bad("pipelined"));
     }
     req.body = buf[end..].to_vec();
-    Ok(Parsed::Done(req))
+    Ok(Parsed::Done(Box::new(req)))
 }
 
 fn find_head_end(buf: &[u8]) -> Option<usize> {
@@ -197,6 +256,8 @@ fn parse_head(head: &[u8]) -> Result<(Request, usize), ParseError> {
         origin: None,
         sec_fetch_site: None,
         csrf: None,
+        browser: "absent",
+        prefetch: false,
         body: Vec::new(),
     };
     let mut seen = 0u8;
@@ -228,6 +289,19 @@ fn parse_head(head: &[u8]) -> Result<(Request, usize), ParseError> {
             "x-setup-csrf" => H_CSRF,
             "transfer-encoding" | "expect" | "upgrade" | "http2-settings" => {
                 return Err(ParseError::Bad("forbidden-header"));
+            }
+            "user-agent" => {
+                if req.browser == "absent" {
+                    req.browser = browser_family(value);
+                }
+                0
+            }
+            "sec-purpose" | "purpose" | "x-purpose" | "x-moz" => {
+                let v = value.to_ascii_lowercase();
+                if v.starts_with("prefetch") || v.starts_with("preview") {
+                    req.prefetch = true;
+                }
+                0
             }
             _ => 0,
         };
@@ -334,7 +408,16 @@ pub(crate) enum ReadError {
     /// Closed, failed or timed out before a single byte arrived (a browser's
     /// speculative connection): no response, not a parse error.
     Empty,
+    /// The first bytes are a TLS handshake record (a browser trying
+    /// `https://` on this plain-HTTP port, for example an HTTPS upgrade):
+    /// closed without a response, not a parse error (section 6.4).
+    Tls,
     Parse(ParseError),
+}
+
+/// A TLS record header of type handshake (22) and major version 3.
+fn looks_like_tls(buf: &[u8]) -> bool {
+    buf.first() == Some(&0x16) && buf.get(1).is_none_or(|&b| b == 0x03)
 }
 
 /// Reads one request, at most `MAX_HEAD + MAX_BODY` bytes, until `deadline`.
@@ -373,8 +456,14 @@ pub(crate) fn read_request<C: Conn>(
             Ok(0) => return Err(fail(&buf, ParseError::Bad("truncated"))),
             Ok(n) => {
                 buf.extend_from_slice(&chunk[..n.min(want)]);
+                if looks_like_tls(&buf) {
+                    if buf.len() < 2 {
+                        continue;
+                    }
+                    return Err(ReadError::Tls);
+                }
                 match parse(&buf) {
-                    Ok(Parsed::Done(r)) => return Ok(r),
+                    Ok(Parsed::Done(r)) => return Ok(*r),
                     Ok(Parsed::Incomplete) => {
                         if buf.len() > MAX_HEAD + MAX_BODY {
                             return Err(ReadError::Parse(ParseError::Bad("too-long")));
@@ -598,7 +687,7 @@ mod tests {
 
     fn done(raw: &[u8]) -> Request {
         match parse(raw) {
-            Ok(Parsed::Done(r)) => r,
+            Ok(Parsed::Done(r)) => *r,
             other => panic!("expected a request, got {other:?}"),
         }
     }
@@ -1024,6 +1113,110 @@ mod tests {
         };
         let r = read_request(&mut f, deadline(2000), || false).expect("request");
         assert_eq!(r.body, br#"{"action":"pair"}"#);
+    }
+
+    #[test]
+    fn a_tls_client_hello_is_not_a_parse_error() {
+        // TLS 1.2/1.3 ClientHello record header, whole and byte by byte.
+        let hello: &[u8] = &[
+            0x16, 0x03, 0x01, 0x02, 0x00, 0x01, 0x00, 0x01, 0xfc, 0x03, 0x03,
+        ];
+        for chunks in [
+            vec![hello.to_vec()],
+            hello.iter().map(|b| vec![*b]).collect::<Vec<_>>(),
+        ] {
+            let mut f = Fake {
+                chunks,
+                delay: Duration::from_millis(1),
+            };
+            assert!(matches!(
+                read_request(&mut f, deadline(500), || false),
+                Err(ReadError::Tls)
+            ));
+        }
+        // Other binary bytes stay parse errors.
+        let mut f = Fake {
+            chunks: vec![vec![0x16, 0x02, 0x00]],
+            delay: Duration::from_millis(1),
+        };
+        assert!(matches!(
+            read_request(&mut f, deadline(500), || false),
+            Err(ReadError::Parse(ParseError::Bad("byte")))
+        ));
+        let mut f = Fake {
+            chunks: vec![b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec()],
+            delay: Duration::from_millis(1),
+        };
+        assert!(matches!(
+            read_request(&mut f, deadline(500), || false),
+            Err(ReadError::Parse(_))
+        ));
+    }
+
+    #[test]
+    fn prefetch_headers_user_agent_and_fetch_site_words() {
+        for h in [
+            "Sec-Purpose: prefetch",
+            "Sec-Purpose: prefetch;prerender",
+            "Sec-Purpose: prefetch;anonymous-client-ip",
+            "Purpose: prefetch",
+            "X-Purpose: preview",
+            "X-Moz: prefetch",
+        ] {
+            let r = done(format!("GET / HTTP/1.1\r\n{HOST}{h}\r\n\r\n").as_bytes());
+            assert!(r.prefetch, "{h}");
+        }
+        let r = done(format!("GET / HTTP/1.1\r\n{HOST}Purpose: other\r\n\r\n").as_bytes());
+        assert!(!r.prefetch);
+        assert_eq!(r.fetch_site(), "absent");
+        assert_eq!(r.browser(), "absent");
+        for (ua, want) in [
+            (
+                "Mozilla/5.0 (Linux; Android 15; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Mobile Safari/537.36",
+                "chrome",
+            ),
+            (
+                "Mozilla/5.0 (Linux; Android 15; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/141.0.0.0 Mobile Safari/537.36",
+                "android-webview",
+            ),
+            (
+                "Mozilla/5.0 (Linux; Android 15; K; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/141.0.0.0 Mobile Safari/537.36",
+                "android-webview",
+            ),
+            (
+                "Mozilla/5.0 (Linux; Android 14; SM-S911B) AppleWebKit/537.36 (KHTML, like Gecko) SamsungBrowser/28.0 Chrome/130.0.0.0 Mobile Safari/537.36",
+                "samsung",
+            ),
+            (
+                "Mozilla/5.0 (Android 15; Mobile; rv:144.0) Gecko/144.0 Firefox/144.0",
+                "firefox",
+            ),
+            (
+                "Mozilla/5.0 (iPhone; CPU iPhone OS 18_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.6 Mobile/15E148 Safari/604.1",
+                "safari",
+            ),
+            (
+                "Mozilla/5.0 (iPhone; CPU iPhone OS 18_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148",
+                "ios-webview",
+            ),
+            (
+                "Mozilla/5.0 (iPhone; CPU iPhone OS 18_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) CriOS/141.0 Mobile/15E148 Safari/604.1",
+                "chrome",
+            ),
+            (
+                "Mozilla/5.0 (iPhone; CPU iPhone OS 18_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) GSA/390.0 Mobile/15E148 Safari/604.1",
+                "google-app",
+            ),
+            ("curl/8.17.0", "curl"),
+            ("something", "other"),
+        ] {
+            let r = done(
+                format!("GET / HTTP/1.1\r\n{HOST}User-Agent: {ua}\r\nSec-Fetch-Site: none\r\n\r\n")
+                    .as_bytes(),
+            );
+            assert_eq!(r.browser(), want, "{ua}");
+            assert_eq!(r.fetch_site(), "none");
+        }
     }
 
     #[test]

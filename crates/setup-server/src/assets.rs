@@ -40,6 +40,9 @@ pub(crate) const ASSETS: &[Asset] = &[
 pub(crate) const NO_SESSION_PAGE: &[u8] = include_bytes!("../assets/no-session.html");
 /// A second use of the QR link (410).
 pub(crate) const LINK_USED_PAGE: &[u8] = include_bytes!("../assets/link-used.html");
+/// The answer to the token (200, with the cookie): moves on to `/` itself,
+/// so that the cookie is sent (see `Core::continue_page`).
+pub(crate) const CONTINUE_PAGE: &[u8] = include_bytes!("../assets/continue.html");
 
 /// Responses are at most 128 KiB (section 6.4). The budget is 80 KiB of assets
 /// in total (the design said 60 KB before the shared `voicepower.js` grew to
@@ -80,7 +83,7 @@ mod tests {
         }
         assert!(page.contains("/assets/phone.js"));
         // The CSP forbids inline script and style and remote assets.
-        for p in [PAGE, NO_SESSION_PAGE, LINK_USED_PAGE] {
+        for p in [PAGE, NO_SESSION_PAGE, LINK_USED_PAGE, CONTINUE_PAGE] {
             let text = std::str::from_utf8(p).expect("utf8");
             assert!(
                 !text.contains("<script>") && !text.contains("style=") && !text.contains("<style")

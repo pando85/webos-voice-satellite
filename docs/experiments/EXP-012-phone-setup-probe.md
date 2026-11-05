@@ -1,6 +1,6 @@
 # EXP-012 — Phone setup web server: on-target probe (Part A, read-only plus short temporary listeners)
 
-**Status:** Part A TARGET_VERIFIED on c3-a (items P1 to P4, P6, P7, P9; P5 partly, by static evidence only). **Part B, TV side, TARGET_VERIFIED on c3-a with package 0.4.0 on 2026-11-05 (P8, P14 and P15 in part; no real action posted).** Part B, the owner's phone test (P11 to P13, P16): **PENDING OWNER**; P10 NOT RUN
+**Status:** Part A TARGET_VERIFIED on c3-a (items P1 to P4, P6, P7, P9; P5 partly, by static evidence only). **Part B, TV side, TARGET_VERIFIED on c3-a with package 0.4.0 on 2026-11-05 (P8, P14 and P15 in part; no real action posted).** Part B, the owner's phone test (P11 to P13, P16): **first attempt FAILED on 2026-11-05** (the phone got no session; cause found and fixed in the server, [below](#part-b-the-owners-first-phone-attempt-2026-11-05-failed)), retest **PENDING OWNER**; P10 NOT RUN
 **Date:** 2026-11-05 (about 07:45 to 08:10 CET)
 **Device alias / model / firmware / webOS / architecture:** c3-a, LG C3 42 inch, firmware `03.30.74`, webOS TV 8.3.0 (Rockhopper release 8.3.0-1508), Homebrew Channel 0.6.3, kernel 5.4.96 aarch64, 32-bit userland, satellite 0.3.0 running
 **Power and playback state:** `Active`, the owner's PC display, no playback, no app opened or closed by the experiment; the TV was on Wi-Fi (Ethernet port without carrier)
@@ -185,6 +185,35 @@ Run by an agent on c3-a (LG C3 42 inch, firmware `03.30.74`, webOS TV 8.3.0, HBC
 - **Review items:** C2 (clean environment), C3 (`setup.pid` is the server), C4 (`/tmp` is `1777` root) and C5 (the heartbeat mtime moves on every `setup status`; 110 polls at 2 s, 0 failures, no session ended early) are **verified on the target**.
 - **HTTP from a PC on the LAN:** QR path `302` with the cookie flags, second use `410`, `/api/state` `403` without and `200` with the cookie and only allow-listed fields, `POST` without the CSRF header `403`, wrong `Host` `400`, foreign `Origin` `403`. **SR-03** works as designed on the target: refresh about every 5 s while polled, none for the page's silent 30 s.
 - **Not exercised:** any action (the table, the TV overlay, the answer file, restores), the phone, the app. They need the owner.
+
+### Part B: the owner's first phone attempt (2026-11-05, failed)
+
+**Setup:** c3-a with 0.4.0. The owner opened the app, then Home Assistant, then "Set up with your phone", and scanned the QR code with his phone. The phone was on the home Wi-Fi; its model and browser are not known. He tried twice.
+
+**What he saw:** the phone showed "Session ended" (the 0.4.0 "no session" page), and the QR code disappeared from the TV.
+
+**Evidence:** `log/setup.log` on c3-a, read afterwards. It contains no token: no `/s/` and no string of 30 or more token characters. Addresses are masked here.
+
+| Time (UTC) | Event |
+| --- | --- |
+| 08:47:36 | `session start` |
+| 08:47:45 | `token consumed peer=<phone>` (a LAN address, not the PC's) |
+| 08:47:46 | `rejected no-session page peer=<phone>` (the redirect to `/` came without the cookie) |
+| 08:47:59, 08:48:33 | the same, twice (reloads) |
+| 08:48:38 | `session end reason=done` (Done on the TV) |
+| 08:48:47 to 08:49:15 | second attempt: `session start`, `token consumed`, then two `rejected no-session page`, all from the same phone address |
+| 08:50:11 | `session end reason=app-gone` (the app was left; the session directory then held only the `ended` state, with no path) |
+
+What the log rules out: no parse error, no TLS, no `HEAD`, no `410` (token already used), no prefetch, no second address, no `wrong-peer`, no refused `Host` or origin.
+
+**Conclusion:** the phone's browser received the cookie with the token's `302` but never sent it back. The cause and the fix are in [phone setup 6.7](../design/phone-setup.md#67-fix-after-the-owners-first-phone-test-2026-11-05) and [security review SR-11](../security/setup-server-review.md#sr-11-the-tokens-redirect-lost-the-cookie-on-real-phones-medium-functional-fixed). In short: a link opened from another app gets cross-site treatment for a `SameSite=Strict` cookie, which is then withheld on the redirect. The token's answer is now a page that moves on to `/` itself.
+
+**Labels:**
+
+- the request sequence: `verified-on-target`;
+- the cause: `hypothesis`, reproduced with Chromium on the host and not yet on the owner's phone.
+
+**For the retest:** use a build with the fix. Note the phone model and browser. Open the link from the camera as before, which is the case that failed. With the new log words, `setup.log` then shows `site=` and `browser=` for the token and for any refusal.
 
 ### Part B: the owner's phone test (pending owner)
 

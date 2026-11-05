@@ -43,6 +43,9 @@ Severity: High (root or TV control without the OK), Medium (a guarantee of the d
 | SR-08 | Info | Local processes on the TV pass the peer filter through the TV's own LAN address | accepted |
 | SR-09 | Info | "Microphone off" runs without the OK on the TV | accepted (owner decision) |
 | SR-10 | Info | An action still running at the end of a session is not killed; a worker panic would leave it `running` | accepted |
+| SR-11 | Medium (functional) | The token's `302` with a `SameSite=Strict` cookie fails for a phone that opens the link from another app: the cookie is not sent to `/` | **fixed** (2026-11-05, after the owner's first phone test) |
+| SR-12 | Low | A TLS ClientHello on the port (a browser's HTTPS upgrade) was a parse error, which ends a session after the token is used | **fixed** (2026-11-05) |
+| SR-13 | Low | A prefetch or link preview of the QR link consumed the token | **fixed** for requests marked as such (2026-11-05) |
 
 ### SR-01: the write limit was per call (Low, fixed)
 
@@ -101,6 +104,47 @@ These are availability problems only, and part of the design's choices.
 
 **Recovery:** the owner restarts the session on the TV.
 
+### SR-11: the token's redirect lost the cookie on real phones (Medium, functional, fixed)
+
+Found by the owner's first phone test on c3-a (0.4.0, 2026-11-05). Evidence from `setup.log` (no token in it, `verified-on-target`):
+
+- on both attempts, `token consumed` from the phone's address;
+- within a second, `rejected no-session page` from the same address, and twice more on reloads;
+- no parse error, `410`, TLS or second address.
+
+The phone never sent `sat_session` after the token.
+
+**Cause** (`hypothesis`, reproduced on the host): a link opened from another app (the camera, a QR scanner) is a cross-site navigation for the cookie rules of Chrome and Firefox on Android. A `SameSite=Strict` cookie set in that navigation is stored, but it is not sent on the `302` to `/`, nor on a reload. `Sec-Fetch-Site` is still `none`, so the origin check passes. A Chromium emulation on the host (a cross-site link, with `Sec-Fetch-Site` rewritten to `none`) gives the c3-a log line for line with the 0.4.0 server.
+
+This was missed because the review and the PC checks used `curl` and a typed URL, which are same-site.
+
+**Fix:** the token's answer is a 200 page with the cookie, a meta refresh to `/` and a link. The page's own navigation is same-origin, so the `Strict` cookie is sent. The cookie attributes, the CSP and every check are unchanged; a meta refresh is not script.
+
+The "no session" and "link used" pages get a same-origin link to `/`. Without the cookie, it leads only to the 403 page again.
+
+**Tests:** `session::tests::token_is_single_use_and_sets_a_strict_cookie`, `a_page_without_the_cookie_logs_why`, and the integration test `tls_hellos_and_prefetches_end_nothing`; the Chromium A/B emulation was run by hand and is not committed. Details: [phone setup 6.7](../design/phone-setup.md#67-fix-after-the-owners-first-phone-test-2026-11-05).
+
+### SR-12 and SR-13: TLS and prefetches (Low, fixed)
+
+**SR-12, TLS:** a browser set to "always use secure connections", or an HTTPS upgrade, sends a TLS ClientHello to the plain-HTTP port first. That was a parse error (`byte`): one after the token ended the session, three before it ended a waiting one.
+
+- **Now:** a first record of type handshake (`0x16 0x03`) is closed without a response and logged as `rejected tls`. It is neither a parse error nor a bad request.
+- **Bound:** it cannot reach a route or the token. A flood of hellos is bounded like any other connection (one at a time, the accept tick), the same as SR-04's silent connections.
+- **Tests:** `http::tests::a_tls_client_hello_is_not_a_parse_error`, `session::tests::a_tls_hello_ends_nothing_and_counts_nothing`, and the integration test.
+
+**SR-13, prefetch:** a `GET` of the QR link with `Sec-Purpose: prefetch…`, `Purpose: prefetch`, `X-Purpose: preview` or `X-Moz: prefetch` consumed the token.
+
+- **Now:** it gets `503 prefetch`, does not consume the token, and is not a bad request. It still counts toward the rate limit and the cap of 2000 requests.
+- **Residual:** a preview fetcher that sends none of those headers still consumes the token (the TV shows its address; the owner restarts).
+- **Tests:** `session::tests::a_prefetch_never_uses_the_token_and_is_not_a_bad_request`, `http::tests::prefetch_headers_user_agent_and_fetch_site_words`.
+
+**Logging (with SR-11):**
+
+- `token consumed` and every refusal without a valid session add `site=` and `browser=`, two fixed words (the `Sec-Fetch-Site` class and the `User-Agent` family, no version);
+- the refusal word tells `no-session`, `no-cookie` and `no-session-cookie` apart.
+
+No header text is logged.
+
 ### SR-05 to SR-10 (Info)
 
 - **SR-05:** `take_answer` reads `answer.json` and then unlinks it. An answer moved into place between the read and the unlink is deleted unread. That needs two answers within microseconds. The lost answer then expires, which counts as a refusal (fail-safe). If the code is touched again, rename the file to a private name first, then read it.
@@ -128,7 +172,7 @@ These are availability problems only, and part of the design's choices.
 
 **Authentication**
 
-- Token: 32 bytes from `/dev/urandom` (fails closed), base64url. It is compared in constant time, consumed only by `GET`, followed by `302` to `/` so that it leaves the address bar, `410` after use, and `404` when wrong.
+- Token: 32 bytes from `/dev/urandom` (fails closed), base64url. It is compared in constant time, consumed only by `GET` (and not by one marked as a prefetch, SR-13), answered by a 200 page that moves on to `/` itself (SR-11; a `302` until 2026-11-05) so that it leaves the address bar, `410` after use, and `404` when wrong.
 - Cookie: 32 bytes, made by the server at start, so there is no session fixation. `HttpOnly; SameSite=Strict; Path=/`, with `Max-Age` set to the time left; constant-time compare; bound to the peer address; a duplicate `sat_session` is refused.
 - CSRF and cross-origin:
   - a 16-byte CSRF token, `X-Setup-CSRF` and `application/json` on every `POST`;
@@ -225,7 +269,7 @@ These are availability problems only, and part of the design's choices.
   - the file modes;
   - the log content;
   - items C3 to C5.
-- Real phone browsers: whether `Sec-Fetch-Site` is `none` when a QR scanner app or a messenger opens the link, and in-app web views that block cookies.
+- Real phone browsers: in-app web views that block cookies. **Update 2026-11-05:** the owner's phone (browser unknown) sent `Sec-Fetch-Site: none` or none at all when it opened the link from the camera, but withheld the `Strict` cookie on the redirect (SR-11, fixed).
 - The daemon's reply-volume reload (P2) and the packaging tests (`packaging/webos/tests/setup.sh`).
 - `cargo deny` with a configuration file: licenses were listed from `cargo metadata` instead.
 - A sanitizer or coverage-guided fuzzing: only the deterministic mutation corpus was run.

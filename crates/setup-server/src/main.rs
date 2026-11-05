@@ -225,6 +225,10 @@ fn connection(
     let resp = match http::read_request(&mut stream, deadline, || dir.stop_requested()) {
         Ok(req) => core.handle(peer, local, &req, Instant::now()),
         Err(ReadError::Empty) => return,
+        Err(ReadError::Tls) => {
+            core.on_tls(peer);
+            return;
+        }
         Err(ReadError::Parse(e)) => core.on_parse_error(peer, e, Instant::now()),
     };
     // 3 s for the whole response, not per write call (SR-01).
