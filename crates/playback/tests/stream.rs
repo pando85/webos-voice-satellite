@@ -24,6 +24,8 @@ use webos_playback::{Pcm, PlaybackError, wav_bytes};
 fn cfg() -> StreamConfig {
     StreamConfig {
         idle_timeout: Duration::from_secs(2),
+        // The test servers listen on loopback (refused in production).
+        insecure_allow_loopback: true,
         ..StreamConfig::default()
     }
 }

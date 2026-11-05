@@ -1,0 +1,39 @@
+# Fuzz targets for webos-playback (design M3b). Not a workspace member: it
+# needs nightly and libFuzzer, and nothing here is linked into the TV build.
+#
+#   cd crates/playback/fuzz
+#   cargo +nightly fuzz run stream_decoder -- -max_total_time=900
+#   cargo +nightly fuzz run redirect_location -- -max_total_time=120
+#
+# Seed the corpus from the test fixtures first: sh seed.sh
+[package]
+name = "webos-playback-fuzz"
+version = "0.0.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+webos-playback = { path = ".." }
+
+# Its own workspace, so the main workspace never builds it.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "stream_decoder"
+path = "fuzz_targets/stream_decoder.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "redirect_location"
+path = "fuzz_targets/redirect_location.rs"
+test = false
+doc = false
+bench = false

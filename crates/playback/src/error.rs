@@ -48,6 +48,11 @@ pub enum PlaybackError {
     /// chunk of a chunked body).
     #[error("stream ended before its declared length")]
     EndedEarly,
+    /// The fetch target is not allowed (loopback, link-local or this
+    /// device's address, a downgrade or too many redirects, an oversized
+    /// URL). The reason never contains the URL or the address.
+    #[error("fetch target refused: {0}")]
+    TargetRefused(String),
     /// Playback was cancelled through a `StopHandle` or a stream `Canceller`.
     #[error("playback cancelled")]
     Cancelled,

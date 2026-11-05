@@ -43,7 +43,12 @@
 //!   by `connect_timeout`).
 //! - A URL is fetched once: there is no retry and no reconnect (a new
 //!   request for an HA proxy URL would restart the track).
-//! - Error texts never contain the URL.
+//! - Error texts never contain the URL; use [`crate::guard::redact_url`]
+//!   to log one.
+//! - Fetch targets follow [`crate::guard`]: at most `max_redirects`, no
+//!   `https` to `http`, no loopback, link-local or own-device address
+//!   (checked after DNS on the address connected to), header and URL caps.
+//!   A refusal is [`PlaybackError::TargetRefused`] and nothing is fetched.
 
 mod buffers;
 mod decoder;
@@ -61,9 +66,11 @@ pub use decoder::{
     MAX_STREAM_RATE, MIN_STREAM_RATE, StreamDecoder,
 };
 
-use self::buffers::{ByteRing, PcmQueue, Pop, lock};
+pub(crate) use self::buffers::lock;
+use self::buffers::{ByteRing, PcmQueue, Pop};
 use crate::error::PlaybackError;
-use crate::fetch::{check_scheme, map_err, tls_config};
+use crate::fetch::{map_err, tls_config};
+use crate::guard::{self, GuardConnector, MAX_HEADER_BYTES};
 use crate::music::{MusicSource, SourceItem};
 use crate::pcm::Pcm;
 
@@ -96,6 +103,12 @@ pub struct StreamConfig {
     pub queue_ms: u32,
     /// Duration of each decoded chunk.
     pub chunk_ms: u32,
+    /// Redirects followed at most (D14: 3); each target is checked again.
+    pub max_redirects: u8,
+    /// **Tests only, never from configuration:** allow loopback targets
+    /// (127.0.0.0/8, `::1`) so a local test server can be used; every other
+    /// rule of [`crate::guard`] still applies.
+    pub insecure_allow_loopback: bool,
 }
 
 impl Default for StreamConfig {
@@ -108,6 +121,8 @@ impl Default for StreamConfig {
             ring_bytes: 512 * 1024,
             queue_ms: 1000,
             chunk_ms: 20,
+            max_redirects: 3,
+            insecure_allow_loopback: false,
         }
     }
 }
@@ -317,10 +332,11 @@ impl Drop for MusicStream {
 /// once; connection and HTTP errors arrive through [`MusicStream::recv`].
 ///
 /// # Errors
-/// [`PlaybackError::BadUrl`] for a scheme other than `http` or `https`, and
+/// [`PlaybackError::BadUrl`] for a scheme other than `http` or `https`,
+/// [`PlaybackError::TargetRefused`] for a URL over the length cap, and
 /// [`PlaybackError::Io`] when a thread cannot be spawned.
 pub fn open(url: &str, cfg: &StreamConfig) -> Result<MusicStream, PlaybackError> {
-    check_scheme(url)?;
+    guard::check_url(url)?;
     let shared = Arc::new(Shared {
         stopped: AtomicBool::new(false),
         agent: Mutex::new(None),
@@ -362,7 +378,12 @@ fn url_extension(url: &str) -> Option<String> {
         .then(|| ext.to_ascii_lowercase())
 }
 
-fn build_agent(cfg: &StreamConfig) -> Result<ureq::Agent, PlaybackError> {
+fn build_agent(
+    cfg: &StreamConfig,
+    refused: &Arc<Mutex<Option<&'static str>>>,
+) -> Result<ureq::Agent, PlaybackError> {
+    use ureq::unversioned::resolver::DefaultResolver;
+    use ureq::unversioned::transport::{Connector, RustlsConnector, TcpConnector};
     let config = ureq::Agent::config_builder()
         .timeout_resolve(Some(cfg.connect_timeout))
         .timeout_connect(Some(cfg.connect_timeout))
@@ -375,10 +396,30 @@ fn build_agent(cfg: &StreamConfig) -> Result<ureq::Agent, PlaybackError> {
         // Never use a proxy from the environment: the target checks apply
         // to the address actually connected to.
         .proxy(None)
-        .max_redirects(3)
+        // Redirects are followed by hand so every hop is checked.
+        .max_redirects(0)
+        .max_response_header_size(MAX_HEADER_BYTES)
         .user_agent("webos-voice-satellite")
         .build();
-    Ok(config.into())
+    // The guard sees the resolved addresses before the TCP connector uses
+    // them (and before TLS); `Agent::shutdown` reaches the sockets the TCP
+    // connector registers.
+    let connector = ()
+        .chain(GuardConnector {
+            allow_loopback: cfg.insecure_allow_loopback,
+            refused: Arc::clone(refused),
+        })
+        .chain(TcpConnector::default())
+        .chain(RustlsConnector::default());
+    Ok(ureq::Agent::with_parts(
+        config,
+        connector,
+        DefaultResolver::default(),
+    ))
+}
+
+fn is_redirect(status: u16) -> bool {
+    matches!(status, 301 | 302 | 303 | 307 | 308)
 }
 
 fn fetch_main(shared: &Shared, url: &str, cfg: &StreamConfig) {
@@ -395,7 +436,8 @@ fn fetch_main(shared: &Shared, url: &str, cfg: &StreamConfig) {
 }
 
 fn fetch_body(shared: &Shared, url: &str, cfg: &StreamConfig) -> Result<(), PlaybackError> {
-    let agent = build_agent(cfg)?;
+    let refused = Arc::new(Mutex::new(None));
+    let agent = build_agent(cfg, &refused)?;
     {
         let mut slot = lock(&shared.agent);
         if shared.stopped() {
@@ -403,7 +445,33 @@ fn fetch_body(shared: &Shared, url: &str, cfg: &StreamConfig) -> Result<(), Play
         }
         *slot = Some(agent.clone());
     }
-    let resp = agent.get(url).call().map_err(|e| map_stream_err(e, cfg))?;
+    let map = |e: ureq::Error| match lock(&refused).take() {
+        Some(reason) => PlaybackError::TargetRefused(reason.into()),
+        None => map_stream_err(e, cfg),
+    };
+    let mut url = url.to_owned();
+    let mut hops = 0u8;
+    let resp = loop {
+        let resp = agent.get(&url).call().map_err(map)?;
+        let status = resp.status().as_u16();
+        if is_redirect(status) {
+            hops += 1;
+            if hops > cfg.max_redirects {
+                return Err(PlaybackError::TargetRefused("too many redirects".into()));
+            }
+            let location = resp
+                .headers()
+                .get("location")
+                .and_then(|v| v.to_str().ok())
+                .ok_or_else(|| PlaybackError::Http("redirect without a location".into()))?;
+            url = guard::next_url(&url, location)?;
+            continue;
+        }
+        if !(200..300).contains(&status) {
+            return Err(PlaybackError::Status(status));
+        }
+        break resp;
+    };
     let content_type = resp
         .headers()
         .get("content-type")
@@ -434,6 +502,9 @@ fn map_stream_err(e: ureq::Error, cfg: &StreamConfig) -> PlaybackError {
             PlaybackError::IdleTimeout(cfg.idle_timeout)
         }
         ureq::Error::Io(io) => map_io(&io, cfg).unwrap_or_else(|| map_err(ureq::Error::Io(io))),
+        ureq::Error::LargeResponseHeader(..) => {
+            PlaybackError::Http("response headers too large".into())
+        }
         other => map_err(other),
     }
 }

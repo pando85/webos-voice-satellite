@@ -1,5 +1,7 @@
 [workspace]
 resolver = "3"
+# Nightly-only libFuzzer targets with their own workspace (design M3b).
+exclude = ["crates/playback/fuzz"]
 members = [
     "crates/satellite",
     "crates/capture",

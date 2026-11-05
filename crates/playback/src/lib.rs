@@ -17,6 +17,7 @@ pub mod music;
 mod decode;
 mod error;
 mod fetch;
+pub mod guard;
 mod pcm;
 mod resample;
 mod sink;
