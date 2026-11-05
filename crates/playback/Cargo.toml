@@ -17,6 +17,10 @@ ureq = { version = "=3.5.0", default-features = false, features = ["rustls"] }
 symphonia = { version = "0.6", default-features = false, features = ["mp3", "flac", "wav", "pcm", "ogg", "vorbis"] }
 tokio = { version = "1", default-features = false, features = ["rt", "process", "io-util", "time", "sync", "macros"] }
 thiserror = "2"
+log = "0.4"
+# getifaddrs(3) behind a safe API (already linked into the daemon through
+# mdns-sd): the guard lists this device's own addresses with it.
+if-addrs = { version = "0.15", default-features = false }
 
 [dev-dependencies]
 tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "time", "process", "test-util"] }

@@ -70,7 +70,7 @@ pub(crate) use self::buffers::lock;
 use self::buffers::{ByteRing, PcmQueue, Pop};
 use crate::error::PlaybackError;
 use crate::fetch::{map_err, tls_config};
-use crate::guard::{self, GuardConnector, MAX_HEADER_BYTES};
+use crate::guard::{self, GuardConnector, MAX_HEADER_BYTES, OwnAddrs};
 use crate::music::{MusicSource, SourceItem};
 use crate::pcm::Pcm;
 
@@ -407,6 +407,7 @@ fn build_agent(
     let connector = ()
         .chain(GuardConnector {
             allow_loopback: cfg.insecure_allow_loopback,
+            on_unknown: OwnAddrs::Refuse,
             refused: Arc::clone(refused),
         })
         .chain(TcpConnector::default())

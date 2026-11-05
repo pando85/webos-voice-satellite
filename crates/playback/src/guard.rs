@@ -18,13 +18,16 @@
 //! - no environment proxy (the check must see the real target);
 //! - no URL in any error text; [`redact_url`] for log lines.
 //!
-//! "This device's addresses" are found by asking the kernel: binding a UDP
-//! socket to an address succeeds only for a local address. If the kernel
-//! accepts a bind to a documentation address (`ip_nonlocal_bind` set), the
-//! answer is unknowable and every target of that family is refused.
+//! "This device's addresses" are listed from the interfaces (`getifaddrs`,
+//! through the `if-addrs` crate) on every check, so a DHCP change is seen
+//! and nothing depends on the kernel's bind behaviour (`ip_nonlocal_bind`
+//! makes bind probes useless). If the list cannot be read, [`OwnAddrs::Refuse`]
+//! (music) refuses the target, [`OwnAddrs::Skip`] (TTS and announcements)
+//! skips only that one rule, with one warning in the log, and keeps the rest.
 
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
+use std::net::IpAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use ureq::unversioned::transport::{ConnectionDetails, Connector};
@@ -37,14 +40,18 @@ pub const MAX_URL_LEN: usize = 4096;
 /// Largest response header block accepted.
 pub const MAX_HEADER_BYTES: usize = 16 * 1024;
 
-/// Why a target address is refused, or `Ok` when it may be fetched.
-///
-/// # Errors
-/// A short reason (never the address) for loopback, unspecified,
-/// link-local, multicast or broadcast addresses and for this device's own
-/// addresses.
-pub fn check_addr(ip: IpAddr) -> Result<(), &'static str> {
-    let ip = ip.to_canonical();
+/// What to do when this device's own addresses cannot be listed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwnAddrs {
+    /// Refuse the target (fail closed): the music stream, which is opt-in.
+    Refuse,
+    /// Skip the own-address rule only, log a warning once, keep every other
+    /// rule: TTS and announcement fetches, which must not break.
+    Skip,
+}
+
+/// The fixed address rules (everything but "this device's own addresses").
+fn check_fixed(ip: IpAddr) -> Result<(), &'static str> {
     match ip {
         IpAddr::V4(a) => {
             if a.is_loopback() {
@@ -75,28 +82,61 @@ pub fn check_addr(ip: IpAddr) -> Result<(), &'static str> {
             }
         }
     }
-    if is_own_address(ip)? {
-        return Err("address of this device");
-    }
     Ok(())
 }
 
-fn binds(ip: IpAddr) -> bool {
-    UdpSocket::bind(SocketAddr::new(ip, 0)).is_ok()
+/// The addresses of this device's interfaces (canonical form), all of them,
+/// up or down. Read afresh on every call: a fetch is rare and the list
+/// changes with DHCP.
+fn own_addresses() -> io::Result<Vec<IpAddr>> {
+    Ok(if_addrs::get_if_addrs()?
+        .iter()
+        .map(|i| i.ip().to_canonical())
+        .collect())
 }
 
-/// True when `ip` belongs to one of this device's interfaces.
-fn is_own_address(ip: IpAddr) -> Result<bool, &'static str> {
-    // TEST-NET-1 and the IPv6 documentation prefix are never assigned; a
-    // successful bind there means the kernel binds anything.
-    let probe = match ip {
-        IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
-        IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
-    };
-    if binds(probe) {
-        return Err("cannot tell this device's addresses (non-local bind is enabled)");
+/// Why a target address is refused, or `Ok` when it may be fetched.
+///
+/// `own` lists this device's addresses, or `None` when they could not be
+/// read; `on_unknown` then decides (see [`OwnAddrs`]).
+fn check_with(
+    ip: IpAddr,
+    own: Option<&[IpAddr]>,
+    on_unknown: OwnAddrs,
+) -> Result<(), &'static str> {
+    let ip = ip.to_canonical();
+    check_fixed(ip)?;
+    match own {
+        Some(list) if list.contains(&ip) => Err("address of this device"),
+        Some(_) => Ok(()),
+        None => match on_unknown {
+            OwnAddrs::Refuse => Err("cannot tell this device's addresses"),
+            OwnAddrs::Skip => {
+                static WARNED: AtomicBool = AtomicBool::new(false);
+                if !WARNED.swap(true, Ordering::Relaxed) {
+                    log::warn!(
+                        "cannot list this device's addresses; the own-address rule of the fetch guard is skipped (the other rules still apply)"
+                    );
+                }
+                Ok(())
+            }
+        },
     }
-    Ok(binds(ip))
+}
+
+/// Why a target address is refused, or `Ok` when it may be fetched.
+///
+/// # Errors
+/// A short reason (never the address) for loopback, unspecified,
+/// link-local, multicast or broadcast addresses and for this device's own
+/// addresses (or, with [`OwnAddrs::Refuse`], when those cannot be listed).
+pub fn check_addr(ip: IpAddr, on_unknown: OwnAddrs) -> Result<(), &'static str> {
+    // Only interface addresses need the list; skip the syscall for the
+    // fixed refusals.
+    let ip = ip.to_canonical();
+    check_fixed(ip)?;
+    let own = own_addresses().ok();
+    check_with(ip, own.as_deref(), on_unknown)
 }
 
 /// Checks the scheme and length of a URL.
@@ -272,6 +312,8 @@ pub(crate) fn get_following(
 pub(crate) struct GuardConnector {
     /// Tests only: let loopback through (all other checks stay).
     pub(crate) allow_loopback: bool,
+    /// Failure policy of the own-address rule.
+    pub(crate) on_unknown: OwnAddrs,
     pub(crate) refused: Arc<Mutex<Option<&'static str>>>,
 }
 
@@ -289,12 +331,14 @@ impl Connector<()> for GuardConnector {
         }
         // Every address ureq may try is checked, so whichever one the TCP
         // connector ends up connected to was allowed.
+        // One listing of the device's addresses for the whole set.
+        let own = own_addresses().ok();
         for a in &details.addrs {
             let ip = a.ip().to_canonical();
             if self.allow_loopback && ip.is_loopback() {
                 continue;
             }
-            if let Err(reason) = check_addr(ip) {
+            if let Err(reason) = check_with(ip, own.as_deref(), self.on_unknown) {
                 *lock(&self.refused) = Some(reason);
                 return Err(refused_error());
             }
@@ -314,6 +358,7 @@ fn refused_error() -> ureq::Error {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use std::net::Ipv4Addr;
 
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
@@ -337,7 +382,8 @@ mod tests {
             ("255.255.255.255", "multicast or broadcast address"),
             ("ff02::1", "multicast or broadcast address"),
         ] {
-            assert_eq!(check_addr(ip(a)), Err(why), "{a}");
+            assert_eq!(check_addr(ip(a), OwnAddrs::Refuse), Err(why), "{a}");
+            assert_eq!(check_addr(ip(a), OwnAddrs::Skip), Err(why), "{a} (skip)");
         }
         // Private LAN ranges and public addresses (TEST-NET, documentation
         // prefixes: never assigned to this host).
@@ -348,22 +394,73 @@ mod tests {
             "2001:db8::5",
             "::ffff:203.0.113.5",
         ] {
-            assert_eq!(check_addr(ip(a)), Ok(()), "{a}");
+            assert_eq!(check_addr(ip(a), OwnAddrs::Refuse), Ok(()), "{a}");
         }
     }
 
     #[test]
     fn own_interface_addresses_are_refused() {
-        // The host's primary address, found without sending anything.
-        let Ok(s) = UdpSocket::bind("0.0.0.0:0") else {
+        // Every address getifaddrs reports that the fixed rules let through
+        // is refused as this device's, with no network traffic and whatever
+        // ip_nonlocal_bind is.
+        let Ok(list) = own_addresses() else {
+            eprintln!("no interface list; skipped");
             return;
         };
-        if s.connect("192.0.2.1:9").is_err() {
-            eprintln!("no IPv4 route; skipped");
-            return;
+        for a in &list {
+            if check_fixed(*a).is_ok() {
+                for p in [OwnAddrs::Refuse, OwnAddrs::Skip] {
+                    assert_eq!(check_addr(*a, p), Err("address of this device"));
+                }
+            }
         }
-        let Ok(local) = s.local_addr() else { return };
-        assert_eq!(check_addr(local.ip()), Err("address of this device"));
+    }
+
+    #[test]
+    fn own_rule_uses_the_list_and_is_not_a_bind_probe() {
+        // A kernel with ip_nonlocal_bind would bind anything; the list does
+        // not care. Unlisted addresses pass, listed ones are refused.
+        let mine = ip("192.0.2.77");
+        let other = ip("192.0.2.78");
+        let own = [mine, ip("2001:db8::77")];
+        for p in [OwnAddrs::Refuse, OwnAddrs::Skip] {
+            assert_eq!(
+                check_with(mine, Some(&own), p),
+                Err("address of this device")
+            );
+            assert_eq!(
+                check_with(ip("::ffff:192.0.2.77"), Some(&own), p),
+                Err("address of this device")
+            );
+            assert_eq!(
+                check_with(ip("2001:db8::77"), Some(&own), p),
+                Err("address of this device")
+            );
+            assert_eq!(check_with(other, Some(&own), p), Ok(()));
+            assert_eq!(check_with(ip("2001:db8::78"), Some(&own), p), Ok(()));
+            // The fixed rules come first.
+            assert_eq!(
+                check_with(ip("127.0.0.1"), Some(&own), p),
+                Err("loopback address")
+            );
+        }
+    }
+
+    #[test]
+    fn unreadable_list_fails_closed_for_music_and_open_for_replies() {
+        assert_eq!(
+            check_with(ip("192.0.2.9"), None, OwnAddrs::Refuse),
+            Err("cannot tell this device's addresses")
+        );
+        assert_eq!(check_with(ip("192.0.2.9"), None, OwnAddrs::Skip), Ok(()));
+        // Skip drops only the own-address rule.
+        for (a, why) in [
+            ("127.0.0.1", "loopback address"),
+            ("169.254.1.1", "link-local address"),
+            ("224.0.0.1", "multicast or broadcast address"),
+        ] {
+            assert_eq!(check_with(ip(a), None, OwnAddrs::Skip), Err(why));
+        }
     }
 
     #[test]

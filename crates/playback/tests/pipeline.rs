@@ -606,6 +606,44 @@ async fn guarded_fetch_refuses_loopback_without_connecting() {
 }
 
 #[tokio::test]
+async fn guarded_fetch_refuses_this_devices_own_address() {
+    use std::sync::atomic::Ordering;
+    // The host's outbound address, found without sending anything. The
+    // rule reads the interface list, so it holds with ip_nonlocal_bind too.
+    let Some(ip) = std::net::UdpSocket::bind("0.0.0.0:0")
+        .ok()
+        .and_then(|s| s.connect("192.0.2.1:9").ok().map(|()| s))
+        .and_then(|s| s.local_addr().ok())
+        .map(|a| a.ip())
+        .filter(|ip| !ip.is_loopback())
+    else {
+        eprintln!("no IPv4 route; skipped");
+        return;
+    };
+    let listener = TcpListener::bind(format!("{ip}:0")).await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let h = std::sync::Arc::clone(&hits);
+    tokio::spawn(async move {
+        while listener.accept().await.is_ok() {
+            h.fetch_add(1, Ordering::SeqCst);
+        }
+    });
+    let cfg = FetchConfig {
+        insecure_allow_loopback: true,
+        ..FetchConfig::default()
+    };
+    let err = fetch(&format!("http://{ip}:{port}/tts"), &cfg)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, PlaybackError::TargetRefused(r) if r == "address of this device"),
+        "{err:?}"
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 0, "no TCP connection");
+}
+
+#[tokio::test]
 async fn guarded_fetch_limits_redirects_and_checks_every_hop() {
     use std::sync::atomic::Ordering;
     // An endless redirect loop on the same server: 1 + 3 requests, then refused.

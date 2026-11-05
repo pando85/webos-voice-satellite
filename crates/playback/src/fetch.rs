@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use ureq::tls::{Certificate, PemItem, RootCerts, TlsConfig, parse_pem};
 
 use crate::error::PlaybackError;
-use crate::guard::{self, GuardConnector, MAX_HEADER_BYTES};
+use crate::guard::{self, GuardConnector, MAX_HEADER_BYTES, OwnAddrs};
 use crate::stream::lock;
 
 /// Default maximum response body size (10 MiB).
@@ -192,6 +192,7 @@ fn get_guarded(
     let connector = ()
         .chain(GuardConnector {
             allow_loopback: cfg.insecure_allow_loopback,
+            on_unknown: OwnAddrs::Skip,
             refused: Arc::clone(&refused),
         })
         .chain(TcpConnector::default())
