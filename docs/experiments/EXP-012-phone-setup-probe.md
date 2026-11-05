@@ -1,6 +1,6 @@
 # EXP-012 — Phone setup web server: on-target probe (Part A, read-only plus short temporary listeners)
 
-**Status:** Part A TARGET_VERIFIED on c3-a (items P1 to P4, P6, P7, P9; P5 partly, by static evidence only); P8, P10 and Part B NOT RUN
+**Status:** Part A TARGET_VERIFIED on c3-a (items P1 to P4, P6, P7, P9; P5 partly, by static evidence only). **Part B, TV side, TARGET_VERIFIED on c3-a with package 0.4.0 on 2026-11-05 (P8, P14 and P15 in part; no real action posted).** Part B, the owner's phone test (P11 to P13, P16): **PENDING OWNER**; P10 NOT RUN
 **Date:** 2026-11-05 (about 07:45 to 08:10 CET)
 **Device alias / model / firmware / webOS / architecture:** c3-a, LG C3 42 inch, firmware `03.30.74`, webOS TV 8.3.0 (Rockhopper release 8.3.0-1508), Homebrew Channel 0.6.3, kernel 5.4.96 aarch64, 32-bit userland, satellite 0.3.0 running
 **Power and playback state:** `Active`, the owner's PC display, no playback, no app opened or closed by the experiment; the TV was on Wi-Fi (Ethernet port without carrier)
@@ -175,6 +175,38 @@ CPU of the whole chain, 10 ms ticks over a 45 s run, one core = 100 percent (the
 - **Recommended poll interval:** 2 s normally, 1 s only while a request is pending or its answer has not yet been seen; a 15 s heartbeat grace is then 7 missed beats. Confidence: medium (one TV, one state, one run of 45 to 60 s each).
 - No leakage of the exec command or its output into any readable log (high confidence for the places searched, none for in-memory buffers).
 
+## Part B: the TV side with package 0.4.0 (2026-11-05, `verified-on-target`)
+
+Run by an agent on c3-a (LG C3 42 inch, firmware `03.30.74`, webOS TV 8.3.0, HBC 0.6.3, satellite 0.4.0 aarch64, power state `Active`, the owner's PC display, no playback, the app not opened). Full tables: [P4 permanent install, 0.4.0](../discovery/c3-a/P4-permanent-install.md#update-to-040-2026-11-05-release-candidate-with-the-phone-setup-server). Summary, with the checklist items it answers:
+
+- **P8 (resources of the real server, in part):** RSS 304 to 328 kB at the start and 424 to 448 kB after 100 to 125 s (2 threads, 5 descriptors); CPU 0.12 to 0.15 % of one core with only the app's exec poll, 0.20 % with the page polling every 3 s, 0.10 % with the page silent. The HBC node process took 0.64 % during the 2 s exec polls. A load of 10 requests per second was not run.
+- **P14 (end conditions, in part):** `setup stop` through `exec` ended two sessions: the listener was gone on return (0.30 s call), the session directory removed, no process left, `/tmp` clean. Not run on the TV: the phone's Done, the 10 minute limit, the 15 s app-gone end (every session was kept alive by polling), the 180 s idle end, a parse error from a LAN host.
+- **P15:** no listener before the first session or after the last (24 listening sockets on the TV, as before); no token in `/proc/*/cmdline`, `/proc/*/environ`, the two logs or `ps`; modes 0700 and 0600; the server's environment is `PATH`, `WEBOS_SAT_SETUP_DIR` and `WEBOS_SAT_PREFIX` only; daemon unaffected (HA connected, 38 entities, 0 WARN or ERROR). An `nmap` scan from another host was not made (the listener was read from `/proc/net/tcp`: one `0.0.0.0` IPv4 socket).
+- **Review items:** C2 (clean environment), C3 (`setup.pid` is the server), C4 (`/tmp` is `1777` root) and C5 (the heartbeat mtime moves on every `setup status`; 110 polls at 2 s, 0 failures, no session ended early) are **verified on the target**.
+- **HTTP from a PC on the LAN:** QR path `302` with the cookie flags, second use `410`, `/api/state` `403` without and `200` with the cookie and only allow-listed fields, `POST` without the CSRF header `403`, wrong `Host` `400`, foreign `Origin` `403`. **SR-03** works as designed on the target: refresh about every 5 s while polled, none for the page's silent 30 s.
+- **Not exercised:** any action (the table, the TV overlay, the answer file, restores), the phone, the app. They need the owner.
+
+### Part B: the owner's phone test (pending owner)
+
+**Status: PENDING OWNER.** Nothing below has been done. Nothing is left running on c3-a: the setup server only starts when you press the button in the app.
+
+**Before you start:** the TV is on 0.4.0 (the redesigned app and the phone setup are in this package). Your phone must be on the **same Wi-Fi or LAN as the TV** (not the guest network or another VLAN; a PC on the same LAN reached it, a phone on Wi-Fi is untested). A session lasts at most 10 minutes. Whoever scans the code first owns the session. No sound is played. Nothing needs to be restored except the settings you change below, and the steps put each one back.
+
+1. **Open the app** on the TV (the "Voice satellite" app in the launcher). Look at **Home**: the Home Assistant card should read **Connected**.
+2. Go to **Home Assistant** and choose **Set up with your phone**. A QR code should appear within about 2 to 4 seconds (first it says it is starting). Note the time it took.
+3. **Scan the code with the phone's camera app.** Note the phone model, OS and browser. What to look for: a "not secure" or HTTPS-first warning (the page is plain HTTP on the LAN by design; if the browser refuses, note the wording), whether the page loads, and that the TV changes to **"Phone <address> connected"** with the code greyed out.
+4. **View status:** the page's cards should fill in within a few seconds (a first moment of "reading" is normal). Compare them with the TV's own **Voice and power** screen: Always Ready, LG hands-free, "when the TV is turned off with the remote", the microphone, the reply volume and the Home Assistant connection. Anything wrong, missing or cut off on the phone's screen is a finding.
+5. **Keep listening on, then off, with OK:** on the phone, choose the "Keep listening" option for "when the TV is turned off with the remote" and send it. On the TV an **overlay** should appear within about 1 to 2 seconds: "Phone <address> wants to: ...". Press **OK** on the remote (OK is ignored for the first 0.7 s on purpose). The phone should show that it was applied, and the TV a result line. Then send the opposite choice (turn it off again, "normal") and allow it with **OK**. Do **not** press the power key.
+6. **Refuse one request with Back:** send any request again (for example Keep listening) and press **Back** on the remote. The phone should say it was refused and nothing should change. Check that Back did not leave the screen under the overlay.
+7. **Microphone off from the phone, then on with OK:** choose microphone **off** on the phone: it should happen **without** an overlay (the TV shows a short notice, "Microphone turned off from the phone."), and the TV app, and Home Assistant's "Microphone muted" and "Listening" sensors, should show it. Then choose microphone **on**: the overlay appears, press **OK**; everything should show listening again. **Leave the microphone on.**
+8. **End the session:** press **Done** on the phone (or on the TV). The phone should say the session ended, the TV should show it ended, and opening the old QR link again must not work.
+
+**What to look for in general:** how long each overlay took to appear after you tapped on the phone; which remote keys work (OK, Back, the arrows, the Magic Remote pointer) and whether the focus starts on **Allow**; whether the page copy is understandable; any moment when the TV or the phone shows a raw error; whether the TV app's poll made the picture or the sound stutter (it should not). Optional extras: the "Add to Home Assistant" copy button on plain HTTP, and closing the app while a session is open (the session should end within about 15 s with "this app stopped answering").
+
+**Report back:** the phone model, OS and browser; anything from the list above that differed; and whether you accept the release gate (the review and the on-target checks are recorded in [the security review](../security/setup-server-review.md) and the [0.4.0 record](../discovery/c3-a/P4-permanent-install.md)).
+
+**Possible blockers (agent's reading):** (1) if the phone is on a network that cannot reach the TV, the page will not load and the TV shows its hint after 45 s (the same-LAN PC test cannot rule out Wi-Fi client isolation between two Wi-Fi devices); (2) the TV is the owner's active display, so opening the app takes over the screen; (3) the first scanner wins, so do not share the QR picture.
+
 ## Rollback and cleanup
 
 - Nothing on the TV was changed: no rule, no service, no setting, no package. The listeners were stopped (no socket on the test ports afterwards), the `sleep 299` was killed (none left), `/tmp/exp012/` and `/tmp/exp012-listen.py` removed, the satellite stayed up with the same pid.
@@ -183,7 +215,7 @@ CPU of the whole chain, 10 ms ticks over a 45 s run, one core = 100 percent (the
 ## Follow-ups / unresolved questions
 
 1. **Part B** with the owner and a phone: the QR scan, the page, cookies on plain HTTP, the real remote's key codes 13 and 461, the `Host` check, a phone on another VLAN or the guest network, `navigator.userAgent` in the app, timers while the app is hidden. Needs the built server and the redesigned app.
-2. P8 and P10 with the built `webos-satellite-setup` (RSS, CPU, descriptor limits, `0.0.0.0` against the Wi-Fi address).
+2. P10 (`0.0.0.0` against the Wi-Fi address) and P8's request-rate load with the built `webos-satellite-setup` (the idle RSS and CPU are recorded in Part B above).
 3. Survival of a detached process when the app is closed, the HBC service restarts, and the TV goes to `Screen Off` or `Active Standby` (not tested: the TV is the owner's active display).
 4. Repeat P1 to P4 on c3-b (read only) if the owner agrees; c3-b may be on Ethernet and have a different default route.
 5. Cold start cost of the HBC service after an idle exit (about 3.5 s in the earlier record, not remeasured here).

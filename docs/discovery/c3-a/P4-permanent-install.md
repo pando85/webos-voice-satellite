@@ -195,6 +195,78 @@ Left changed: on the TV only the new version (app directory, `/var/lib/webos-sat
 
 **Left changed:** on the TV the new version (app directory, `/var/lib/webos-satellite/bin`, `VERSION`, `package.sums`, hook with the same content, rotated log) and a new **`etc/reply_volume` holding `40`** (the reload test wrote it; before, none was stored and the daemon used the config default of 40, so the effective value is the same). `etc/tv-settings.log` gained two `reply-volume` result lines. Always Ready, Hi LG, remote off, volume 89, mute, input and power state were not touched. `/tmp` holds none of our files. HA access: a short-lived token in a 0600 file, shredded afterwards; the one refresh token created by this session was deleted over the websocket by its own id (the access token was rejected afterwards); no other token touched, no HA configuration change. Rollback: install the 0.3.0 ipk the same way and run `ctl.sh install` (to remove the stored reply volume: delete `etc/reply_volume`).
 
+## Update to 0.4.0 (2026-11-05, release candidate with the phone setup server)
+
+- **Approval:** the owner (2026-11-05): put the 0.4.0 release candidate, with the phone setup server, on c3-a only (the owner's active PC display; c3-b not touched), run the on-target part of the security review gate, and leave the phone test to the owner. Rules kept: no sound, no TV reboot, no screen, input, app, power, LG setting or TV-volume change, **the app was not opened or launched**, no ASoC or debugfs read, no `apiadapter/system/getSystemInfo`, no real action posted to the setup server (no request that changes the TV), no Home Assistant configuration change.
+- **Package:** `0.4.0` (commits `b102475` review fixes, `037cc07` "version 0.4.0"), `make build-tv-all` (setup server: armv7 612,596 bytes, aarch64 590,672 bytes, stripped static musl), `make ipk` with `--require-setup` (check passed: "36 entries, payload 18 files, with the setup server"; sha256 `3aed9b11...`, 4.61 MB). Installed as in 0.3.1: `scp`, `tv/appinstall.sh install` (the Homebrew Channel path, `appinstall: install done`), then `ctl.sh install` (daemon and supervisor stopped, aarch64 build, "phone setup server: the aarch64 build", "keeping etc/config.toml", hook refreshed, started again; the whole update took about 2 s). Host checks before the build: `cargo test --workspace` 663 passed (counted from the result lines), clippy `-D warnings`, fmt, `make test-packaging` (including the new `tests/no_self_stop.py` check and the `env -i` checks in `tests/setup.sh`, and the app smoke test with the 700 ms guard), `python3 tools/check_docs.py`.
+- **Daemon code is unchanged since 0.3.1** (`git diff 0.3.1..0.4.0` touches only `crates/setup-server`, `ctl.sh`, the app, tests and docs), so any CPU difference to 0.3.1 comes from the TV's state, not from the daemon.
+
+### The daemon
+
+| Check | Result | Label |
+| --- | --- | --- |
+| Version and state kept | `ctl.sh status`: package, installed and running `0.4.0 (aarch64-unknown-linux-musl)`; `etc/config.toml` and `etc/noise_psk` sha256 prefixes equal before and after (`397af7a9b282`, `3f4ab1329e90`); start at boot on; firmware "verified"; HA reconnected 3.5 s after the start with the stored key (key `fixed`) | verified-on-target |
+| Startup log | Same lines as 0.3.1: `tv_control: ready (power state Active; volume=ok mute=ok input=ok apps=ok lg_always_ready=ok lg_hands_free=ok)`, microphone open, three subscriptions, HA connected, streaming to the wake word stage, `self-check: passed (peak -55 dBFS)`; **0 WARN or ERROR lines** in the new instance (checked again after all the tests below); `dmesg` (tail and grep for oops, BUG, panic, call trace): none; `tainted` stays `4097` | verified-on-target |
+| HA entities | 38 ESPHome entities for `lg-c3-a`, the same ids as before; every state equal before, after the start and after all the tests, apart from the self-check text (`passed (peak -54 dBFS)` to `-55`, re-run at the start). TV media player `on`, volume 89, mute off, input HDMI 1 as before | verified-on-target |
+| Resources (daemon, power state **`Active`**, the log shows the usual `Request Screen Saver` and `Screen On` pair every 3 min) | 495 ticks in 311.6 s: **1.59 % of one core**. RSS 1800 kB at the start, 1776 kB at the end (VmHWM 1876 kB), 6 threads, 15 descriptors | verified-on-target |
+| Answer to the open 0.3.1 question | 0.3.0 in `Active`: 1.62 %; 0.3.1 in `Screen Saver`: 2.2 % (2.20 % in a quiet window); 0.4.0 in `Active`: **1.59 %**. The daemon code is the same in 0.3.1 and 0.4.0, so the higher figure of 0.3.1 came from the power state (or from noise between runs), not from a change in the daemon. A same-version run in `Screen Saver` and in `Active` was not made, so "state, not code" rests on the code being unchanged | verified-on-target (figures); the cause is a conclusion from the unchanged code |
+
+### The phone setup server on the TV (EXP-012 Part B, TV side; the phone test is pending the owner)
+
+Two sessions were run through the Homebrew Channel `exec` path exactly as the app does (`luna-send ... luna://org.webosbrew.hbchannel.service/exec` with `sh '<app dir>/payload/ctl.sh' setup start 2>&1`, from a script run with `ssh -tt`), each ended with `setup stop` through the same path, plus a third short one that only read the listener. The scripts ran from `/tmp` and removed themselves; the one-time path was never printed and the searches below took it from a 0600 file.
+
+| Item | Result | Label |
+| --- | --- | --- |
+| C4: `/tmp` | mode `1777`, owner `root` (before any session). The server's parent-directory check (SR-02) therefore passes; the server started | verified-on-target |
+| `setup start` | `returnValue true`; first call after an idle HBC service **3.20 s**, second run **1.49 s**; one JSON line, state `waiting`, `expires_in_s` 599, a port and a path of the shape `/s/<43 characters>`; no session before | verified-on-target |
+| C3: `setup.pid` | the server's **own** pid: `/proc/<pid>/cmdline` is `/var/lib/webos-satellite/bin/webos-satellite-setup --ctl /var/lib/webos-satellite/bin/ctl.sh`, `exe` the same binary, `ppid` 1, its own session and process group (`setsid` did not fork; `env` exec'd, so `$!` is the server); `uid` 0; one process names the server | verified-on-target |
+| C2: environment of the server | `/proc/<pid>/environ` holds exactly three variables, `PATH=/usr/sbin:/usr/bin:/sbin:/bin`, `WEBOS_SAT_SETUP_DIR` and `WEBOS_SAT_PREFIX`; nothing from the exec caller | verified-on-target |
+| Descriptors | 5: `/dev/null`, the log file three times (stdout, stderr and the log's own handle) and the listening socket | verified-on-target |
+| Listener | `/proc/net/tcp`: one new LISTEN socket `00000000:<port>` (**0.0.0.0**, IPv4 only, nothing in `tcp6`); the number of listening sockets on the TV went from 24 to 25 during the session and back to 24 after. (`netstat -p` and `ps -o` are not usable on this busybox; `/proc` was read instead.) | verified-on-target |
+| Files | `/tmp/webos-satellite-setup/` mode 0700 root; `heartbeat`, `setup.pid`, `state.json` mode 0600 (and `stop` or `answer.json` only when used) | verified-on-target |
+| No token in `ps`, logs, argv or environ | searched with the token read from a file (`grep -F -f`, so that the search itself does not carry it): **0** of all `/proc/*/cmdline` and `/proc/*/environ`; **0** matches in `log/setup.log` and `log/webos-satellite.log`; in the session directory only `state.json` holds it (as designed, until it is used); `ps w`: 0. The server's log shows only fixed event words and the peer address (`session start port=...`, `rejected host peer=...`, `request GET api-state status=200 peer=...`, `session end reason=done`) | verified-on-target (for these places) |
+| C5: heartbeat | `setup status --json` through `exec` changes the heartbeat mtime on every call (a truncating `: >heartbeat`; two calls 1 s apart: mtimes 09:36:58 then 09:36:59, and 09:39:24 then 09:39:25). Polling every 2 s for 60 and 50 polls (125 s and 105 s): **0 failed calls, the session stayed alive far beyond 15 s**, states seen `waiting` then `active`, never `ended` | verified-on-target |
+| `setup status --json` latency through `exec` | **50 / 60 / 90 ms** (min / median / max) over 110 polls | verified-on-target |
+| `setup stop` | `returnValue true`, **0.30 s** both times; on return the listener was gone, the session directory removed, the pid dead, no process naming the server; `/tmp` holds none of our files | verified-on-target |
+
+From the PC (a wired host on the same LAN /24 as the TV; the "other client" is the same PC without the cookie, as a second device was not available), against the real server:
+
+| Request | Result | Label |
+| --- | --- | --- |
+| `GET` the QR path | `302 Found`, `Location: /`, `Set-Cookie: sat_session=...; Path=/; HttpOnly; SameSite=Strict; Max-Age=594`, `Cache-Control: no-store`, `Referrer-Policy: no-referrer` | verified-on-target |
+| `GET` the same path again, no cookie | `410 Gone`, the "link used" page | verified-on-target |
+| `GET /api/state` without the cookie | `403 Forbidden` | verified-on-target |
+| `GET /api/state` with the cookie | `200`, `application/json`. Keys: `age_s`, `device`, `errors`, `pending`, `schema`, `tv`. `device`: `ha` (`state`, `since_s` only), `installed`, `installed_version`, `key`, `pairing`, `pairing_window_s`, `port` (the satellite's API port 6053), `reply_volume`, `reply_volume_default`, `running`. `tv`: `always_ready`, `hi_lg`, `last_change`, `luna`, `mic`, `power_state`, `remote_off`. **No** IPv4 literal, no token, no `prefix`, `name`, `log`, `pid`, `uid`, `firmware`, `path`, `csrf` or `cookie` in the body (checked by key and by a regular expression). The very first answer, about 1 s after the token, has `device` and `tv` `null` and `age_s` `null` while the first refresh runs; the next poll had them (first `age_s` 0.4) | verified-on-target |
+| `POST /api/actions` **without** `X-Setup-CSRF` (cookie and `Origin` right, body an unknown action, so nothing could run) | `403 {"error":"csrf",...}` | verified-on-target |
+| The same with the CSRF token (control; unknown action) | `400 bad_request` (nothing ran) | verified-on-target |
+| `GET /api/state` with `Host: evil.example` | `400 bad_host` | verified-on-target |
+| `GET /api/state` with `Origin: http://evil.example` | `403` | verified-on-target |
+| The session after those refusals | still served (`200`); the refusals use 4 of the budget of 20 | verified-on-target |
+
+No real action was posted (no `set ...`, `mic` or `pair` ran on the TV), so the confirmation overlay, the answer file, the action table and the TV app's side were **not** exercised here.
+
+**SR-03 on the TV** (page polling every 3 s like the phone page, then silent, then one request):
+
+| Phase | Result | Label |
+| --- | --- | --- |
+| Page polling every 3 s, 30 s | `age_s` cycles 0.4, 3.4, 0.7, 3.7, 1.1, 4.1, 1.5, 4.5, 1.8, 4.8: a refresh about every 5 s, as designed | verified-on-target |
+| Page silent for 30 s (only the app's heartbeat polls through `exec` go on) | the first `/api/state` after it had `age_s` **26.9**: one last refresh ran within the 10 s window after the last poll, then none; 7 s after that request `age_s` was 0.8, so a poll starts the refresh again | verified-on-target |
+
+**Cost of a session (item 4, `Active`):**
+
+| Measurement | Result | Label |
+| --- | --- | --- |
+| Server, waiting and then active, nobody polling `/api/state`, the app's poll through `exec` every 2 s | 15 ticks in 125.3 s (**0.12 % of one core**) and 16 in 104.6 s (0.15 %); RSS 304 to 328 kB at the start, **424 to 448 kB** at the end (VmHWM equal); 2 threads | verified-on-target |
+| Server with the page polling every 3 s | 6 ticks in 30.3 s (**0.20 %**), RSS 436 kB | verified-on-target |
+| Server with the page silent | 3 ticks in 30.1 s (0.10 %) | verified-on-target |
+| Daemon during the polled runs | 207 ticks in 125.3 s (1.65 %) and 179 in 104.6 s (1.71 %), against 1.59 % quiet: inside the noise | verified-on-target |
+| HBC service (node) during the 2 s polls | 67 ticks in 104.6 s (**0.64 % of one core**); the rest of the exec chain (`ls-hubd`, `luna-send` children) was not measured here; EXP-012 P7 measured the whole chain for a light command at 3.8 % of a core at 0.5 Hz | verified-on-target (node only) |
+| HA and the daemon during the sessions | 38 entities unchanged; `ha.state` `connected` with `since_s` about 500 in the second session (no reconnect since the start); 0 WARN or ERROR in the daemon log | verified-on-target |
+
+**Left changed:** on the TV the new version (app directory, `/var/lib/webos-satellite/bin` with `webos-satellite-setup`, `VERSION`, `package.sums`, hook with the same content, rotated log) and `log/setup.log` (about 20 lines of event words, no secret). Always Ready, Hi LG, remote off, reply volume (40), volume 89, mute, input and power state were not touched. **No session, listener or setup process is left; `/tmp` holds none of our files; the app was not opened.** HA access: a short-lived token in a 0600 file, shredded afterwards; the one refresh token created by this session was deleted over the websocket by its own id (the access token was rejected afterwards); no other token touched, no HA configuration change. Rollback: install the 0.3.1 ipk the same way (`make tv-install-ipk WITH_SETUP=0` at that commit) and run `ctl.sh install`.
+
+**Pending owner:** the phone test (open the app, scan, view status, Keep listening on and off, one refused request, microphone off and on, End session). The steps and what to look for are in [EXP-012 Part B](../../experiments/EXP-012-phone-setup-probe.md#part-b-the-owners-phone-test-pending-owner). The release gate of [phone setup, section 13.2](../../design/phone-setup.md#132-security-review-gate-backlog-3-before-the-040-release) stays open until the owner has done it and signed off.
+
 ## Home Assistant side, 2026-11-04 (no change on the TV)
 
 The owner asked for the TV control entities to be exposed to Assist: the screen switch, mute switch, turn-on button, volume number and up and down buttons, input select and app select of `lg-c3-a` are exposed to `conversation` with Spanish aliases ("tele del despacho", "televisión del despacho", "volumen de la tele del despacho" and similar), and the device was put in the HA area "Office A". Details and the c3-b equivalent: [c3-b P4](../c3-b/P4-permanent-install.md#home-assistant-side-done-with-a-short-lived-token-that-was-deleted-afterwards). No setter was called on c3-a.
@@ -207,5 +279,6 @@ The owner asked for the TV control entities to be exposed to Assist: the screen 
 ## Residual unknowns
 
 - Start at boot on c3-a with HBC 0.6.3: pending the owner's next restart. Check afterwards: `log/autostart.log` (60 s delay, "validated; starting"), `ctl.sh status`, no failsafe toast.
+- The phone test of the 0.4.0 release candidate (the app, the QR scan, the overlay with the real remote) is **pending the owner**: [EXP-012 Part B](../../experiments/EXP-012-phone-setup-probe.md#part-b-the-owners-phone-test-pending-owner).
 - The app UI on c3-a (HBC 0.6.3) was not opened, including the 0.3.0 Voice and power screen and the 0.3.1 redesign (needs the owner at the screen; the `exec` path it uses was checked from SSH). Focus, layout, key codes and the Home Assistant card on a real screen are open.
 - Replies, announcements, the "Keep listening (screen off)" mode and resume after a kernel suspend were not exercised on this unit in this session (no sound, no power-state change allowed). They are verified on c3-b only ([always-on section 13](../../design/always-on.md#13-implemented-in-the-daemon-010-and-checked-on-c3-b)).
