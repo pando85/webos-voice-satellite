@@ -1428,7 +1428,8 @@ async def scenario_music(binary: str) -> None:
 async def scenario_music_harness(binary: str) -> None:
     """The M1 helpers (media player commands, flags, formats, the fake proxies) against
     fake_device: first music off (flags 5124, one ANNOUNCEMENT format), then `--music` over
-    an encrypted session (M2). What needs the satellite fetching the URL is pending (M5)."""
+    an encrypted session (M2). What needs the satellite fetching the URL is in
+    satellite_music_e2e.py (M5, S1 to S15)."""
     print("\n== scenario P: music harness helpers (music off, then --music) ==")
     dev = Device(binary, ["--mode", "none", "--mac", "02:00:00:00:00:10"], None)
     await dev.start()
@@ -1550,9 +1551,9 @@ async def scenario_music_harness(binary: str) -> None:
         await cli.disconnect()
     finally:
         await dev.stop()
-    pending("P-music-on the satellite fetches the URLs from fake_proxy (ha-proxy slot count back to its start, ma-flow endless) and plays them",
-            "needs M3 and M5 (scenarios S1 to S15)")
-    pending("P-music-on a refused URL (ENQUEUE, plaintext) is opened and closed, freeing HA's proxy slot", "needs M5 (S13)")
+    # What needs the satellite fetching and playing the URLs (the proxy slot count back to its
+    # start, MA's endless stream, a refused ENQUEUE URL opened and closed) runs against the real
+    # daemon: satellite_music_e2e.py, scenarios S1 to S15 (M5).
 
 
 async def main() -> int:

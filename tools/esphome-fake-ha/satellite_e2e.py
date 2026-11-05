@@ -91,13 +91,18 @@ def write_mic(path: str, seconds: float) -> None:
 
 
 class Satellite:
-    def __init__(self, binary: str, config: str, log_path: str) -> None:
-        self.binary, self.config, self.log_path = binary, config, log_path
+    # Media fetches (TTS URLs, announcements, music) follow the fetch guard,
+    # which refuses loopback; the fake servers here listen on 127.0.0.1, so
+    # the daemon gets the test aid that lets 127.0.0.0/8 through (every other
+    # guard rule still applies).
+    def __init__(self, binary: str, config: str, log_path: str,
+                 extra: tuple[str, ...] = ("--test-fetch-loopback",)) -> None:
+        self.binary, self.config, self.log_path, self.extra = binary, config, log_path, extra
 
     async def start(self) -> None:
         self.log = open(self.log_path, "w")
         self.proc = await asyncio.create_subprocess_exec(
-            self.binary, "--config", self.config,
+            self.binary, "--config", self.config, *self.extra,
             stdin=asyncio.subprocess.DEVNULL, stdout=self.log, stderr=self.log,
         )
         ok = await until_true(lambda: "ESPHome API on" in self.text(), TIMEOUT)
@@ -1463,6 +1468,9 @@ async def main() -> int:
             await scenario_aec(args.binary, tmp)
             await scenario_tv_control(args.binary, tmp)
             await scenario_compat(args.binary, tmp)
+            import satellite_music_e2e  # the music scenarios S1 to S15 (M5); imports this module
+            await satellite_music_e2e.scenario_music(args.binary, tmp)
+            await satellite_music_e2e.scenario_music_off_and_plaintext(args.binary, tmp)
         except Exception as err:  # noqa: BLE001
             failed = True
             print(f"FAIL  {type(err).__name__}: {err}", flush=True)
@@ -1470,7 +1478,9 @@ async def main() -> int:
                          "satellite-nosound.log", "satellite-notimers.log", "satellite-pairing.log",
                          "satellite-pairing.log.2", "satellite-window.log", "satellite-aec.log", "satellite-tv.log",
                          "satellite-compat-ok.log", "satellite-compat-chg.log",
-                         "satellite-compat-bad.log", "satellite-compat-strict.log"):
+                         "satellite-compat-bad.log", "satellite-compat-strict.log",
+                         "satellite-music.log", "satellite-music-off.log", "satellite-music-plain.log",
+                         "satellite-music-lo.log"):
                 log = os.path.join(tmp, name)
                 if os.path.exists(log):
                     print(f"---- {name} ----")

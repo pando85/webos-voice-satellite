@@ -3,7 +3,9 @@
 # fake-HA harnesses against them:
 #   1. fake_ha.py       protocol scenarios against the fake_device example (with
 #                       the music harness helpers over fake_proxy.py, scenario P)
-#   2. satellite_e2e.py the real daemon with a file mic and the wav sink
+#   2. satellite_e2e.py the real daemon with a file mic and the wav sink (with
+#                       the music scenarios of satellite_music_e2e.py: fake_proxy
+#                       in ha-proxy and ma-flow modes, S1 to S15)
 # Usage (from anywhere): tools/esphome-fake-ha/run.sh [--device-only | --satellite-only]
 # Creates tools/esphome-fake-ha/.venv (gitignored) with aioesphomeapi==46.6.0
 # on first use. No HA, TV or network access beyond 127.0.0.1.
