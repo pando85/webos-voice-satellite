@@ -14,7 +14,7 @@ All requirements are targets until verified; see [experiments](../experiments/RE
 | F5 | Quality in real conditions | Repeatable speech recognition with TV playback and noise | pending. Mic is near-raw with no AEC/NS; echo behaviour and the SpeakerFeedback reference are untested (D4). Roadmap Phase 2 |
 | F6 | Screen-off/Always Ready mode | Daemon, audio, network and energy behavior measured separately | pending (D5 not done). Roadmap Phase 3 |
 | F7 | Secure, consented always-listening | Mute, privacy, authentication and retention model documented | pending. Safety and privacy rules exist ([discovery safety rules](../discovery/README.md#safety-rules-learned)); mute switch and a truthful listening indicator (HA entities "Listening" and "Microphone muted", driven by the real PCM state, [development](../development.md#listening-indicator)) built and PC-tested 2026-11-04, **not yet verified on a TV or in the owner's HA**; the rest of the model is open. Roadmap Phases 1.7 and 4 |
-| F8 | Music playback | Existing AirPlay/other receiver behavior validated separately | pending. Not tested ([EXP-008](../experiments/EXP-008-airplay-media.md)); backlog item |
+| F8 | Music playback | Existing AirPlay/other receiver behavior validated separately | pending. Not tested ([EXP-008](../experiments/EXP-008-airplay-media.md)); backlog item. Design proposal (2026-11-05, owner decision pending): [music playback](../design/music-playback.md), [ADR 0010](../decisions/0010-music-playback.md). The non-goal below is unchanged |
 
 **Go/no-go for MVP:** F1 + F2 + F3; F4 to complete end-to-end voice response. F6 is a crucial product goal but not a prerequisite to prove initial feasibility.
 

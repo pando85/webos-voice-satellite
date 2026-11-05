@@ -63,7 +63,7 @@ Items not in the ranked list stay in the backlog without a priority or a phase: 
 
 ## 5. Music via the TV's AirPlay 2 receiver and Music Assistant
 
-- **Status:** not prioritized (2026-11-02).
+- **Status:** not prioritized (2026-11-02). **Design proposal 2026-11-05:** [music playback](../design/music-playback.md) compares this route (option A, run [EXP-008](../experiments/EXP-008-airplay-media.md) first) with native playback in the satellite through the ESPHome `media_player` (option B, target if the owner accepts the scope), Sendspin and LG app launching; owner decision pending in [ADR 0010](../decisions/0010-music-playback.md) (Proposed).
 - **Why:** music should use the receiver the TV already ships, separate from conversational TTS ([research 06](../research/06-media.md), [EXP-008](../experiments/EXP-008-airplay-media.md)).
 - **Approach options:** Home Assistant to Music Assistant to the TV's AirPlay receiver; test coexistence with the satellite's playback path.
 - **Dependencies:** Phase 2 playback behaviour, TV input and app state handling.
