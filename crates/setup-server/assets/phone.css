@@ -1,0 +1,5 @@
+/* Placeholder style (setup server step P4; the real page is step P6). */
+:root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+main { max-width: 36rem; margin: 0 auto; padding: 1rem; }
+button { min-height: 2.75rem; margin: 0.25rem; padding: 0 1rem; font-size: 1rem; }
+pre { white-space: pre-wrap; word-break: break-word; font-size: 0.8rem; }

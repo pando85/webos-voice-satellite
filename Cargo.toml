@@ -7,6 +7,7 @@ members = [
     "crates/dsp",
     "crates/esphome-api",
     "crates/playback",
+    "crates/setup-server",
     "crates/tv-control",
 ]
 

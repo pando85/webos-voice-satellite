@@ -1616,6 +1616,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "webos-satellite-setup"
+version = "0.3.0"
+dependencies = [
+ "rustix",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "webos-tv-control"
 version = "0.3.0"
 dependencies = [

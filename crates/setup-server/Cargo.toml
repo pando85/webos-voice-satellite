@@ -1,0 +1,25 @@
+[package]
+name = "webos-satellite-setup"
+description = "webos-voice-satellite: the phone setup web server (std-only HTTP subset; ADR 0009, docs/design/phone-setup.md)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+build = "build.rs"
+
+[[bin]]
+name = "webos-satellite-setup"
+path = "src/main.rs"
+
+# Kept to the design's list (section 12): serde and serde_json (already in the
+# lock file) and rustix (workspace dependency; `net` adds the listen backlog
+# of 4, `process` the process-group kill of a hung ctl.sh). No async runtime,
+# no HTTP or TLS library.
+[dependencies]
+rustix = { workspace = true, features = ["net"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[lints]
+workspace = true
