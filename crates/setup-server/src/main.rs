@@ -16,7 +16,7 @@ mod secret;
 mod session;
 mod worker;
 
-use std::io::{Read, Write};
+use std::io::Read;
 use std::net::{Ipv4Addr, Shutdown, SocketAddr, SocketAddrV4, TcpListener, TcpStream};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -227,9 +227,8 @@ fn connection(
         Err(ReadError::Empty) => return,
         Err(ReadError::Parse(e)) => core.on_parse_error(peer, e, Instant::now()),
     };
-    let _ = stream.set_write_timeout(Some(WRITE_LIMIT));
-    let _ = stream.write_all(&resp.to_bytes());
-    let _ = stream.flush();
+    // 3 s for the whole response, not per write call (SR-01).
+    let _ = http::write_response(&mut stream, &resp.to_bytes(), Instant::now() + WRITE_LIMIT);
     let _ = stream.shutdown(Shutdown::Write);
     // Read what the client may still send (briefly), so closing does not
     // reset the connection before it read the reply.

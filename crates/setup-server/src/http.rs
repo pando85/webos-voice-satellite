@@ -8,7 +8,7 @@
 //! parser rejects rather than interprets.
 
 use std::fmt::{self, Write as _};
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
@@ -393,6 +393,50 @@ pub(crate) fn read_request<C: Conn>(
             Err(_) => return Err(fail(&buf, ParseError::Bad("io"))),
         }
     }
+}
+
+/// A connection a response is written to (a socket, or a fake in tests).
+pub(crate) trait Sink: Write {
+    fn set_write_limit(&mut self, d: Duration) -> io::Result<()>;
+}
+
+impl Sink for TcpStream {
+    fn set_write_limit(&mut self, d: Duration) -> io::Result<()> {
+        self.set_write_timeout(Some(d))
+    }
+}
+
+/// Writes the whole response before `deadline` or gives up (section 6.4: 3 s
+/// to write the response). The socket's write timeout alone limits each
+/// `write` call, not the response: a client that reads a few bytes now and
+/// then would hold the single-threaded loop (and the stop, the heartbeat and
+/// the lifetime checks) for many such calls. Security review SR-01.
+pub(crate) fn write_response<S: Sink>(
+    s: &mut S,
+    bytes: &[u8],
+    deadline: Instant,
+) -> io::Result<()> {
+    let mut off = 0;
+    while off < bytes.len() {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        s.set_write_limit(left)?;
+        match s.write(&bytes[off..]) {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(n) => off += n,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock
+                        | io::ErrorKind::TimedOut
+                        | io::ErrorKind::Interrupted
+                ) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    s.flush()
 }
 
 const CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
@@ -1091,5 +1135,65 @@ mod tests {
     fn header_values_with_control_characters_are_dropped() {
         let r = Response::empty(302).header("Location", "/\r\nX: y".to_owned());
         assert!(r.header_value("Location").is_none());
+    }
+
+    /// A client that takes `per_call` bytes per `write` and needs `delay`
+    /// for each (a slow reader behind a small TCP window).
+    struct Trickle {
+        out: Vec<u8>,
+        per_call: usize,
+        delay: Duration,
+        limits: Vec<Duration>,
+    }
+
+    impl Write for Trickle {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            std::thread::sleep(self.delay);
+            let n = buf.len().min(self.per_call);
+            self.out.extend_from_slice(&buf[..n]);
+            Ok(n)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Sink for Trickle {
+        fn set_write_limit(&mut self, d: Duration) -> io::Result<()> {
+            self.limits.push(d);
+            Ok(())
+        }
+    }
+
+    /// SR-01: the write limit covers the whole response, not each call.
+    #[test]
+    fn a_slow_reader_cannot_hold_the_loop_past_the_write_deadline() {
+        let body = vec![b'x'; 64 * 1024];
+        let mut slow = Trickle {
+            out: Vec::new(),
+            per_call: 16,
+            delay: Duration::from_millis(2),
+            limits: Vec::new(),
+        };
+        let start = Instant::now();
+        let r = write_response(&mut slow, &body, deadline(150));
+        let took = start.elapsed();
+        assert_eq!(r.map_err(|e| e.kind()), Err(io::ErrorKind::TimedOut));
+        // Each call made progress, so a per-call timeout alone would have
+        // taken 4096 calls (over 8 s here).
+        assert!(took < Duration::from_secs(2), "{took:?}");
+        assert!(slow.out.len() < body.len());
+        // The socket limit shrinks with the time left.
+        assert!(slow.limits.windows(2).all(|w| w[1] <= w[0]));
+        assert!(slow.limits.iter().all(|d| *d <= Duration::from_millis(150)));
+
+        let mut fast = Trickle {
+            out: Vec::new(),
+            per_call: 4096,
+            delay: Duration::ZERO,
+            limits: Vec::new(),
+        };
+        write_response(&mut fast, &body, deadline(3000)).expect("written");
+        assert_eq!(fast.out, body);
     }
 }

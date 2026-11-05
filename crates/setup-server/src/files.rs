@@ -30,6 +30,8 @@ pub(crate) enum DirError {
     Io(io::Error),
     NotADirectory,
     WrongOwner,
+    /// A directory above it that another user could change (SR-02).
+    UnsafeParent(PathBuf),
 }
 
 impl std::fmt::Display for DirError {
@@ -38,6 +40,11 @@ impl std::fmt::Display for DirError {
             DirError::Io(e) => write!(f, "{e}"),
             DirError::NotADirectory => f.write_str("not a directory (or a symbolic link)"),
             DirError::WrongOwner => f.write_str("owned by another user"),
+            DirError::UnsafeParent(p) => write!(
+                f,
+                "{} is owned by another user, or writable by others without the sticky bit",
+                p.display()
+            ),
         }
     }
 }
@@ -47,6 +54,7 @@ impl Dir {
     /// when it is a real directory owned by this user (then forced to 0700);
     /// removes stale `answer.json`, `stop` and temporary files.
     pub(crate) fn prepare(path: &Path) -> Result<Self, DirError> {
+        ancestors_safe(path, rustix::process::geteuid().as_raw())?;
         match fs::symlink_metadata(path) {
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 DirBuilder::new()
@@ -130,6 +138,32 @@ impl Dir {
         let _ = fs::remove_file(&path);
         answer.map_or(Taken::Invalid, Taken::Answer)
     }
+}
+
+/// Every directory above the session directory (after resolving symbolic
+/// links) must be owned by root or by this user, and when others may write
+/// to it, carry the sticky bit (`/tmp` is 1777). Otherwise another user
+/// could rename the session directory away, between the checks of
+/// [`Dir::prepare`] or later, and put their own directory or a symbolic link
+/// in its place: the root server would then chmod a target of their choice
+/// and write the one-time token into their directory. Security review SR-02;
+/// the server fails closed.
+fn ancestors_safe(path: &Path, euid: u32) -> Result<(), DirError> {
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => return Err(DirError::UnsafeParent(path.to_owned())),
+    };
+    let real = fs::canonicalize(parent).map_err(DirError::Io)?;
+    for a in real.ancestors() {
+        let md = fs::metadata(a).map_err(DirError::Io)?;
+        let owner_ok = md.uid() == 0 || md.uid() == euid;
+        let shared = md.mode() & 0o022 != 0;
+        let sticky = md.mode() & 0o1000 != 0;
+        if !owner_ok || (shared && !sticky) {
+            return Err(DirError::UnsafeParent(a.to_owned()));
+        }
+    }
+    Ok(())
 }
 
 /// What [`Dir::take_answer`] found.
@@ -260,6 +294,47 @@ pub(crate) mod tests {
         assert!(matches!(Dir::prepare(&p), Err(DirError::NotADirectory)));
         let _ = fs::remove_file(&p);
         let _ = fs::remove_dir_all(&target);
+    }
+
+    /// SR-02: a parent that other users can write to without the sticky bit
+    /// is refused before anything is created in it; 1777 (like `/tmp`) and
+    /// 0755 are accepted.
+    #[test]
+    fn a_parent_writable_by_others_without_sticky_is_refused() {
+        let parent = scratch("parent");
+        fs::create_dir(&parent).expect("mkdir");
+        let p = parent.join("setup");
+        for mode in [0o777, 0o775, 0o757] {
+            fs::set_permissions(&parent, fs::Permissions::from_mode(mode)).expect("chmod");
+            assert!(
+                matches!(Dir::prepare(&p), Err(DirError::UnsafeParent(ref a)) if *a == fs::canonicalize(&parent).expect("canon")),
+                "{mode:o}"
+            );
+            assert!(!p.exists(), "{mode:o}: nothing may be created");
+        }
+        for mode in [0o1777, 0o755, 0o700] {
+            fs::set_permissions(&parent, fs::Permissions::from_mode(mode)).expect("chmod");
+            Dir::prepare(&p).unwrap_or_else(|e| panic!("{mode:o}: {e}"));
+            fs::remove_dir(&p).expect("rmdir");
+        }
+        // Through a symbolic link, the real directory is the one checked.
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o777)).expect("chmod");
+        let link = scratch("parent-link");
+        std::os::unix::fs::symlink(&parent, &link).expect("symlink");
+        assert!(matches!(
+            Dir::prepare(&link.join("setup")),
+            Err(DirError::UnsafeParent(_))
+        ));
+        // Another owner (here: a uid that is neither root nor this user).
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o755)).expect("chmod");
+        assert!(
+            matches!(
+                ancestors_safe(&p, u32::MAX - 1),
+                Err(DirError::UnsafeParent(_))
+            ) || rustix::process::geteuid().is_root()
+        );
+        let _ = fs::remove_file(&link);
+        let _ = fs::remove_dir_all(&parent);
     }
 
     #[test]
