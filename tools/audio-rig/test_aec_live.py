@@ -569,6 +569,45 @@ class Conversion(unittest.TestCase):
         self.assertAlmostEqual(p[("Q", "DEFAULT")]["p"], 0.344, places=3)
 
 
+class LiveRunHelpers(unittest.TestCase):
+    def test_prior_runs_keeps_the_armed_run_out(self):
+        # the newest run is the armed wake word run: a detection continues it, so it must not count as seen
+        runs = [{"pipeline_run_id": "a", "timestamp": "2026-11-05T13:00:00"},
+                {"pipeline_run_id": "c", "timestamp": "2026-11-05T13:02:00"},
+                {"pipeline_run_id": "b", "timestamp": "2026-11-05T13:01:00"}]
+        self.assertEqual(ab.prior_runs(runs), {"a", "b"})
+        self.assertEqual(ab.prior_runs([]), set())
+
+    def test_collect_log_keeps_lines_across_rotations(self):
+        w1 = ("2026-11-05T11:41:47.262Z DEBUG aec: last 60 s: delay 16.5 ms (confidence 11), ERLE 9.8 dB "
+              "(sonora n/a dB) over 4000 active-reference frames, sonora 400 us/frame mean 9000 max "
+              "(4.00 % of a core), bypassed 0/6000 frames, reference underruns 0")
+        w2 = w1.replace("11:41:47", "11:42:47")
+        served = [[w1, "2026-11-05T11:41:50Z INFO  config: name=secret-host x", "noise"], [w2]]
+
+        class T:
+            def aec_log_lines(self):
+                return served.pop(0)
+        with tempfile.TemporaryDirectory() as d:
+            ctx = ab.Ctx()
+            ctx.out, ctx.tv = Path(d), T()
+            ab.collect_log(ctx)
+            ab.collect_log(ctx)     # the first lines have rotated away by now
+            text = (Path(d) / "tvlog-aec.txt").read_text()
+        self.assertIn(w1, text)
+        self.assertIn(w2, text)
+        self.assertNotIn("secret-host", text)
+        self.assertNotIn("noise", text)
+        self.assertEqual(len([e for e in L.parse_aec_lines(text) if e["kind"] == "window"]), 2)
+
+    def test_log_reads_include_the_rotated_file(self):
+        run = FakeRun()
+        tv = ab.Tv("root@tv", run=run)
+        tv.log_entries(10)
+        tv.aec_log_lines()
+        self.assertTrue(all("webos-satellite.log.1" in c for c in run.calls))
+
+
 class Stats(unittest.TestCase):
     def test_mcnemar_exact(self):
         self.assertEqual(L.mcnemar_exact(0, 0), 1.0)

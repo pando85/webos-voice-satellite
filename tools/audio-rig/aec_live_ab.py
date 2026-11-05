@@ -45,6 +45,7 @@ import aec_live_lib as L
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
 SSH_OPTS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "LogLevel=ERROR"]
+AEC_LOG_RE = r"aec:|capture:|streaming mic|config: name"
 
 
 def sh(cmd, input_bytes=None, timeout=120):
@@ -116,8 +117,14 @@ class Tv:
         self.ssh(f"sh {self.ctl} stop 2>&1 | tail -2", timeout=60)
 
     def log_entries(self, tail=6000):
-        rc, out = self.ssh(f"tail -n {tail} {self.log}", timeout=60)
+        # the daemon rotates its log (about 256 KB, under 20 min at debug level): read the rotated file too
+        rc, out = self.ssh(f"cat {self.log}.1 {self.log} 2>/dev/null | tail -n {tail}", timeout=60)
         return L.parse_aec_lines(out.decode(errors="replace")), out.decode(errors="replace")
+
+    def aec_log_lines(self):
+        """The `aec:` / `capture:` / streaming / config lines of the current and the rotated log."""
+        rc, out = self.ssh(f"cat {self.log}.1 {self.log} 2>/dev/null | grep -E '{AEC_LOG_RE}'", timeout=60)
+        return out.decode(errors="replace").splitlines()
 
     def wait_streaming(self, t_restart, timeout=90):
         end = time.monotonic() + timeout
@@ -283,6 +290,15 @@ def tv_arm_apply(ctx, arm):
     return t
 
 
+def prior_runs(runs):
+    """Run ids to ignore when looking for the trial's run: every listed run except the newest, which is
+    the armed wake word run (wait_ready checked it) that a detection continues into STT."""
+    if not runs:
+        return set()
+    newest = max(runs, key=lambda r: r.get("timestamp", ""))
+    return {r["pipeline_run_id"] for r in runs if r is not newest}
+
+
 async def run_trial(ctx, item, blk):
     """One played item. Returns the raw trial record (see aec_live_lib.trial_row)."""
     pr = ctx.p2r
@@ -294,7 +310,7 @@ async def run_trial(ctx, item, blk):
         rec.update(valid=False, t_play=time.time(), lead_s=tm["lead_s"], sink_latency_s=tm["sink_latency_s"])
         rec["notes"].append("satellite_not_ready")
         return rec
-    seen = ctx.seen | {r["pipeline_run_id"] for r in await ctx.ha.pipeline_runs(ctx.pid)}
+    seen = ctx.seen | prior_runs(await ctx.ha.pipeline_runs(ctx.pid))
     ctx.seen = seen
     sf, np = ctx.sf, ctx.np
     x, sr = sf.read(str(Path(a.corpus) / item["file_48k_stereo"]), dtype="float64", always_2d=True)
@@ -429,20 +445,38 @@ async def run_ab(ctx):
         ctx.block_recs[blk["index"]] = brec
         ctx.blocks_f.write(json.dumps(brec) + "\n")
         ctx.blocks_f.flush()
+        try:
+            collect_log(ctx)        # before the log rotates the block's `aec:` lines away
+        except Exception as e:
+            log(f"could not fetch the TV log after block {blk['index']}: {e}")
     ctx.content.stop()
+
+
+def collect_log(ctx):
+    """Add the TV log's new `aec:` / `capture:` / streaming lines to tvlog-aec.txt (kept across rotations)."""
+    out = Path(ctx.out) / "tvlog-aec.txt"
+    if not hasattr(ctx, "log_lines"):
+        ctx.log_lines = out.read_text().splitlines() if out.exists() else []
+    have = set(ctx.log_lines)
+    for l in ctx.tv.aec_log_lines():
+        if not re.search(AEC_LOG_RE, l):
+            continue
+        l = re.sub(r"config: name=\S+.*", "config: (redacted)", l)
+        if l not in have:
+            have.add(l)
+            ctx.log_lines.append(l)
+    out.write_text("\n".join(ctx.log_lines) + "\n")
+    return ctx.log_lines
 
 
 def finalize_outputs(ctx):
     """tvlog-aec.txt, trials.csv and blocks.csv from what was recorded (safe to call more than once)."""
     out = Path(ctx.out)
     try:
-        ents, raw = ctx.tv.log_entries(20000)
-        keep = [l for l in raw.splitlines() if re.search(r"aec:|capture:|streaming mic|config: name", l)]
-        keep = [re.sub(r"config: name=\S+.*", "config: (redacted)", l) for l in keep]
-        (out / "tvlog-aec.txt").write_text("\n".join(keep) + "\n")
+        collect_log(ctx)
     except Exception as e:
         log(f"could not fetch the TV log: {e}")
-        ents = L.parse_aec_lines((out / "tvlog-aec.txt").read_text()) if (out / "tvlog-aec.txt").exists() else []
+    ents = L.parse_aec_lines((out / "tvlog-aec.txt").read_text()) if (out / "tvlog-aec.txt").exists() else []
     rebuild_csv(ctx.plan, ctx.run_id, out, ents, ctx.skew)
 
 
@@ -739,7 +773,9 @@ async def live(a, plan):
         log(f"error: {type(e).__name__}: {e}; restoring")
         failures.append(f"{type(e).__name__}: {e}")
     finally:
-        signal.signal(signal.SIGINT, signal.SIG_IGN)   # a second Ctrl-C must not abort the restore
+        # a second Ctrl-C or SIGTERM must not abort the restore (EXP-020: a repeated SIGTERM did)
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
         if ctx.ha:
             try:
                 await ctx.ha.__aexit__(None, None, None)
@@ -752,6 +788,7 @@ async def live(a, plan):
                 log(f"could not write the CSV ({e}); rebuild with --rebuild")
         failures += restore_all(ctx, orig, orig_cfg)
         signal.signal(signal.SIGINT, signal.default_int_handler)
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
     if a.public_csv and (out / "trials.csv").exists():
         Path(a.public_csv).write_bytes((out / "trials.csv").read_bytes())
         log(f"trials.csv copied to {a.public_csv}: check it, then commit")
