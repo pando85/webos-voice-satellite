@@ -45,7 +45,7 @@ Use the optional [REA reverse-engineering tool](https://github.com/morluto/rea) 
 - Keep capture, preprocessing/AEC, activation, Assist transport, playback, power lifecycle, and media control separable.
 - Prefer stable public interfaces. Never hard-code `hw:1,0`, private Luna endpoints, model names, or ALSA indexes as universal truths.
 - Home Assistant owns STT/conversation/TTS in MVP. Wake word runs server-side (HA openWakeWord) for the MVP per [ADR 0003](docs/decisions/0003-server-side-wake-word-for-mvp.md); on-TV wake word is a later improvement.
-- Existing TV AirPlay receiver / Music Assistant is a **candidate for music**, not the path for conversational TTS.
+- Music playback is native in the satellite's ESPHome media player (HA and Music Assistant `play_media`), per [ADR 0010](docs/decisions/0010-music-playback.md); the TV's AirPlay receiver is not used.
 - Don't invent unverified API calls, provider behavior, latency, audio channels, or wake-word compatibility.
 
 ## Deliverables and quality gates
