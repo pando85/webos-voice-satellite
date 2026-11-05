@@ -419,6 +419,8 @@ What the phone page shows, in this order (all text in the page, English):
 5. **Step text for the flow after the link:** "Host: [copy] 192.168.1.50 Port: [copy] 6053. With Home Assistant 2026.9 or newer no key is needed while the window is open; Home Assistant stores the key itself." (the existing app text, [packaging](packaging.md)).
 6. **Done detection:** the page polls `/api/state`; when `key` becomes `paired` it shows "Paired with Home Assistant". It cannot know that the HA entry is configured otherwise (no HA data is read).
 
+**Verified on c3-b (EXP-013, 2026-11-05):** deleting the old entry in Home Assistant while it is connected clears the key on the TV, and adding the TV again with host and port gives the new entry the same device (area, name), entity ids, Assist exposure and aliases as before (Home Assistant restores them for entities and devices deleted within 30 days; the 30-day limit itself is documented, not tested). Not verified: the wording seen by the owner and the My Home Assistant link of 4a.
+
 Not offered: a second route that types the key, an HA URL field, an "open my HA" link built from a typed URL, and mDNS (`mdns = false` by default).
 
 ## 11. Static assets and the shared string tables
