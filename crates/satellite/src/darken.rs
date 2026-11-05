@@ -398,6 +398,9 @@ impl Darkener {
 
 /// Object id of the HA select.
 pub(crate) const SELECT_OBJECT_ID: &str = "remote_power_off";
+/// Trigger file (in the report directory) that `ctl.sh set remote-off` creates
+/// after writing the mode file: the daemon reloads the mode.
+pub(crate) const RELOAD_TRIGGER: &str = "remote-off-reload";
 /// Its name in HA.
 pub(crate) const SELECT_NAME: &str = "When the TV is turned off with the remote";
 /// Option for [`RemoteOff::Normal`].

@@ -31,6 +31,7 @@ mod selftest;
 mod testutil;
 mod tv_control;
 mod verified;
+mod voice_status;
 mod volume;
 mod watchdog;
 

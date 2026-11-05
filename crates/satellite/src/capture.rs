@@ -93,6 +93,10 @@ pub(crate) struct Shared {
     /// Re-run the microphone self-check (HA button, `ctl.sh selfcheck`, a
     /// firmware change): set by the daemon, taken by the capture thread.
     pub(crate) selfcheck_rerun: AtomicBool,
+    /// The last open failed because another process holds the PCM (LG
+    /// hands-free); cleared by an open, a gate or the thread's end. Only for
+    /// `run/voice.json`.
+    pub(crate) mic_busy: AtomicBool,
 }
 
 /// What the capture thread needs from the configuration.
@@ -661,6 +665,7 @@ fn run(
                 }
             }
             // Not inside `pump`, so the PCM is closed here.
+            shared.mic_busy.store(false, Ordering::Relaxed);
             ind.listening(false);
             ind.muted(true);
             if idle_reason != Some(why) {
@@ -695,6 +700,9 @@ fn run(
         let src = match open_source(cfg) {
             Ok(src) => src,
             Err(e) => {
+                shared
+                    .mic_busy
+                    .store(matches!(e, CaptureError::MicBusy), Ordering::Relaxed);
                 if let Some(g) = glue.as_mut() {
                     g.open_failed(matches!(e, CaptureError::MicBusy), shared);
                 }
@@ -722,6 +730,7 @@ fn run(
                 continue;
             }
         };
+        shared.mic_busy.store(false, Ordering::Relaxed);
         if busy_logged {
             log::info!("capture: mic is free again");
         }
@@ -775,6 +784,7 @@ fn run(
         }
     }
     shared.open.store(false, Ordering::Relaxed);
+    shared.mic_busy.store(false, Ordering::Relaxed);
     ind.listening(false);
     log::debug!("capture: thread stopped");
 }

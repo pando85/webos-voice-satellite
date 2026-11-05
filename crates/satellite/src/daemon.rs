@@ -43,6 +43,7 @@ use crate::player::{Done, Kind, Player, redact_url};
 use crate::power::{self, PowerUpdate};
 use crate::selfcheck::Note;
 use crate::tv_control::{self, Tv, TvMsg};
+use crate::voice_status::{Mic, VoiceFile, VoiceStatus};
 use crate::volume::{self, SharedGain};
 use crate::watchdog::{self, Beats};
 use crate::{resume, volume::Origin};
@@ -542,6 +543,8 @@ struct Daemon {
     report_dir: PathBuf,
     /// Counts kill-switch polls: the compat triggers are checked once a second.
     compat_poll: u32,
+    /// `run/voice.json`, written on change.
+    voice_file: VoiceFile,
 }
 
 impl Daemon {
@@ -610,7 +613,91 @@ impl Daemon {
         if consume_trigger(&self.report_dir.join(compat::ACK_TRIGGER), &mut warned) {
             self.acknowledge_firmware("ctl.sh").await;
         }
+        let reload = consume_trigger(&self.report_dir.join(darken::RELOAD_TRIGGER), &mut warned);
         self.trigger_warned = warned;
+        if reload {
+            self.reload_remote_off("ctl.sh").await;
+        }
+        self.publish_voice_status();
+    }
+
+    /// The microphone as `run/voice.json` reports it.
+    fn mic_state(&self) -> Mic {
+        if self.shared.open.load(Ordering::Relaxed) {
+            Mic::Listening
+        } else if self.gate.mic_off() {
+            Mic::Muted
+        } else if self.shared.mic_busy.load(Ordering::Relaxed) {
+            Mic::Busy
+        } else {
+            Mic::Closed
+        }
+    }
+
+    /// Writes `run/voice.json` if its content changed (or the keep-alive is
+    /// due).
+    fn publish_voice_status(&mut self) {
+        let status = VoiceStatus {
+            mic: self.mic_state(),
+            remote_off: self.darkener.mode(),
+            remote_off_active: self.luna.is_some(),
+            power_state: self.last_power.as_ref().and_then(|p| p.state.clone()),
+        };
+        self.voice_file.publish(Instant::now().into_std(), &status);
+    }
+
+    /// `ctl.sh set remote-off` wrote the mode file and created the trigger:
+    /// read it again and apply a change. An unusable file keeps the current
+    /// mode. The file already holds the value, so it is not written back.
+    async fn reload_remote_off(&mut self, source: &str) {
+        let path = self.remote_off_file.clone();
+        match darken::load_mode(&path) {
+            Ok(Some(mode)) if mode != self.darkener.mode() => {
+                self.apply_remote_off(mode, source);
+                // HA's select follows (there is one only with the power watch).
+                if self.luna.is_some() {
+                    self.send(AppCommand::SetSelect {
+                        object_id: darken::SELECT_OBJECT_ID.to_owned(),
+                        option: darken::option_for(mode).to_owned(),
+                    })
+                    .await;
+                }
+            }
+            Ok(Some(_)) => log::debug!(
+                "remote power-off: {} reloaded ({source}); the mode is unchanged",
+                path.display()
+            ),
+            Ok(None) => log::warn!(
+                "remote power-off: reload requested ({source}) but {} does not exist; keeping {:?}",
+                path.display(),
+                self.darkener.mode()
+            ),
+            Err(why) => log::warn!(
+                "remote power-off: reload requested ({source}) but {} is not usable ({why}); keeping {:?}",
+                path.display(),
+                self.darkener.mode()
+            ),
+        }
+    }
+
+    /// Puts a new remote power-off mode in force and logs who asked. Used by
+    /// HA's select ([`Daemon::on_select`], which also stores the word) and by
+    /// the reload of the mode file; it does not write the file.
+    fn apply_remote_off(&mut self, mode: RemoteOff, source: &str) {
+        self.darkener.set_mode(mode);
+        match mode {
+            RemoteOff::KeepListening => {
+                log::warn!(
+                    "remote power-off set to KEEP LISTENING by {source}: after the remote turns the TV off the satellite wakes it and turns the screen off (the TV stays on with a dark screen; more power than standby, OLED panel care may not run)"
+                );
+                if self.luna.is_none() {
+                    log::warn!("power: keep listening needs the power watch, which is not running");
+                }
+            }
+            RemoteOff::Normal => {
+                log::info!("remote power-off set to turn off normally by {source}");
+            }
+        }
     }
 
     /// Polls the kill-switch file.
@@ -761,15 +848,7 @@ impl Daemon {
         let Some(mode) = darken::mode_for(option) else {
             return;
         };
-        self.darkener.set_mode(mode);
-        match mode {
-            RemoteOff::KeepListening => log::warn!(
-                "remote power-off set to KEEP LISTENING by Home Assistant: after the remote turns the TV off the satellite wakes it and turns the screen off (the TV stays on with a dark screen; more power than standby, OLED panel care may not run)"
-            ),
-            RemoteOff::Normal => {
-                log::info!("remote power-off set to turn off normally by Home Assistant");
-            }
-        }
+        self.apply_remote_off(mode, "Home Assistant");
         let word = darken::file_word(mode);
         if let Err(e) = volume::write_atomic(&self.remote_off_file, &format!("{word}\n")) {
             log::warn!(
@@ -1535,7 +1614,9 @@ pub(crate) async fn run(mut settings: Settings, triggers: TestTriggers) -> Resul
         compat,
         report_dir: settings.report.dir_or_default(),
         compat_poll: 0,
+        voice_file: VoiceFile::new(&settings.report.dir_or_default()),
     };
+    d.publish_voice_status();
     d.publish_timers().await;
     let mut tv_rx = None;
     if let Some(started) = tv_started.take() {
@@ -1645,6 +1726,7 @@ pub(crate) async fn run(mut settings: Settings, triggers: TestTriggers) -> Resul
     // Shutdown: stop streaming and playback (kills pacat), release the mic,
     // then close the command channel so the server says goodbye to HA.
     beats.disarmed.store(true, Ordering::Relaxed);
+    d.voice_file.remove();
     if let Some(w) = power_watch {
         w.shutdown().await;
     }
@@ -1918,6 +2000,227 @@ mod tests {
         assert!(!s.pairing.key_file().exists() && s.pairing.open_now);
         let mut warned = false;
         assert!(!consume_trigger(&dir.join("absent"), &mut warned) && !warned);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A daemon wired to nothing: the command channel is returned so a test
+    /// sees what HA would be sent.
+    fn test_daemon(
+        dir: &Path,
+        mode: RemoteOff,
+        luna: bool,
+    ) -> (Daemon, mpsc::Receiver<AppCommand>) {
+        let mut s = Settings::default();
+        s.report.dir = Some(dir.join("run"));
+        s.safety.firmware_seen_file = Some(dir.join("firmware_seen"));
+        let verdict = firmware::evaluate(&s, Err("no file".to_owned()), Model::NotChecked);
+        let compat = Compat::new(&s, Err("no file".to_owned()), ModelState::NotRead, verdict);
+        let (cmd_tx, cmd_rx) = mpsc::channel(16);
+        let (done_tx, _done_rx) = mpsc::unbounded_channel();
+        let gain = SharedGain::new(1.0);
+        let d = Daemon {
+            cmd_tx,
+            shared: Arc::new(Shared::default()),
+            player: Player::new(s.sink.clone(), gain.clone(), done_tx),
+            runs: RunTracker::default(),
+            connected: false,
+            gate: MicGate::default(),
+            kill_switch: dir.join("kill"),
+            mute_file: dir.join("muted"),
+            timers: TimerTable::new(),
+            alarm: Alarm::new(Duration::ZERO),
+            timers_on: false,
+            last_timers_text: None,
+            last_ringing: None,
+            pairing_triggers: None,
+            trigger_warned: false,
+            volume_gain: gain,
+            volume_file: dir.join("volume"),
+            luna: luna.then(|| PathBuf::from("luna-send")),
+            last_power: None,
+            darkener: Darkener::new(mode, 3, Duration::from_secs(60)),
+            remote_off_file: dir.join("remote_off"),
+            resume: resume::Detector::default(),
+            last_resume: None,
+            tv: None,
+            in_run: false,
+            compat,
+            report_dir: dir.join("run"),
+            compat_poll: 0,
+            voice_file: VoiceFile::new(&dir.join("run")),
+        };
+        (d, cmd_rx)
+    }
+
+    fn test_dir(name: &str) -> PathBuf {
+        let d =
+            std::env::temp_dir().join(format!("webos-sat-daemon-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("run")).unwrap();
+        d
+    }
+
+    fn select_option(cmd: AppCommand) -> String {
+        match cmd {
+            AppCommand::SetSelect { object_id, option } => {
+                assert_eq!(object_id, darken::SELECT_OBJECT_ID);
+                option
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn reload_applies_a_mode_written_outside_ha() {
+        let dir = test_dir("reload");
+        let (mut d, mut rx) = test_daemon(&dir, RemoteOff::Normal, true);
+        let file = dir.join("remote_off");
+        // What `ctl.sh set remote-off keep` does: the file, then the trigger.
+        std::fs::write(&file, "keep_listening\n").unwrap();
+        std::fs::write(dir.join("run").join(darken::RELOAD_TRIGGER), b"").unwrap();
+        // The poll runs on every fourth call (once a second).
+        for _ in 0..4 {
+            d.poll_compat_triggers().await;
+        }
+        assert_eq!(d.darkener.mode(), RemoteOff::KeepListening);
+        assert_eq!(
+            select_option(rx.try_recv().unwrap()),
+            "Keep listening (screen off)"
+        );
+        assert!(rx.try_recv().is_err());
+        // The trigger is consumed and the file is not rewritten by the daemon.
+        assert!(!dir.join("run").join(darken::RELOAD_TRIGGER).exists());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "keep_listening\n");
+        // The status file follows within the same poll.
+        let v = std::fs::read_to_string(dir.join("run").join(crate::voice_status::FILE)).unwrap();
+        assert!(v.contains("\"remote_off\":\"keep_listening\""), "{v}");
+        assert!(v.contains("\"remote_off_active\":true"), "{v}");
+        // The same word again: nothing to apply, nothing sent.
+        std::fs::write(dir.join("run").join(darken::RELOAD_TRIGGER), b"").unwrap();
+        d.reload_remote_off("test").await;
+        d.poll_compat_triggers().await;
+        assert!(rx.try_recv().is_err());
+        // Back to normal.
+        std::fs::write(&file, "normal\n").unwrap();
+        d.reload_remote_off("test").await;
+        assert_eq!(d.darkener.mode(), RemoteOff::Normal);
+        assert_eq!(select_option(rx.try_recv().unwrap()), "Turn off normally");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn reload_keeps_the_mode_when_the_file_is_unusable() {
+        let dir = test_dir("invalid");
+        let (mut d, mut rx) = test_daemon(&dir, RemoteOff::KeepListening, true);
+        let file = dir.join("remote_off");
+        // Missing file.
+        d.reload_remote_off("test").await;
+        assert_eq!(d.darkener.mode(), RemoteOff::KeepListening);
+        // Garbage, an empty file and a directory.
+        for bad in ["darken\n", "", "keep\n"] {
+            std::fs::write(&file, bad).unwrap();
+            d.reload_remote_off("test").await;
+            assert_eq!(d.darkener.mode(), RemoteOff::KeepListening, "{bad:?}");
+        }
+        std::fs::remove_file(&file).unwrap();
+        std::fs::create_dir(&file).unwrap();
+        d.reload_remote_off("test").await;
+        assert_eq!(d.darkener.mode(), RemoteOff::KeepListening);
+        assert!(rx.try_recv().is_err(), "HA is told nothing");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn reload_without_the_power_watch_sends_no_select_state() {
+        let dir = test_dir("nowatch");
+        let (mut d, mut rx) = test_daemon(&dir, RemoteOff::Normal, false);
+        std::fs::write(dir.join("remote_off"), "keep_listening\n").unwrap();
+        d.reload_remote_off("test").await;
+        // No select entity exists without the power watch.
+        assert!(rx.try_recv().is_err());
+        d.publish_voice_status();
+        let v = std::fs::read_to_string(dir.join("run").join(crate::voice_status::FILE)).unwrap();
+        assert!(v.contains("\"remote_off\":\"keep_listening\""), "{v}");
+        assert!(v.contains("\"remote_off_active\":false"), "{v}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn ha_select_applies_and_stores_the_word() {
+        let dir = test_dir("select");
+        let (mut d, mut rx) = test_daemon(&dir, RemoteOff::Normal, true);
+        d.on_select(darken::SELECT_OBJECT_ID, "Keep listening (screen off)");
+        assert_eq!(d.darkener.mode(), RemoteOff::KeepListening);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("remote_off")).unwrap(),
+            "keep_listening\n"
+        );
+        // HA already shows its own choice: no echo.
+        assert!(rx.try_recv().is_err());
+        // Another object id and an unknown option change nothing.
+        d.on_select("other", "Turn off normally");
+        d.on_select(darken::SELECT_OBJECT_ID, "nonsense");
+        assert_eq!(d.darkener.mode(), RemoteOff::KeepListening);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn voice_json_follows_the_microphone_and_power_state() {
+        let dir = test_dir("voice");
+        let (mut d, _rx) = test_daemon(&dir, RemoteOff::Normal, true);
+        let read = |dir: &Path| {
+            std::fs::read_to_string(dir.join("run").join(crate::voice_status::FILE)).unwrap()
+        };
+        // Nothing open, nothing wanted off: closed.
+        d.publish_voice_status();
+        assert!(read(&dir).contains("\"mic\":\"closed\""));
+        assert!(read(&dir).contains("\"power_state\":null"));
+        // Another process holds the PCM.
+        d.shared.mic_busy.store(true, Ordering::Relaxed);
+        assert_eq!(d.mic_state(), Mic::Busy);
+        // Open and delivering.
+        d.shared.open.store(true, Ordering::Relaxed);
+        assert_eq!(d.mic_state(), Mic::Listening);
+        d.shared.open.store(false, Ordering::Relaxed);
+        d.shared.mic_busy.store(false, Ordering::Relaxed);
+        // Each gate reads as muted, and a gate wins over busy.
+        d.shared.mic_busy.store(true, Ordering::Relaxed);
+        let _ = d.gate.on_mute_changed(true);
+        assert_eq!(d.mic_state(), Mic::Muted);
+        let _ = d.gate.on_mute_changed(false);
+        let _ = d.gate.set_kill(true);
+        assert_eq!(d.mic_state(), Mic::Muted);
+        let _ = d.gate.set_kill(false);
+        let _ = d.gate.set_unpaired(true);
+        assert_eq!(d.mic_state(), Mic::Muted);
+        let _ = d.gate.set_unpaired(false);
+        d.shared.mic_busy.store(false, Ordering::Relaxed);
+        // The last settled power state is reported.
+        d.last_power = Some(PowerUpdate {
+            state: Some("Screen Off".to_owned()),
+            ..PowerUpdate::default()
+        });
+        d.shared.open.store(true, Ordering::Relaxed);
+        d.publish_voice_status();
+        let v = read(&dir);
+        assert!(v.contains("\"mic\":\"listening\""), "{v}");
+        assert!(v.contains("\"power_state\":\"Screen Off\""), "{v}");
+        // No identifier of any kind: only the five documented keys.
+        let parsed: Vec<&str> = v
+            .trim_matches(|c| c == '{' || c == '}' || c == '\n')
+            .split(',')
+            .map(|kv| kv.split(':').next().unwrap())
+            .collect();
+        assert_eq!(
+            parsed,
+            [
+                "\"schema\"",
+                "\"mic\"",
+                "\"remote_off\"",
+                "\"remote_off_active\"",
+                "\"power_state\""
+            ]
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

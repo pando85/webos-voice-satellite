@@ -257,7 +257,18 @@ It lives in `etc/` (kept by `uninstall`, removed by `purge`, not rotated with th
 
 ### 6.4 Status file from the daemon
 
-The daemon writes `run/voice.json` (atomically, only on change, at most once a second, mode 0644) with `{"mic":"listening|busy|muted|closed","remote_off":"normal|keep_listening","remote_off_active":true,"power_state":"Active"}`, from state it already has (the capture-live and gate state, the darkener's mode, the power watch). It carries no identifiers. `ctl.sh` reads it; a file older than 60 s or missing gives `unknown`/null. This is the only new daemon-to-script channel; it follows `run/compat.json`.
+The daemon writes `run/voice.json` (atomically with a temporary file and `rename`, mode 0600 like `compat.json`; `ctl.sh` runs as root) with one JSON line:
+
+```json
+{"schema":1,"mic":"listening","remote_off":"keep_listening","remote_off_active":true,"power_state":"Active"}
+```
+
+- `mic`: `listening` (the capture PCM is open and delivering), `muted` (closed because a gate holds it: HA's mute switch, the kill switch, the firmware guard or an unpaired satellite), `busy` (wanted but another process holds the PCM, for example LG hands-free), `closed` (any other reason). `ctl.sh` still reads the kill-switch file itself for `mic.kill_switch`.
+- `remote_off`: the mode the daemon holds now (`normal` or `keep_listening`).
+- `remote_off_active`: the power watch runs, so keep listening can act (false with `power.watch = false` or no `luna-send`); it does not depend on the mode.
+- `power_state`: the last settled power state word from the subscription (`Active`, `Screen Off`, `Active Standby`, ...), or `null` before the first update.
+
+It is checked once a second from the daemon's existing trigger poll (never per audio frame) and rewritten only when the content changed, plus a keep-alive rewrite every 30 s so that a file older than 60 s can be read as stale (`unknown`/null, for example after a crash); a clean shutdown deletes it. It carries no identifiers. It lives in the report directory (`report.dir`, `run/` in the package) beside `compat.json`, which it follows as the daemon-to-script channel. Implemented in `crates/satellite/src/voice_status.rs` (step V3).
 
 ### 6.5 How the running daemon picks up a `remote_off` change without a restart
 
@@ -266,7 +277,7 @@ The daemon writes `run/voice.json` (atomically, only on change, at most once a s
 **Proposed mechanism: a reload trigger file plus a shared apply function.**
 
 1. `ctl.sh set remote-off normal|keep` writes the word (`normal` or `keep_listening`) to the configured `remote_off_file` with a temporary file and `mv` (the same atomic write as the daemon; the path comes from `cfg_value remote_off_file` resolved against `etc/`, default `etc/remote_off`), then creates the trigger `run/remote-off-reload` (empty file), the same pattern as `selfcheck-run` and `firmware-ack`.
-2. The daemon's existing once-a-second trigger poll (`poll_compat_triggers`, directory `report.dir`) also consumes `remote-off-reload` with the existing `consume_trigger`, then calls `darken::load_mode(&remote_off_file)`. `Ok(Some(mode))` different from the current mode goes through a new `apply_remote_off(mode, source)` that holds the code now inside `on_select` (set the mode, the `warn` or `info` log line with `source = "app"`, **no file write** because the file already holds the value) and sends `AppCommand::SetSelect` with the new option so HA's select follows. `Ok(None)` or `Err` logs one `warn` and keeps the current mode. HA's own select still goes through `on_select`, which now calls `apply_remote_off(mode, "Home Assistant")` and then writes the file.
+2. The daemon's existing once-a-second trigger poll (`poll_compat_triggers`, directory `report.dir`) also consumes `remote-off-reload` with the existing `consume_trigger`, then calls `darken::load_mode(&remote_off_file)`. `Ok(Some(mode))` different from the current mode goes through `apply_remote_off(mode, source)` (implemented, step V3) that holds the code now inside `on_select` (set the mode, the `warn` or `info` log line with the source `ctl.sh`, **no file write** because the file already holds the value) and sends `AppCommand::SetSelect` with the new option so HA's select follows. `Ok(None)` (file missing) or `Err` logs one `warn` and keeps the current mode; the same word as now is ignored. Without the power watch the select entity does not exist, so no `SetSelect` is sent. HA's own select still goes through `on_select`, which now calls `apply_remote_off(mode, "Home Assistant")` and then writes the file.
 3. With the daemon stopped, nothing to do: the file is read at the next start. `ctl.sh` reports `daemon: not running`.
 4. Two writers at once (HA select and the app): the file holds the last writer's word; the daemon's reload reads the file, so after at most one second the daemon, the file, the HA select and the app agree.
 5. `power.watch = false` (no power watch): the daemon ignores keep listening at start today; the reload applies the same rule and `remote_off.active` in `run/voice.json` is false, so the app says so (`Keep listening needs the power watch, which is off in the config.`).
