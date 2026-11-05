@@ -10,7 +10,7 @@
 //! binary sensor with no valid state is sent with `missing_state` (HA shows
 //! "unknown").
 
-use crate::app::{PlayerState, PlayerStatus};
+use crate::app::{MusicState, PlayerState, PlayerStatus};
 use crate::config::{
     BinarySensorEntity, ButtonEntity, MediaPlayerEntity, NumberEntity, Resolved, SelectEntity,
     SwitchEntity, TextSensorEntity,
@@ -48,20 +48,38 @@ pub const FEATURE_VOLUME_MUTE: u32 = 1 << 3;
 pub const FEATURE_TURN_ON: u32 = 1 << 7;
 /// `MediaPlayerEntityFeature.TURN_OFF`: HA sends `TURN_OFF`.
 pub const FEATURE_TURN_OFF: u32 = 1 << 8;
-/// `MediaPlayerEntityFeature.PLAY_MEDIA` (never offered by an
-/// application-owned media player).
+/// `MediaPlayerEntityFeature.PLAY_MEDIA` (offered by the built-in media
+/// player with music enabled; never by an application-owned one).
 pub const FEATURE_PLAY_MEDIA: u32 = 1 << 9;
 /// `MediaPlayerEntityFeature.PLAY`.
 pub const FEATURE_PLAY: u32 = 1 << 14;
-/// `MediaPlayerEntityFeature.MEDIA_ANNOUNCE` (never offered by an
-/// application-owned media player).
+/// `MediaPlayerEntityFeature.MEDIA_ANNOUNCE` (offered by the built-in media
+/// player with music enabled and announce on; never by an
+/// application-owned one).
 pub const FEATURE_MEDIA_ANNOUNCE: u32 = 1 << 20;
+
+/// `MediaPlayerEntityFeature.BROWSE_MEDIA`: offered with music so HA's media
+/// browser works (HA implements the browsing itself; the device has none).
+pub const FEATURE_BROWSE_MEDIA: u32 = 1 << 17;
 
 /// The media player features offered: stop and the reply volume (set and
 /// step). HA 2026.10.4 takes the entity's features from these flags
 /// (`feature_flags_compat` for API 1.14). play_media and mute are not
 /// implemented.
 pub const MEDIA_PLAYER_FEATURES: u32 = FEATURE_STOP | FEATURE_VOLUME_SET | FEATURE_VOLUME_STEP;
+
+/// The built-in media player's features with music enabled: the base ones
+/// plus `PLAY_MEDIA`, `PAUSE`, `PLAY` and `BROWSE_MEDIA` (= 153093).
+/// `VOLUME_MUTE` is deliberately not offered (design D13), nor
+/// `MEDIA_ENQUEUE` (HA sends `ENQUEUE` anyway; it is refused).
+pub const MUSIC_FEATURES: u32 = MEDIA_PLAYER_FEATURES
+    | FEATURE_PLAY_MEDIA
+    | FEATURE_PAUSE
+    | FEATURE_PLAY
+    | FEATURE_BROWSE_MEDIA;
+
+/// [`MUSIC_FEATURES`] plus `MEDIA_ANNOUNCE` (= 1201669).
+pub const MUSIC_ANNOUNCE_FEATURES: u32 = MUSIC_FEATURES | FEATURE_MEDIA_ANNOUNCE;
 
 /// The features an application-owned media player
 /// ([`crate::MediaPlayerEntity`]) may advertise: controls only. No
@@ -196,21 +214,42 @@ pub fn volume_step(percent: u8, up: bool) -> u8 {
     }
 }
 
+/// The built-in media player's feature flags for this configuration.
+pub(crate) fn media_player_features(cfg: &Resolved) -> u32 {
+    match &cfg.music {
+        None => MEDIA_PLAYER_FEATURES,
+        Some(m) if m.announce => MUSIC_ANNOUNCE_FEATURES,
+        Some(_) => MUSIC_FEATURES,
+    }
+}
+
 pub(crate) fn list_media_player(cfg: &Resolved) -> ListEntitiesMediaPlayerResponse {
     let fmt = &cfg.announcement_format;
+    // The ANNOUNCEMENT format stays first: HA takes the TTS format from the
+    // first ANNOUNCEMENT entry and `play_media` from the first DEFAULT one.
+    let mut supported_formats = vec![MediaPlayerSupportedFormat {
+        format: fmt.format.clone(),
+        sample_rate: fmt.sample_rate,
+        num_channels: fmt.num_channels,
+        purpose: MediaPlayerFormatPurpose::Announcement as i32,
+        sample_bytes: fmt.sample_bytes,
+    }];
+    if let Some(m) = &cfg.music {
+        supported_formats.push(MediaPlayerSupportedFormat {
+            format: m.format.format.clone(),
+            sample_rate: m.format.sample_rate,
+            num_channels: m.format.num_channels,
+            purpose: MediaPlayerFormatPurpose::Default as i32,
+            sample_bytes: m.format.sample_bytes,
+        });
+    }
     ListEntitiesMediaPlayerResponse {
         object_id: MEDIA_PLAYER_OBJECT_ID.to_owned(),
         key: media_player_key(),
         // Empty name: HA names the entity after the device.
         name: String::new(),
-        supported_formats: vec![MediaPlayerSupportedFormat {
-            format: fmt.format.clone(),
-            sample_rate: fmt.sample_rate,
-            num_channels: fmt.num_channels,
-            purpose: MediaPlayerFormatPurpose::Announcement as i32,
-            sample_bytes: fmt.sample_bytes,
-        }],
-        feature_flags: MEDIA_PLAYER_FEATURES,
+        supported_formats,
+        feature_flags: media_player_features(cfg),
         ..Default::default()
     }
 }
@@ -315,19 +354,29 @@ pub(crate) fn power_state(state: Option<&str>) -> TextSensorStateResponse {
     }
 }
 
+/// The state HA sees: a reply or announcement in progress reads `playing`
+/// whatever the music does, otherwise the music state.
+pub(crate) fn merged_state(voice: MediaState, music: MusicState) -> MediaPlayerState {
+    match (voice, music) {
+        // HA 2026.10.4 maps only IDLE/PLAYING/PAUSED/OFF/ON
+        // (`esphome/media_player.py` `_STATES`); ANNOUNCING raised a
+        // KeyError in HA on every TTS reply (seen on c3-a).
+        (MediaState::Announcing, _) | (MediaState::Idle, MusicState::Playing) => {
+            MediaPlayerState::Playing
+        }
+        (MediaState::Idle, MusicState::Paused) => MediaPlayerState::Paused,
+        (MediaState::Idle, MusicState::Idle) => MediaPlayerState::Idle,
+    }
+}
+
 pub(crate) fn media_player_state(
-    state: MediaState,
+    voice: MediaState,
+    music: MusicState,
     volume_percent: u8,
 ) -> MediaPlayerStateResponse {
     MediaPlayerStateResponse {
         key: media_player_key(),
-        state: match state {
-            MediaState::Idle => MediaPlayerState::Idle,
-            // HA 2026.10.4 maps only IDLE/PLAYING/PAUSED/OFF/ON
-            // (`esphome/media_player.py` `_STATES`); ANNOUNCING raised a
-            // KeyError in HA on every TTS reply (seen on c3-a).
-            MediaState::Announcing => MediaPlayerState::Playing,
-        } as i32,
+        state: merged_state(voice, music) as i32,
         volume: f32::from(volume_percent.min(100)) / 100.0,
         muted: false,
         ..Default::default()
@@ -432,11 +481,90 @@ mod tests {
     #[test]
     fn media_player_offers_stop_and_volume() {
         assert_eq!(MEDIA_PLAYER_FEATURES, 4096 | 4 | 1024);
+        assert_eq!(MEDIA_PLAYER_FEATURES, 5124);
         let cfg = crate::Config::default().resolve().unwrap();
         assert_eq!(list_media_player(&cfg).feature_flags, MEDIA_PLAYER_FEATURES);
-        let st = media_player_state(MediaState::Idle, 40);
+        let st = media_player_state(MediaState::Idle, MusicState::Idle, 40);
         assert!((st.volume - 0.4).abs() < 1e-6);
-        assert!((media_player_state(MediaState::Idle, 250).volume - 1.0).abs() < 1e-6);
+        let loud = media_player_state(MediaState::Idle, MusicState::Idle, 250);
+        assert!((loud.volume - 1.0).abs() < 1e-6);
+    }
+
+    fn music_cfg(announce: bool) -> Resolved {
+        crate::Config {
+            music: Some(crate::MusicConfig {
+                announce,
+                ..crate::MusicConfig::default()
+            }),
+            ..crate::Config::default()
+        }
+        .resolve()
+        .unwrap()
+    }
+
+    #[test]
+    fn music_flags_are_the_documented_sums() {
+        // aioesphomeapi 46.6.0 / HA MediaPlayerEntityFeature values.
+        assert_eq!(FEATURE_PAUSE, 1);
+        assert_eq!(FEATURE_VOLUME_SET, 4);
+        assert_eq!(FEATURE_PLAY_MEDIA, 512);
+        assert_eq!(FEATURE_VOLUME_STEP, 1024);
+        assert_eq!(FEATURE_STOP, 4096);
+        assert_eq!(FEATURE_PLAY, 16_384);
+        assert_eq!(FEATURE_BROWSE_MEDIA, 131_072);
+        assert_eq!(FEATURE_MEDIA_ANNOUNCE, 1_048_576);
+        assert_eq!(MUSIC_FEATURES, 153_093);
+        assert_eq!(MUSIC_ANNOUNCE_FEATURES, 1_201_669);
+        // Mute and enqueue are deliberately not offered.
+        let f = MUSIC_ANNOUNCE_FEATURES;
+        assert_eq!(f & FEATURE_VOLUME_MUTE, 0);
+        assert_eq!(f & (1 << 21), 0, "MEDIA_ENQUEUE");
+        assert_eq!(f & (FEATURE_TURN_ON | FEATURE_TURN_OFF), 0);
+        assert_eq!(list_media_player(&music_cfg(false)).feature_flags, 153_093);
+        assert_eq!(list_media_player(&music_cfg(true)).feature_flags, 1_201_669);
+    }
+
+    #[test]
+    fn music_adds_a_default_format_after_the_announcement_one() {
+        let mp = list_media_player(&music_cfg(true));
+        assert_eq!(mp.supported_formats.len(), 2);
+        let (a, d) = (&mp.supported_formats[0], &mp.supported_formats[1]);
+        assert_eq!(a.purpose, MediaPlayerFormatPurpose::Announcement as i32);
+        assert_eq!(
+            (
+                a.format.as_str(),
+                a.sample_rate,
+                a.num_channels,
+                a.sample_bytes
+            ),
+            ("flac", 22_050, 1, 2)
+        );
+        assert_eq!(d.purpose, MediaPlayerFormatPurpose::Default as i32);
+        assert_eq!(
+            (
+                d.format.as_str(),
+                d.sample_rate,
+                d.num_channels,
+                d.sample_bytes
+            ),
+            ("flac", 48_000, 2, 2)
+        );
+        // Music off: the single ANNOUNCEMENT entry, as before.
+        let off = crate::Config::default().resolve().unwrap();
+        assert_eq!(list_media_player(&off).supported_formats.len(), 1);
+    }
+
+    #[test]
+    fn music_state_merges_with_the_voice_state() {
+        use MediaPlayerState as S;
+        let m = |v, u| merged_state(v, u);
+        assert_eq!(m(MediaState::Idle, MusicState::Idle), S::Idle);
+        assert_eq!(m(MediaState::Idle, MusicState::Playing), S::Playing);
+        assert_eq!(m(MediaState::Idle, MusicState::Paused), S::Paused);
+        // A reply over paused or playing music reads playing.
+        assert_eq!(m(MediaState::Announcing, MusicState::Idle), S::Playing);
+        assert_eq!(m(MediaState::Announcing, MusicState::Paused), S::Playing);
+        assert_eq!(m(MediaState::Announcing, MusicState::Playing), S::Playing);
     }
 
     #[test]

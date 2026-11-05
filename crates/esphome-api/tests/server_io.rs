@@ -10,7 +10,10 @@ use tokio::sync::mpsc;
 use tokio::time::{Duration, timeout};
 use webos_esphome_api::frame::{self, Codec, NOISE_PROLOGUE, NOISE_PROTOCOL, RawMessage};
 use webos_esphome_api::proto::{self as pb, ApiMessage, VoiceAssistantTimerEvent as E};
-use webos_esphome_api::{AppCommand, AppEvent, Config, PipelineMode, Server, TimerEvent};
+use webos_esphome_api::{
+    AppCommand, AppEvent, Config, MusicCommand, MusicConfig, MusicState, PipelineMode, Server,
+    TimerEvent,
+};
 
 const PSK_B64: &str = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=";
 
@@ -1107,4 +1110,329 @@ async fn resume_probe_keeps_a_live_connection_and_drops_a_silent_one() {
     .await
     .expect("not dropped");
     assert!(ev);
+}
+
+// ---- Music on the built-in media player (design M2) ----
+
+fn music_cfg(psk: Option<&str>, music: Option<MusicConfig>) -> Config {
+    Config {
+        noise_psk: psk.map(str::to_owned),
+        music,
+        ..plain_cfg()
+    }
+}
+
+/// A Noise client (the same handshake as `noise_handshake_and_wrong_key`).
+async fn connect_noise(port: u16) -> Client {
+    let psk = frame::decode_psk(PSK_B64).unwrap();
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let mut hs = snow::Builder::new(NOISE_PROTOCOL.parse().unwrap())
+        .psk(0, &psk)
+        .unwrap()
+        .prologue(NOISE_PROLOGUE)
+        .unwrap()
+        .build_initiator()
+        .unwrap();
+    let mut msg = [0_u8; 128];
+    let n = hs.write_message(&[], &mut msg[1..]).unwrap();
+    let mut out = vec![0x01, 0x00, 0x00];
+    frame::encode_noise_frame(&msg[..=n], &mut out).unwrap();
+    stream.write_all(&out).await.unwrap();
+    let mut buf = Vec::new();
+    let _server_hello = read_noise_frame(&mut stream, &mut buf).await;
+    let reply = read_noise_frame(&mut stream, &mut buf).await;
+    assert_eq!(reply[0], 0x00);
+    let mut scratch = vec![0_u8; 128];
+    hs.read_message(&reply[1..], &mut scratch).unwrap();
+    let mut c = Client {
+        stream,
+        codec: Codec::Noise(Box::new(test_transport(hs.into_transport_mode().unwrap()))),
+        buf,
+    };
+    c.hello().await;
+    c
+}
+
+fn mp_cmd(key: u32, command: pb::MediaPlayerCommand) -> pb::MediaPlayerCommandRequest {
+    pb::MediaPlayerCommandRequest {
+        key,
+        has_command: true,
+        command: command as i32,
+        ..Default::default()
+    }
+}
+
+fn mp_url(key: u32, url: &str, announce: Option<bool>) -> pb::MediaPlayerCommandRequest {
+    pb::MediaPlayerCommandRequest {
+        key,
+        has_media_url: true,
+        media_url: url.into(),
+        has_announcement: announce.is_some(),
+        announcement: announce.unwrap_or(false),
+        ..Default::default()
+    }
+}
+
+fn mp_enqueue(key: u32, url: &str) -> pb::MediaPlayerCommandRequest {
+    pb::MediaPlayerCommandRequest {
+        has_command: true,
+        command: pb::MediaPlayerCommand::Enqueue as i32,
+        ..mp_url(key, url, None)
+    }
+}
+
+/// A ping round trip: everything the server did for earlier requests (events
+/// included) has happened when it returns.
+async fn sync(c: &mut Client) {
+    c.send(&pb::PingRequest {}).await;
+    let _: pb::PingResponse = c.recv_as().await;
+}
+
+fn no_event(events: &mut mpsc::UnboundedReceiver<AppEvent>) {
+    loop {
+        match events.try_recv() {
+            Ok(AppEvent::HaConnected { .. } | AppEvent::MuteChanged(_)) => {}
+            Ok(other) => panic!("unexpected event {other:?}"),
+            Err(_) => return,
+        }
+    }
+}
+
+#[tokio::test]
+async fn music_off_keeps_flags_formats_and_ignores_media_commands() {
+    let (port, mut events, cmds) = start_cfg(music_cfg(None, None)).await;
+    let mut c = connect_plain(port).await;
+    c.send(&pb::ListEntitiesRequest {}).await;
+    let mp: pb::ListEntitiesMediaPlayerResponse = c.recv_as().await;
+    assert_eq!(mp.feature_flags, 5124);
+    assert_eq!(mp.supported_formats.len(), 1);
+    assert_eq!(
+        mp.supported_formats[0].purpose,
+        pb::MediaPlayerFormatPurpose::Announcement as i32
+    );
+    c.send(&mp_url(mp.key, "http://h/a.flac", None)).await;
+    c.send(&mp_url(mp.key, "http://h/a.flac", Some(true))).await;
+    for cmd in [
+        pb::MediaPlayerCommand::Pause,
+        pb::MediaPlayerCommand::Play,
+        pb::MediaPlayerCommand::Enqueue,
+    ] {
+        c.send(&mp_cmd(mp.key, cmd)).await;
+    }
+    c.send(&mp_enqueue(mp.key, "http://h/b.flac")).await;
+    sync(&mut c).await;
+    no_event(&mut events);
+    // SetMusicState is ignored: the state stays idle.
+    cmds.send(AppCommand::SetMusicState(MusicState::Playing))
+        .await
+        .unwrap();
+    c.send(&pb::SubscribeStatesRequest {}).await;
+    let st: pb::MediaPlayerStateResponse = c.recv_as().await;
+    assert_eq!(st.state, pb::MediaPlayerState::Idle as i32);
+}
+
+#[tokio::test]
+async fn music_on_lists_flags_and_the_default_format_after_the_announcement_one() {
+    for (announce, flags) in [(true, 1_201_669), (false, 153_093)] {
+        let music = MusicConfig {
+            announce,
+            ..MusicConfig::default()
+        };
+        let (port, _events, _cmds) = start_cfg(music_cfg(None, Some(music))).await;
+        let mut c = connect_plain(port).await;
+        c.send(&pb::ListEntitiesRequest {}).await;
+        let mp: pb::ListEntitiesMediaPlayerResponse = c.recv_as().await;
+        assert_eq!(mp.feature_flags, flags);
+        assert_eq!(mp.supported_formats.len(), 2);
+        let (a, d) = (&mp.supported_formats[0], &mp.supported_formats[1]);
+        assert_eq!(a.purpose, pb::MediaPlayerFormatPurpose::Announcement as i32);
+        assert_eq!((a.sample_rate, a.num_channels), (22_050, 1));
+        assert_eq!(d.purpose, pb::MediaPlayerFormatPurpose::Default as i32);
+        assert_eq!(
+            (
+                d.format.as_str(),
+                d.sample_rate,
+                d.num_channels,
+                d.sample_bytes
+            ),
+            ("flac", 48_000, 2, 2)
+        );
+    }
+    // WAV is selectable; MP3 is never advertised.
+    let mut wav = MusicConfig::default();
+    "wav".clone_into(&mut wav.format.format);
+    assert!(music_cfg(None, Some(wav)).validate().is_ok());
+    let mut mp3 = MusicConfig::default();
+    "mp3".clone_into(&mut mp3.format.format);
+    assert!(music_cfg(None, Some(mp3)).validate().is_err());
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn music_commands_become_events_on_an_encrypted_session() {
+    let (port, mut events, _cmds) =
+        start_cfg(music_cfg(Some(PSK_B64), Some(MusicConfig::default()))).await;
+    let mut c = connect_noise(port).await;
+    c.send(&pb::ListEntitiesRequest {}).await;
+    let mp: pb::ListEntitiesMediaPlayerResponse = c.recv_as().await;
+    c.send(&pb::SubscribeStatesRequest {}).await;
+    let _: pb::MediaPlayerStateResponse = c.recv_as().await;
+    let url = "http://ma.lan:8097/flow/abc.flac";
+    let play = |announce| {
+        AppEvent::Music(MusicCommand::Play {
+            url: url.into(),
+            announce,
+        })
+    };
+
+    c.send(&mp_url(mp.key, url, None)).await;
+    assert_eq!(next_event(&mut events).await, play(false));
+    c.send(&mp_url(mp.key, url, Some(true))).await;
+    assert_eq!(next_event(&mut events).await, play(true));
+    // An explicit announcement: false is a plain play.
+    c.send(&mp_url(mp.key, url, Some(false))).await;
+    assert_eq!(next_event(&mut events).await, play(false));
+    c.send(&mp_cmd(mp.key, pb::MediaPlayerCommand::Pause)).await;
+    assert_eq!(
+        next_event(&mut events).await,
+        AppEvent::Music(MusicCommand::Pause)
+    );
+    c.send(&mp_cmd(mp.key, pb::MediaPlayerCommand::Play)).await;
+    assert_eq!(
+        next_event(&mut events).await,
+        AppEvent::Music(MusicCommand::Resume)
+    );
+    c.send(&mp_cmd(mp.key, pb::MediaPlayerCommand::Stop)).await;
+    assert_eq!(next_event(&mut events).await, AppEvent::MediaStop);
+    c.send(&pb::MediaPlayerCommandRequest {
+        key: mp.key,
+        has_volume: true,
+        volume: 0.3,
+        ..Default::default()
+    })
+    .await;
+    let st: pb::MediaPlayerStateResponse = c.recv_as().await;
+    assert!((st.volume - 0.3).abs() < 1e-6);
+    assert_eq!(next_event(&mut events).await, AppEvent::VolumeChanged(30));
+
+    // ENQUEUE with a URL: refused, the URL is handed up, the state echoed.
+    c.send(&mp_enqueue(mp.key, url)).await;
+    let st: pb::MediaPlayerStateResponse = c.recv_as().await;
+    assert_eq!(st.state, pb::MediaPlayerState::Idle as i32);
+    assert_eq!(
+        next_event(&mut events).await,
+        AppEvent::Music(MusicCommand::EnqueueRefused {
+            url: Some(url.into())
+        })
+    );
+    // ENQUEUE without a URL: refused, nothing handed up.
+    c.send(&mp_cmd(mp.key, pb::MediaPlayerCommand::Enqueue))
+        .await;
+    let _: pb::MediaPlayerStateResponse = c.recv_as().await;
+
+    // Mute, unmute, toggle and an empty URL do nothing.
+    for cmd in [
+        pb::MediaPlayerCommand::Mute,
+        pb::MediaPlayerCommand::Unmute,
+        pb::MediaPlayerCommand::Toggle,
+    ] {
+        c.send(&mp_cmd(mp.key, cmd)).await;
+    }
+    c.send(&mp_url(mp.key, "", None)).await;
+    let _: pb::MediaPlayerStateResponse = c.recv_as().await;
+    sync(&mut c).await;
+    no_event(&mut events);
+}
+
+#[tokio::test]
+async fn announce_is_refused_when_it_is_not_offered() {
+    let music = MusicConfig {
+        announce: false,
+        ..MusicConfig::default()
+    };
+    let (port, mut events, _cmds) = start_cfg(music_cfg(Some(PSK_B64), Some(music))).await;
+    let mut c = connect_noise(port).await;
+    c.send(&pb::ListEntitiesRequest {}).await;
+    let mp: pb::ListEntitiesMediaPlayerResponse = c.recv_as().await;
+    c.send(&pb::SubscribeStatesRequest {}).await;
+    let _: pb::MediaPlayerStateResponse = c.recv_as().await;
+    c.send(&mp_url(mp.key, "http://h/a.flac", Some(true))).await;
+    let _: pb::MediaPlayerStateResponse = c.recv_as().await;
+    sync(&mut c).await;
+    no_event(&mut events);
+    c.send(&mp_url(mp.key, "http://h/a.flac", None)).await;
+    assert!(matches!(
+        next_event(&mut events).await,
+        AppEvent::Music(MusicCommand::Play {
+            announce: false,
+            ..
+        })
+    ));
+}
+
+#[tokio::test]
+async fn media_urls_are_refused_on_a_plaintext_session_unless_allowed() {
+    let (port, mut events, _cmds) = start_cfg(music_cfg(None, Some(MusicConfig::default()))).await;
+    let mut c = connect_plain(port).await;
+    c.send(&pb::ListEntitiesRequest {}).await;
+    let mp: pb::ListEntitiesMediaPlayerResponse = c.recv_as().await;
+    c.send(&pb::SubscribeStatesRequest {}).await;
+    let _: pb::MediaPlayerStateResponse = c.recv_as().await;
+    c.send(&mp_url(mp.key, "http://h/a.flac", None)).await;
+    let _: pb::MediaPlayerStateResponse = c.recv_as().await;
+    c.send(&mp_enqueue(mp.key, "http://h/a.flac")).await;
+    let _: pb::MediaPlayerStateResponse = c.recv_as().await;
+    sync(&mut c).await;
+    no_event(&mut events);
+    // Controls are not media URLs: pause still arrives.
+    c.send(&mp_cmd(mp.key, pb::MediaPlayerCommand::Pause)).await;
+    assert_eq!(
+        next_event(&mut events).await,
+        AppEvent::Music(MusicCommand::Pause)
+    );
+
+    let music = MusicConfig {
+        allow_plaintext: true,
+        ..MusicConfig::default()
+    };
+    let (port, mut events, _cmds) = start_cfg(music_cfg(None, Some(music))).await;
+    let mut c = connect_plain(port).await;
+    c.send(&mp_url(mp.key, "http://h/a.flac", None)).await;
+    assert!(matches!(
+        next_event(&mut events).await,
+        AppEvent::Music(MusicCommand::Play { .. })
+    ));
+}
+
+#[tokio::test]
+async fn music_state_is_reported_merged_with_the_voice_state() {
+    let (port, _events, cmds) = start_cfg(music_cfg(None, Some(MusicConfig::default()))).await;
+    cmds.send(AppCommand::SetVolume(40)).await.unwrap();
+    cmds.send(AppCommand::SetMusicState(MusicState::Paused))
+        .await
+        .unwrap();
+    let mut c = connect_plain(port).await;
+    c.send(&pb::SubscribeStatesRequest {}).await;
+    // The state held at connect time (set before HA connected).
+    let st: pb::MediaPlayerStateResponse = c.recv_as().await;
+    assert_eq!(st.state, pb::MediaPlayerState::Paused as i32);
+    assert!((st.volume - 0.4).abs() < 1e-6);
+
+    for (state, want) in [
+        (MusicState::Playing, pb::MediaPlayerState::Playing),
+        (MusicState::Idle, pb::MediaPlayerState::Idle),
+    ] {
+        cmds.send(AppCommand::SetMusicState(state)).await.unwrap();
+        let st: pb::MediaPlayerStateResponse = c.recv_as().await;
+        assert_eq!(st.state, want as i32);
+        assert!((st.volume - 0.4).abs() < 1e-6);
+    }
+    // An unchanged state is not repeated: the next message is the volume's.
+    cmds.send(AppCommand::SetMusicState(MusicState::Idle))
+        .await
+        .unwrap();
+    cmds.send(AppCommand::SetVolume(55)).await.unwrap();
+    let st: pb::MediaPlayerStateResponse = c.recv_as().await;
+    assert_eq!(st.state, pb::MediaPlayerState::Idle as i32);
+    assert!((st.volume - 0.55).abs() < 1e-6);
 }

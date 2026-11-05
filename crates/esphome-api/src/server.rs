@@ -13,7 +13,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinSet;
 use tokio::time::{Duration, Instant, sleep_until, timeout};
 
-use crate::app::{AppCommand, AppEvent, PairingEvent, PlayerStatus};
+use crate::app::{AppCommand, AppEvent, MusicCommand, MusicState, PairingEvent, PlayerStatus};
 use crate::config::{Config, ConfigError, Resolved, features};
 use crate::entities;
 use crate::frame::{
@@ -191,6 +191,7 @@ impl Server {
             mdns: None,
             bind,
             volume: 100,
+            music_state: MusicState::Idle,
             power_state: None,
             selects: vec![None; self.cfg.selects.len()],
             numbers: vec![None; self.cfg.numbers.len()],
@@ -333,6 +334,12 @@ struct Session {
 }
 
 impl Session {
+    /// Whether the session is Noise-encrypted (a plaintext one is a
+    /// development session, or a keyless pairing one).
+    fn encrypted(&self) -> bool {
+        matches!(self.codec, Codec::Noise(_))
+    }
+
     fn new(stream: TcpStream, peer: SocketAddr, epoch: u64) -> Self {
         let (rd, wr) = stream.into_split();
         Self {
@@ -608,6 +615,8 @@ struct Ctx {
     bind: SocketAddr,
     /// Reply volume in percent, reported as the media player's volume.
     volume: u8,
+    /// Music state reported by the application ([`AppCommand::SetMusicState`]).
+    music_state: MusicState,
     /// Text of the TV power state sensor (`None` until the first state).
     power_state: Option<String>,
     /// State of each select in `cfg.selects` (same order).
@@ -980,8 +989,12 @@ impl Ctx {
                     .await
             }
             ToHa::MediaState(state) if s.states_subscribed => {
-                s.send(&entities::media_player_state(state, self.volume))
-                    .await
+                s.send(&entities::media_player_state(
+                    state,
+                    self.music_state,
+                    self.volume,
+                ))
+                .await
             }
             ToHa::MuteState(muted) if s.states_subscribed => {
                 s.send(&entities::mute_state(muted)).await
@@ -1086,6 +1099,7 @@ impl Ctx {
                 s.states_subscribed = true;
                 s.send(&entities::media_player_state(
                     self.voice.media_state(),
+                    self.music_state,
                     self.volume,
                 ))
                 .await?;
@@ -1301,6 +1315,7 @@ impl Ctx {
                     self.close(&err.to_string());
                 }
             }
+            AppCommand::SetMusicState(state) => self.set_music_state(state).await,
             AppCommand::SetPowerState(text) => {
                 self.power_state = Some(text);
                 let Some(s) = self.session.as_mut() else {
@@ -1638,10 +1653,22 @@ impl Ctx {
 
     /// Sends the media player state (with the reply volume) if HA subscribed.
     async fn send_media_state(&mut self) -> Result<(), FrameError> {
-        let state = entities::media_player_state(self.voice.media_state(), self.volume);
+        let state =
+            entities::media_player_state(self.voice.media_state(), self.music_state, self.volume);
         match self.session.as_mut() {
             Some(s) if s.states_subscribed => s.send(&state).await,
             _ => Ok(()),
+        }
+    }
+
+    async fn set_music_state(&mut self, state: MusicState) {
+        if self.cfg.music.is_none() {
+            log::warn!("esphome-api: music state ignored (music is not enabled)");
+        } else if state != self.music_state {
+            self.music_state = state;
+            if let Err(err) = self.send_media_state().await {
+                self.close(&err.to_string());
+            }
         }
     }
 
@@ -1738,12 +1765,28 @@ impl Ctx {
         &mut self,
         c: &pb::MediaPlayerCommandRequest,
     ) -> Result<(), FrameError> {
+        if self.cfg.music.is_some() && c.has_media_url {
+            return self.music_media_url(c).await;
+        }
+        let music = self.cfg.music.is_some();
         let mut volume = None;
         if c.has_volume {
             volume = Some(entities::volume_to_percent(c.volume));
         }
         if c.has_command {
             match pb::MediaPlayerCommand::try_from(c.command) {
+                Ok(pb::MediaPlayerCommand::Pause) if music => {
+                    self.emit(AppEvent::Music(MusicCommand::Pause));
+                }
+                Ok(pb::MediaPlayerCommand::Play) if music => {
+                    self.emit(AppEvent::Music(MusicCommand::Resume));
+                }
+                Ok(pb::MediaPlayerCommand::Enqueue) if music => {
+                    // No queue here (design D12). Without a URL there is
+                    // nothing to free on HA's proxy either.
+                    log::info!("esphome-api: enqueue without a media URL refused");
+                    self.send_media_state().await?;
+                }
                 Ok(pb::MediaPlayerCommand::Stop) => {
                     self.voice.on_media_stop();
                     self.emit(AppEvent::MediaStop);
@@ -1771,6 +1814,52 @@ impl Ctx {
             // Always answer, so HA's slider shows the value in effect.
             self.send_media_state().await?;
         }
+        Ok(())
+    }
+
+    /// A media URL sent to the built-in player with music enabled: `play_media`
+    /// (optionally `announce`), or `ENQUEUE`, which is refused. Never on a
+    /// plaintext session unless `allow_plaintext` is set (D14). The URL is
+    /// never logged.
+    async fn music_media_url(
+        &mut self,
+        c: &pb::MediaPlayerCommandRequest,
+    ) -> Result<(), FrameError> {
+        let Some(music) = self.cfg.music.clone() else {
+            return Ok(());
+        };
+        let encrypted = self.session.as_ref().is_some_and(Session::encrypted);
+        if !encrypted && !music.allow_plaintext {
+            log::warn!(
+                "esphome-api: media URL refused: the API session is not encrypted (music.allow_plaintext is off)"
+            );
+            return self.send_media_state().await;
+        }
+        let enqueue = c.has_command
+            && pb::MediaPlayerCommand::try_from(c.command) == Ok(pb::MediaPlayerCommand::Enqueue);
+        let announce = c.has_announcement && c.announcement;
+        if enqueue {
+            log::info!(
+                "esphome-api: enqueue refused (no queue); the URL is handed up to be released"
+            );
+            self.emit(AppEvent::Music(MusicCommand::EnqueueRefused {
+                url: (!c.media_url.is_empty()).then(|| c.media_url.clone()),
+            }));
+            return self.send_media_state().await;
+        }
+        if c.media_url.is_empty() {
+            log::info!("esphome-api: play_media with an empty URL ignored");
+            return self.send_media_state().await;
+        }
+        if announce && !music.announce {
+            log::info!("esphome-api: announce refused (MEDIA_ANNOUNCE is not offered)");
+            return self.send_media_state().await;
+        }
+        log::info!("esphome-api: play_media by HA (announce: {announce})");
+        self.emit(AppEvent::Music(MusicCommand::Play {
+            url: c.media_url.clone(),
+            announce,
+        }));
         Ok(())
     }
 

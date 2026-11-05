@@ -73,6 +73,93 @@ pub enum PlayerCommand {
     Stop,
 }
 
+/// What the built-in media player reports about **music** playback
+/// ([`AppCommand::SetMusicState`]). Merged by the server with the voice
+/// state: while a reply or announcement plays, HA sees `playing`, whatever
+/// the music does (ducked music is `playing` too).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MusicState {
+    /// No music (also: the stream ended, failed or was stopped; the ESPHome
+    /// API has no error state, the reason belongs in the application's log).
+    #[default]
+    Idle,
+    /// Music is producing audio (also while ducked).
+    Playing,
+    /// Music is paused.
+    Paused,
+}
+
+/// A music command from HA to the built-in media player
+/// ([`AppEvent::Music`]); only sent when [`crate::Config::music`] is set.
+///
+/// Related commands that already have their own events and are **not**
+/// repeated here:
+///
+/// - `STOP` is [`AppEvent::MediaStop`] (sent for every stop; the application
+///   stops a ringing alarm first, otherwise the music: design D5);
+/// - volume (`VOLUME_SET`, `VOLUME_UP`, `VOLUME_DOWN`) is
+///   [`AppEvent::VolumeChanged`], one volume shared with the replies (D2).
+///
+/// Mute, seek, next, previous, shuffle and repeat are not offered and never
+/// arrive. A media URL on a plaintext (unencrypted) API session is refused by
+/// the server and never reaches the application unless
+/// [`crate::MusicConfig::allow_plaintext`] is set (D14).
+///
+/// The URL is sensitive (it may hold a token) and `Debug` never prints it.
+/// **The application validates the URL before fetching it** (design M3b);
+/// the server only checks it is non-empty.
+#[derive(Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum MusicCommand {
+    /// `play_media`: replace the current music with the stream at `url` (HA's
+    /// ffmpeg proxy URL, a Music Assistant stream URL on another host, or any
+    /// direct media URL). The server does not echo a state: the application
+    /// reports `playing` with [`AppCommand::SetMusicState`] once audio is
+    /// queued, and `idle` when the stream ends.
+    Play {
+        /// The media URL. HA's proxy URLs must never be retried.
+        url: String,
+        /// `announce: true` (needs [`crate::MusicConfig::announce`]): play
+        /// over the music on the reply path with the music ducked; the music
+        /// is not interrupted and its state does not change.
+        announce: bool,
+    },
+    /// `media_pause`: stop reading the stream and hold it.
+    Pause,
+    /// `media_play`: resume a paused stream.
+    Resume,
+    /// HA sent `ENQUEUE` (`media_play_media` with `enqueue: add`; HA sends it
+    /// even though `MEDIA_ENQUEUE` is not offered). There is no queue here:
+    /// it is **refused**, and the server has already echoed the unchanged
+    /// state. When `url` is set, the application should **open and close it
+    /// at once without playing it** (a GET and drop), so HA's ffmpeg proxy
+    /// frees the conversion slot an unfetched URL would hold (design D12,
+    /// at most 2 per device). `url` is `None` when HA sent no URL; a URL on
+    /// a refused plaintext session is not handed up at all.
+    EnqueueRefused {
+        /// The refused URL, to be opened and closed by the application.
+        url: Option<String>,
+    },
+}
+
+impl fmt::Debug for MusicCommand {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Play { url, announce } => f
+                .debug_struct("Play")
+                .field("url_bytes", &url.len())
+                .field("announce", announce)
+                .finish(),
+            Self::Pause => f.write_str("Pause"),
+            Self::Resume => f.write_str("Resume"),
+            Self::EnqueueRefused { url } => f
+                .debug_struct("EnqueueRefused")
+                .field("url_bytes", &url.as_ref().map(String::len))
+                .finish(),
+        }
+    }
+}
+
 /// Pairing (HA-driven key provisioning, [`crate::pairing`]) changes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -234,6 +321,9 @@ pub enum AppEvent {
         /// What HA asked for.
         command: PlayerCommand,
     },
+    /// HA sent a music command to the built-in media player
+    /// ([`crate::Config::music`]); see [`MusicCommand`].
+    Music(MusicCommand),
     /// HA pressed a button entity ([`crate::Config::buttons`]).
     ButtonPressed {
         /// The button's object id.
@@ -395,6 +485,12 @@ pub enum AppCommand {
         /// The state, or `None` for unknown.
         state: Option<bool>,
     },
+    /// The music state of the built-in media player
+    /// ([`crate::Config::music`]), merged with the voice state (a reply or
+    /// announcement reads `playing`). Sent to HA on a change and again when
+    /// HA connects or resubscribes. Ignored, with a log line, when music is
+    /// not enabled. The volume HA sees is [`AppCommand::SetVolume`].
+    SetMusicState(MusicState),
     /// The state of an application-owned media player
     /// ([`crate::Config::media_players`]). Sent to HA on a change and again
     /// when HA connects or resubscribes; an unchanged state is not repeated.
@@ -490,6 +586,7 @@ impl fmt::Debug for AppEvent {
                 .field("object_id", object_id)
                 .field("command", command)
                 .finish(),
+            Self::Music(c) => f.debug_tuple("Music").field(c).finish(),
             Self::ButtonPressed { object_id } => f
                 .debug_struct("ButtonPressed")
                 .field("object_id", object_id)
@@ -557,6 +654,7 @@ impl fmt::Debug for AppCommand {
                 .field("object_id", object_id)
                 .field("state", state)
                 .finish(),
+            Self::SetMusicState(m) => f.debug_tuple("SetMusicState").field(m).finish(),
             Self::SetMediaPlayer { object_id, status } => f
                 .debug_struct("SetMediaPlayer")
                 .field("object_id", object_id)
@@ -607,6 +705,13 @@ mod tests {
                 text: "SECRET text".to_owned(),
                 start_conversation: false,
             },
+            AppEvent::Music(MusicCommand::Play {
+                url: "http://h/a?authSig=SECRET".to_owned(),
+                announce: false,
+            }),
+            AppEvent::Music(MusicCommand::EnqueueRefused {
+                url: Some("http://h/b?authSig=SECRET".to_owned()),
+            }),
             AppEvent::StartStreaming {
                 wake_word: true,
                 conversation_id: Some("SECRET".to_owned()),

@@ -6,7 +6,8 @@
 //! cargo run -p webos-esphome-api --example fake_device -- \
 //!     [--bind 127.0.0.1] [--port 6053] [--name fake-tv] [--mode wake|ptt|none] \
 //!     [--features 23] [--mac 02:00:00:00:00:01] [--mdns] [--demo-entities] [--no-capture] \
-//!     [--pair-key-file FILE [--pair-window SECS] [--pair-closed]]
+//!     [--pair-key-file FILE [--pair-window SECS] [--pair-closed]] \
+//!     [--music [--music-format flac|wav] [--music-no-announce] [--music-allow-plaintext]]
 //! ```
 //!
 //! The Noise key is read from the `WEBOS_ESPHOME_PSK` environment variable
@@ -19,7 +20,8 @@
 //! `reset-pairing`, `number VALUE|unknown`, `binary on|off|unknown`,
 //! `switch on|off|unknown`, `text VALUE|unknown`, `select OPTION|unknown`,
 //! `options A,B,C` and `mp on|off|playing VOLUME|unknown muted|unmuted`
-//! (states and options of the `--demo-entities`), `quit`. Log level: `FAKE_DEVICE_LOG=info|debug|trace`.
+//! (states and options of the `--demo-entities`), `music idle|playing|paused`
+//! (the music state of the built-in player, with `--music`), `quit`. Log level: `FAKE_DEVICE_LOG=info|debug|trace`.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -34,8 +36,8 @@ use webos_esphome_api::entities::{
 use webos_esphome_api::proto::{EntityCategory, NumberMode};
 use webos_esphome_api::{
     AppCommand, AppEvent, BinarySensorEntity, ButtonEntity, Config, MediaPlayerEntity,
-    NumberEntity, PipelineMode, PlayerState, PlayerStatus, Provisioning, SelectEntity, Server,
-    SwitchEntity, TextSensorEntity,
+    MusicCommand, MusicConfig, MusicState, NumberEntity, PipelineMode, PlayerState, PlayerStatus,
+    Provisioning, SelectEntity, Server, SwitchEntity, TextSensorEntity,
 };
 
 /// `mp on|off|playing VOLUME|unknown muted|unmuted`.
@@ -185,6 +187,14 @@ fn event_line(ev: &AppEvent) -> String {
         } => format!(
             "Timer {{ event: {event}, id: {id:?}, name: {name:?}, total_seconds: {total_seconds}, seconds_left: {seconds_left}, is_active: {is_active} }}"
         ),
+        // The harness prints the (otherwise hidden) music URL in full.
+        AppEvent::Music(MusicCommand::Play { url, announce }) => {
+            format!("MusicPlay {{ url: {url:?}, announce: {announce} }}")
+        }
+        AppEvent::Music(MusicCommand::EnqueueRefused { url }) => {
+            format!("MusicEnqueueRefused {{ url: {url:?} }}")
+        }
+        AppEvent::Music(other) => format!("Music{other:?}"),
         other => format!("{other:?}"),
     }
 }
@@ -232,6 +242,24 @@ fn parse_args() -> (Config, Option<PipelineMode>, bool) {
             "--mdns" => cfg.mdns = true,
             "--demo-entities" => add_demo_entities(&mut cfg),
             "--no-capture" => capture = false,
+            "--music" => {
+                cfg.music.get_or_insert_with(MusicConfig::default);
+            }
+            "--music-format" => {
+                let f = val();
+                cfg.music
+                    .get_or_insert_with(MusicConfig::default)
+                    .format
+                    .format = f;
+            }
+            "--music-no-announce" => {
+                cfg.music.get_or_insert_with(MusicConfig::default).announce = false;
+            }
+            "--music-allow-plaintext" => {
+                cfg.music
+                    .get_or_insert_with(MusicConfig::default)
+                    .allow_plaintext = true;
+            }
             "--pair-key-file" => {
                 cfg.provisioning
                     .get_or_insert_with(Provisioning::default)
@@ -349,6 +377,17 @@ async fn main() {
                         .map(|o| o.trim().to_owned())
                         .collect(),
                 },
+                other if other.starts_with("music ") => {
+                    AppCommand::SetMusicState(match other["music ".len()..].trim() {
+                        "idle" => MusicState::Idle,
+                        "playing" => MusicState::Playing,
+                        "paused" => MusicState::Paused,
+                        _ => {
+                            eprintln!("bad music command {other}");
+                            continue;
+                        }
+                    })
+                }
                 other if other.starts_with("mp ") => {
                     let Some(status) = parse_mp(&other["mp ".len()..]) else {
                         eprintln!("bad mp command {other}");

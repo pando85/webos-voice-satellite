@@ -1217,6 +1217,93 @@ async def scenario_two_media_players(binary: str) -> None:
         await dev.stop()
 
 
+async def scenario_music(binary: str) -> None:
+    """Music on the satellite's media player (design M2): flags, formats, commands, states."""
+    print("\n== scenario K: music on the satellite media player (flags, formats, commands, state) ==")
+    psk = base64.b64encode(os.urandom(32)).decode()
+    dev = Device(binary, ["--mode", "none", "--music", "--mac", "02:00:00:00:00:10"], psk)
+    await dev.start()
+    feat = MediaPlayerEntityFeature
+    try:
+        ha = FakeHA(dev.port, psk)
+        cli = await ha.connect()
+        _info, entities, _ = await cli.device_info_and_list_entities()
+        sat = next(e for e in entities if isinstance(e, MediaPlayerInfo))
+        flags = feat(sat.feature_flags_compat(APIVersion(1, 14)))
+        want = (feat.PAUSE | feat.VOLUME_SET | feat.PLAY_MEDIA | feat.VOLUME_STEP | feat.STOP
+                | feat.PLAY | feat.BROWSE_MEDIA | feat.MEDIA_ANNOUNCE)
+        check("K1 flags 1201669: pause, volume set/step, play media, stop, play, browse, announce; no mute or enqueue",
+              sat.feature_flags == 1201669 and flags == want
+              and not flags & (feat.VOLUME_MUTE | feat.MEDIA_ENQUEUE | feat.TURN_ON | feat.TURN_OFF),
+              f"{sat.feature_flags} {flags!r}")
+        fm = sat.supported_formats
+        check("K2 formats: ANNOUNCEMENT flac/22050/mono first, then DEFAULT flac/48000/stereo/16-bit",
+              len(fm) == 2
+              and fm[0].purpose == MediaPlayerFormatPurpose.ANNOUNCEMENT
+              and (fm[0].format, fm[0].sample_rate, fm[0].num_channels) == ("flac", 22050, 1)
+              and fm[1].purpose == MediaPlayerFormatPurpose.DEFAULT
+              and (fm[1].format, fm[1].sample_rate, fm[1].num_channels, fm[1].sample_bytes) == ("flac", 48000, 2, 2),
+              str(fm))
+
+        states: list = []
+        cli.subscribe_states(lambda st: states.append(st) if st.key == sat.key else None)
+        await until_true(lambda: bool(states))
+        check("K3 initial state idle", states[-1].state == MediaPlayerState.IDLE, str(states[-1]))
+
+        url = "http://ma.example.invalid:8097/flow/x.flac"
+        cli.media_player_command(sat.key, media_url=url)
+        ev = await dev.wait_event("MusicPlay")
+        check("K4 play_media becomes MusicPlay with the URL, announce false",
+              ev == f'MusicPlay {{ url: "{url}", announce: false }}', ev)
+        cli.media_player_command(sat.key, media_url=url, announcement=True)
+        ev = await dev.wait_event("MusicPlay")
+        check("K5 play_media with announce: true", ev.endswith("announce: true }"), ev)
+        cli.media_player_command(sat.key, command=MediaPlayerCommand.PAUSE)
+        check("K6 pause", await dev.wait_event("MusicPause") == "MusicPause")
+        cli.media_player_command(sat.key, command=MediaPlayerCommand.PLAY)
+        check("K7 play resumes", await dev.wait_event("MusicResume") == "MusicResume")
+        cli.media_player_command(sat.key, command=MediaPlayerCommand.STOP)
+        check("K8 stop is MediaStop", await dev.wait_event("MediaStop") == "MediaStop")
+        cli.media_player_command(sat.key, volume=0.35)
+        check("K9 volume set is VolumeChanged", await dev.wait_event("VolumeChanged") == "VolumeChanged(35)")
+
+        # What HA sends for enqueue: ENQUEUE plus the URL, although the flag is not offered.
+        n = len(states)
+        cli.media_player_command(sat.key, media_url=url, command=MediaPlayerCommand.ENQUEUE)
+        ev = await dev.wait_event("MusicEnqueueRefused")
+        ok = await until_true(lambda: len(states) > n)
+        check("K10 ENQUEUE is refused: the URL is handed up and the state echoed",
+              ev == f'MusicEnqueueRefused {{ url: Some("{url}") }}' and ok, ev)
+
+        for state, want_state in (("playing", MediaPlayerState.PLAYING), ("paused", MediaPlayerState.PAUSED),
+                                  ("idle", MediaPlayerState.IDLE)):
+            await dev.command(f"music {state}")
+            ok = await until_true(lambda: states[-1].state == want_state)
+            check(f"K11 SetMusicState({state}) reaches HA with the volume",
+                  ok and abs(states[-1].volume - 0.35) < 1e-6, str(states[-1]))
+        await cli.disconnect()
+
+        # A plaintext session never gets a media URL through (no key, no allow_plaintext).
+        dev2 = Device(binary, ["--mode", "none", "--music", "--mac", "02:00:00:00:00:11"], None)
+        await dev2.start()
+        try:
+            cli2 = await FakeHA(dev2.port).connect()
+            _i, ents2, _ = await cli2.device_info_and_list_entities()
+            sat2 = next(e for e in ents2 if isinstance(e, MediaPlayerInfo))
+            cli2.media_player_command(sat2.key, media_url=url)
+            cli2.media_player_command(sat2.key, media_url=url, command=MediaPlayerCommand.ENQUEUE)
+            cli2.media_player_command(sat2.key, command=MediaPlayerCommand.PAUSE)
+            await dev2.wait_event("MusicPause")
+            check("K12 a plaintext session: play_media and ENQUEUE refused, pause still arrives",
+                  dev2.count_since("MusicPlay", 0) == 0 and dev2.count_since("MusicEnqueue", 0) == 0,
+                  str(dev2.events))
+            await cli2.disconnect()
+        finally:
+            await dev2.stop()
+    finally:
+        await dev.stop()
+
+
 async def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--device", required=True, help="path to the fake_device binary")
@@ -1225,7 +1312,7 @@ async def main() -> int:
     for scenario in (scenario_plaintext_speaker, scenario_capture_live, scenario_noise_url, scenario_timers,
                      scenario_pairing, scenario_pairing_window, scenario_window_behind_router,
                      scenario_key_clear, scenario_entities, scenario_generic_entities,
-                     scenario_two_media_players):
+                     scenario_two_media_players, scenario_music):
         try:
             await scenario(args.device)
         except Exception as err:  # noqa: BLE001

@@ -52,6 +52,14 @@
 //!   announce feature; commands arrive as [`AppEvent::MediaPlayerCommand`]
 //!   and states go out with [`AppCommand::SetMediaPlayer`]. The built-in
 //!   media player keeps its object id `media_player` and key.
+//! - Music ([`Config::music`], off by default): the built-in media player
+//!   also offers `PLAY_MEDIA`, `PAUSE`, `PLAY`, `BROWSE_MEDIA` (flags 153093)
+//!   and `MEDIA_ANNOUNCE` (1201669), with a second, `DEFAULT`-purpose format
+//!   after the ANNOUNCEMENT one. HA's commands arrive as
+//!   [`AppEvent::Music`] ([`MusicCommand`]), `STOP` as [`AppEvent::MediaStop`]
+//!   and volume as [`AppEvent::VolumeChanged`]; the application reports
+//!   idle/playing/paused with [`AppCommand::SetMusicState`]. The server
+//!   fetches and plays nothing.
 //!
 //! # Usage
 //!
@@ -140,11 +148,12 @@ pub mod varint;
 mod voice;
 
 pub use app::{
-    AppCommand, AppEvent, PairingEvent, PipelineMode, PlayerCommand, PlayerState, PlayerStatus,
+    AppCommand, AppEvent, MusicCommand, MusicState, PairingEvent, PipelineMode, PlayerCommand,
+    PlayerState, PlayerStatus,
 };
 pub use config::{
     AudioFormat, BinarySensorEntity, ButtonEntity, Config, ConfigError, Mac, MediaPlayerEntity,
-    NumberEntity, SelectEntity, SwitchEntity, TextSensorEntity, features,
+    MusicConfig, NumberEntity, SelectEntity, SwitchEntity, TextSensorEntity, features,
 };
 pub use frame::{NOISE_PREAMBLE, PLAINTEXT_PREAMBLE};
 pub use pairing::Provisioning;

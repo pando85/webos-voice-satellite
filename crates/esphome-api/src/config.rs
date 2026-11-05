@@ -206,6 +206,51 @@ pub struct TextSensorEntity {
     pub entity_category: crate::proto::EntityCategory,
 }
 
+/// Music playback on the built-in `media_player` (design
+/// `docs/design/music-playback.md`, ADR 0010). `Config::music = None` (the
+/// default) keeps the entity exactly as it was: feature flags 5124, the
+/// ANNOUNCEMENT format only, and a media URL from HA ignored.
+///
+/// When set, the entity also offers `PLAY_MEDIA`, `PAUSE`, `PLAY` and
+/// `BROWSE_MEDIA` (flags 153093), plus `MEDIA_ANNOUNCE` when
+/// [`MusicConfig::announce`] is set (1201669), and lists a second supported
+/// format with purpose `DEFAULT` **after** the ANNOUNCEMENT one (HA takes the
+/// TTS format from the first ANNOUNCEMENT entry, so TTS is unchanged).
+///
+/// The server only decodes and routes HA's commands
+/// ([`crate::AppEvent::Music`]); fetching, decoding and playing are the
+/// application's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MusicConfig {
+    /// The `DEFAULT`-purpose format HA's ffmpeg proxy converts music to:
+    /// `flac` or `wav` (MP3 is never advertised), 16-bit, one or two
+    /// channels. The player follows the header of the stream it gets, not
+    /// this value, which only steers HA's proxy and Music Assistant.
+    pub format: AudioFormat,
+    /// Offer `MEDIA_ANNOUNCE` (`play_media` with `announce: true`).
+    pub announce: bool,
+    /// Act on a media URL from a **plaintext** (unencrypted) API session.
+    /// Default `false`: such a URL is refused, because the application
+    /// fetches it (design decision D14).
+    pub allow_plaintext: bool,
+}
+
+impl Default for MusicConfig {
+    /// FLAC, 48000 Hz, stereo, 16-bit; announce offered; plaintext refused.
+    fn default() -> Self {
+        Self {
+            format: AudioFormat {
+                format: "flac".to_owned(),
+                sample_rate: 48_000,
+                num_channels: 2,
+                sample_bytes: 2,
+            },
+            announce: true,
+            allow_plaintext: false,
+        }
+    }
+}
+
 /// An application-owned `media_player` entity besides the built-in one (the
 /// satellite's reply-volume and announcement player, whose object id and key
 /// never change). Use it for a thing the application controls, such as the
@@ -292,6 +337,9 @@ pub struct Config {
     pub text_sensors: Vec<TextSensorEntity>,
     /// Application-owned media players (besides the built-in one).
     pub media_players: Vec<MediaPlayerEntity>,
+    /// Music playback on the built-in media player; `None` (default) keeps it
+    /// announcements-only ([`MusicConfig`]).
+    pub music: Option<MusicConfig>,
 }
 
 impl Default for Config {
@@ -317,6 +365,7 @@ impl Default for Config {
             switches: Vec::new(),
             text_sensors: Vec::new(),
             media_players: Vec::new(),
+            music: None,
         }
     }
 }
@@ -343,6 +392,7 @@ impl fmt::Debug for Config {
             .field("switches", &self.switches)
             .field("text_sensors", &self.text_sensors)
             .field("media_players", &self.media_players)
+            .field("music", &self.music)
             .finish_non_exhaustive()
     }
 }
@@ -367,6 +417,8 @@ pub enum ConfigError {
     /// An entity definition is not usable (object id, duplicate id or key,
     /// number range); the text says which.
     InvalidEntity(String),
+    /// The music format is not usable; the text says why.
+    InvalidMusic(&'static str),
 }
 
 impl fmt::Display for ConfigError {
@@ -380,6 +432,7 @@ impl fmt::Display for ConfigError {
                 "voice_features must include VOICE_ASSISTANT and API_AUDIO and only implemented bits",
             ),
             Self::InvalidEntity(why) => write!(f, "invalid entity: {why}"),
+            Self::InvalidMusic(why) => write!(f, "invalid music config: {why}"),
         }
     }
 }
@@ -464,6 +517,7 @@ pub(crate) struct Resolved {
     pub(crate) switches: Vec<SwitchEntity>,
     pub(crate) text_sensors: Vec<TextSensorEntity>,
     pub(crate) media_players: Vec<MediaPlayerEntity>,
+    pub(crate) music: Option<MusicConfig>,
 }
 
 /// An ESPHome object id: `[a-z0-9_]`, 1 to 120 characters.
@@ -593,6 +647,23 @@ impl Config {
             return Err(ConfigError::InvalidFeatures);
         }
         self.check_entities()?;
+        if let Some(m) = &self.music {
+            let f = &m.format;
+            if f.format != "flac" && f.format != "wav" {
+                return Err(ConfigError::InvalidMusic("format must be flac or wav"));
+            }
+            if f.sample_rate == 0 {
+                return Err(ConfigError::InvalidMusic("sample_rate must be non-zero"));
+            }
+            if !(1..=2).contains(&f.num_channels) {
+                return Err(ConfigError::InvalidMusic("channels must be 1 or 2"));
+            }
+            if f.sample_bytes != 2 {
+                return Err(ConfigError::InvalidMusic(
+                    "only 16-bit (2 bytes) is offered",
+                ));
+            }
+        }
         let psk = self
             .noise_psk
             .as_deref()
@@ -638,6 +709,7 @@ impl Config {
             switches: self.switches.clone(),
             text_sensors: self.text_sensors.clone(),
             media_players: self.media_players.clone(),
+            music: self.music.clone(),
         })
     }
 }
@@ -848,6 +920,47 @@ mod tests {
         assert!(bad(&c), "a select needs options");
         c.selects[0].options.push("Other".to_owned());
         c.validate().unwrap();
+    }
+
+    #[test]
+    fn music_config_is_validated() {
+        let with = |f: &dyn Fn(&mut MusicConfig)| {
+            let mut m = MusicConfig::default();
+            f(&mut m);
+            Config {
+                music: Some(m),
+                ..Config::default()
+            }
+            .validate()
+        };
+        assert!(with(&|_| {}).is_ok());
+        assert!(with(&|m| "wav".clone_into(&mut m.format.format)).is_ok());
+        assert!(with(&|m| m.format.num_channels = 1).is_ok());
+        // MP3 is never advertised; nor an unknown name, rate 0, 3 channels, 24-bit.
+        for bad in [
+            &(|m: &mut MusicConfig| "mp3".clone_into(&mut m.format.format))
+                as &dyn Fn(&mut MusicConfig),
+            &|m| "opus".clone_into(&mut m.format.format),
+            &|m| m.format.sample_rate = 0,
+            &|m| m.format.num_channels = 3,
+            &|m| m.format.num_channels = 0,
+            &|m| m.format.sample_bytes = 3,
+        ] {
+            assert!(matches!(with(bad), Err(ConfigError::InvalidMusic(_))));
+        }
+        // Defaults: FLAC, 48 kHz, stereo, 16-bit; announce on; plaintext refused.
+        let d = MusicConfig::default();
+        assert_eq!(
+            (
+                d.format.format.as_str(),
+                d.format.sample_rate,
+                d.format.num_channels,
+                d.format.sample_bytes
+            ),
+            ("flac", 48_000, 2, 2)
+        );
+        assert!(d.announce && !d.allow_plaintext);
+        assert!(Config::default().music.is_none());
     }
 
     #[test]
