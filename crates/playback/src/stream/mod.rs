@@ -418,10 +418,6 @@ fn build_agent(
     ))
 }
 
-fn is_redirect(status: u16) -> bool {
-    matches!(status, 301 | 302 | 303 | 307 | 308)
-}
-
 fn fetch_main(shared: &Shared, url: &str, cfg: &StreamConfig) {
     let res = fetch_body(shared, url, cfg);
     let err = match res {
@@ -449,29 +445,7 @@ fn fetch_body(shared: &Shared, url: &str, cfg: &StreamConfig) -> Result<(), Play
         Some(reason) => PlaybackError::TargetRefused(reason.into()),
         None => map_stream_err(e, cfg),
     };
-    let mut url = url.to_owned();
-    let mut hops = 0u8;
-    let resp = loop {
-        let resp = agent.get(&url).call().map_err(map)?;
-        let status = resp.status().as_u16();
-        if is_redirect(status) {
-            hops += 1;
-            if hops > cfg.max_redirects {
-                return Err(PlaybackError::TargetRefused("too many redirects".into()));
-            }
-            let location = resp
-                .headers()
-                .get("location")
-                .and_then(|v| v.to_str().ok())
-                .ok_or_else(|| PlaybackError::Http("redirect without a location".into()))?;
-            url = guard::next_url(&url, location)?;
-            continue;
-        }
-        if !(200..300).contains(&status) {
-            return Err(PlaybackError::Status(status));
-        }
-        break resp;
-    };
+    let resp = guard::get_following(&agent, url, cfg.max_redirects, || None, map)?;
     let content_type = resp
         .headers()
         .get("content-type")

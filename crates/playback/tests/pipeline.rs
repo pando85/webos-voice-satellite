@@ -213,15 +213,13 @@ fn silence_stays_silent_after_resample() {
 async fn fetch_serves_wav_and_play_url_writes_wav() {
     let src = sine(22_050, 1, 440.0, 0.5);
     let url = serve("200 OK", "audio/wav", wav_bytes(&src)).await;
-    let body = fetch(&url, &FetchConfig::default()).await.unwrap();
+    let body = fetch(&url, &local()).await.unwrap();
     assert_eq!(body, wav_bytes(&src));
 
     let dir = tmp_dir("wavsink");
     let out_path = dir.join("out.wav");
     let mut sink = WavFileSink::new(&out_path);
-    let t = play_url(&url, &FetchConfig::default(), &mut sink)
-        .await
-        .unwrap();
+    let t = play_url(&url, &local(), &mut sink).await.unwrap();
     assert!((t.audio.as_secs_f64() - 0.5).abs() < 0.01);
     let written = decode(&std::fs::read(&out_path).unwrap(), Some("wav")).unwrap();
     assert_eq!((written.rate, written.channels), (44_100, 2));
@@ -229,9 +227,17 @@ async fn fetch_serves_wav_and_play_url_writes_wav() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+/// The test servers listen on 127.0.0.1, which the fetch guard refuses.
+fn local() -> FetchConfig {
+    FetchConfig {
+        insecure_allow_loopback: true,
+        ..FetchConfig::default()
+    }
+}
+
 #[tokio::test]
 async fn fetch_errors() {
-    let cfg = FetchConfig::default();
+    let cfg = local();
     assert!(matches!(
         fetch("not a url", &cfg).await.unwrap_err(),
         PlaybackError::BadUrl(_)
@@ -254,7 +260,7 @@ async fn fetch_errors() {
     let big = serve("200 OK", "audio/wav", vec![0u8; 5000]).await;
     let small = FetchConfig {
         max_bytes: 1000,
-        ..FetchConfig::default()
+        ..local()
     };
     assert!(matches!(
         fetch(&big, &small).await.unwrap_err(),
@@ -271,12 +277,9 @@ async fn fetch_connection_refused_is_http_error() {
         .local_addr()
         .unwrap()
         .port();
-    let err = fetch(
-        &format!("http://127.0.0.1:{port}/x"),
-        &FetchConfig::default(),
-    )
-    .await
-    .unwrap_err();
+    let err = fetch(&format!("http://127.0.0.1:{port}/x"), &local())
+        .await
+        .unwrap_err();
     assert!(matches!(err, PlaybackError::Http(_)), "{err:?}");
 }
 
@@ -290,7 +293,7 @@ async fn fetch_times_out() {
     });
     let cfg = FetchConfig {
         timeout: Duration::from_millis(300),
-        ..FetchConfig::default()
+        ..local()
     };
     let err = fetch(&format!("http://{addr}/slow"), &cfg)
         .await
@@ -302,9 +305,7 @@ async fn fetch_times_out() {
 async fn play_url_non_audio_body_is_decode_error() {
     let url = serve("200 OK", "text/html", b"<html>hello</html>".to_vec()).await;
     let mut sink = NullSink::default();
-    let err = play_url(&url, &FetchConfig::default(), &mut sink)
-        .await
-        .unwrap_err();
+    let err = play_url(&url, &local(), &mut sink).await.unwrap_err();
     assert!(matches!(err, PlaybackError::Decode(_)), "{err:?}");
     assert_eq!(sink.plays, 0);
 }
@@ -544,4 +545,91 @@ async fn pacat_sink_applies_software_gain() {
         }
     }
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+// ------------------------------------------------------- fetch target guard
+
+/// A server that answers every request with `head` (a redirect) and counts
+/// the requests.
+async fn serve_head(head: String) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use std::sync::atomic::Ordering;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let h = std::sync::Arc::clone(&hits);
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            h.fetch_add(1, Ordering::SeqCst);
+            let head = head.clone();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 2048];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            });
+        }
+    });
+    (format!("http://{addr}/api/tts_proxy/x"), hits)
+}
+
+fn redirect(to: &str) -> String {
+    format!(
+        "HTTP/1.1 302 Found\r\nLocation: {to}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    )
+}
+
+#[tokio::test]
+async fn guarded_fetch_refuses_loopback_without_connecting() {
+    use std::sync::atomic::Ordering;
+    let (url, hits) = serve_head(redirect("/again")).await;
+    let err = fetch(&url, &FetchConfig::default()).await.unwrap_err();
+    assert!(
+        matches!(&err, PlaybackError::TargetRefused(r) if r == "loopback address"),
+        "{err:?}"
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 0, "no TCP connection");
+    assert!(
+        !err.to_string().contains("tts_proxy"),
+        "no URL in the error"
+    );
+    // Unguarded (the behaviour before M5) reaches it.
+    let src = sine(8_000, 1, 440.0, 0.1);
+    let ok = serve("200 OK", "audio/wav", wav_bytes(&src)).await;
+    let unguarded = FetchConfig {
+        guarded: false,
+        ..FetchConfig::default()
+    };
+    assert_eq!(fetch(&ok, &unguarded).await.unwrap(), wav_bytes(&src));
+}
+
+#[tokio::test]
+async fn guarded_fetch_limits_redirects_and_checks_every_hop() {
+    use std::sync::atomic::Ordering;
+    // An endless redirect loop on the same server: 1 + 3 requests, then refused.
+    let (url, hits) = serve_head(redirect("/again")).await;
+    let err = fetch(&url, &local()).await.unwrap_err();
+    assert!(
+        matches!(&err, PlaybackError::TargetRefused(r) if r == "too many redirects"),
+        "{err:?}"
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 4);
+    // A redirect to a link-local address is refused before connecting.
+    let (url, _) = serve_head(redirect("http://169.254.169.254/latest/meta-data")).await;
+    let err = fetch(&url, &local()).await.unwrap_err();
+    assert!(
+        matches!(&err, PlaybackError::TargetRefused(r) if r == "link-local address"),
+        "{err:?}"
+    );
+    // Another scheme is refused.
+    let (url, _) = serve_head(redirect("file:///etc/passwd")).await;
+    let err = fetch(&url, &local()).await.unwrap_err();
+    assert!(matches!(err, PlaybackError::BadUrl(_)), "{err:?}");
+    // A redirect that ends at a good body is followed.
+    let src = sine(8_000, 1, 440.0, 0.1);
+    let target = serve("200 OK", "audio/wav", wav_bytes(&src)).await;
+    let (url, _) = serve_head(redirect(&target)).await;
+    assert_eq!(fetch(&url, &local()).await.unwrap(), wav_bytes(&src));
 }

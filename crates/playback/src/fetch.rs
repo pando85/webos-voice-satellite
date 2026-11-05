@@ -3,14 +3,23 @@
 //! The TV has no usable system CA store for a static musl binary, so trust
 //! anchors come from `webpki-roots` (compiled in). Certificates are always
 //! validated. There is deliberately no switch to disable validation.
+//!
+//! By default ([`FetchConfig::guarded`]) the target rules of [`crate::guard`]
+//! apply, as for music streams: http and https only, at most
+//! [`FetchConfig::max_redirects`] redirects followed by hand with no `https`
+//! to `http` downgrade, and no loopback, link-local, multicast or own-device
+//! address (checked after DNS resolution); private LAN addresses are allowed
+//! (Home Assistant lives there).
 
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use ureq::tls::{Certificate, PemItem, RootCerts, TlsConfig, parse_pem};
 
 use crate::error::PlaybackError;
+use crate::guard::{self, GuardConnector, MAX_HEADER_BYTES};
+use crate::stream::lock;
 
 /// Default maximum response body size (10 MiB).
 pub const DEFAULT_MAX_BYTES: u64 = 10 * 1024 * 1024;
@@ -27,6 +36,15 @@ pub struct FetchConfig {
     /// PEM file with trust anchors that **replaces** the bundled Mozilla roots
     /// (for a private CA in front of HA). `None` uses the bundled roots.
     pub ca_file: Option<PathBuf>,
+    /// Apply the fetch target rules of [`crate::guard`] (default `true`).
+    /// `false` keeps ureq's own redirect handling and no address checks.
+    pub guarded: bool,
+    /// Redirects followed at most when [`Self::guarded`] (3).
+    pub max_redirects: u8,
+    /// **Tests only, never from configuration:** with [`Self::guarded`],
+    /// let loopback targets (127.0.0.0/8, `::1`) through so a local test
+    /// server can be used; every other rule still applies.
+    pub insecure_allow_loopback: bool,
 }
 
 impl Default for FetchConfig {
@@ -36,6 +54,9 @@ impl Default for FetchConfig {
             connect_timeout: Duration::from_secs(5),
             max_bytes: DEFAULT_MAX_BYTES,
             ca_file: None,
+            guarded: true,
+            max_redirects: 3,
+            insecure_allow_loopback: false,
         }
     }
 }
@@ -53,8 +74,8 @@ pub struct Fetched {
 ///
 /// # Errors
 /// [`PlaybackError::BadUrl`], [`PlaybackError::Tls`], [`PlaybackError::Status`],
-/// [`PlaybackError::Timeout`], [`PlaybackError::TooLarge`] or
-/// [`PlaybackError::Http`].
+/// [`PlaybackError::Timeout`], [`PlaybackError::TooLarge`],
+/// [`PlaybackError::TargetRefused`] or [`PlaybackError::Http`].
 pub async fn fetch(url: &str, cfg: &FetchConfig) -> Result<Vec<u8>, PlaybackError> {
     Ok(fetch_with_meta(url, cfg).await?.bytes)
 }
@@ -68,6 +89,9 @@ pub async fn fetch(url: &str, cfg: &FetchConfig) -> Result<Vec<u8>, PlaybackErro
 /// Same as [`fetch`].
 pub async fn fetch_with_meta(url: &str, cfg: &FetchConfig) -> Result<Fetched, PlaybackError> {
     check_scheme(url)?;
+    if cfg.guarded {
+        guard::check_url(url)?;
+    }
     let url = url.to_owned();
     let cfg = cfg.clone();
     tokio::task::spawn_blocking(move || fetch_blocking(&url, &cfg))
@@ -112,16 +136,19 @@ pub(crate) fn tls_config(ca_file: Option<&PathBuf>) -> Result<TlsConfig, Playbac
 }
 
 fn fetch_blocking(url: &str, cfg: &FetchConfig) -> Result<Fetched, PlaybackError> {
-    let tls = tls_config(cfg.ca_file.as_ref())?;
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .timeout_global(Some(cfg.timeout))
-        .timeout_connect(Some(cfg.connect_timeout))
-        .tls_config(tls)
-        .user_agent("webos-voice-satellite")
-        .build()
-        .into();
-
-    let resp = agent.get(url).call().map_err(map_err)?;
+    let resp = if cfg.guarded {
+        get_guarded(url, cfg)?
+    } else {
+        let tls = tls_config(cfg.ca_file.as_ref())?;
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .timeout_global(Some(cfg.timeout))
+            .timeout_connect(Some(cfg.connect_timeout))
+            .tls_config(tls)
+            .user_agent("webos-voice-satellite")
+            .build()
+            .into();
+        agent.get(url).call().map_err(map_err)?
+    };
     let content_type = resp
         .headers()
         .get("content-type")
@@ -142,6 +169,48 @@ fn fetch_blocking(url: &str, cfg: &FetchConfig) -> Result<Fetched, PlaybackError
         bytes,
         content_type,
     })
+}
+
+/// The guarded request: the address check in front of the TCP connector,
+/// redirects by hand, one overall deadline across all hops.
+fn get_guarded(
+    url: &str,
+    cfg: &FetchConfig,
+) -> Result<ureq::http::Response<ureq::Body>, PlaybackError> {
+    use ureq::unversioned::resolver::DefaultResolver;
+    use ureq::unversioned::transport::{Connector, RustlsConnector, TcpConnector};
+    let config = ureq::Agent::config_builder()
+        .timeout_global(Some(cfg.timeout))
+        .timeout_connect(Some(cfg.connect_timeout))
+        .tls_config(tls_config(cfg.ca_file.as_ref())?)
+        .proxy(None)
+        .max_redirects(0)
+        .max_response_header_size(MAX_HEADER_BYTES)
+        .user_agent("webos-voice-satellite")
+        .build();
+    let refused = Arc::new(Mutex::new(None));
+    let connector = ()
+        .chain(GuardConnector {
+            allow_loopback: cfg.insecure_allow_loopback,
+            refused: Arc::clone(&refused),
+        })
+        .chain(TcpConnector::default())
+        .chain(RustlsConnector::default());
+    let agent = ureq::Agent::with_parts(config, connector, DefaultResolver::default());
+    let deadline = Instant::now() + cfg.timeout;
+    let map = |e: ureq::Error| match lock(&refused).take() {
+        Some(reason) => PlaybackError::TargetRefused(reason.into()),
+        None => map_err(e),
+    };
+    // Each hop gets what is left of the overall deadline.
+    let remaining = || {
+        Some(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .max(Duration::from_millis(1)),
+        )
+    };
+    guard::get_following(&agent, url, cfg.max_redirects, remaining, map)
 }
 
 pub(crate) fn map_err(e: ureq::Error) -> PlaybackError {

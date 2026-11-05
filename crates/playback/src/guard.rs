@@ -214,6 +214,57 @@ pub fn redact_url(url: &str) -> String {
     }
 }
 
+fn is_redirect(status: u16) -> bool {
+    matches!(status, 301 | 302 | 303 | 307 | 308)
+}
+
+/// GET `url` on a guarded agent (built with `max_redirects(0)` and a
+/// [`GuardConnector`]), following at most `max_redirects` redirects by hand
+/// so every hop goes through [`next_url`] and the connector again.
+/// `timeout` gives the per-request overall deadline of each hop (`None`
+/// keeps the agent's settings); `map` turns a ureq error into ours.
+///
+/// # Errors
+/// The mapped transport error, [`PlaybackError::TargetRefused`] for too
+/// many redirects or a refused hop, [`PlaybackError::Status`] for a
+/// non-success status.
+pub(crate) fn get_following(
+    agent: &ureq::Agent,
+    url: &str,
+    max_redirects: u8,
+    mut timeout: impl FnMut() -> Option<std::time::Duration>,
+    map: impl Fn(ureq::Error) -> PlaybackError,
+) -> Result<ureq::http::Response<ureq::Body>, PlaybackError> {
+    let mut url = url.to_owned();
+    let mut hops = 0u8;
+    loop {
+        let req = agent.get(&url);
+        let resp = match timeout() {
+            Some(t) => req.config().timeout_global(Some(t)).build().call(),
+            None => req.call(),
+        }
+        .map_err(&map)?;
+        let status = resp.status().as_u16();
+        if is_redirect(status) {
+            hops += 1;
+            if hops > max_redirects {
+                return Err(PlaybackError::TargetRefused("too many redirects".into()));
+            }
+            let location = resp
+                .headers()
+                .get("location")
+                .and_then(|v| v.to_str().ok())
+                .ok_or_else(|| PlaybackError::Http("redirect without a location".into()))?;
+            url = next_url(&url, location)?;
+            continue;
+        }
+        if !(200..300).contains(&status) {
+            return Err(PlaybackError::Status(status));
+        }
+        return Ok(resp);
+    }
+}
+
 /// First connector of the music agent's chain: checks every resolved
 /// address before the TCP connector uses them. The reason of a refusal is
 /// left in `refused` (ureq's error type cannot carry it).

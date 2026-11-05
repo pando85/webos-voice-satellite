@@ -10,6 +10,7 @@
 //!   --ca FILE                          PEM trust anchors replacing the bundled roots
 //!   --fetch-only                       download and report size/content type, no decode
 //!   --cancel-after-ms N                stop playback after N ms (tests cancellation)
+//!   --allow-loopback                   let the fetch reach 127.0.0.1 (a local test server)
 //! ```
 #![allow(clippy::print_stdout, clippy::print_stderr, clippy::too_many_lines)]
 
@@ -22,7 +23,7 @@ use webos_playback::{
 
 fn usage() -> ! {
     eprintln!(
-        "usage: play_url <url|file> [--sink pacat|wav:FILE|null] [--volume N] [--gain F] [--device D] [--pacat PATH] [--ca FILE] [--fetch-only] [--cancel-after-ms N]"
+        "usage: play_url <url|file> [--sink pacat|wav:FILE|null] [--volume N] [--gain F] [--device D] [--pacat PATH] [--ca FILE] [--fetch-only] [--cancel-after-ms N] [--allow-loopback]"
     );
     std::process::exit(2);
 }
@@ -49,6 +50,7 @@ async fn main() {
             "--pacat" => pacat = PathBuf::from(val()),
             "--ca" => cfg.ca_file = Some(PathBuf::from(val())),
             "--fetch-only" => fetch_only = true,
+            "--allow-loopback" => cfg.insecure_allow_loopback = true,
             "--cancel-after-ms" => cancel_ms = val().parse().ok().or_else(|| usage()),
             _ => usage(),
         }
