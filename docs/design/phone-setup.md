@@ -1,0 +1,514 @@
+# Phone setup: a QR code on the TV, a small web server, every change approved on the TV
+
+- **Status:** design, accepted by the owner on 2026-11-05 ([ADR 0009](../decisions/0009-phone-setup-web-server.md)). **Nothing is implemented and nothing was run on a TV.** Every statement about the TV (inbound connections, the app's web engine, the exec channel under load) is `hypothesis` until the probe in [section 15](#15-on-target-probe-checklist-exp-012-part-a-read-only-first) is run with the owner's authorization.
+- **Date:** 2026-11-05. TV facts are for c3-a (LG C3, webOS TV 8.3.0, firmware `03.30.74`, Homebrew Channel 0.6.3) and c3-b (firmware `03.30.73`) where the repository already has them; other models are not covered. External research date: 2026-11-05 (HA core `dev` branch files read on that date, see [Sources](#sources)).
+- **Version:** planned for 0.4.0, together with the redesigned TV app (four screens: Home, Voice and power, Home Assistant, Diagnostics; its mockup is made separately).
+- **Related:** [install and configuration UX](install-and-config-ux.md) (section 3.2 is the threat model reused here, section 5 the pairing window), [Voice and power screen](voice-and-power-screen.md) (the string tables and the outcome matrix, `window.voicePower`), [packaging](packaging.md), [ADR 0008](../decisions/0008-user-initiated-lg-settings.md), backlog [#15](../project/backlog.md#15-set-up-with-your-phone-phone-setup-web-server) and [#3](../project/backlog.md#3-install-and-configuration-ux).
+
+## 1. Scope
+
+**In scope (owner, 2026-11-05):** Home Assistant setup help and settings, from a phone, with every change approved on the TV.
+
+| Area | What the phone page does |
+| --- | --- |
+| Home Assistant setup help | Shows the TV's address and port with copy buttons, offers the pairing window (an action, approved on the TV), explains the steps in HA, links to HA's ESPHome add flow, and shows "paired" when HA has connected ([section 10](#10-add-to-home-assistant)) |
+| Settings (changes) | Always Ready on/off, LG hands-free "Hi LG" on/off, "keep listening after the power button" on/off, microphone on/off, reply volume, start the pairing window ([section 9](#9-actions-and-what-each-one-runs)) |
+| Read-only status | The same facts as `ctl.sh status --json` and `ctl.sh tv-settings --json`, through an allow-list, with the same power-button sentence the TV app shows ([section 8.4](#84-get-apistate)) |
+
+**Not in scope:** typing any text into a command (no device name, no HA URL, no key); showing or accepting the Noise key, an HA login or token, or any HA data; start, stop, update, uninstall, autostart, reset pairing, report, firmware acknowledgement; playing a sound (no "test sound" button: no sound is played without the owner's authorization); remote access from outside the LAN; more than one phone at once.
+
+**What the TV app gets** (built in the redesign, [P7](#16-implementation-steps)): a "Set up with your phone" button, a screen with the QR code, the state line and a Done button, and a confirmation overlay.
+
+## 2. Evidence and labels
+
+Labels as in [AGENTS.md](../../AGENTS.md). "Repo code" means read in this repository at 0.3.0 (not a device claim).
+
+| Claim | Label | Source |
+| --- | --- | --- |
+| The daemon reads `etc/reply_volume` only at startup; Home Assistant's media-player volume is the only runtime writer (`on_volume`, which also stores the file); `AppCommand::SetVolume` at runtime updates HA's media-player state without being echoed back | repo code | `crates/satellite/src/volume.rs`, `daemon.rs` (`on_volume`, startup `volume::load`), `crates/esphome-api/src/app.rs`, `server.rs` |
+| The `remote_off` reload (`run/remote-off-reload`, polled once a second with `consume_trigger`) and the `lg-settings-refresh` trigger exist and are the pattern for a reply-volume reload | repo code | commit `f018c91`, `daemon.rs` (`poll_compat_triggers`), [Voice and power section 6.5](voice-and-power-screen.md#65-how-the-running-daemon-picks-up-a-remote_off-change-without-a-restart) |
+| The MAC that HA uses as the device identity is derived from `mac_seed` (or from `name` when no seed or MAC is set); the packaged config always sets a random `mac_seed` | repo code | `crates/esphome-api/src/config.rs` (`Mac::derive`), `packaging/webos/config.default.toml` |
+| HA's ESPHome integration, on a connect where the MAC matches but the device name differs, overwrites the stored device name silently and continues; it does **not** change the entry title or entity ids; HA does not pass an expected name to the connection. A different MAC is an "Unexpected device" error | documented (HA core `dev`, `homeassistant/components/esphome/manager.py`, read 2026-11-05); **not run** on the owner's HA 2026.10.x | [Sources](#sources) |
+| HA's ESPHome config flow `async_step_user` takes `host` and `port` only from the submitted form; nothing reads a URL parameter or a flow context to prefill them (reconfigure and discovery set them internally) | documented (HA core `dev`, `config_flow.py`, read 2026-11-05) | Sources |
+| `https://my.home-assistant.io/redirect/config_flow_start/?domain=esphome` starts the add-integration flow for ESPHome | documented (an older ESPHome getting-started guide uses it as its badge link); the current My Home Assistant page for `config_flow_start` was fetched but lists no parameters, so the `domain` parameter is **not confirmed on the current page**; not run | Sources |
+| `navigator.clipboard` is available only in secure contexts (HTTPS or localhost), so a plain-HTTP phone page needs the `document.execCommand("copy")` fallback | documented (MDN Clipboard API; recalled, not re-fetched on 2026-11-05) | |
+| The daemon survives the Homebrew Channel `exec` that starts it (`setsid nohup`, no inherited descriptors) | observed with the daemon on c3-a and c3-b (`start.sh`, autostart); **not observed for a second process** | [packaging](packaging.md), [P4 c3-a](../discovery/c3-a/P4-permanent-install.md) |
+| The kill switch lives in `/tmp` and is lost at reboot, so `/tmp` is volatile on the TV | repo docs (verified with the kill switch) | [packaging](packaging.md), `lib.sh` |
+| Whether the TV's firewall accepts inbound TCP on a random high port | **hypothesis**: port 6053 is reachable from HA (verified), which says nothing about other ports | [section 15](#15-on-target-probe-checklist-exp-012-part-a-read-only-first) |
+| The web engine of the TV app on webOS 8 (the app is ES5, with `qrcodegen.js` needing ES2015) | **hypothesis** (LG documents Chromium 94 for webOS TV 8, recalled, not re-checked); the probe reads `navigator.userAgent` | section 15 |
+| `python3` 3.8 exists on c3-a; `busybox httpd`, `nc`, `ss`, `iptables` availability is unknown | python3 observed on c3-a; the rest unknown | [D0-D1](../discovery/c3-a/D0-D1-runtime.md), section 15 |
+
+## 3. Process model
+
+### 3.1 Decision: a separate, small, std-only binary `webos-satellite-setup`
+
+A new workspace crate `crates/setup-server` builds the binary `webos-satellite-setup` for armv7 and aarch64 musl (static, like the daemon). It is installed beside the daemon in `/var/lib/webos-satellite/bin/`, verified by `install.sh` the same way (`--version` must print its own target triple), and started only by `ctl.sh setup start`.
+
+| Option | For | Against | Verdict |
+| --- | --- | --- | --- |
+| **A. A task or thread in the daemon** | no extra process, direct access to daemon state | the daemon is a single-threaded loop with a stall watchdog (`limits.loop_stall_s`) and a 64 MiB RSS ceiling; an HTTP parser would share an address space with the Noise key, the microphone and the HA session, and a bug or a slow client could trip the watchdog and restart the voice path; the listener would need a runtime switch inside the voice process | rejected |
+| **B. The same binary in a `--setup-server` mode** | one artifact per architecture, no packaging change | the process links tokio, the audio, DSP, AEC and TV-control crates for a feature that needs a small fraction of them; the security review scope and dependency audit would cover the whole daemon; one binary to patch for both concerns; RSS is by touched pages, so the saving in memory is small, but the attack surface and the review scope are not | rejected |
+| **C. A separate std-only binary (chosen)** | process isolation (a crash or a hang ends only the setup session); the review and audit scope is one small crate; no tokio, no audio, no key access (the process never opens `etc/noise_psk` or the config); can use its own resource limits (`nice`, descriptor limit) and its own log; the daemon is untouched | one more artifact per architecture in the IPK (estimated 0.3 to 0.6 MB, `hypothesis`, measured in [P8](#16-implementation-steps)), a second `--version` check in `install.sh` | **chosen** |
+| D. `busybox httpd` with shell CGI, or Python `http.server` | no new binary | availability on other TVs unknown; untrusted input would go through an interpreter or `sh`; hard to bound memory and lifetime | rejected |
+
+**RSS budget (target, not measured):** under 4 MiB resident at idle and under 8 MiB during a session, one thread for the HTTP loop and one worker thread for commands. The daemon's own ceiling stays untouched. **Crash isolation:** the daemon never depends on the server; if the server dies, `ctl.sh setup status` reports `ended` with reason `crashed` and the TV app says so.
+
+### 3.2 Why a second thread
+
+The HTTP loop must never wait for a command: `tv-settings --json` can take 12 s in the worst case (two reads over a pseudo-terminal, [Voice and power section 6](voice-and-power-screen.md#6-ctlsh-interface)), and an LG write plus read-back about 20 s. A **worker thread** runs the commands from a queue of one (state refresh or an approved action); the HTTP loop only reads a cached state. The loop ticks every 100 ms (non-blocking accept, one connection at a time) to check the lifetime, the heartbeat, the answer file and the pending timeout.
+
+### 3.3 Not at boot, only on an explicit action
+
+- `ctl.sh setup start` is the only way to start it. The boot hook and `ctl.sh start` never start it (a packaging test greps for it, [section 14](#14-tests)).
+- The TV app calls it from the "Set up with your phone" button (a fixed whitelisted string). SSH can call it too.
+- The server refuses to start without the install marker, and it exits by itself in every end condition of [section 4.2](#42-states-and-end-conditions).
+
+### 3.4 Privileges
+
+The server runs as root, because it is started by `ctl.sh` through the Homebrew Channel exec and because the commands it runs need root (`luna-send`, files in `etc/`). It does not drop privileges (a user to drop to, and who owns `etc/`, is not known; not assumed). Hardening therefore relies on what it does not do: no shell, no file serving, no config or key access, a fixed argument list per action, a cleared environment for children, and a short life. A seccomp filter or a chroot is a later option, not a design assumption.
+
+## 4. Lifecycle, files and `ctl.sh setup`
+
+### 4.1 Directory and files
+
+The session state lives in a **volatile** directory so that the token never reaches the flash: `/tmp/webos-satellite-setup/` (mode 0700, root; `WEBOS_SAT_SETUP_DIR` overrides it in tests). This is a deliberate difference from `run/`, which is under the persistent prefix. A reboot removes it.
+
+| File | Written by | Content |
+| --- | --- | --- |
+| `setup.pid` | `ctl.sh setup start` | the server's pid; liveness is checked by `/proc/<pid>/cmdline` naming `webos-satellite-setup` |
+| `state.json` | the server (atomic: temporary file and `rename`, mode 0600), on every change and every 2 s | the session state, the one the TV app reads ([section 4.3](#43-ctlsh-setup-interface)) |
+| `heartbeat` | `ctl.sh setup status` (touch) | the server compares the mtime with the one it saw last; **a change counts as a heartbeat on the server's own monotonic clock**, so a clock step on the TV (NTP) cannot end or extend a session |
+| `answer.json` | `ctl.sh setup answer` (atomic) | `{"id":"a1b2c3d4","verdict":"allow"}`; the server consumes and deletes it |
+
+The server's log goes to `/var/lib/webos-satellite/log/setup.log` (mode 0600; `ctl.sh setup start` truncates it above 64 KiB). Log lines, in English, carry only events and the peer address ([section 6.6](#66-logging)).
+
+### 4.2 States and end conditions
+
+```
+start -> waiting (listening, QR shown, token unused)
+waiting -> active (the token was consumed: a phone has a session)
+waiting|active -> ended (reason)
+```
+
+| End reason (`reason` in `state.json`) | Trigger |
+| --- | --- |
+| `done` | the phone's Done button (`POST /api/session/end`) or the TV app's Done (`ctl.sh setup stop`) |
+| `timeout` | 10 minutes after the start (hard limit, not extended by activity) |
+| `idle` | after the token was consumed, no request from the session for 180 s |
+| `app-gone` | no heartbeat for **15 s** (the TV app is closed, in the background, or the TV left `Active`); a pending request is refused |
+| `parse-error` | a request that is not valid HTTP within the accepted subset, oversize, or with an invalid encoding (owner's rule: any parse error ends the session; see [open question 2](#17-open-questions)) |
+| `too-many-refusals` | three requests refused or expired on the TV in one session |
+| `too-many-bad-requests` | 20 unauthenticated requests (wrong token, no or wrong cookie) |
+| `crashed` | the server process disappeared without writing `ended` (found by `ctl.sh`) |
+
+On any end the server closes the listener first, deletes `state.json`'s token path, writes `ended`, removes `answer.json`, and exits. The TV app keeps showing the last `ended` state until the user leaves the screen.
+
+### 4.3 `ctl.sh setup` interface
+
+New commands (root, install lock only for `start`), all with fixed arguments. The app's whitelist gets exactly these strings and the one pattern of `setup answer`.
+
+```
+setup start            start the server; prints the state JSON (below). Refuses when not installed,
+                       not root, or when a session is already active (state "active");
+                       a session still "waiting" is returned as it is (the app was reopened)
+setup status --json    print state.json (+ liveness) and touch the heartbeat; "none" when no server
+setup answer ID allow|refuse
+                       answer the pending request ID (8 lowercase hex characters, validated here)
+setup stop             end the session (reason "done") and remove the directory
+```
+
+`setup status --json` output (schema 1). `path` exists only while `state` is `waiting`; the app builds the URL from its own address knowledge (`http://<tvAddress>:<port><path>`, [section 5.4](#54-the-address-in-the-qr-code)):
+
+```json
+{
+  "schema": 1,
+  "state": "waiting",
+  "reason": "",
+  "port": 49731,
+  "path": "/s/q3V2...43-characters...",
+  "expires_in_s": 587,
+  "peer": null,
+  "peer_other_subnet": null,
+  "pending": null,
+  "last_result": null
+}
+```
+
+After a phone connects: `state` `active`, `path` removed, `peer` `"192.168.1.23"` (an IP literal only). While a request awaits the OK:
+
+```json
+"pending": {"id": "a1b2c3d4", "action": "hi-lg", "value": "off", "peer": "192.168.1.23", "timeout_in_s": 47}
+```
+
+and after it is answered: `"last_result": {"id": "a1b2c3d4", "action": "hi-lg", "value": "off", "verdict": "allowed", "result": "applied", "error": ""}`. `verdict`: `allowed`, `refused`, `expired`, `aborted` (session ended first). `result` is the `result` field of the `ctl.sh set` JSON (`applied`, `already`, `mismatch`, `failed`, `refused`), or `ok`/`failed` for commands that print no JSON, or `""` when not run. `error` is the one-line error already allowed by the Voice and power design, never a reply body.
+
+Exit status as the other ctl.sh commands: 0 printed, 1 failed, 2 usage. `setup status` exits 0 whenever it printed JSON.
+
+### 4.4 Heartbeat
+
+The TV app polls `setup status --json` **about once a second while a session is `waiting` or `active`, from any screen** (a pending request must surface wherever the user is), and stops when the state is `ended`. The poll is the heartbeat. Nothing else keeps a session alive, so a closed app, a suspended web view or a TV that left `Active` ends it in at most 15 s. Polling cost through exec (fork of `sh`, two small files) is unmeasured; the probe checks it ([section 15](#15-on-target-probe-checklist-exp-012-part-a-read-only-first), item P7).
+
+## 5. Network
+
+### 5.1 Listener
+
+- **IPv4 only**, `0.0.0.0` on a port the kernel picks (`bind` to port 0, then read it back: a random high port from the ephemeral range, never fixed, never 6053). Reasons for IPv4 only: the QR URL carries an IPv4 literal (the app already shows the TV's address), IPv6 would add privacy addresses and scope ids for no benefit, and the ESPHome listener's default bind is `0.0.0.0` as well.
+- **Peer filter:** the server accepts a connection only from private, link-local or (in tests) loopback addresses: `10/8`, `172.16/12`, `192.168/16`, `169.254/16`. Anything else is closed at once without a response and counts as a bad request. This keeps a port forward or a public address of the TV from reaching it. Carrier-grade NAT or tailnet addresses (`100.64/10`) are not accepted in 0.4.0.
+- **`Host` check (DNS rebinding):** the `Host` header must equal `<local address of the accepted socket>:<port>` exactly (an IP literal). A hostname is refused. The phone opened an IP-literal URL, so this always matches for a real use.
+- One listener, `listen` backlog 4, closed the instant the session ends.
+- The server does **not** try to choose the interface (`std` has no interface list; `/proc/net/fib_trie` is a possibility, unverified on webOS). Binding to the address of the default-route interface instead of `0.0.0.0` is an option to decide after the probe (item P3) shows what interfaces the TV has.
+
+### 5.2 If the TV's firewall blocks inbound connections
+
+`hypothesis`: nothing is known about an `iptables` input policy on c3-a or c3-b; HA reaches 6053 (verified), so at least that port is open or no filter exists. If a filter blocks random high ports, the options (decided after the probe, not before) are: a documented fixed port added to the allow list by the user, the daemon's own port 6053 reused with a different route (rejected: it would put HTTP into the daemon), or declaring the feature unsupported on that TV with a clear message. The probe in section 15 lists exactly what to measure.
+
+### 5.3 Phone and TV on different networks (clear failure hint)
+
+The server cannot see a blocked path: a phone that cannot reach the TV never connects. So the hint is on the TV app's phone screen, shown **45 s after the start while the state is still `waiting`**, in English:
+
+> Nothing has opened the link yet. Your phone must be on the same network as this TV. A guest network, a different VLAN, a Wi-Fi "client isolation" setting, or a VPN on the phone will block it. This TV: 192.168.1.50 (port 49731).
+
+If a phone does connect from an address outside the TV's own `/24` (a heuristic: the netmask is not known to the server), the state carries `"peer_other_subnet": true` and the TV screen adds "The phone connected from a different network (10.0.2.5). That is unusual: check who it is." It is informational; the TV overlay still shows the peer for every request. The static docs for this feature repeat the hint.
+
+### 5.4 The address in the QR code
+
+The QR URL is `http://<TV IPv4>:<port>/s/<token>`. The TV app already finds the TV's address through `connectionmanager/getStatus` (`tvAddress` in `app.js`); the server only knows its port and path. If the app cannot find an address, it shows the path and port and says so (and no QR). The URL is under 80 characters, so the existing `qrcodegen.js` draws it at low error correction (the compatibility-report QR is longer).
+
+## 6. Authentication, session and request hygiene
+
+### 6.1 Token
+
+- 32 random bytes from `/dev/urandom` (256 bits; the requirement is at least 128), base64url without padding (43 characters), generated by the server at start. If `/dev/urandom` cannot be read the server exits (fail closed).
+- Lives in server memory, in `state.json` while `waiting` (tmpfs, 0600) and in the app's memory. It is never on the persistent flash, never in a log, an argument or the environment of any process.
+- **Single use:** `GET /s/<token>` is the only request that can consume it (compared in constant time). `HEAD` and other methods get 405 and do not consume it. A second `GET` of the same URL gets `410 Gone` ("this link was already used; press Start again on the TV"). A wrong token gets the same `404` as every other unknown path.
+- Consuming it creates the session and removes `path` from `state.json`, so the QR code disappears from the TV (the app shows "Phone connected from <peer>" with a Disconnect button). **If a link preview, a scanner app or a second person consumed the token first, the owner sees a different peer on the TV and can disconnect; the cost of a consumed token is a restart.**
+
+### 6.2 Session cookie
+
+- The response to the token request sets `sat_session=<32 random bytes, base64url>; Path=/; HttpOnly; SameSite=Strict; Max-Age=600` and answers `302 Location: /` so the token does not stay in the address bar or history. `Secure` cannot be set on plain HTTP (a `__Host-` prefix is therefore not usable).
+- **One session at a time.** After the token is consumed, a second token request is `410`; there is no way to start a second session without a restart on the TV.
+- The session is **bound to the peer IP** of the token request. A request with the right cookie from another IP is refused (`403`) and logged. `hypothesis` (probe): an IPv4 phone does not change its source address within a Wi-Fi session; a phone switching between Wi-Fi and mobile data would lose the session, which is acceptable and gives a restart hint.
+- Cookie value comparison is constant-time. The server stores the value only in memory.
+
+### 6.3 CSRF, content type and cross-origin
+
+- `GET /api/session` (cookie required) returns the per-session CSRF token (16 random bytes, hex). Every `POST` must carry `X-Setup-CSRF: <token>` and `Content-Type: application/json`. Without them: `403` (CSRF) or `415`. Because the header is custom and the content type is JSON, a cross-origin page cannot send it without a CORS preflight, and **the server never answers a preflight or sends any `Access-Control-*` header** (`OPTIONS` gets `405`).
+- If an `Origin` header is present it must equal `http://<Host>`; if `Sec-Fetch-Site` is present it must be `same-origin` or `none`. Otherwise `403`.
+- The cookie is `SameSite=Strict`, so a cross-site navigation does not carry it.
+
+### 6.4 Limits (all enforced before any command runs)
+
+| Limit | Value |
+| --- | --- |
+| Request line and headers | 4 KiB in total, at most 24 headers; no folded headers, no `Transfer-Encoding`, no `Expect`, no `Upgrade`, no pipelining, `HTTP/1.1` only |
+| Body | `Content-Length` required on `POST`, at most 1 KiB, exactly one such header, no body on `GET` |
+| Time | 3 s to read a whole request (headers and body), 3 s to write the response; slower is `408` and the connection is closed |
+| Connections | one at a time; the next is accepted after the current one closes; every response carries `Connection: close` |
+| Requests | at most 20 per second and 2000 per session |
+| Response size | at most 128 KiB (embedded assets are far smaller) |
+| Unauthenticated requests | 20 per session, then the session ends (`too-many-bad-requests`) |
+
+Parse errors end the session ([section 4.2](#42-states-and-end-conditions)).
+
+### 6.5 Why plain HTTP is acceptable
+
+No secret passes. The page never contains and the API never accepts the Noise key, an HA URL, login, token, or any HA data; the status mirror is allow-listed and carries no address, serial, name, key, log line or path ([section 8.4](#84-get-apistate)). What a passive sniffer on the LAN or the same Wi-Fi **can** see: the token request (single use, already consumed when the sniffer could replay it), the session cookie and CSRF token of every later request, and the page data. A sniffer that copies the cookie is rejected by the peer binding unless it also spoofs the phone's IP (possible only for an active attacker on the same segment), and even then **every write still needs the owner's OK on the TV, which shows the peer and the action**. The remaining risk is stated in the threat table. TLS was rejected because the only available certificate would be self-signed (warnings that train users to click through; no pinning route for ordinary phones, `hypothesis`) and it would protect nothing that matters here.
+
+### 6.6 Logging
+
+One line per event in `setup.log`, with the peer address: `session start port=49731`, `token consumed peer=…`, `request GET api-state peer=…` (a route name, **never the raw path**, which contains the token on the first request), `rejected csrf peer=…`, `action requested id=… action=hi-lg value=off peer=…`, `answer allow|refuse`, `action result id=… result=applied`, `session end reason=…`. Never logged: the token, the cookie, the CSRF token, request paths, headers, bodies, response bodies. Command output is reduced to the allowed `result` and `error` fields.
+
+## 7. TV confirmation
+
+1. The phone posts an action ([section 8.5](#85-post-apiactions)). The server validates it against the action table ([section 9](#9-actions-and-what-each-one-runs)), allows **one** pending request at a time (`409 busy` otherwise), makes up an id (4 random bytes as 8 hex characters) and writes `pending` into `state.json`.
+2. The TV app's one-second poll sees `pending`, and shows an **overlay** in its own words: the action text comes from the **app's own string table keyed by `action` and `value`** (built from the confirm texts of the Voice and power design, plus new ones for the microphone, the reply volume and the pairing window), plus the peer address (an IP literal, validated by the app). An unknown action or value, or a `peer` that is not an IP literal, is refused automatically (`ctl.sh setup answer <id> refuse`). The overlay says: "OK to allow, Back to refuse", and counts down from `timeout_in_s`.
+3. **OK** (Enter) calls `ctl.sh setup answer <id> allow`; **Back** (the Back key, 461, and Esc or Backspace as in the app's other screens) calls `... refuse`. Nothing else answers: not the phone, not a timeout (a timeout refuses).
+4. The server reads `answer.json` (every 200 ms while a request is pending), checks the id matches the pending request, and either hands the action to the worker (allow) or finishes with `refused`.
+5. **Request timeout: 60 s** from the post. A request not answered in that time is `expired` (the phone shows "the TV did not answer"). After a refusal or an expiry there is a 3 s cooldown before the next request; three refusals or expiries end the session.
+6. While an allowed action runs (up to 25 s), the pending slot stays taken (`state` `running` on the phone, the overlay shows "Applying…"). The result goes into `last_result`; the TV app shows it as the existing result line and re-reads its own screens.
+7. If the heartbeat is lost, the session ends, the pending request becomes `aborted`, and nothing runs.
+
+The overlay needs the app open, which is why the heartbeat is part of the design. The answer path is the same root exec primitive as every other app action: another app on the TV that can run `ctl.sh` as root could answer too, which is the existing trust boundary (install-and-config-ux 3.1), not a new one.
+
+## 8. HTTP API
+
+HTTP/1.1, `Connection: close`, UTF-8 JSON bodies (`Content-Type: application/json; charset=utf-8`). Every response carries `Cache-Control: no-store`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`; HTML responses add `Content-Security-Policy: default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'`. No CORS headers are ever sent. Errors are `{"error":"<code>","message":"<English sentence>"}`.
+
+### 8.1 Routes
+
+| Method and path | Needs | Purpose | Success | Errors |
+| --- | --- | --- | --- | --- |
+| `GET /s/<token>` | token | consume the token, set the cookie | `302` to `/` | `404` (unknown or wrong), `410` (already used) |
+| `GET /` | cookie | the phone page (HTML) | `200` | `403` page "Session ended; scan the QR code on the TV again" (no cookie or wrong), `404` otherwise |
+| `GET /assets/<name>` | cookie | embedded JS and CSS (`phone.js`, `voicepower.js`, `phone.css`) | `200` | `404` |
+| `GET /api/session` | cookie | the CSRF token and the remaining time | `200` | `403` |
+| `GET /api/state` | cookie | the status mirror | `200` | `403` |
+| `POST /api/actions` | cookie, CSRF | request one action | `202` | `400`, `403`, `409`, `415`, `422`, `429`, `503` |
+| `GET /api/actions/<id>` | cookie | state of a request | `200` | `403`, `404` |
+| `POST /api/session/end` | cookie, CSRF | the Done button | `200` | `403` |
+
+Any other path: `404`. A known path with a wrong method: `405` with `Allow`. Oversize body `413`, oversize headers `431`, slow request `408`, bad `Host` or `Origin` `400` or `403`. (`429` is the 3 s cooldown and the 20 per second limit; `503` is "the TV app is not answering", i.e. the heartbeat is late by more than 8 s.)
+
+### 8.2 `GET /api/session`
+
+```json
+{"schema": 1, "csrf": "9f3c...32 hex characters", "expires_in_s": 540, "idle_timeout_s": 180}
+```
+
+### 8.3 Cookie and token exchange
+
+`GET /s/<token>` response: `302`, `Location: /`, `Set-Cookie: sat_session=…; Path=/; HttpOnly; SameSite=Strict; Max-Age=600`, no body.
+
+### 8.4 `GET /api/state`
+
+A cached merge of two commands the worker refreshes every 3 s while a session is active, plus an immediate refresh after each action: `ctl.sh status --json` (package state) and `ctl.sh tv-settings --json` (LG settings and microphone). **The server copies an allow-list, never the whole output** (no `prefix`, `log`, `pid`, `firmware` string, `name`, `uid`, HA peer, key detail):
+
+```json
+{
+  "schema": 1,
+  "age_s": 1.2,
+  "device": {
+    "installed": true, "installed_version": "0.4.0", "running": true,
+    "key": "paired", "port": 6053,
+    "reply_volume": 40, "reply_volume_default": 40,
+    "pairing_window_s": 600
+  },
+  "tv": {
+    "luna": true,
+    "always_ready": {"state": "off", "raw": "off", "error": ""},
+    "hi_lg": {"state": "off", "thinq": false, "amazon": false, "dangbei": false, "error": ""},
+    "remote_off": {"state": "keep_listening", "active": true},
+    "mic": {"state": "listening", "kill_switch": false},
+    "power_state": "Active",
+    "last_change": null
+  },
+  "pending": null
+}
+```
+
+- `key` is the existing `ctl.sh status` word (`fixed`, `paired`, `unpaired`, `cleared`, `none`); the page uses it to decide whether to offer the pairing window.
+- `reply_volume` is the stored value, or `reply_volume_default` when none is stored; `pairing_window_s` comes from the config's `window_s` (the daemon does not publish the remaining time today; an optional later step adds it to `run/voice.json`, [open question 7](#17-open-questions)).
+- A command that fails or times out leaves its part `null` with `"error"`, never a guess. `age_s` tells the page how old the cache is.
+- The page computes the power-button sentence with the **shared** `window.voicePower.outcome(...)` ([section 11](#11-static-assets-and-the-shared-string-tables)) from `tv` and `device`, the same function the TV app runs.
+
+### 8.5 `POST /api/actions`
+
+Request: `{"action": "<id>", "value": "<value>"}`; the id and value come from the table in section 9 and nothing else is accepted (unknown keys, other types, duplicate keys: `400`).
+
+Response `202`: `{"id": "a1b2c3d4", "state": "pending", "timeout_s": 60}`.
+
+Errors: `400 bad_request` (shape or unknown action or value), `403 csrf` or `no_session`, `409 busy` (a request is pending or running), `415 unsupported` (content type), `422 not_applicable` (a precondition of the table failed, with a `message` such as "The pairing window is only for an unpaired TV"), `429 rate_limited` (3 s cooldown), `503 app_gone` (no heartbeat for 8 s: the TV app cannot show the overlay, so nothing is queued).
+
+### 8.6 `GET /api/actions/<id>`
+
+```json
+{"id": "a1b2c3d4", "state": "pending", "timeout_in_s": 47, "result": null}
+```
+
+`state`: `pending` (waiting for the OK), `running`, `done`, `refused`, `expired`, `aborted`. With `done`: `"result": {"result": "applied", "error": ""}` using the `result` vocabulary of [section 4.3](#43-ctlsh-setup-interface). Only the latest request is kept, for 60 s after it finished; another id is `404`. The page polls this every second while `pending` or `running`.
+
+### 8.7 `POST /api/session/end`
+
+Body `{}`; response `200 {"state":"ended","reason":"done"}`; the server closes after sending it.
+
+## 9. Actions and what each one runs
+
+### 9.1 The table
+
+The server holds a fixed table. For each row it builds the argument list itself; the value is checked against the listed set before it is placed in the list, so no request byte reaches a command except a validated integer.
+
+| Action id | Values | Runs (argv, no shell) | Precondition (server, from the cached state) | TV overlay says (app string table) |
+| --- | --- | --- | --- | --- |
+| `always-ready` | `on`, `off` | `ctl.sh set always-ready on|off` | `luna` true and `always_ready.raw` is `off` or `alwaysReady` (`ctl.sh` also refuses otherwise) | the Always Ready confirm text of the Voice and power design |
+| `hi-lg` | `on`, `off` | `ctl.sh set hi-lg on|off` | `luna` true; thinQ is the only provider the toggle changes | the Hi LG confirm text |
+| `remote-off` | `normal`, `keep` | `ctl.sh set remote-off normal|keep` | none | the Keep listening confirm text |
+| `mic` | `off`, `on` | `ctl.sh mic off|on` (the kill switch) | none | "Turn the microphone off?" / "Turn the microphone on? The satellite will listen again." |
+| `pair` | none | `ctl.sh pair` | daemon running and `key` is `unpaired` or `cleared` (a paired device is not offered a window) | "Open the pairing window for 10 minutes? Anyone on your network who connects first can claim this TV while it is open." |
+| `reply-volume` | integer 0 to 100 as a decimal string, at most 3 digits | `ctl.sh set reply-volume N` (new, [9.2](#92-reply-volume)) | none | "Set the reply volume to N %?" (0 adds "Replies and timer alarms will be silent.") |
+
+Excluded on purpose: start, stop, restart, install, update, uninstall, purge, autostart, reset pairing, report, self-check, firmware acknowledgement, and any device name or config value. These stay on the TV (or SSH). Commands run with `env_clear` plus a fixed `PATH`, stdin from `/dev/null`, stdout limited to 64 KiB, and a 25 s limit (the worker kills the child; the result is `failed` `timeout`). The commands' own history log (`etc/tv-settings.log`, ADR 0008) still records `source=ctl`; the setup log adds the peer.
+
+### 9.2 Reply volume
+
+**Findings (repo code, 0.3.0):** the reply volume is stored as a whole percent (0 to 100) in `sink.volume_file`, which resolves to `etc/reply_volume` in the package config. The daemon reads it **only at startup** (`volume::load`); at runtime the file is written only by the daemon when **Home Assistant** sets the volume (`on_volume`: gain `0.5 dB per percent`, 100 % = 0 dB, 0 % silent; then `volume::store`). A file written by something else is **ignored until a restart**, and HA's media-player slider would not follow. The `remote_off` change (commit `f018c91`) shows the pattern; `AppCommand::SetVolume(percent)`, used at startup to publish the stored value, also works at runtime (it refreshes HA's media-player state and is not echoed back as a change).
+
+**Design (one new ctl.sh command and one daemon trigger, step [P2](#16-implementation-steps)):**
+
+1. `ctl.sh set reply-volume N` (digits only, 0 to 100, else exit 2): read the current stored value (`etc/reply_volume`, or the config default); equal means `already`, no write. Otherwise write the percent with a temporary file and `mv` (the daemon's own atomic way, mode 0600), create the trigger `run/reply-volume-reload`, wait up to 3 s for the daemon to consume it, and print one JSON line like `set remote-off`: `{"schema":1,"setting":"reply-volume","requested":"30","before":"40","after":"30","result":"applied","daemon":"applied","error":""}` (`daemon` is `pending` when the trigger was not consumed in 3 s and `not running` when stopped; the next start reads the file). One history line is appended to `etc/tv-settings.log` as for `remote-off`.
+2. The daemon's once-a-second trigger poll also consumes `reply-volume-reload`, calls `volume::load` and, for a valid value that differs from the current one, sets the shared gain (`volume_gain.set(gain_for(p))`, so a reply already playing changes too), sends `AppCommand::SetVolume(p)` so HA's media player follows, and logs `reply volume P % (…) set by ctl.sh`. An unusable file keeps the current value with one `warn` (as `reload_remote_off`). It does **not** write the file back (already there). A consumed trigger with an unchanged value is a `debug` line.
+3. The phone page offers a slider in steps of 5 and the text of the dB mapping from `volume.rs` ("40 % is -30 dB"); 0 shows "silent: replies and timer alarms make no sound" (the daemon already warns about a 0 % alarm).
+
+No sound is played by any of this. A first real run on a TV would not play a test reply either.
+
+### 9.3 Device name
+
+**What changing the ESPHome device name does to the existing HA entry** (documented from HA core source, **not tested** on the owner's HA 2026.10.x; [Sources](#sources)):
+
+- The HA entry is keyed by the **MAC** (unique id). The satellite derives the MAC from `mac_seed`, which the packaged config always sets, so a name change keeps the identity. If a user's config has neither `mac` nor `mac_seed`, the MAC is derived **from the name**: a rename would then create a new device in HA. The setup server cannot assume the seed exists.
+- On the next connect with the same MAC and a new name, HA silently overwrites the stored device name in the entry data and continues; the entry title stays, the entity ids stay (they live in HA's entity registry); the device registry name follows `friendly_name`. The mDNS instance name changes too (mDNS is off by default). HA's zeroconf step with the same MAC only updates host and port.
+- The name is read from `config.toml` at startup, so a change needs a **config write and a daemon restart** (a few seconds without HA connection and without the microphone). A shell edit of TOML from a web request is the riskiest piece of text handling in the whole feature, for a setting that HA already lets the user rename in its own UI (device page, "rename").
+
+**Decision: the device name (`device.name`) is not changeable from the phone in 0.4.0, and neither is `friendly_name`.** The name is the satellite's identity string (also the base of HA's default entity names, a unique id for mDNS and the key-exchange logs), and renaming is done in HA. `friendly_name` is a possible later action `friendly-name` (a restricted character set, at most 32 characters, one config key rewrite by `ctl.sh set friendly-name`, a restart, the TV overlay showing the new text) but only with an owner request and a TOML-writing test; it is [open question 4](#17-open-questions). The name is not in the status allow-list (section 8.4), so the phone page does not show it either.
+
+## 10. "Add to Home Assistant"
+
+What the phone page shows, in this order (all text in the page, English):
+
+1. **State line** from `device.key`: not paired, paired, or unpaired by Home Assistant. When `paired` the page says so and offers nothing more here.
+2. **"Open the pairing window"** (an action; the TV asks for OK; only when `key` is `unpaired` or `cleared` and the daemon is running). The page then says it is open for up to `pairing_window_s` seconds from the OK (the daemon's own window; the exact remaining time is not known to `ctl.sh` today).
+3. **Address and port with copy buttons.** The address is `location.hostname` of the page (the IP the phone used to reach the TV, which is by construction an address the phone can reach; HA must reach it too, which is the same-network assumption) and the port is `device.port` (6053 by default; the server does not know the HA-facing port otherwise). `navigator.clipboard.writeText` needs a secure context and **plain HTTP is not one**; the page uses `document.execCommand("copy")` on a selected, read-only text input as the primary route here, falls back to "touch and hold to copy" with the text pre-selected, and uses the Clipboard API only if `isSecureContext` is true (documented, section 2).
+4. **A link that opens HA's add flow:** `https://my.home-assistant.io/redirect/config_flow_start/?domain=esphome` (opens in a new tab with `rel="noopener noreferrer"`). **Finding:** this link goes to HA's "add integration" flow for ESPHome (the `domain` parameter is documented through ESPHome's older getting-started guide and **not confirmed on the current My Home Assistant page**; labelled `documented, unconfirmed on the current page`, to be tested once on the owner's phone, probe item P11). **Host and port cannot be prefilled:** the ESPHome config flow's user step takes them only from the submitted form, nothing reads a URL parameter or flow context (HA core `dev` source, 2026-11-05; `documented`). So the page says: "In Home Assistant: Settings, Devices & services, Add integration, ESPHome. Paste the host and the port." The page does not ask for or store the user's HA address: the My redirect uses the instance URL saved in the phone's own browser (documented by My Home Assistant).
+5. **Step text for the flow after the link:** "Host: [copy] 192.168.1.50 Port: [copy] 6053. With Home Assistant 2026.9 or newer no key is needed while the window is open; Home Assistant stores the key itself." (the existing app text, [packaging](packaging.md)).
+6. **Done detection:** the page polls `/api/state`; when `key` becomes `paired` it shows "Paired with Home Assistant". It cannot know that the HA entry is configured otherwise (no HA data is read).
+
+Not offered: a second route that types the key, an HA URL field, an "open my HA" link built from a typed URL, and mDNS (`mdns = false` by default).
+
+## 11. Static assets and the shared string tables
+
+- **Served from the binary, not from files.** The server has a fixed route table and `include_bytes!`ed assets from `packaging/webos/app/phone/` (`phone.html`, `phone.js`, `phone.css`) and the shared model file. There is **no filesystem serving**, so there is no path traversal surface, no dependency on the app package's location (which changes with updates and is found through `app-dir`), and the page always matches the binary's API. The cost (a rebuild for a text change) is accepted; the IPK build already rebuilds both for a release. Size budget: under 60 KB of assets uncompressed.
+- **One model file for both screens.** The strings and the outcome matrix move out of `app.js` into **`packaging/webos/app/voicepower.js`**: ES5, no DOM, a UMD wrapper that sets `window.voicePower` in a browser and `module.exports` in Node (the existing `tests/app_matrix.js` then requires it directly instead of reading `app.js`). It holds exactly what `window.voicePower` exports today (`outcome`, `rows`, `resultMessage` and the `POWER`, `LISTEN`, `NOTE`, `POWER_EXTRA` tables) plus the confirm texts and the new action texts of section 9. The TV app loads it with a `<script>` tag from its package directory; the server embeds the **same file** with `include_str!("../../../packaging/webos/app/voicepower.js")`, so there is one copy in the repository. A test fails if the server crate's embedded file differs from the app's (it is the same path, so the test checks that the include path exists and the build copies nothing).
+- **Phone page code is separate.** `phone.js` is modern JavaScript for a current mobile browser (fetch, `async`, CSS grid); it only reads `window.voicePower`. The TV app stays ES5. Rule for `voicepower.js`: **ES5 only** (the webOS 8 web engine is `hypothesis` Chromium 94, the probe confirms; the app's other files stay ES5, `qrcodegen.js` needs ES2015).
+- **No inline script or style, no remote assets, no fonts, no analytics.** The CSP of section 8 enforces that. The page is usable at 360 px width and in a dark theme (`prefers-color-scheme`), large touch targets, no hover-only controls; it works without cookies being readable by script (HttpOnly) and says what to do when cookies are blocked (some QR apps open links in an embedded view that blocks them).
+- **Coordination with the redesign.** `app.js` is being restructured; the extraction ([P5](#16-implementation-steps)) must be done inside the redesign's Voice and power screen work or right after it, not in parallel on the old `app.js`. The contract the redesign must keep: **the strings and the matrix live in `voicepower.js`**, pure and ES5.
+
+## 12. Implementation language and dependencies
+
+- **Rust, std-only HTTP/1.1** for the server: a hand-written parser for the subset of section 6.4 (one request per connection, no chunked bodies, no keep-alive, no upgrade). It is smaller and easier to audit than a general parser because it rejects everything outside the subset; a dependency such as `httparse` (MIT or Apache-2.0, no dependencies) is the fallback if the hand parser grows past roughly 300 lines or the review prefers it.
+- **Dependencies:** `serde_json` and `serde` (already in the lock file through `webos-tv-control` and `webos-satellite`; `MIT OR Apache-2.0`, pure Rust, audited in [packaging section 8.1](packaging.md#8-license-decision-and-dependency-audit)), and nothing else. No `tokio`, no `hyper`, `axum`, `tiny_http`, `rustls`, `ring` (those add roughly a megabyte, many packages and a larger review for one connection at a time). Randomness from `/dev/urandom` through `std::fs` (fail closed); constant-time comparison is a ten-line fold; child processes through `std::process::Command`; descriptor and priority limits through `rustix` (already a workspace dependency; its `process` features are already enabled). `#![forbid(unsafe_code)]` through the workspace lint.
+- **Build:** `cargo zigbuild --release -p webos-satellite-setup --target armv7-unknown-linux-musleabi` and `aarch64-unknown-linux-musl` with the existing flags, `opt-level = "z"`, `lto`, `strip`; the dlmalloc allocator is not needed (a session is short). **Size:** estimated 0.3 to 0.6 MB per architecture (`hypothesis`; measured in P8; budget 0.7 MB). Licence of the crate: GPL-3.0-or-later like the workspace; no new third-party license enters the notice file (the same external packages as the daemon's subset).
+- The dependency audit of packaging section 8.1 is repeated for the new crate's tree (`cargo metadata` for the package, `cargo deny check licenses` and `cargo audit`, both installed locally) and recorded in P8.
+
+## 13. Threat table and the security review gate
+
+### 13.1 Threat table (updated from [install-and-config-ux 3.2](install-and-config-ux.md#32-option-b-embedded-web-config-server-plus-a-qr-code-on-the-tv))
+
+Assets: the TV's root control plane (the server runs as root; a defect is root on the TV), the microphone state and the pairing window (who can receive audio), the LG settings, and the owner's attention at the TV. **Not assets here:** the Noise key (never shown, accepted or readable by this process), HA credentials and HA data (none touched).
+
+| Threat | Notes | Mitigation in this design |
+| --- | --- | --- |
+| LAN attacker finds the open port | a random port on `0.0.0.0` is scannable for the session's life | explicit start only, never at boot; random port; closed on every end condition; 10 minutes at most; peer filter to private ranges; no listener the rest of the time (checked by an `nmap` run in the review) |
+| Guessing the token | online brute force | 256-bit token, single use, constant-time compare; 20 unauthenticated requests end the session; one connection at a time and 20 requests per second make 2^256 unreachable |
+| Passive sniffer on Wi-Fi or LAN sees the token, cookie or page | plain HTTP | no secret is on the page or in the API; the token is already consumed when seen; the cookie is bound to the peer IP; every write needs the OK on the TV with the peer address shown; the session lasts at most 10 minutes. The cookie and the status mirror are visible to a sniffer (accepted: non-secret, no address or key in them) |
+| Active attacker (ARP spoofing, rogue AP) | can relay, replace the page, or send writes with a stolen cookie from a spoofed address | the TV overlay is out of band and shows the peer and the action text from the app's own table; the owner approves only what they asked for; the phone page cannot approve; at most whitelisted actions; the blast radius is the six actions (the sharpest are "microphone on" and "pairing window", both only on an explicit OK and the window only for an unpaired TV) |
+| Someone else scans the QR first (a visitor, a photo of the screen) | they get the session | the QR disappears when the token is consumed; the TV shows "Phone connected from <peer>" with a Disconnect button; every write still needs the OK; the QR is on screen only while waiting; the first scanner sees only non-secret status |
+| Link previews, scanner apps or prefetchers consume the token | availability only | `HEAD` and non-GET do not consume; on a consumed link the phone gets `410` with instructions; restart creates a new token |
+| CSRF or a malicious page opened on the phone | a browser can post to a LAN address | `SameSite=Strict` cookie, custom header plus per-session token, JSON content type, `Origin` and `Sec-Fetch-Site` checks, no CORS, `OPTIONS` refused |
+| DNS rebinding | a hostile page re-resolves its name to the TV | the `Host` header must equal the socket's local IP and port; a name is refused; the cookie is host-bound |
+| Shoulder surfing or a camera on the screen | QR on screen for minutes | see "someone else scans first"; hidden after the first use; 10 minutes |
+| Secrets the page may **show** | | none: no key, no HA data, no names, no addresses beyond the one the phone used, no log lines |
+| Secrets the page may **accept** | | none: no text is accepted; enumerated actions and one validated integer only |
+| Parser or logic bug becomes root code execution | root process with a LAN-facing parser | std-only subset parser (rejects everything else), no `unsafe`, no shell, fixed argv, cleared environment, no file serving, hand-fuzzed malformed corpus, size and time limits, a separate process with no key access; the independent review below; short life |
+| A phone request makes the TV do something unwanted | a toggle flipped | the action list is the app's own (section 9); every change needs OK; ADR 0008 rules (read-back, history log) still hold; the daemon never changes an LG setting |
+| Overlay spam | repeated requests pester the owner | one pending request, 3 s cooldown, three refusals end the session |
+| Pairing window abused | a LAN peer claims the satellite | offered only when unpaired; needs OK; the window is the daemon's existing 10-minute window ([install-and-config-ux 5.3](install-and-config-ux.md#53-threat-model-for-the-pairing-window)) |
+| Logging | secrets in logs | events and peer only; never the token, cookie, CSRF, path, body (a test greps the log) |
+| The token reaches a persistent or shared place | `state.json` and the exec reply | `state.json` is on tmpfs, 0600; the exec reply goes only to the app; the app does not log it; whether HBC or the TV's log service retains exec output is **unknown** (probe P9) |
+| Resource exhaustion | one single-threaded server | tiny limits, one connection, a 10-minute life, worker queue of one, children capped at 25 s and 64 KiB |
+| A local app on the TV answers the overlay itself | any HBC app can exec `ctl.sh` as root | unchanged trust boundary (an app with root exec can already do every action directly); not a new exposure |
+
+### 13.2 Security review gate (backlog [#3](../project/backlog.md#3-install-and-configuration-ux)) before the 0.4.0 release
+
+The release is not tagged and the package is not published until all of this is done and recorded in a new document under `docs/design/` or the discovery records:
+
+1. An **independent review** of `crates/setup-server`, `ctl.sh setup`, the app's overlay and the phone page by someone other than the author (a fresh agent running the repository's security-review process, then the owner): parser, state machine, token and cookie handling, CSRF, limits, command construction, file permissions, log content.
+2. A **malformed-input corpus** and a short fuzz run (host): bad request lines, oversized and duplicated headers, `Content-Length` conflicts, `Transfer-Encoding`, non-UTF-8, NUL bytes, slowloris, request smuggling shapes, huge cookie, 10 000 connections in a loop; the process must end the session cleanly or refuse, never panic and never hang.
+3. **Dependency and license audit** of the new crate (`cargo metadata`, `cargo deny check licenses`, `cargo audit`), size recorded.
+4. **On the TV, with the owner:** an `nmap` (or equivalent) scan from another LAN host shows **no** extra listener while idle and while waiting before start; the port is closed after each end condition (done, timeout, app-gone, parse error); `ps` and `/proc/*/cmdline` show no token; the files in `/tmp/webos-satellite-setup/` have mode 0600/0700; the log contains no token, cookie or path ([section 15](#15-on-target-probe-checklist-exp-012-part-a-read-only-first), Part B).
+5. The **threat table** above is walked row by row and each row has a test or a recorded reason.
+6. The owner reads the result and signs off. A failed item blocks the release.
+
+## 14. Tests
+
+### 14.1 Host tests (no TV)
+
+- **Rust, `crates/setup-server` (integration tests with a fake `ctl.sh`, a temporary setup directory, 127.0.0.1 and an ephemeral port, a std `TcpStream` client; a second loopback address such as 127.0.0.2 plays "another phone"):**
+  - token: unknown token 404; first use 302 with the cookie flags (`HttpOnly`, `SameSite=Strict`, `Path=/`, `Max-Age`), second use 410, `HEAD` 405 and not consuming; the token never appears in the log or in `state.json` after use;
+  - session: no cookie 403 page, wrong cookie 403, right cookie from another address 403, one session only, idle end, hard timeout end (`--lifetime-s 2` test switch), `Host` and `Origin` mismatches, `Sec-Fetch-Site: cross-site`;
+  - CSRF and types: missing and wrong header 403, wrong content type 415, `OPTIONS` 405 with no CORS headers;
+  - limits: oversize headers 431, oversize body 413, missing or duplicate `Content-Length`, `Transfer-Encoding`, slow headers and slow body 408, a parse error ends the session, 20 unauthenticated requests end it, one connection at a time (a second connection waits, it is not served in parallel), rate limit 429;
+  - actions: every row of the table builds exactly the expected argv (checked by the fake `ctl.sh` recording its arguments), invalid values and unknown keys 400, the precondition 422, one pending at a time 409, the 3 s cooldown, three refusals end the session;
+  - confirmation: allowed (fake `ctl.sh setup answer` writes `answer.json`) runs the action and returns its `result`; refused and expired (`--request-timeout-s 1`) run nothing; a wrong id is ignored; heartbeat loss (`--heartbeat-grace-s 2`) ends the session and aborts a pending request; a worker command that hangs is killed at its limit;
+  - state mirror: the allow-list (a canary field in the fake `status --json`, `name` and `prefix`, must never appear), a failing or slow fake command shows `null` and `error` and does not block the HTTP loop;
+  - cleanup: after every end reason the listener is closed, `state.json` says `ended`, no token is left.
+- **Shell, `packaging/webos/tests/setup.sh` (new, added to `make test-packaging` and CI):** `ctl.sh setup start|status|answer|stop` with a **fake server** (a shell script that writes `state.json` and honours the heartbeat); start refused when not installed, not root or already active; `status` touches the heartbeat and prints `none` without a server; `answer` validates the id (8 lowercase hex) and the verdict; a stale pid is `crashed`; `stop` removes the directory; `uninstall`, `purge`, `install` (update) and `stop` all stop the server; **the boot hook template and `ctl.sh start` never reference `setup`**; the directory mode is 0700 and nothing is written outside it and `log/`; `set reply-volume` (write, `already`, trigger, bad value, history line); the reload with the fake daemon not running.
+- **Rust, daemon:** the reply-volume reload (file written, trigger consumed, gain changed, `SetVolume` sent, invalid file keeps the value), beside the existing `reload_*` tests in `daemon.rs`.
+- **Packaging (`ipk.sh`, `build_ipk.py check`):** both architectures of the new binary are in the payload, in `SHA256SUMS`, and `install.sh` installs it and checks `--version`; the app lists `voicepower.js`; no extra files.
+- **App (node, standard library only, `app_smoke.js` and `app_matrix.js`):** the whitelist contains exactly the new strings and the one `setup answer` pattern; the poll runs once a second only while `waiting` or `active`, from any screen, and stops on `ended`; the overlay maps OK to `allow` and Back to `refuse`; an unknown action, an unknown value or a non-IP `peer` is auto-refused; the 45 s hint; the QR is built from the app's address and the state's path; `app_matrix.js` still passes with the strings coming from `voicepower.js`.
+- **Phone page (node with a fake DOM and a fake fetch):** copy fallbacks (`execCommand` path, `isSecureContext` false), the sentence computed with `voicePower`, polling and the cooldown, error and expired texts, `key` states, the pairing step visibility.
+- **PC end to end (P9):** the real server and `ctl.sh` with fake `luna-send` and a fake app loop that polls `setup status` and answers; a scripted HTTP client does the whole flow for each action; optionally a headless browser run if one is installed (not required).
+
+### 14.2 On the TV (c3-a; the owner does the phone scan once)
+
+Part A (probe, read-only first, before the server is built) and Part B (the real build) in [section 15](#15-on-target-probe-checklist-exp-012-part-a-read-only-first). Every run needs the owner's authorization; no sound is played; each LG setting written from the phone is restored and read back; the pairing window is **not** opened on c3-a's permanent entry (the page must not offer it while paired; the pairing action is tested on a PC fake HA).
+
+## 15. On-target probe checklist (EXP-012, Part A read-only first)
+
+Experiment ID **EXP-012** (to be written in P1 with prerequisites, commands, expected signals, failure interpretation and rollback, as the template requires). Run on c3-a, then on c3-b read-only if the owner agrees. Record the model, firmware, HBC version, power state and date with each item; negative and inconclusive results are recorded as such; no raw output is committed.
+
+**Part A: before anything is built (read-only, no listener, except P3 and P7 which need an explicit OK)**
+
+| # | Measure | Why |
+| --- | --- | --- |
+| P1 | Which tools exist: `iptables`, `ip6tables`, `nft`, `ip`, `ifconfig`, `ss`, `netstat`, `nc`/`busybox nc`, `busybox httpd`, `python3`; `/proc/net/fib_trie`, `/proc/net/route` readable | decides the interface choice (5.1), the probe method, and the fallback options |
+| P2 | The firewall state, read-only: `iptables -S` and `ip6tables -S` (or `nft list ruleset`): INPUT policy, any rule on TCP destination ports, any rule per interface or source range; kernel modules for netfilter present or not | whether inbound high ports could be blocked at all |
+| P3 | **Inbound reachability** (needs the owner's OK: a short-lived listener, 30 s, started by hand, killed after): a listener on a random port in 49152-65535, another in 32768-49151, and 6053 as the known-good control, from (a) a phone on the same Wi-Fi, (b) a PC on the same Wi-Fi, (c) a wired host if the TV has both interfaces, (d) a host on another VLAN or the guest network if one exists; record which succeed per interface, whether the TV was on Wi-Fi or Ethernet, and the power state (`Active` only matters: the app needs a lit TV) | the central hypothesis of 5.2 and the cross-VLAN failure hint of 5.3 |
+| P4 | The TV's own addresses: every interface and IPv4 address (what `connectionmanager/getStatus` reports for the app versus what the kernel has), netmask, default route interface; whether more than one address is up (Wi-Fi Direct, Ethernet and Wi-Fi at once) | the QR address (5.4), the `/24` heuristic, the bind choice |
+| P5 | The TV app's web engine: `navigator.userAgent` and feature checks (`fetch`, `Promise`, `Array.prototype.includes`, CSS flex gap, `position: fixed` overlay stacking, `KeyboardEvent.keyCode` for OK (13) and Back (461), `document.visibilityState` and timers while the app is hidden, `performance.now`), read through a one-line diagnostic added to the existing app on a scratch copy, or the Diagnostics screen once redesigned | the ES5 rule and the overlay and heartbeat design |
+| P6 | Exec channel: that a **second** process started through `ctl.sh`-style `setsid nohup` from an HBC `exec` survives the exec's return and the app being closed; HBC service restart; how the TV treats the process when it goes to `Screen Off` and `Active Standby` (the server should die with the app anyway) | section 3.3 |
+| P7 | Exec polling cost: `ctl.sh status`-like call once a second for 10 minutes through the app's `exec`: round-trip time, CPU of the fork, any LG or HBC log growth, missed beats | the 1 s heartbeat and the 15 s grace |
+| P8 | Resource baseline for the server: RSS, CPU and startup time of a placeholder std-only listener built for the TV (measured in P4's first build) idle and under 10 requests per second; descriptor limits | the RSS budget (3.1) |
+| P9 | Does HBC or the TV's log (`journald`, `pmlogd`, `/var/log`, HBC's own log) retain an exec call's stdout, so a token printed by `setup status` could persist? Look with a harmless marker string in an exec reply, then search the likely logs | the token-in-logs row of the threat table |
+| P10 | A **test listener on the TV bound to `0.0.0.0` and a second to the Wi-Fi address only**: whether both are reachable; whether a connection from outside the private ranges is possible (if the TV has a public path, unlikely) | the peer filter and bind choice |
+
+**Part B: after P1 to P9 and the server is built (deploy to c3-a, owner authorization):**
+
+| # | Check |
+| --- | --- |
+| P11 | **The owner's phone scan, once:** from the TV app's button, scan the QR with the phone's camera app (note the phone model, OS, browser and version); does the page load, is there a "not secure" or HTTPS-first interstitial, does the cookie stick (an embedded QR-reader view may block it), does the copy button work on plain HTTP, does the My Home Assistant link open the add flow for ESPHome with the `domain` parameter (documented, unconfirmed) and what it shows |
+| P12 | The overlay on the TV for each action, OK and Back with the **real remote** (key codes 13 and 461), the 60 s timeout, the cooldown, and that Back refuses; the app polling while on another screen |
+| P13 | Each action end to end on c3-a: Always Ready and Hi LG (authorized writes, restored and read back), keep listening on/off, microphone on/off (the kill switch restored), reply volume changed and restored (HA's media-player slider follows, **no reply is played**), the pairing action only checked to be hidden while paired |
+| P14 | End conditions on the TV: Done on the phone and on the TV, 10-minute timeout, closing the app (15 s), TV to standby, a malformed request from a LAN host ending the session; after each, the port is closed (`nmap` or a connect test from another host) and `/tmp/webos-satellite-setup/` is gone |
+| P15 | No extra listener while idle (before start and after end), no token in `ps`, `/proc/*/cmdline`, logs or the persistent prefix; RSS and CPU of the server during the session; daemon RSS, loop-stall and HA connection unaffected during the session (the daemon's own log and HA's Listening state) |
+| P16 | The network hint: from a host on another VLAN or the guest network (if available) the page fails to load and the TV shows the 45 s hint |
+
+## 16. Implementation steps
+
+Each step is sized for one agent and says what it can run in parallel with. **The TV app redesign** (four screens, being mocked up separately) owns `packaging/webos/app/`; steps that edit that directory are serial with it.
+
+| Step | Work | Needs | Parallel with the redesign? |
+| --- | --- | --- | --- |
+| **P0** | This design, ADR 0009, backlog #15. **Done 2026-11-05.** Docs only | | n/a |
+| **P1** | Write EXP-012 (Part A and B of section 15 as a template-conforming plan); with owner authorization run Part A on c3-a and record the results (compatibility rows scoped to model, firmware, power state); decides the bind choice, the firewall fallback and the engine facts | owner authorization for P3 and P6 to P10 | **yes** (also answers open questions the redesign needs: the web engine) |
+| **P2** | Reply volume: `ctl.sh set reply-volume` (+ usage text, whitelist notes, the history line), the daemon's `reply-volume-reload` trigger and reload (beside `reload_remote_off`), host tests in shell and Rust, design notes in [Voice and power section 6](voice-and-power-screen.md#6-ctlsh-interface) | none | **yes** |
+| **P3** | `ctl.sh setup start|status|answer|stop`, the file protocol of section 4 (state file, heartbeat, answer, volatile directory, log truncation), integration in `stop`, `uninstall`, `purge` and `install`; `tests/setup.sh` with a fake server; usage text | the contract of this document | **yes** (shell only) |
+| **P4** | `crates/setup-server`: the HTTP subset parser, limits, token, cookie, CSRF, peer and `Host` checks, the session and end conditions, the worker thread and action table, the state mirror allow-list, pending and answer files, the log; embedded placeholder assets; Rust integration tests (section 14.1); size and RSS note. May be split: P4a (HTTP core, auth, limits, end conditions) and P4b (actions, confirmation, state mirror) | P3 file contract (this document); P1 results can refine the bind choice | **yes** |
+| **P5** | Extract the strings and the outcome matrix from `app.js` into `voicepower.js` (ES5, UMD), load it from `index.html`, point `app_matrix.js` and `app_smoke.js` at it, add the action texts of section 9 | the redesign's Voice and power screen | **no** (serial: do it in or right after the redesign's app work) |
+| **P6** | The phone page (`phone.html`, `phone.js`, `phone.css`): layout, status mirror, sentence through `voicePower`, the actions with the pending and result states, "Add to Home Assistant" (copy fallbacks, My link, steps, done detection), failure and expiry texts, dark theme, 360 px; page tests with a fake DOM and fetch | the API of section 8; `voicepower.js` for the sentence | **partly**: layout and API client can start against a mock server before P5; the sentence needs P5 |
+| **P7** | TV app: the "Set up with your phone" button and screen (QR from the app's address and the state path, state lines, 45 s hint, Done and Disconnect), the app-wide one-second poll, the confirmation overlay with OK and Back, the whitelist additions (exact strings and the `setup answer` pattern), app tests | P3 interface; the redesign's structure and navigation | **no** (serial with the redesign) |
+| **P8** | Packaging: `Makefile` targets for both architectures, `build_ipk.py` and `install.sh` (install, `--version` triple check, `SHA256SUMS`), `ipk.sh`/`run.sh` checks, size and license-audit record for the new crate, `config.default.toml` unchanged | P4 compiles | **yes** (does not touch the app directory except the IPK file list) |
+| **P9** | PC end-to-end test (real server and `ctl.sh`, fake `luna-send`, a scripted app loop) for every action and every end condition; docs updates: [development](../development.md), [packaging](packaging.md), [install-and-config-ux](install-and-config-ux.md) status | P3, P4, P6, P7, P8 | after the others |
+| **P10** | **Security review gate** (section 13.2, items 1 to 3, 5, 6): independent review, malformed corpus and fuzz, threat table walk; findings fixed or recorded | P9 | after P9 |
+| **P11** | Deploy to c3-a (silent), run EXP-012 Part B with the owner doing the phone scan once; record the experiment, the compatibility rows and, after the TV-side review items (13.2 item 4), the sign-off | P10, owner present with a phone | after P10 |
+| **P12** | Version 0.4.0 release (bump, packaging checks, docs, release notes) | P11 and the owner's sign-off | last |
+
+## 17. Open questions
+
+1. **Inbound reachability** of a random high port on the TV: unknown until P3. If blocked, which fallback (a documented fixed port, a user-run command, or unsupported on that TV)?
+2. **A parse error ends the session** (owner's rule). A port scanner or a stray connection sending garbage would end a waiting session before the owner scans. Recommendation (not applied): count parse errors **before the token is consumed** and end only after 3, while a parse error from the session's own peer still ends it at once.
+3. **IPv4 only.** Is that acceptable for IPv6-only home networks (rare)? The TV app's address lookup would also need to return an IPv6 literal in brackets.
+4. **`friendly_name` from the phone** (section 9.3): wanted at all, given HA's own rename? If yes, the config-write test and the restart cost need an owner decision.
+5. **Bind to the default-route interface** instead of `0.0.0.0` once P4 and the probe show whether it is determinable without `unsafe`.
+6. **Peer binding** may annoy a phone that roams between Wi-Fi bands or switches to mobile data; the alternative (cookie only) is weaker. Keep, and watch the first real use.
+7. **Pairing window countdown:** `ctl.sh` cannot read the remaining time; an optional `pairing` field in `run/voice.json` (window open, seconds left) would let the TV app and the phone show it (install-and-config-ux 5.2 rule 2 asked for a visible countdown).
+8. **`100.64/10` peers** (a phone on a tailnet while at home): refused in 0.4.0; revisit if users ask.
+9. **The My Home Assistant link:** the `domain` parameter is unconfirmed on the current page; if P11 shows it does not preselect ESPHome, the page should link to the generic add-integration redirect and name ESPHome in the text.
+10. **Where the redesign shows the pending-request overlay** when the user is inside another full-screen flow (the compatibility-report QR, an arm-and-confirm prompt): which has priority? Proposal: the phone overlay always wins and disarms any other armed button.
+
+## Sources
+
+Research date 2026-11-05.
+
+- Home Assistant core `dev`: `homeassistant/components/esphome/manager.py` (connect: MAC check, name overwrite, device registry) and `config_flow.py` (user step, zeroconf, reauth), raw files read on 2026-11-05: <https://raw.githubusercontent.com/home-assistant/core/dev/homeassistant/components/esphome/manager.py>, <https://raw.githubusercontent.com/home-assistant/core/dev/homeassistant/components/esphome/config_flow.py>. A local copy was grepped for `expected_name` (not present).
+- My Home Assistant: <https://www.home-assistant.io/integrations/my/> (no parameter list for `config_flow_start`) and <https://my.home-assistant.io/redirect/config_flow_start/> (title "Link to Integrations: add integration"; no parameters shown). The older ESPHome getting-started guide badge `my.home-assistant.io/redirect/config_flow_start/?domain=esphome` was found through a web search (copies of the esphome-docs file), not on the current docs.
+- MDN, Clipboard API requires a secure context (recalled, not re-fetched).
+- In this repository: [install and configuration UX](install-and-config-ux.md), [Voice and power screen](voice-and-power-screen.md), [packaging](packaging.md), `crates/satellite/src/{volume,daemon}.rs`, `crates/esphome-api/src/{app,server,config}.rs`, `packaging/webos/{ctl.sh,config.default.toml}`, `packaging/webos/app/app.js`.

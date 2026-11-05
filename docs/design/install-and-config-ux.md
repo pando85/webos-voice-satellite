@@ -116,6 +116,8 @@ HA and `aioesphomeapi` are the only clients we have to satisfy; HA 2026.9.0 or n
 
 ### 3.2 Option B: embedded web config server plus a QR code on the TV
 
+> **Update 2026-11-05 ([ADR 0009](../decisions/0009-phone-setup-web-server.md)):** the owner decided to build a form of Option B in 0.4.0: a "Set up with your phone" button in the TV app, a QR code with a one-time URL, a small separate web server, scope limited to Home Assistant setup help and settings, every change from the phone approved with the TV remote. This **reverses** the "Option B is not built" recommendation in section 4 for this feature; the assessment and the threat model below are kept as written and reused, and the updated threat table is in [Phone setup section 13](phone-setup.md#13-threat-table-and-the-security-review-gate). Where the design differs from the mitigations listed below: no typed second-factor code (the OK on the TV covers every write), the key and HA data are never shown or accepted, and the server is a separate process.
+
 - **What:** the daemon (or a helper) serves a config page on the LAN. The TV app shows a QR code with the URL, the phone opens it, the user enters the HA connection details and the key.
 - **Effort:** high. HTTP server in a 64 MiB-RSS-limited static daemon (or a second process), QR rendering in the TV app, session handling, TLS decision, a rate limiter, tests, a security review ([backlog #3](../project/backlog.md) already requires one). Plus Option A's UI shell.
 - **UX:** good for typing; poor for trust (browser warnings if TLS is self-signed; phone and TV must be on the same VLAN, and guest or IoT VLANs often block phone-to-TV traffic).
@@ -162,6 +164,8 @@ Assets: the Noise key (it decides who can stream microphone audio to a controlle
 ## 4. Recommendation
 
 **C as the pairing and configuration path, with a minimal A as the on-TV face; B is not built unless a concrete need appears after C.**
+
+> **Superseded in part (2026-11-05, [ADR 0009](../decisions/0009-phone-setup-web-server.md)):** B is now built, as the phone setup web server of [Phone setup](phone-setup.md) (version 0.4.0). C stays the pairing path; item 4 below and the last bullet of section 4.2 no longer apply. The text is kept as the record of the 2026-11-02 recommendation.
 
 1. Package the daemon as an HBC IPK with a small web app (A) that shows state and offers start, stop, autostart, kill switch, start pairing and reset pairing, using only fixed `exec` subcommands.
 2. Pair through HA (C): the daemon starts unprovisioned inside a timed pairing window, HA generates and sets the key; the key never appears on screen, in the phone or in logs.
