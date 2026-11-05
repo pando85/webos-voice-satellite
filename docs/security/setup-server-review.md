@@ -11,7 +11,7 @@
 | --- | --- |
 | `crates/setup-server` (binary `webos-satellite-setup`): `main.rs`, `http.rs`, `session.rs`, `actions.rs`, `worker.rs`, `mirror.rs`, `files.rs`, `secret.rs`, `log.rs`, `config.rs`, `assets.rs`, `build.rs`, `tests/server.rs` | commits `4bb7b00` (P4) and `6de54a1` (P6) |
 | Phone page assets: `assets/phone.html`, `phone.js`, `phone.css`, `no-session.html`, `link-used.html`; the embedded `packaging/webos/app/voicepower.js`, scanned for DOM sinks only | `6de54a1` |
-| `packaging/webos/ctl.sh` and `lib.sh`: `set`, `mic`, `pair`, `status`, and `setup` with its helpers | `main` has **no** `setup` and **no** `set reply-volume`. The `setup` code reviewed is the **uncommitted P3 work in the shared tree** on 2026-11-05 (another agent is still finishing it). See [items to re-check](#ctlsh-items-for-the-p3-author) |
+| `packaging/webos/ctl.sh` and `lib.sh`: `set` (including `set reply-volume`), `mic`, `pair`, `status`, and `setup` with its helpers | P3 as committed in `47b9288` (reviewed first as uncommitted work in the shared tree, then re-checked on the commit: the same code, plus a pid-only liveness check in the start loop). See [items for the P3 author](#ctlsh-items-for-the-p3-author) |
 
 **Method:** a line-by-line reading of the crate and the shell code. Host runs:
 
@@ -25,7 +25,7 @@
 
 No High or Medium finding. The HTTP subset, the token, cookie and CSRF handling, the action table and the confirmation state machine meet the design. Two Low findings are fixed with regression tests (SR-01, SR-02). The rest are accepted design trade-offs, or open items for the owner and for the on-TV probe.
 
-**Supervised test on c3-a:** acceptable from the server's side once `ctl.sh setup` (P3) has landed on `main`, with items C3 to C5 below checked during the test. **Release (0.4.0):** not yet. The overlay review, the on-TV checks (gate item 4) and the owner's sign-off are still open.
+**Supervised test on c3-a:** acceptable from the server's side, with items C3 to C5 below checked during the test. `ctl.sh setup` (P3) is on `main` since `47b9288`. **Release (0.4.0):** not yet. The overlay review, the on-TV checks (gate item 4) and the owner's sign-off are still open.
 
 ## Findings
 
@@ -165,6 +165,11 @@ These are availability problems only, and part of the design's choices.
 - Log lines are fixed words, IP literals and sanitized one-line errors (printable ASCII, at most 160 characters). Request paths, headers and bodies are never logged.
 - `Debug` of a request hides the target, the cookie and the CSRF token.
 - `/api/state` copies an allow-list field by field: no prefix, name, log or firmware. The test canaries cover this.
+- `device.ha` (added after P3 at the coordinator's request) carries only:
+  - `state`, one of `connected`, `disconnected`, `unpaired` or `unknown`, else null;
+  - `since_s`, a whole number of at most ten years, else null.
+
+  No address, name or version is copied. Test: `mirror::tests::ha_connection_is_allow_listed`.
 - Responses carry `Referrer-Policy: no-referrer`, and the page also has a meta tag.
 
 **Phone page**
@@ -186,9 +191,9 @@ These are availability problems only, and part of the design's choices.
 
 ## ctl.sh items for the P3 author
 
-`ctl.sh` was not changed by this review. Items C1 to C5 should be settled before a test on the TV.
+`ctl.sh` was not changed by this review. Items C2 to C5 should be settled before a test on the TV.
 
-- **C1 (blocker for any deploy):** on `main`, `ctl.sh` has neither `setup` nor `set reply-volume`. The app cannot start a session, and the server's `reply-volume` action would end `failed` with "no result from ctl.sh". P3 must land first.
+- **C1 (resolved):** when the review started, `main` had neither `setup` nor `set reply-volume`, so no session could start. P3 landed in `47b9288`.
 - **C2:** `setup start` passes its whole inherited environment to the server; its comment says only the session and install directories. The server forwards only its allow-list to its children, but `WEBOS_SAT_LUNA_SEND`, `WEBOS_SAT_INITD`, `WEBOS_SAT_LOCK`, `WEBOS_SAT_ALLOW_NONROOT` and `WEBOS_SAT_SETTLE` from the exec environment would still reach the root commands. The trust is equal today, because the exec caller is root. Still, start the server with `env -i PATH=… WEBOS_SAT_SETUP_DIR=… WEBOS_SAT_PREFIX=…` and have the tests add their variables explicitly, so that the comment holds.
 - **C3:** `setup.pid` is the `$!` of `$SETSID nohup …`. `setsid` forks when its caller leads a process group (util-linux and BusyBox). `setup.pid` would then name a process that exits at once: `setup start` would report a failure, and `stop_setup_server` would remove the directory, which ends the server. That fails safe, but would make the feature unusable. Verify on c3-a that `/proc/$(cat setup.pid)/cmdline` is the server itself.
 - **C4:** `/tmp` must be 1777 and owned by root on the TV: `setup start` (`rm -rf` then `mkdir -m 700`) and the server (SR-02, now enforced) rely on it. Record `stat -c '%a %U' /tmp` in EXP-012 Part B.

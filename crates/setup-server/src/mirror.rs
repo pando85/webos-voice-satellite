@@ -145,6 +145,18 @@ fn device_part(s: &Value) -> Value {
         }),
         _ => Value::Null,
     };
+    // {"state": word, "since_s": N|null}: the HA API connection from
+    // run/voice.json (P3). Only these two fields: no address, name or version.
+    let ha = match g("ha") {
+        Some(Value::Object(h)) => json!({
+            "state": match h.get("state").and_then(Value::as_str) {
+                Some(w @ ("connected" | "disconnected" | "unpaired" | "unknown")) => Value::from(w),
+                _ => Value::Null,
+            },
+            "since_s": number(h.get("since_s"), 10 * 366 * 86_400),
+        }),
+        _ => Value::Null,
+    };
     let default = number(g("reply_volume_default"), 100);
     let stored = number(g("reply_volume"), 100);
     json!({
@@ -158,6 +170,7 @@ fn device_part(s: &Value) -> Value {
         "pairing_window_s": number(g("pairing_window_s"), 86_400),
         // {"open": bool, "ends_in_s": N|null} from run/voice.json (P2).
         "pairing": pairing,
+        "ha": ha,
     })
 }
 
@@ -213,7 +226,7 @@ mod tests {
 
     use super::*;
 
-    const STATUS: &str = r#"{"package_version":"0.4.0","installed":true,"installed_version":"0.4.0","build":"webos-satellite 0.4.0 (armv7)","update_pending":false,"uid":0,"machine":"armv7l","running":true,"pid":1234,"supervised":true,"autostart":false,"disabled":false,"crashloop":false,"mic_off":false,"firmware":"03.30.74 CANARY","firmware_ok":true,"firmware_verified":true,"compat":{"x":"CANARY"},"key":"unpaired","name":"CANARY-name","port":"6053","remote_off":"normal","reply_volume":"","reply_volume_default":"40","pairing_window_s":"600","pairing":{"open":true,"ends_in_s":321,"x":"CANARY"},"prefix":"/var/lib/CANARY","log":["CANARY log line"]}"#;
+    const STATUS: &str = r#"{"package_version":"0.4.0","installed":true,"installed_version":"0.4.0","build":"webos-satellite 0.4.0 (armv7)","update_pending":false,"uid":0,"machine":"armv7l","running":true,"pid":1234,"supervised":true,"autostart":false,"disabled":false,"crashloop":false,"mic_off":false,"firmware":"03.30.74 CANARY","firmware_ok":true,"firmware_verified":true,"compat":{"x":"CANARY"},"key":"unpaired","name":"CANARY-name","port":"6053","remote_off":"normal","reply_volume":"","reply_volume_default":"40","pairing_window_s":"600","pairing":{"open":true,"ends_in_s":321,"x":"CANARY"},"ha":{"state":"connected","since_s":42,"address":"CANARY-addr","version":"CANARY-ver","peer":"10.0.0.9"},"prefix":"/var/lib/CANARY","log":["CANARY log line"]}"#;
     const TV: &str = r#"{"schema":1,"luna":true,"daemon_running":true,"always_ready":{"state":"off","raw":"off","error":""},"hi_lg":{"state":"on","thinq":true,"amazon":false,"dangbei":null,"error":""},"remote_off":{"state":"keep_listening","active":true},"mic":{"state":"listening","kill_switch":false},"power_state":"Active","last_change":{"setting":"hi-lg","from":"off","to":"on","at":"2026-11-05T10:00:00Z"},"canary":"CANARY"}"#;
 
     fn mirror() -> (Mirror, Instant) {
@@ -244,6 +257,11 @@ mod tests {
             v["device"]["pairing"],
             json!({"open": true, "ends_in_s": 321})
         );
+        assert_eq!(
+            v["device"]["ha"],
+            json!({"state": "connected", "since_s": 42})
+        );
+        assert!(!text.contains("10.0.0.9") && !text.contains("address"));
         assert_eq!(v["tv"]["hi_lg"]["thinq"], json!(true));
         assert_eq!(v["tv"]["hi_lg"]["dangbei"], Value::Null);
         assert_eq!(v["tv"]["remote_off"]["state"], json!("keep_listening"));
@@ -277,6 +295,41 @@ mod tests {
         assert_eq!(v["tv"]["always_ready"]["error"], json!("line1 line2"));
         assert_eq!(v["tv"]["power_state"], json!("Active Standby"));
         assert_eq!(v["tv"]["hi_lg"]["state"], Value::Null);
+    }
+
+    /// `ha` (P3): only `state` from its four words and `since_s` as a bounded
+    /// whole number; anything else is null, and a non-object `ha` is null.
+    #[test]
+    fn ha_connection_is_allow_listed() {
+        let now = Instant::now();
+        let mut m = Mirror::default();
+        for (ha, want) in [
+            (
+                r#"{"state":"unknown","since_s":null}"#,
+                json!({"state": "unknown", "since_s": null}),
+            ),
+            (
+                r#"{"state":"disconnected","since_s":"17"}"#,
+                json!({"state": "disconnected", "since_s": 17}),
+            ),
+            (
+                r#"{"state":"connected to 10.0.0.9","since_s":-1}"#,
+                json!({"state": null, "since_s": null}),
+            ),
+            (
+                r#"{"state":"unpaired","since_s":1e9,"host":"10.0.0.9"}"#,
+                json!({"state": "unpaired", "since_s": null}),
+            ),
+            (r#""connected""#, Value::Null),
+        ] {
+            let status = format!(r#"{{"installed":true,"ha":{ha}}}"#);
+            m.update(Ok(status.into_bytes()), Err("x".into()), now);
+            let v = m.to_json(&Value::Null, now);
+            assert_eq!(v["device"]["ha"], want, "{ha}");
+            assert!(!v.to_string().contains("10.0.0.9"), "{ha}");
+        }
+        m.update(Ok(br#"{"installed":true}"#.to_vec()), Err("x".into()), now);
+        assert_eq!(m.to_json(&Value::Null, now)["device"]["ha"], Value::Null);
     }
 
     #[test]
