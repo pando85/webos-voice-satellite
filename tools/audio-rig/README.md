@@ -270,6 +270,108 @@ Assistant. Separate venv: `numpy scipy soundfile pyopen-wakeword==1.1.0 faster-w
   calibration against HA. `aec_eval/stt_eval.py`: faster-whisper WER on the command segments.
 - Tests: `python3 -m unittest discover -s tools/audio-rig/aec_eval -p 'test_*.py'`.
 
+## Live AEC A/B on a TV (`aec_live_ab.py`)
+
+Used for [EXP-018](../../docs/experiments/EXP-018-aec-live-c3-a.md) (by hand, with scratch scripts) and
+for the follow-up run (this runner). One command runs a plan file: it switches the satellite's AEC
+arm, restarts it, waits for Home Assistant and the delay lock, plays TV content from the PC and
+synthetic "alexa" positives on a loudspeaker, reads the wake detections and the STT from HA, parses
+the satellite's `aec:` debug lines and writes one CSV row per trial. It **plays sound in the room
+and changes the TV's config**: run it only with the owner's authorization for the session (AGENTS.md).
+
+Files (all in `tools/audio-rig/`; the unit tests need no device: `python3 -m unittest discover -s tools/audio-rig -p 'test_aec_live.py'`):
+
+- `aec_live_ab.py`: the runner (`--dry-run` prints everything and touches nothing).
+- `aec_live_lib.py`: plan parsing, schedule, config editor, safety rails, log parser, CSV schema, McNemar.
+- `aec_plans/exp018.toml` (EXP-018 as run, explicit block order from its log) and
+  `aec_plans/exp019-off-vs-bns.toml` (the next run). A plan holds arms as `[aec]` snippets only
+  (OFF = no `[aec]` section), conditions (TV volume, content on or off, talker level), item sets,
+  the schedule, and the optional mic + reference capture and echo-path sweep. **No sink names, hosts,
+  tokens, keys or addresses**: those are command-line arguments.
+- `aec_live_report.py`: per-cell table and paired McNemar tests against OFF, for one or several CSVs.
+- `aec_live_convert.py`: turns EXP-018's private files into the same CSV schema.
+
+**What the runner does to the TV.** It changes only the `[aec]` / `[aec.*]` tables and the `[log] level`
+key (the `aec:` window lines need `debug`) of `etc/config.toml`; every other byte stays (checked before
+each write). The original is copied to the private output directory (mode 0600) with its md5, and written
+back and md5-checked on exit, Ctrl-C, SIGTERM or error, followed by `ctl.sh restart`. The new config is
+uploaded to a `.new` file, md5-checked and moved into place. Restarts use `ctl.sh restart` only; after a
+restart the runner waits for the `streaming mic audio to HA` log line, for HA's entity to be idle with the
+next wake word run armed, and (arm with AEC and content playing) for the first `aec: echo delay` line.
+Trials are played as in `p2_runner.py` (same arming wait, same detection rule; an HA WebSocket drop is
+retried after a reconnect). The satellite's `aec:` 60 s window covering each trial gives its delay, ERLE
+and reference underruns; the daemon's CPU is sampled from `/proc/<pid>/stat` once per block (all trials of
+a block share it).
+
+**Safety rails** (checked before the run and again before every block and trial): TV volume above 20 is
+refused (plans and the setter; only the final restore may set the owner's volume back); sound only
+08:00 to 21:00 local time unless `--allow-any-time` (and the local date and time are printed first); the
+HDMI sink must be named with `--content-sink` (no default), an HDMI-looking name is refused as the
+talker sink, both sinks must exist; the token file must be mode 0600 and is never printed; PC and TV clocks
+must agree within 2 minutes. Levels are set and restored in a fixed order: content off, TV volume down,
+then the PC sink up; at the end the PC sinks first, then the TV volume (as EXP-018's rollback did).
+
+**Results schema** (`trials.csv`, one row per played trial; also `docs/experiments/data/*-trials.csv`):
+
+| Column | Meaning |
+| --- | --- |
+| `run_id`, `plan` | run (plan id + date) and plan id |
+| `arm` | `OFF`, `DEFAULT`, `B`, `B+NS` (the arm names of the plan) |
+| `condition` | plan condition (`Q` quiet, `C10`, `C15`: content at TV volume 10 or 15) |
+| `tv_volume`, `talker_level` | TV master volume; `natural` (owner-natural: loudspeaker sink 82 %) or `loud` (100 %) |
+| `item_id`, `voice`, `phrase_id` | synthetic corpus item, its Piper voice (`:M`/`:F` for the two sharvard speakers), phrase (`alone` or `cmd_<slug of the synthetic command>`) |
+| `detected` | 1 if HA's openWakeWord fired (entity `idle` to `listening`) from 0.2 s before the item to 1.5 s after its end, else 0; empty = invalid trial (skipped by the report) |
+| `wake_latency_ms` | first detection, from the item's nominal start (assuming 0.2 s loudspeaker latency) |
+| `stt_match`, `stt_wer` | for command items that woke: 1 if the transcript equals the synthetic reference after P2 normalization, and the word error rate; blank otherwise. The transcript is not kept |
+| `delay_ms`, `erle_db`, `underruns` | from the satellite's 60 s `aec:` window covering the trial (blank with AEC off or no active reference); underruns are the window's reference underruns |
+| `daemon_cpu_pct` | the daemon's CPU, share of one core, over the trial's block (blank in EXP-018's data) |
+| `notes` | `key=value;...`: `block=N`, `lock_ms=...`, `no_restart`, `no_delay_lock`, `retried_after_ha_error`, `reconstructed`, `invalid`, ... |
+
+A second file, `blocks.csv`, has one row per block (arm, condition, trials, content seconds, **false wakes**
+while content played outside any trial window, CPU, notes). Rows contain no room speech, no audio, no tokens,
+no addresses, no timestamps (the writer refuses IPs, MACs, URLs and token-like strings).
+
+**Analysis and pooling.** `aec_live_report.py A-trials.csv B-trials.csv` prints, per cell (condition, TV volume,
+talker level) and arm: k/n with the 95 % Wilson interval, the paired exact McNemar test against OFF on the same
+items (pairs are run + item), the share of STT matches, median latency, ERLE and delay. A loud-talker cell of one
+run is never merged with a natural-talker cell of another. It reproduces EXP-018's table from
+`docs/experiments/data/EXP-018-trials.csv` (checked by `test_aec_live.py`).
+
+**Committed and private.** Committed: the plans, the code and tests, and the checked per-trial / per-block CSVs
+under `docs/experiments/data/`. Private (`devices/private/<device>/<run-id>/`, gitignored, never committed):
+the config backup, `trials.jsonl` (raw, with the STT text and times), `blocks.jsonl`, `tvlog-aec.txt`,
+`content-playlog.jsonl`, the mic + reference captures (`dualcap/`) with their session WAVs, and the echo-path
+captures (`echo-path/`). A CI regression test with a **measured echo path** (convolving synthetic speech with the
+response estimated from the private echo-path captures and running `aec_offline`) is possible later; it is not built.
+
+**Step by step (the follow-up run, `exp019-off-vs-bns.toml`).**
+
+1. Owner's authorization for the session; daytime; the owner present and **not typing** (EXP-018's block noise);
+   LG hands-free off; the HA pipeline selected on the satellite must not be able to act on a transcript (check as in
+   the "No actuation" note above); nothing else playing on the PC.
+2. `python3 tools/audio-rig/aec_live_ab.py tools/audio-rig/aec_plans/exp019-off-vs-bns.toml --dry-run`: check the
+   date check, the arms, the block order and the estimated sound minutes with the owner.
+3. Put a fresh HA token in a mode-0600 file (a bare access token, or the `/auth/token` JSON; revoke it afterwards).
+4. Run (the sink names come from `pactl list short sinks`; `--content-sink` is the HDMI sink feeding the TV):
+
+   ```sh
+   .venv/bin/python tools/audio-rig/aec_live_ab.py tools/audio-rig/aec_plans/exp019-off-vs-bns.toml \
+       --tv-ssh root@<tv> --ha-url <https://ha> --token-file <0600-file> --pipeline <name> \
+       --entity assist_satellite.<satellite> --talker-sink <loudspeaker-sink> --content-sink <hdmi-sink> \
+       --public-csv docs/experiments/data/<EXP-id>-trials.csv
+   ```
+
+   Stages: `ab` (160 trials, 16 blocks), then `dualcap` (the same 40 items over the content at each volume,
+   satellite stopped) and `sweep` (three 10 s sweeps through the TV, satellite stopped); `--stages ab` runs only the
+   A/B. Ctrl-C is safe: everything is restored. After a crash, `--rebuild OUT_DIR` rebuilds the CSVs.
+5. Check `trials.csv` and `blocks.csv` (no identifiers), then
+   `.venv/bin/python tools/audio-rig/aec_live_report.py docs/experiments/data/EXP-018-trials.csv docs/experiments/data/<EXP-id>-trials.csv`
+   to see the new cells and the pooled comparison. Write the experiment up (model, firmware, state, `verified-on-target`
+   labels, residual unknowns) and link the CSV.
+6. Offline re-scoring of the capture: `tv_dualcap_demux` output is already in `dualcap/<condition>/`; the echo path:
+   `.venv/bin/python tools/audio-rig/analysis/tvcap.py echo <out>/echo-path/sweep --digital <out>/echo-path/sweep-train.wav`.
+   Keep all of it private.
+
 ## Privacy
 
 Recordings can contain people's voices from the room. Keep them short, local and opt-in; tell

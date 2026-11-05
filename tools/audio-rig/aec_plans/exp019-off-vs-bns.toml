@@ -1,0 +1,127 @@
+# Live AEC A/B, next run after EXP-018: OFF against B+NS only, TV content at volume 10 and 15,
+# the synthetic talker at the owner-natural level in both (JBL sink 82 %), 40 positives per cell,
+# arms alternating every 10 trials in a counterbalanced (ABBA) order drawn from a fixed seed,
+# then a mic + reference capture with the satellite stopped (for offline re-scoring) and a short
+# echo-path sweep through the TV (kept private).
+#
+#   python3 tools/audio-rig/aec_live_ab.py tools/audio-rig/aec_plans/exp019-off-vs-bns.toml --dry-run
+#
+# Nothing identifying belongs here: sink names, the TV's ssh target, the HA URL, its credentials file and the entity id
+# are command-line arguments of the runner. Arms are `[aec]` snippets only.
+#
+# Experiment numbering: the file is named after the next AEC run; give the experiment the next free
+# EXP id when it is written up (EXP-019 is already taken by the small-local-models experiment).
+
+[plan]
+id = "exp019-off-vs-bns"
+title = "OFF against B+NS, content volume 10 and 15, owner-natural talker, 40 positives per cell, alternating arms"
+seed = 19
+log_level = "debug"          # the satellite's `aec:` window lines (delay, ERLE, underruns) need debug
+gain_db = 24                 # play_record.py convention: +24 dB = the corpus item at its own level
+trial_seconds = 13           # from EXP-018: a cell of 10 trials took 2:00 to 2:35 including the arming wait
+restart_seconds = 60         # ctl.sh restart + HA reconnect + delay lock
+content_lead_s = 15          # content plays this long before the first trial of a condition
+
+[timing]
+sink_latency_s = 0.2         # assumed loudspeaker (Bluetooth) latency, as in EXP-018
+settle_s = 1.5
+post_s = 3.0
+max_run_s = 40.0
+lead_s = 1.0
+
+[content]
+category = "sampler"         # the 10-minute sampler of devices/private/content/p2-v1
+pc_sink_pct = 100            # the PC's HDMI sink level, as in EXP-018 and session 2 (restored at the end)
+repeat = 10
+
+[talkers.natural]
+sink_pct = 82                # JBL at 82 %: -48.7 dBFS at the mic, confirmed by the owner as natural (EXP-018)
+label = "owner-natural"
+
+[talkers.loud]
+sink_pct = 100               # the JBL's maximum with these files: -40.5 dBFS at the mic (not used here)
+label = "loud"
+
+[arms.OFF]
+aec = ""                     # no [aec] section: the canceller is off
+note = "baseline"
+
+[arms."B+NS"]
+note = "B plus noise suppression"
+aec = """
+[aec]
+enabled = true
+render_channels = 2
+ns = true
+
+[aec.aec3]
+"linear_mix" = 0.4
+"ep_strength.default_len" = 0.0
+"""
+
+[conditions.C10]
+tv_volume = 10
+content = true
+talker = "natural"
+
+[conditions.C15]
+tv_volume = 15
+content = true
+talker = "natural"
+
+# 4 sets of 10 positives (5 "alexa" alone + 5 "alexa" + a harmless question: time, temperature,
+# weather or timer status; no light, climate or timer-start command). Piper MLS voices left out
+# (0 of 13 each through HA in P2 session 2). Every set is played once per arm and condition, so each
+# item is paired across arms (40 per cell).
+[sets]
+S1 = [
+  "pos_alone_sharM_v0", "pos_alone_sharF_v1", "pos_alone_davefx_v2", "pos_alone_claude_v0", "pos_alone_lessac_v1",
+  "pos_cmd_sharM_02", "pos_cmd_sharF_00", "pos_cmd_davefx_00", "pos_cmd_ald_02", "pos_cmd_claude_02",
+]
+S2 = [
+  "pos_alone_sharM_v1", "pos_alone_sharF_v2", "pos_alone_ald_v0", "pos_alone_claude_v1", "pos_alone_lessac_v2",
+  "pos_cmd_sharM_04", "pos_cmd_sharF_02", "pos_cmd_davefx_01", "pos_cmd_ald_04", "pos_cmd_claude_05",
+]
+S3 = [
+  "pos_alone_sharM_v2", "pos_alone_davefx_v0", "pos_alone_ald_v1", "pos_alone_claude_v2", "pos_alone_ryan_v0",
+  "pos_cmd_sharM_05", "pos_cmd_sharF_03", "pos_cmd_davefx_05", "pos_cmd_ald_07", "pos_cmd_claude_07",
+]
+S4 = [
+  "pos_alone_sharF_v0", "pos_alone_davefx_v1", "pos_alone_ald_v2", "pos_alone_lessac_v0", "pos_alone_ryan_v1",
+  "pos_cmd_sharM_09", "pos_cmd_sharF_07", "pos_cmd_davefx_08", "pos_cmd_ald_09", "pos_cmd_claude_08",
+]
+
+# Per condition: the arm order of item set i is the i-th of [A B], [B A], [B A], [A B] (ABBA), with
+# which arm is "A" and the item order inside a block drawn from the seed. A block is 10 trials; the
+# daemon restarts only when the arm changes (B B or A A need no restart). TV content keeps playing
+# across the blocks of a condition (including the restarts).
+[schedule]
+mode = "generated"
+layout = "cond-set-arm"
+arm_order = ["OFF", "B+NS"]
+conditions = ["C10", "C15"]
+condition_order = "seeded"
+sets = ["S1", "S2", "S3", "S4"]
+shuffle_items = true
+
+# Mic + reference with the satellite stopped (tv_dualcap.py: hw:LGSIC,0 and SoundEngineCapture),
+# the same 40 positives at the owner-natural level over the content, once per condition. Private.
+[dualcap]
+enabled = true
+conditions = ["C10", "C15"]
+sets = ["S1", "S2", "S3", "S4"]
+gap_s = 2.5
+ref = "hw:LGSIC,3"
+ref_channels = 2
+ref_format = "S32_LE"
+
+# Echo-path measurement: three 10 s log sweeps through the TV speaker (HDMI), nobody talking,
+# satellite stopped, mic + reference captured. Private; analysis with analysis/tvcap.py echo.
+[sweep]
+enabled = true
+tv_volume = 10
+repeats = 3
+stimulus = "sweep_48k_stereo.wav"
+sweep_s = 10
+lead_s = 3
+gap_s = 2

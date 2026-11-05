@@ -1,0 +1,205 @@
+# EXP-018 as it was run on 2026-11-05 on c3-a (docs/experiments/EXP-018-aec-live-c3-a.md), as a plan.
+# The original drove p2_runner.py with scratch shell wrappers; this file reproduces its design as
+# closely as the runner allows. Differences: the old wrappers set the sink levels and the TV
+# volume per cell with ad-hoc commands (this runner does the same from the plan and restores them),
+# the arm configs were whole files copied over config.toml (this runner replaces only the [aec]
+# tables and the [log] level), and the old B+NS blocks ran last, at C10 only, as here.
+#
+# Design: 20 positives per cell (two sets of 10, "pass 1" = X and "pass 2" = Y), 3 arms (OFF, DEFAULT, B)
+# x 3 conditions (Q quiet, C10 content at TV volume 10, C15 content at volume 15 with the loud talker),
+# arm order DEFAULT, B, OFF in pass 1 and OFF, B, DEFAULT in pass 2, the condition order drawn at random
+# per arm (seed 18) and reversed in pass 2 (the explicit block list below is the order that was run),
+# then B+NS at C10 (both sets). Content restarted for every cell (`content_each_block`).
+#
+#   python3 tools/audio-rig/aec_live_ab.py tools/audio-rig/aec_plans/exp018.toml --dry-run
+
+[plan]
+id = "exp018"
+title = "EXP-018: live AEC A/B on c3-a, OFF / DEFAULT / B (and B+NS at C10), 20 positives per cell"
+seed = 18
+log_level = "debug"
+gain_db = 24
+trial_seconds = 13
+restart_seconds = 60
+content_lead_s = 15
+
+[timing]
+sink_latency_s = 0.2
+settle_s = 1.5
+post_s = 3.0
+max_run_s = 40.0
+lead_s = 1.0
+
+[content]
+category = "sampler"
+pc_sink_pct = 100
+repeat = 10
+
+[talkers.natural]
+sink_pct = 82
+label = "owner-natural"
+
+[talkers.loud]
+sink_pct = 100
+label = "loud"
+
+[arms.OFF]
+aec = ""
+
+[arms.DEFAULT]
+aec = """
+[aec]
+enabled = true
+"""
+
+[arms.B]
+aec = """
+[aec]
+enabled = true
+render_channels = 2
+
+[aec.aec3]
+"linear_mix" = 0.4
+"ep_strength.default_len" = 0.0
+"""
+
+[arms."B+NS"]
+aec = """
+[aec]
+enabled = true
+render_channels = 2
+ns = true
+
+[aec.aec3]
+"linear_mix" = 0.4
+"ep_strength.default_len" = 0.0
+"""
+
+[conditions.Q]
+tv_volume = 10
+content = false
+talker = "natural"
+
+[conditions.C10]
+tv_volume = 10
+content = true
+talker = "natural"
+
+[conditions.C15]
+tv_volume = 15
+content = true
+talker = "loud"
+
+[sets]
+X = [
+  "pos_alone_sharM_v0", "pos_alone_davefx_v1", "pos_alone_claude_v2", "pos_alone_lessac_v0", "pos_alone_ryan_v1",
+  "pos_cmd_sharM_05", "pos_cmd_sharF_00", "pos_cmd_davefx_00", "pos_cmd_ald_07", "pos_cmd_claude_08",
+]
+Y = [
+  "pos_alone_sharF_v1", "pos_alone_ald_v2", "pos_alone_claude_v0", "pos_alone_lessac_v2", "pos_alone_ryan_v0",
+  "pos_cmd_sharM_02", "pos_cmd_sharF_02", "pos_cmd_davefx_05", "pos_cmd_ald_04", "pos_cmd_claude_05",
+]
+
+[schedule]
+mode = "explicit"
+content_each_block = true
+
+[[schedule.block]]
+arm = "DEFAULT"
+condition = "Q"
+set = "X"
+
+[[schedule.block]]
+arm = "DEFAULT"
+condition = "C10"
+set = "X"
+
+[[schedule.block]]
+arm = "DEFAULT"
+condition = "C15"
+set = "X"
+
+[[schedule.block]]
+arm = "B"
+condition = "C15"
+set = "X"
+
+[[schedule.block]]
+arm = "B"
+condition = "Q"
+set = "X"
+
+[[schedule.block]]
+arm = "B"
+condition = "C10"
+set = "X"
+
+[[schedule.block]]
+arm = "OFF"
+condition = "C15"
+set = "X"
+
+[[schedule.block]]
+arm = "OFF"
+condition = "C10"
+set = "X"
+
+[[schedule.block]]
+arm = "OFF"
+condition = "Q"
+set = "X"
+
+[[schedule.block]]
+arm = "OFF"
+condition = "Q"
+set = "Y"
+
+[[schedule.block]]
+arm = "OFF"
+condition = "C10"
+set = "Y"
+
+[[schedule.block]]
+arm = "OFF"
+condition = "C15"
+set = "Y"
+
+[[schedule.block]]
+arm = "B"
+condition = "C10"
+set = "Y"
+
+[[schedule.block]]
+arm = "B"
+condition = "Q"
+set = "Y"
+
+[[schedule.block]]
+arm = "B"
+condition = "C15"
+set = "Y"
+
+[[schedule.block]]
+arm = "DEFAULT"
+condition = "C15"
+set = "Y"
+
+[[schedule.block]]
+arm = "DEFAULT"
+condition = "C10"
+set = "Y"
+
+[[schedule.block]]
+arm = "DEFAULT"
+condition = "Q"
+set = "Y"
+
+[[schedule.block]]
+arm = "B+NS"
+condition = "C10"
+set = "X"
+
+[[schedule.block]]
+arm = "B+NS"
+condition = "C10"
+set = "Y"
