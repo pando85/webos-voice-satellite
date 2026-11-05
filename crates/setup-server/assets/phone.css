@@ -47,6 +47,7 @@ body { margin: 0; min-height: 100vh; background: var(--t-bg) radial-gradient(900
 .p-v { font-family: var(--t-mono); font-size: 20px; font-variant-numeric: tabular-nums; color: var(--t-fg); background: none; border: 0; padding: 0; width: 100%; min-width: 0; }
 .p-lbl { font-weight: 700; font-size: 16px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .p-tag { font-size: 10px; font-weight: 800; letter-spacing: .08em; padding: 1px 6px; border-radius: 5px; border: 1px solid var(--t-line); color: var(--t-muted); }
+.p-link { color: var(--t-accent); text-decoration: underline; }
 .p-rsub { font-size: 13px; color: var(--t-muted); line-height: 1.35; margin: 0; }
 .p-word { font-size: 13px; color: var(--t-muted); white-space: nowrap; }
 .p-word.warn { color: var(--t-warn); } .p-word.bad { color: var(--t-bad); }

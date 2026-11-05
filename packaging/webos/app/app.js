@@ -212,9 +212,9 @@
   // ---- two-press buttons (outside Voice and power) ------------------------------
 
   var ARM_TEXT = {
-    'a-reset': ['a-reset-t', 'a-reset-sub', 'Reset pairing', 'Unpairs this TV', 'Home Assistant then has to pair again.'],
-    'x-uninstall': ['x-uninstall-t', 'x-uninstall-sub', 'Remove service (keep settings)', 'Asks twice', 'The satellite stops and is removed. Settings stay.'],
-    'x-purge': ['x-purge-t', 'x-purge-sub', 'Remove service and all data', 'Asks twice', 'Removes the satellite, its settings and its pairing.']
+    'a-reset': ['a-reset-t', 'a-reset-sub', 'Reset pairing', 'Unpairs this TV', 'Unpairs this TV. ' + VP.HA_CLEANUP.reset],
+    'x-uninstall': ['x-uninstall-t', 'x-uninstall-sub', 'Remove service (keep settings)', 'Asks twice', 'The satellite stops and is removed. Settings stay. ' + VP.HA_CLEANUP.uninstall],
+    'x-purge': ['x-purge-t', 'x-purge-sub', 'Remove service and all data', 'Asks twice', 'Removes the satellite, its settings and its pairing. ' + VP.HA_CLEANUP.purge]
   };
 
   function renderArmed() {

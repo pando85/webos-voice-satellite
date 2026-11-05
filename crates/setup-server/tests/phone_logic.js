@@ -176,6 +176,12 @@ for (const m of html.matchAll(/(?:for|aria-labelledby)="([^"]+)"/g)) { assert.ok
 // the only absolute URL is the My Home Assistant redirect
 assert.deepStrictEqual([...js.matchAll(/https?:\/\/[^'"\s]+/g)].map((m) => m[0]).filter((u) => !/^https?:\/\/my\.home-assistant\.io\//.test(u)), []);
 assert.strictEqual(phone.MY_HA, 'https://my.home-assistant.io/redirect/config_flow_start/?domain=esphome');
+assert.strictEqual(phone.MY_HA_ESPHOME, 'https://my.home-assistant.io/redirect/integration/?domain=esphome');
+// clean-up guidance for Home Assistant's own entry (shared wording in voicepower.js)
+assert.match(vp.HA_CLEANUP.phone, /Settings, Devices & services, ESPHome, this TV, Delete/);
+assert.ok(html.includes('id="ha-esphome"') && html.includes('id="ha-cleanup"') && html.includes('Open ESPHome in Home Assistant'));
+assert.ok(/rel="noopener noreferrer"/.test(html.match(/<a[^>]*id="ha-esphome"[^>]*>/)[0]));
+assert.ok(!/Delete/.test(html), 'the wording lives in voicepower.js');
 // the page only calls the server's documented API
 const paths = new Set([...js.matchAll(/'(\/api\/[a-z/]*)/g)].map((m) => m[1]));
 assert.deepStrictEqual([...paths].sort(), ['/api/actions', '/api/actions/', '/api/session', '/api/session/end', '/api/state']);

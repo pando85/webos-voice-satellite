@@ -13,6 +13,8 @@
   'use strict';
 
   var MY_HA = 'https://my.home-assistant.io/redirect/config_flow_start/?domain=esphome';
+  // Shows the ESPHome integration in the person's own Home Assistant (redirect `integration`, parameter `domain`).
+  var MY_HA_ESPHOME = 'https://my.home-assistant.io/redirect/integration/?domain=esphome';
   var STATE_MS = 3000;     // the server refreshes its cache every 5 s, only while this page polls (SR-03)
   var ACTION_MS = 1000;    // while a request waits for the TV
   var GIVE_UP_AFTER = 3;   // failed polls in a row before the session counts as gone
@@ -164,7 +166,7 @@
   var pure = {
     clock: clock, volumeText: volumeText, tvModel: tvModel, buildView: buildView, askText: askText,
     lastResult: lastResult, resultLine: resultLine, errorLine: errorLine, sessionGone: sessionGone,
-    MY_HA: MY_HA, STATE_MS: STATE_MS, ACTION_MS: ACTION_MS, GIVE_UP_AFTER: GIVE_UP_AFTER
+    MY_HA: MY_HA, MY_HA_ESPHOME: MY_HA_ESPHOME, STATE_MS: STATE_MS, ACTION_MS: ACTION_MS, GIVE_UP_AFTER: GIVE_UP_AFTER
   };
   if (typeof module === 'object' && module.exports) { module.exports = pure; }
   if (typeof document === 'undefined' || !root || !root.voicePower) { return; }
@@ -308,6 +310,7 @@
     show($('pair-btn'), h.showPair);
     $('pair-btn').disabled = !h.canPair;
     $('ha-steps').textContent = vp.HA_STEPS;
+    $('ha-cleanup').textContent = vp.HA_CLEANUP.phone;
     show($('p-warn'), !!view.warn);
     text($('p-warn'), view.warn);
 
@@ -536,6 +539,7 @@
   function start() {
     buildRows();
     $('ha-link').href = MY_HA;
+    $('ha-esphome').href = MY_HA_ESPHOME;
     $('copy-addr').addEventListener('click', function () { copyField($('ha-addr'), $('copy-addr')); });
     $('copy-port').addEventListener('click', function () { copyField($('ha-port'), $('copy-port')); });
     $('pair-btn').addEventListener('click', function () { request('pair', null); });

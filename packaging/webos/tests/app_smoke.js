@@ -141,6 +141,8 @@ const refresh = async () => { const t = T.timers.filter((x) => x.live && x.inter
   byId['a-reset'].focus();
   ok();
   check('Reset pairing needs a second press', execs().length === 0 && byId['a-reset-t'].textContent === 'Press OK again' && /armed/.test(byId['a-reset'].className));
+  check('armed Reset pairing says to delete the device in Home Assistant too', /Settings, Devices & services, ESPHome, this TV, Delete/.test(byId['a-reset-sub'].textContent)
+    && /error for this TV until it is paired again/.test(byId['a-reset-sub'].textContent));
   advance(5000);
   check('the arming ends after 5 s', byId['a-reset-t'].textContent === 'Reset pairing');
   key(461);
@@ -209,6 +211,7 @@ const refresh = async () => { const t = T.timers.filter((x) => x.live && x.inter
   click('x-purge');
   await settle();
   check('purge needs a second press', execs().length === 0 && byId['x-purge-t'].textContent === 'Press OK again');
+  check('armed purge says to delete the device in Home Assistant too', /Also delete this TV in Home Assistant: Settings, Devices & services, ESPHome, this TV, Delete/.test(byId['x-purge-sub'].textContent));
   click('x-purge');
   await settle();
   check('second press runs purge', execs().indexOf('purge') >= 0);

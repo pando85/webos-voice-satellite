@@ -107,6 +107,19 @@
     unpaired: { short: 'Not paired', full: 'Open Home Assistant here and start pairing.', tone: 'warn' },
     unknown: { short: 'Not known', full: 'The connection is not known now: the satellite is stopped or has not reported yet.', tone: 'idle' }
   };
+  // Cleaning up Home Assistant's side. The satellite holds no Home Assistant
+  // login, so it cannot delete its own entry there: the person has to.
+  var HA_DELETE_PATH = 'Settings, Devices & services, ESPHome, this TV, Delete';
+  var HA_CLEANUP = {
+    // Reset pairing (TV confirm text, after 'Unpairs this TV.').
+    reset: 'Home Assistant shows an error for this TV until it is paired again. Or delete this TV in Home Assistant (' + HA_DELETE_PATH + ') and add it again.',
+    // Remove service, keep settings: the key stays, so the old entry still fits a later install.
+    uninstall: 'Home Assistant keeps this TV and shows it as unavailable. Delete it there if you do not install again: ' + HA_DELETE_PATH + '.',
+    // Remove service and all data.
+    purge: 'Also delete this TV in Home Assistant: ' + HA_DELETE_PATH + '. The satellite cannot do that itself.',
+    // The phone page, next to the link that opens ESPHome in Home Assistant.
+    phone: 'Setting this TV up again? Delete the old entry in Home Assistant first: ' + HA_DELETE_PATH + '.'
+  };
   var SETUP_UNAVAILABLE = 'Phone setup is not available in this version';
   var HA_STEPS = 'In Home Assistant: Settings, Devices & services, Add integration, ESPHome. Enter the address and the port. No key to type: Home Assistant sets it while pairing is open.';
 
@@ -492,7 +505,7 @@
     POWER: POWER, LISTEN: LISTEN, NOTE: NOTE, POWER_EXTRA: POWER_EXTRA, ROWS: ROWS,
     AR_MENU: AR_MENU, HL_MENU: HL_MENU, CONFIRM_TAIL: CONFIRM_TAIL,
     // cards
-    haSummary: haSummary, haCard: haCard, SETUP_UNAVAILABLE: SETUP_UNAVAILABLE, HA_CONN: HA_CONN, compat: compat, KEY: KEY, COMPAT: COMPAT, HA_STEPS: HA_STEPS,
+    haSummary: haSummary, haCard: haCard, SETUP_UNAVAILABLE: SETUP_UNAVAILABLE, HA_CONN: HA_CONN, compat: compat, KEY: KEY, COMPAT: COMPAT, HA_STEPS: HA_STEPS, HA_CLEANUP: HA_CLEANUP, HA_DELETE_PATH: HA_DELETE_PATH,
     // phone requests
     requestText: requestText, phoneResult: phoneResult, endedText: endedText, isIPv4: isIPv4,
     REQUEST: REQUEST, ENDED: ENDED
