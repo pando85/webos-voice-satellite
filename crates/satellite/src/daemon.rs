@@ -21,7 +21,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
@@ -43,7 +43,7 @@ use crate::player::{Done, Kind, Player, redact_url};
 use crate::power::{self, PowerUpdate};
 use crate::selfcheck::Note;
 use crate::tv_control::{self, Tv, TvMsg};
-use crate::voice_status::{Mic, VoiceFile, VoiceStatus};
+use crate::voice_status::{Ha, Mic, VoiceFile, VoiceStatus};
 use crate::volume::{self, SharedGain};
 use crate::watchdog::{self, Beats};
 use crate::{resume, volume::Origin};
@@ -415,6 +415,13 @@ impl MicGate {
     }
 }
 
+/// Seconds since the Unix epoch (0 if the clock is before it).
+fn epoch_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
 /// Deletes a trigger file. True if it existed and is gone (act on it once).
 fn consume_trigger(path: &Path, warned: &mut bool) -> bool {
     match std::fs::remove_file(path) {
@@ -523,6 +530,13 @@ struct Daemon {
     /// Reply volume gain shared with the player.
     volume_gain: SharedGain,
     volume_file: PathBuf,
+    /// The reply volume in force, in percent (what HA's media player shows).
+    reply_volume: u8,
+    /// When the pairing window closes, while it is open (`run/voice.json`).
+    pairing_until: Option<SystemTime>,
+    /// The Home Assistant state last published and when it began (epoch s).
+    ha_state: Ha,
+    ha_since: u64,
     /// `luna-send`, when the power watch runs.
     luna: Option<PathBuf>,
     /// Last power state update (for change-only logging and the sensor).
@@ -618,9 +632,14 @@ impl Daemon {
             &self.report_dir.join(tv_control::LG_REFRESH_TRIGGER),
             &mut warned,
         );
+        let volume_reload =
+            consume_trigger(&self.report_dir.join(volume::RELOAD_TRIGGER), &mut warned);
         self.trigger_warned = warned;
         if reload {
             self.reload_remote_off("ctl.sh").await;
+        }
+        if volume_reload {
+            self.reload_reply_volume("ctl.sh").await;
         }
         if lg_refresh {
             // Read-only: the sensors show what the TV holds now. Without TV
@@ -649,13 +668,79 @@ impl Daemon {
     /// Writes `run/voice.json` if its content changed (or the keep-alive is
     /// due).
     fn publish_voice_status(&mut self) {
+        let ha = if self.gate.unpaired {
+            Ha::Unpaired
+        } else if self.connected {
+            Ha::Connected
+        } else {
+            Ha::Disconnected
+        };
+        if ha != self.ha_state {
+            self.ha_state = ha;
+            self.ha_since = epoch_now();
+        }
         let status = VoiceStatus {
             mic: self.mic_state(),
             remote_off: self.darkener.mode(),
             remote_off_active: self.luna.is_some(),
             power_state: self.last_power.as_ref().and_then(|p| p.state.clone()),
+            pairing_until: self.pairing_until_epoch(),
+            ha,
+            ha_since: self.ha_since,
         };
         self.voice_file.publish(Instant::now().into_std(), &status);
+    }
+
+    /// The end of the open pairing window as seconds since the Unix epoch, or
+    /// `None` when it is closed (an end in the past counts as closed, in case
+    /// the close event was missed). The wall clock is used on purpose: a
+    /// reader has no access to this process's monotonic clock.
+    fn pairing_until_epoch(&mut self) -> Option<u64> {
+        let until = self.pairing_until?;
+        if until <= SystemTime::now() {
+            self.pairing_until = None;
+            return None;
+        }
+        until
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .map(|d| d.as_secs() + u64::from(d.subsec_nanos() > 0))
+    }
+
+    /// `ctl.sh set reply-volume` wrote `etc/reply_volume` and created the
+    /// trigger: read it again and apply a change (gain, and HA's media player
+    /// follows). An unusable or missing file keeps the current value. The
+    /// file already holds the value, so it is not written back.
+    async fn reload_reply_volume(&mut self, source: &str) {
+        let path = self.volume_file.clone();
+        let (percent, origin) = volume::load(&path, self.reply_volume);
+        match origin {
+            Origin::Stored if percent != self.reply_volume => {
+                self.reply_volume = percent;
+                self.volume_gain.set(volume::gain_for(percent));
+                log::info!(
+                    "reply volume {percent} % ({}) set by {source}",
+                    volume::db_for(percent)
+                        .map_or_else(|| "silent".to_owned(), |db| format!("{db:.1} dB"))
+                );
+                // HA's media player shows the new value (not echoed back).
+                self.send(AppCommand::SetVolume(percent)).await;
+            }
+            Origin::Stored => log::debug!(
+                "reply volume: {} reloaded ({source}); the value is unchanged ({percent} %)",
+                path.display()
+            ),
+            Origin::Default => log::warn!(
+                "reply volume: reload requested ({source}) but {} does not exist; keeping {} %",
+                path.display(),
+                self.reply_volume
+            ),
+            Origin::Invalid(why) => log::warn!(
+                "reply volume: reload requested ({source}) but {} is not usable ({why}); keeping {} %",
+                path.display(),
+                self.reply_volume
+            ),
+        }
     }
 
     /// `ctl.sh set remote-off` wrote the mode file and created the trigger:
@@ -766,6 +851,7 @@ impl Daemon {
                     "PAIRED by {client_info:?} from {}; if that is not your Home Assistant, reset the pairing",
                     peer.ip()
                 );
+                self.pairing_until = None;
                 self.set_unpaired(false).await;
                 if self.gate.mic_off() {
                     log::info!(
@@ -781,6 +867,7 @@ impl Daemon {
                 self.set_unpaired(true).await;
             }
             PairingEvent::Cleared { client_info, peer } => {
+                self.pairing_until = None;
                 self.set_streaming(false);
                 log::warn!(
                     "pairing CLEARED by {client_info:?} from {} (the device was removed in Home Assistant): microphone closed; to pair again, open the pairing window locally (--pair or the pair file)",
@@ -790,8 +877,12 @@ impl Daemon {
             }
             PairingEvent::WindowOpened { seconds } => {
                 log::info!("pairing window open for {seconds} s");
+                self.pairing_until = SystemTime::now().checked_add(Duration::from_secs(seconds));
             }
-            PairingEvent::WindowClosed => log::info!("pairing window closed"),
+            PairingEvent::WindowClosed => {
+                log::info!("pairing window closed");
+                self.pairing_until = None;
+            }
             other => log::debug!("pairing event {other:?}"),
         }
     }
@@ -838,7 +929,8 @@ impl Daemon {
     }
 
     /// HA set the reply volume: apply it to the next samples and store it.
-    fn on_volume(&self, percent: u8) {
+    fn on_volume(&mut self, percent: u8) {
+        self.reply_volume = percent.min(100);
         self.volume_gain.set(volume::gain_for(percent));
         log::info!(
             "reply volume {percent} % ({}) set by Home Assistant",
@@ -1611,6 +1703,14 @@ pub(crate) async fn run(mut settings: Settings, triggers: TestTriggers) -> Resul
         trigger_warned: false,
         volume_gain,
         volume_file: settings.sink.volume_file.clone(),
+        reply_volume,
+        pairing_until: None,
+        ha_state: if unpaired {
+            Ha::Unpaired
+        } else {
+            Ha::Disconnected
+        },
+        ha_since: epoch_now(),
         luna,
         last_power: None,
         darkener: Darkener::new(
@@ -2048,6 +2148,10 @@ mod tests {
             trigger_warned: false,
             volume_gain: gain,
             volume_file: dir.join("volume"),
+            reply_volume: 100,
+            pairing_until: None,
+            ha_state: Ha::Disconnected,
+            ha_since: 1_762_000_000,
             luna: luna.then(|| PathBuf::from("luna-send")),
             last_power: None,
             darkener: Darkener::new(mode, 3, Duration::from_secs(60)),
@@ -2117,6 +2221,181 @@ mod tests {
         d.reload_remote_off("test").await;
         assert_eq!(d.darkener.mode(), RemoteOff::Normal);
         assert_eq!(select_option(rx.try_recv().unwrap()), "Turn off normally");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `ctl.sh set reply-volume N`: the file, then the trigger. The poll
+    /// consumes it, the shared gain changes (so a reply that is playing
+    /// follows), HA's media player is told, and the file is not rewritten.
+    #[tokio::test]
+    async fn reply_volume_reload_applies_a_value_written_outside_ha() {
+        let dir = test_dir("volume-reload");
+        let (mut d, mut rx) = test_daemon(&dir, RemoteOff::Normal, true);
+        let file = dir.join("volume");
+        let trigger = dir.join("run").join(volume::RELOAD_TRIGGER);
+        std::fs::write(&file, "30\n").unwrap();
+        std::fs::write(&trigger, b"").unwrap();
+        // The poll runs on every fourth call (once a second).
+        for _ in 0..4 {
+            d.poll_compat_triggers().await;
+        }
+        assert_eq!(d.reply_volume, 30);
+        assert!((d.volume_gain.get() - volume::gain_for(30)).abs() < f32::EPSILON);
+        assert!(matches!(rx.try_recv().unwrap(), AppCommand::SetVolume(30)));
+        assert!(rx.try_recv().is_err());
+        assert!(!trigger.exists(), "the trigger is consumed");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "30\n");
+        // The same value again: nothing applied, nothing sent.
+        std::fs::write(&trigger, b"").unwrap();
+        for _ in 0..4 {
+            d.poll_compat_triggers().await;
+        }
+        assert!(rx.try_recv().is_err());
+        assert!(!trigger.exists());
+        // 0 is silent, 100 is unity.
+        std::fs::write(&file, "0\n").unwrap();
+        d.reload_reply_volume("test").await;
+        assert_eq!(d.volume_gain.get().to_bits(), 0.0_f32.to_bits());
+        assert!(matches!(rx.try_recv().unwrap(), AppCommand::SetVolume(0)));
+        std::fs::write(&file, "100\n").unwrap();
+        d.reload_reply_volume("test").await;
+        assert!((d.volume_gain.get() - 1.0).abs() < f32::EPSILON);
+        assert!(matches!(rx.try_recv().unwrap(), AppCommand::SetVolume(100)));
+        // HA's own change keeps the value in force in step.
+        d.on_volume(55);
+        assert_eq!(d.reply_volume, 55);
+        std::fs::write(&file, "55\n").unwrap();
+        d.reload_reply_volume("test").await;
+        assert!(rx.try_recv().is_err(), "unchanged after HA's own change");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn reply_volume_reload_keeps_the_value_when_the_file_is_unusable() {
+        let dir = test_dir("volume-invalid");
+        let (mut d, mut rx) = test_daemon(&dir, RemoteOff::Normal, true);
+        d.on_volume(40);
+        let file = dir.join("volume");
+        // Missing file (on_volume stored one: remove it).
+        std::fs::remove_file(&file).unwrap();
+        d.reload_reply_volume("test").await;
+        assert_eq!(d.reply_volume, 40);
+        // Garbage, above 100, negative, empty, and a directory.
+        for bad in ["loud\n", "101\n", "-5\n", "", "50 %\n"] {
+            std::fs::write(&file, bad).unwrap();
+            d.reload_reply_volume("test").await;
+            assert_eq!(d.reply_volume, 40, "{bad:?}");
+        }
+        std::fs::remove_file(&file).unwrap();
+        std::fs::create_dir(&file).unwrap();
+        d.reload_reply_volume("test").await;
+        assert_eq!(d.reply_volume, 40);
+        assert!((d.volume_gain.get() - volume::gain_for(40)).abs() < f32::EPSILON);
+        assert!(rx.try_recv().is_err(), "HA is told nothing");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The pairing window is published as its end time (written on open and
+    /// close only), so a reader can show a countdown.
+    #[tokio::test]
+    async fn voice_json_reports_the_pairing_window() {
+        let dir = test_dir("voice-pairing");
+        let (mut d, _rx) = test_daemon(&dir, RemoteOff::Normal, true);
+        let read = |dir: &Path| {
+            std::fs::read_to_string(dir.join("run").join(crate::voice_status::FILE)).unwrap()
+        };
+        d.publish_voice_status();
+        assert!(read(&dir).contains("\"pairing_until\":null"));
+        let before = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        d.on_pairing(PairingEvent::WindowOpened { seconds: 600 })
+            .await;
+        d.publish_voice_status();
+        let v = read(&dir);
+        let until: u64 = v
+            .split("\"pairing_until\":")
+            .nth(1)
+            .unwrap()
+            .split(',')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap_or_else(|_| panic!("{v}"));
+        assert!(
+            (before + 600..=before + 602).contains(&until),
+            "{until} {before}"
+        );
+        // Closing without a key.
+        d.on_pairing(PairingEvent::WindowClosed).await;
+        d.publish_voice_status();
+        assert!(read(&dir).contains("\"pairing_until\":null"));
+        // A window that ends in the past counts as closed (a missed event).
+        d.pairing_until = Some(SystemTime::now() - Duration::from_secs(5));
+        d.publish_voice_status();
+        assert!(read(&dir).contains("\"pairing_until\":null"));
+        assert!(d.pairing_until.is_none());
+        // Pairing ends the window.
+        d.on_pairing(PairingEvent::WindowOpened { seconds: 60 })
+            .await;
+        assert!(d.pairing_until.is_some());
+        d.on_pairing(PairingEvent::Paired {
+            client_info: "Home Assistant".to_owned(),
+            peer: "127.0.0.1:1".parse().unwrap(),
+        })
+        .await;
+        assert!(d.pairing_until.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The Home Assistant connection in `run/voice.json`: a state word and
+    /// the time it began, nothing else (no address, name or version).
+    #[tokio::test]
+    async fn voice_json_reports_the_home_assistant_connection() {
+        let dir = test_dir("voice-ha");
+        let (mut d, _rx) = test_daemon(&dir, RemoteOff::Normal, true);
+        let read = |dir: &Path| {
+            std::fs::read_to_string(dir.join("run").join(crate::voice_status::FILE)).unwrap()
+        };
+        let since = |v: &str| -> u64 {
+            v.split("\"ha_since\":")
+                .nth(1)
+                .unwrap()
+                .trim_end_matches(['}', '\n'])
+                .parse()
+                .unwrap()
+        };
+        d.publish_voice_status();
+        let v = read(&dir);
+        assert!(v.contains("\"ha\":\"disconnected\""), "{v}");
+        let t0 = since(&v);
+        assert!(t0 > 1_700_000_000, "{v}");
+        // The session opens (the event carries an address; it never reaches the file).
+        d.on_event(AppEvent::HaConnected {
+            client_info: "Home Assistant 2026.10".to_owned(),
+            peer: "192.168.1.9:50000".parse().unwrap(),
+        })
+        .await;
+        d.publish_voice_status();
+        let v = read(&dir);
+        assert!(v.contains("\"ha\":\"connected\""), "{v}");
+        assert!(since(&v) >= t0);
+        assert!(!v.contains("192.168") && !v.contains("2026.10"), "{v}");
+        // An unchanged state keeps its start time.
+        let t1 = since(&v);
+        d.ha_since = t1 - 100;
+        d.publish_voice_status();
+        assert_eq!(since(&read(&dir)), t1 - 100);
+        // Unpaired wins over a session; pairing brings the state back.
+        let _ = d.gate.set_unpaired(true);
+        d.publish_voice_status();
+        assert!(read(&dir).contains("\"ha\":\"unpaired\""));
+        assert!(since(&read(&dir)) >= t1);
+        let _ = d.gate.set_unpaired(false);
+        d.on_event(AppEvent::HaDisconnected).await;
+        d.publish_voice_status();
+        assert!(read(&dir).contains("\"ha\":\"disconnected\""));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2303,7 +2582,7 @@ esac
         let v = read(&dir);
         assert!(v.contains("\"mic\":\"listening\""), "{v}");
         assert!(v.contains("\"power_state\":\"Screen Off\""), "{v}");
-        // No identifier of any kind: only the five documented keys.
+        // No identifier of any kind: only the eight documented keys.
         let parsed: Vec<&str> = v
             .trim_matches(|c| c == '{' || c == '}' || c == '\n')
             .split(',')
@@ -2316,7 +2595,10 @@ esac
                 "\"mic\"",
                 "\"remote_off\"",
                 "\"remote_off_active\"",
-                "\"power_state\""
+                "\"power_state\"",
+                "\"pairing_until\"",
+                "\"ha\"",
+                "\"ha_since\""
             ]
         );
         let _ = std::fs::remove_dir_all(&dir);

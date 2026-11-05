@@ -13,9 +13,15 @@ an `ar` archive with `debian-binary` ("2.0"), `control.tar.gz` (one
 Design: docs/design/packaging.md.
 
 usage:
-  build_ipk.py build --armv7 BIN --aarch64 BIN [--app-id ID] [--version V]
-                     [--out DIR] [--no-elf-check]
+  build_ipk.py build --armv7 BIN --aarch64 BIN
+                     [--setup-armv7 BIN --setup-aarch64 BIN]
+                     [--app-id ID] [--version V] [--out DIR] [--no-elf-check]
   build_ipk.py check IPK [--app-id ID] [--version V] [--no-elf-check]
+                     [--require-setup]
+
+The phone setup server (webos-satellite-setup, ADR 0009) goes in as two more
+builds, both or neither. `check` accepts a package with both or with none;
+--require-setup (a release) refuses one without.
 """
 
 from __future__ import annotations
@@ -54,6 +60,7 @@ ID_RE = re.compile(r"^[a-z0-9][a-z0-9.+-]+$")  # LG appinfo.json rules; ares-cli
 VERSION_RE = re.compile(r"^(0|[1-9]\d{0,8})\.(0|[1-9]\d{0,8})\.(0|[1-9]\d{0,8})$")
 FORBIDDEN_PREFIXES = ("com.palm", "com.webos", "com.lge", "com.palmdts")
 ELF_MACHINE = {"armv7": (1, 40), "aarch64": (2, 183)}  # (EI_CLASS, e_machine)
+SETUP_NAMES = [f"webos-satellite-setup-{a}" for a in ELF_MACHINE]
 
 
 def die(msg: str) -> None:
@@ -192,6 +199,16 @@ def build(args: argparse.Namespace) -> Path:
             die(f"missing {arch} binary: {path}")
         if not args.no_elf_check:
             elf_check(path, arch)
+    setup_bins = {}
+    if args.setup_armv7 or args.setup_aarch64:
+        if not (args.setup_armv7 and args.setup_aarch64):
+            die("give both --setup-armv7 and --setup-aarch64, or neither")
+        setup_bins = {"armv7": Path(args.setup_armv7), "aarch64": Path(args.setup_aarch64)}
+        for arch, path in setup_bins.items():
+            if not path.is_file():
+                die(f"missing {arch} setup server binary: {path}")
+            if not args.no_elf_check:
+                elf_check(path, arch)
 
     payload: dict[str, tuple[bytes, int]] = {}
     for name in PAYLOAD_SCRIPTS:
@@ -200,6 +217,8 @@ def build(args: argparse.Namespace) -> Path:
     payload["config.default.toml"] = ((PKG / "config.default.toml").read_bytes(), 0o644)
     for arch, path in bins.items():
         payload[f"webos-satellite-{arch}"] = (path.read_bytes(), 0o755)
+    for arch, path in setup_bins.items():
+        payload[f"webos-satellite-setup-{arch}"] = (path.read_bytes(), 0o755)
     payload["VERSION"] = (f"{version}\n".encode(), 0o644)
     sums = "".join(f"{hashlib.sha256(data).hexdigest()}  {name}\n"
                    for name, (data, _) in sorted(payload.items()))
@@ -359,6 +378,11 @@ def check(args: argparse.Namespace) -> None:
                if n.startswith(f"{appdir}/payload/") and d is not None}
     expected = set(PAYLOAD_SCRIPTS) | {"webos-satellite.hook", "config.default.toml", "VERSION",
                                        "SHA256SUMS", "webos-satellite-armv7", "webos-satellite-aarch64"}
+    have_setup = [n for n in SETUP_NAMES if n in payload]
+    need(len(have_setup) in (0, len(SETUP_NAMES)), f"only one build of the setup server: {have_setup}")
+    need(have_setup or not args.require_setup, "the phone setup server is not in the package (--require-setup)")
+    if have_setup:
+        expected |= set(SETUP_NAMES)
     need(set(payload) == expected, f"payload files differ: {sorted(set(payload) ^ expected)}")
     need(payload.get("VERSION") == f"{version}\n".encode(), "payload VERSION differs")
     for line in (payload.get("SHA256SUMS") or b"").decode().splitlines():
@@ -366,7 +390,7 @@ def check(args: argparse.Namespace) -> None:
         need(hashlib.sha256(payload.get(name, b"")).hexdigest() == digest, f"SHA256SUMS mismatch for {name}")
     need(len((payload.get("SHA256SUMS") or b"").decode().splitlines()) == len(expected) - 1,
          "SHA256SUMS does not cover every payload file")
-    for name in PAYLOAD_SCRIPTS + ["webos-satellite-armv7", "webos-satellite-aarch64"]:
+    for name in PAYLOAD_SCRIPTS + ["webos-satellite-armv7", "webos-satellite-aarch64"] + have_setup:
         info = data.get(f"{appdir}/payload/{name}", (None, None))[0]
         need(info is not None and info.mode == 0o755, f"payload/{name} mode is not 0755")
     for name in PAYLOAD_SCRIPTS:
@@ -374,10 +398,11 @@ def check(args: argparse.Namespace) -> None:
             need((payload.get(name) or b"").startswith(b"#!/bin/sh"), f"payload/{name} is not a sh script")
     if not args.no_elf_check:
         for arch in ELF_MACHINE:
-            blob = payload.get(f"webos-satellite-{arch}") or b""
-            want_class, want_machine = ELF_MACHINE[arch]
-            need(blob[:4] == b"\x7fELF" and blob[4] == want_class
-                 and struct.unpack("<H", blob[18:20])[0] == want_machine, f"{arch} binary is not {arch} ELF")
+            for name in [f"webos-satellite-{arch}"] + ([f"webos-satellite-setup-{arch}"] if have_setup else []):
+                blob = payload.get(name) or b""
+                want_class, want_machine = ELF_MACHINE[arch]
+                need(blob[:4] == b"\x7fELF" and blob[4] == want_class
+                     and struct.unpack("<H", blob[18:20])[0] == want_machine, f"{name} is not {arch} ELF")
     need(b"@PREFIX@" in (payload.get("webos-satellite.hook") or b""), "hook template lacks @PREFIX@")
     secret = re.compile(rb"^\s*noise_psk\s*=", re.M)
     need(not secret.search(payload.get("config.default.toml") or b""), "default config holds an inline key")
@@ -385,7 +410,8 @@ def check(args: argparse.Namespace) -> None:
     if errors:
         print("\n".join(f"FAIL  {e}" for e in errors), file=sys.stderr)
         sys.exit(1)
-    print(f"ok: {path.name} ({len(data)} entries, payload {len(payload)} files)")
+    print(f"ok: {path.name} ({len(data)} entries, payload {len(payload)} files"
+          f"{', with the setup server' if have_setup else ', no setup server'})")
 
 
 def main() -> None:
@@ -394,6 +420,8 @@ def main() -> None:
     b = sub.add_parser("build")
     b.add_argument("--armv7", required=True)
     b.add_argument("--aarch64", required=True)
+    b.add_argument("--setup-armv7")
+    b.add_argument("--setup-aarch64")
     b.add_argument("--app-id", default=DEFAULT_APP_ID)
     b.add_argument("--version")
     b.add_argument("--out", default=str(ROOT / "target" / "ipk"))
@@ -403,6 +431,7 @@ def main() -> None:
     c.add_argument("--app-id")
     c.add_argument("--version")
     c.add_argument("--no-elf-check", action="store_true")
+    c.add_argument("--require-setup", action="store_true", help="refuse a package without the setup server")
     args = ap.parse_args()
     if args.cmd == "build":
         build(args)

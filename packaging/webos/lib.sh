@@ -65,6 +65,13 @@ set_paths() {
     # CRASHLOOP: written by supervise.sh when it gave up.
     DISABLE=$PREFIX/disable
     CRASHLOOP=$PREFIX/crashloop
+    # The phone setup server (docs/design/phone-setup.md): its session
+    # directory is volatile on purpose (the one-time token never reaches the
+    # flash). WEBOS_SAT_SETUP_DIR and WEBOS_SAT_SETUP_BIN are for tests.
+    SETUP_BIN=${WEBOS_SAT_SETUP_BIN:-$PREFIX/bin/webos-satellite-setup}
+    SETUP_DIR=${WEBOS_SAT_SETUP_DIR:-/tmp/webos-satellite-setup}
+    SETUP_PID=$SETUP_DIR/setup.pid
+    SETUP_LOG=$PREFIX/log/setup.log
 }
 
 # Default kill-switch file of the daemon (safety.kill_switch in the config).
@@ -210,6 +217,54 @@ supervisor_alive() {
     tr '\0' ' ' <"/proc/$sp/cmdline" 2>/dev/null | grep -q "supervise.sh"
 }
 
+# True if the phone setup server is running: the pid in setup.pid is alive
+# and its command line names the server binary.
+setup_alive() {
+    # Shell built-ins only (the app polls this once a second through exec):
+    # read the pid, then the command line. A shell drops the NUL bytes
+    # between the arguments, which leaves the names in one string.
+    sp=
+    if [ -f "$SETUP_PID" ]; then read -r sp <"$SETUP_PID" || true; fi
+    case $sp in '' | *[!0-9]*) return 1 ;; esac
+    kill -0 "$sp" 2>/dev/null || return 1
+    cl=
+    IFS= read -r cl <"/proc/$sp/cmdline" 2>/dev/null || true
+    case $cl in *"${SETUP_BIN##*/}"*) return 0 ;; esac
+    # No match: a reused pid, or a shell that keeps only part of the
+    # NUL-separated file. The slow way decides (rare).
+    tr '\0' ' ' <"/proc/$sp/cmdline" 2>/dev/null | grep -qF "${SETUP_BIN##*/}"
+}
+
+# Ends the phone setup server and removes its session directory (token,
+# state, answer). A no-op without one. Called by stop_daemon, so stop,
+# restart, update, uninstall and purge all end a session.
+stop_setup_server() {
+    if setup_alive; then
+        sp=$(read_pid "$SETUP_PID")
+        note "stopping the phone setup server (pid $sp)"
+        # The server polls this file every 100 ms and ends the session
+        # (state ended, reason done); it has no signal handler, so TERM
+        # after 2 s ends it at once.
+        : >"$SETUP_DIR/stop" 2>/dev/null || true
+        i=0
+        while setup_alive && [ "$i" -lt 10 ]; do
+            sleep 0.2 2>/dev/null || sleep 1
+            i=$((i + 1))
+        done
+        if setup_alive; then
+            kill -TERM "$sp" 2>/dev/null || true
+            sleep 0.2 2>/dev/null || sleep 1
+        fi
+        if setup_alive; then
+            kill -KILL "$sp" 2>/dev/null || true
+        fi
+    fi
+    case $SETUP_DIR in
+    /?*) rm -rf "$SETUP_DIR" 2>/dev/null || true ;;
+    esac
+    return 0
+}
+
 # Stops the supervisor (if any), the daemon (TERM, wait, then KILL) and the
 # log rotator, and removes the pidfiles. Argument: seconds to wait (default 10).
 # Every kill tolerates a process that is already gone: the supervisor
@@ -217,6 +272,7 @@ supervisor_alive() {
 # callers run with `set -e` (found on c3-b, EXP-009).
 stop_daemon() {
     wait_s=${1:-10}
+    stop_setup_server
     pid=$(read_pid "$PIDFILE")
     if supervisor_alive; then
         # The supervisor forwards TERM to the daemon and will not restart it.
@@ -258,7 +314,9 @@ stop_daemon() {
 
 # --- Binary selection (install.sh) -------------------------------------------
 # A package carries webos-satellite-armv7 (static armv7 musl, the build
-# verified on c3-a) and webos-satellite-aarch64 (static aarch64 musl).
+# verified on c3-a) and webos-satellite-aarch64 (static aarch64 musl), and the
+# same two builds of the phone setup server as webos-satellite-setup-armv7 and
+# webos-satellite-setup-aarch64.
 
 # Prints the build to try first for `uname -m` output $1. aarch64 means a
 # 64-bit kernel: c3-a reports it for every process although its userland is
@@ -287,11 +345,12 @@ triple_of_arch() {
 }
 
 # True if binary $1 runs here: `--version` exits 0 and prints
-# "webos-satellite <version> (<triple>)", with triple $2 when it is given.
+# "<name> <version> (<triple>)", with triple $2 when it is given; <name> is
+# $3 (default webos-satellite; the phone setup server is webos-satellite-setup).
 binary_runs() {
     out=$("$1" --version 2>/dev/null) || return 1
     case $out in
-    "webos-satellite "*) ;;
+    "${3:-webos-satellite} "*) ;;
     *) return 1 ;;
     esac
     [ -z "${2:-}" ] && return 0

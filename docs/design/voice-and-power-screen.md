@@ -273,13 +273,15 @@ It lives in `etc/` (kept by `uninstall`, removed by `purge`, not rotated with th
 The daemon writes `run/voice.json` (atomically with a temporary file and `rename`, mode 0600 like `compat.json`; `ctl.sh` runs as root) with one JSON line:
 
 ```json
-{"schema":1,"mic":"listening","remote_off":"keep_listening","remote_off_active":true,"power_state":"Active"}
+{"schema":1,"mic":"listening","remote_off":"keep_listening","remote_off_active":true,"power_state":"Active","pairing_until":null,"ha":"connected","ha_since":1762345000}
 ```
 
 - `mic`: `listening` (the capture PCM is open and delivering), `muted` (closed because a gate holds it: HA's mute switch, the kill switch, the firmware guard or an unpaired satellite), `busy` (wanted but another process holds the PCM, for example LG hands-free), `closed` (any other reason). `ctl.sh` still reads the kill-switch file itself for `mic.kill_switch`.
 - `remote_off`: the mode the daemon holds now (`normal` or `keep_listening`).
 - `remote_off_active`: the power watch runs, so keep listening can act (false with `power.watch = false` or no `luna-send`); it does not depend on the mode.
 - `power_state`: the last settled power state word from the subscription (`Active`, `Screen Off`, `Active Standby`, ...), or `null` before the first update.
+- `pairing_until` (added with the phone setup, step P2; additive, schema stays 1): the end of the open pairing window as seconds since the Unix epoch, or `null` while it is closed. Written on open and on close only (the file is under the persistent prefix, so no per-second writes); a reader computes the countdown. `ctl.sh status --json` turns it into `"pairing":{"open":true,"ends_in_s":412}` (closed when the file is stale, the daemon is stopped or the end is in the past).
+- `ha` and `ha_since` (added for the Home screen's Home Assistant card; additive): the API connection as a state word only, `connected` (an API session is open), `disconnected` (none now), or `unpaired` (pairing is on and no key is stored; wins over the other two), and when that state began (epoch seconds; the daemon's start for the first one). Written on a change only. No address, name or version. `ctl.sh status --json` has `"ha":{"state":"connected","since_s":120}` (`state` also `unknown` with `since_s` null when the daemon is stopped, the file is stale or an older daemon wrote none).
 
 It is checked once a second from the daemon's existing trigger poll (never per audio frame) and rewritten only when the content changed, plus a keep-alive rewrite every 30 s so that a file older than 60 s can be read as stale (`unknown`/null, for example after a crash); a clean shutdown deletes it. It carries no identifiers. It lives in the report directory (`report.dir`, `run/` in the package) beside `compat.json`, which it follows as the daemon-to-script channel. Implemented in `crates/satellite/src/voice_status.rs` (step V3).
 

@@ -28,6 +28,8 @@ jobs:
         run: sh packaging/webos/tests/ipk.sh
       - name: ctl.sh tv-settings and set (fake luna-send)
         run: sh packaging/webos/tests/tv_settings.sh
+      - name: ctl.sh setup, set reply-volume (fake setup server)
+        run: sh packaging/webos/tests/setup.sh
       - name: Status app smoke test
         run: node packaging/webos/tests/app_smoke.js
   build-tv:

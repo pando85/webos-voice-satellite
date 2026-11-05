@@ -21,6 +21,10 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
+/// Trigger file in the report directory (`run/`): `ctl.sh set reply-volume`
+/// wrote `sink.volume_file` and asks the running daemon to read it again.
+pub(crate) const RELOAD_TRIGGER: &str = "reply-volume-reload";
+
 /// Attenuation at 1 %, in dB; 100 % is 0 dB. 50 dB over the slider gives
 /// 0.5 dB per percent, so one HA volume step (5 %) is 2.5 dB.
 pub(crate) const RANGE_DB: f32 = 50.0;

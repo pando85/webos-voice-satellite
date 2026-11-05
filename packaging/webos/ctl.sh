@@ -36,10 +36,20 @@
 #                     read Always Ready, LG hands-free (Hi LG), the remote
 #                     power-off setting and the microphone state (read only)
 #   set always-ready on|off | hi-lg on|off | remote-off normal|keep
+#       | reply-volume N
 #                     change one setting on an explicit request: the two LG
 #                     settings are written once, read back and logged to
-#                     etc/tv-settings.log (ADR 0008); remote-off is the
-#                     satellite's own setting. The daemon never does this
+#                     etc/tv-settings.log (ADR 0008); remote-off and
+#                     reply-volume (N = 0 to 100) are the satellite's own
+#                     settings, written to etc/ and picked up by the running
+#                     daemon within a second. The daemon never does this
+#   setup start|status --json|answer ID allow|refuse|stop
+#                     the phone setup web server (ADR 0009): start runs it
+#                     (only on this explicit call, never at boot), status is
+#                     the session state and the app's heartbeat, answer
+#                     allows or refuses the request waiting for the TV
+#                     remote's OK (ID: 8 lowercase hex characters), stop ends
+#                     the session. All print JSON (schema 1)
 #   reset-pairing     forget the stored key and open the window
 #   clear-crashloop   delete DIR/crashloop after fixing the cause
 #   uninstall         delete the boot hook, stop, delete the daemon; KEEP
@@ -51,7 +61,8 @@
 # WEBOS_SAT_PREFIX (DIR), WEBOS_SAT_INITD (default /var/lib/webosbrew/init.d),
 # WEBOS_SAT_LOCK, WEBOS_SAT_ALLOW_NONROOT=1 (skip the root check),
 # WEBOS_SAT_LUNA_SEND (default luna-send), WEBOS_SAT_SETTLE (seconds before a
-# read-back, default 0.5).
+# read-back, default 0.5), WEBOS_SAT_SETUP_DIR (the setup session directory,
+# default /tmp/webos-satellite-setup), WEBOS_SAT_SETUP_BIN (the setup server).
 # Exit status: 0 done, 1 failed (message on stderr), 2 usage.
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
@@ -59,7 +70,7 @@ here=$(cd "$(dirname "$0")" && pwd)
 . "$here/lib.sh"
 
 usage() {
-    sed -n '2,55p' "$0" >&2
+    sed -n '2,66p' "$0" >&2
     exit 2
 }
 
@@ -142,6 +153,7 @@ cmd_install() {
         note "already up to date ($(cat "$P/VERSION" 2>/dev/null || echo unknown)); nothing to do (--force reinstalls)"
         return 0
     fi
+    stop_setup_server
     was_running=0
     if [ -f "$P/$MARKER" ] && running; then
         was_running=1
@@ -310,6 +322,7 @@ cmd_ack_firmware() {
 
 remove_hook_and_stop() {
     rm -f "$HOOK"
+    stop_setup_server
     if [ -f "$P/$MARKER" ]; then
         stop_daemon 10
     fi
@@ -330,6 +343,7 @@ cmd_purge() {
     need_root
     locked
     rm -f "$HOOK"
+    stop_setup_server
     if [ -e "$P" ]; then
         [ -f "$P/$MARKER" ] || die "$P exists but is not a webos-satellite install; not removing it"
         stop_daemon 10
@@ -351,6 +365,59 @@ json_bool() { if "$@"; then printf true; else printf false; fi; }
 cfg_value() {
     sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*\"\{0,1\}\([^\"#]*\)\"\{0,1\}.*/\1/p" "$CFG" 2>/dev/null |
         head -n 1 | sed 's/[[:space:]]*$//'
+}
+
+# The reply volume file: sink.volume_file of the config, relative to etc/
+# (the daemon's default is etc/reply_volume).
+volume_file() {
+    f=$(cfg_value volume_file)
+    f=${f:-reply_volume}
+    case $f in /*) ;; *) f=$P/etc/$f ;; esac
+    echo "$f"
+}
+
+# The open pairing window as JSON, from run/voice.json: {"open":true,
+# "ends_in_s":412}, else {"open":false,"ends_in_s":null} (closed, daemon
+# stopped, or a status file older than 60 s). The daemon publishes the end
+# as seconds since the epoch (written on open and close only).
+pairing_json() {
+    until=
+    if running && voice_fresh; then
+        until=$(sed -n 's/.*"pairing_until"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\)[,}].*/\1/p' "$RUN_DIR/voice.json" 2>/dev/null | head -n 1)
+    fi
+    now=$(date +%s)
+    case $until$now in *[!0-9]*) until= ;; esac
+    if [ -n "$until" ] && [ "$until" -gt "$now" ]; then
+        printf '{"open":true,"ends_in_s":%s}' "$((until - now))"
+    else
+        printf '{"open":false,"ends_in_s":null}'
+    fi
+}
+
+# The Home Assistant API connection as JSON, from run/voice.json:
+# {"state":"connected|disconnected|unpaired","since_s":N} (N seconds since the
+# state began), or {"state":"unknown","since_s":null} when the daemon is
+# stopped, the file is stale or an older daemon does not write it. Only the
+# state: no address, name or version.
+ha_json() {
+    st=
+    since=
+    if running && voice_fresh; then
+        st=$(voice_field ha)
+        since=$(sed -n 's/.*"ha_since"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\)[,}].*/\1/p' "$RUN_DIR/voice.json" 2>/dev/null | head -n 1)
+    fi
+    now=$(date +%s)
+    case $st in connected | disconnected | unpaired) ;; *) st= ;; esac
+    case $since$now in *[!0-9]*) since= ;; esac
+    if [ -n "$st" ]; then
+        if [ -n "$since" ] && [ "$since" -le "$now" ]; then
+            printf '{"state":"%s","since_s":%s}' "$st" "$((now - since))"
+        else
+            printf '{"state":"%s","since_s":null}' "$st"
+        fi
+    else
+        printf '{"state":"unknown","since_s":null}'
+    fi
 }
 
 # Key state: fixed (etc/noise_psk named in the config), paired (a key set by
@@ -423,7 +490,7 @@ cmd_status() {
     # Written by the daemon when Home Assistant changes them (etc/). `1{...;p;}`
     # prints even when the line is already clean (`s///gp` printed nothing then).
     remote_off=$(sed -n '1{s/[^a-z_]//g;p;}' "$P/etc/remote_off" 2>/dev/null || true)
-    reply_volume=$(sed -n '1{s/[^0-9]//g;p;}' "$P/etc/reply_volume" 2>/dev/null || true)
+    reply_volume=$(sed -n '1{s/[^0-9]//g;p;}' "$(volume_file)" 2>/dev/null || true)
     # Until Home Assistant stores one, the daemon uses sink.volume (percent).
     reply_volume_default=$(cfg_value volume | sed 's/[^0-9]//g')
     name=$(cfg_value name)
@@ -472,6 +539,8 @@ cmd_status() {
     printf '"key":%s,"name":%s,"port":%s,' "$(json_str "$keys")" "$(json_str "$name")" "$(json_str "${port:-6053}")"
     printf '"remote_off":%s,"reply_volume":%s,' "$(json_str "${remote_off:-normal}")" "$(json_str "$reply_volume")"
     printf '"reply_volume_default":%s,' "$(json_str "$reply_volume_default")"
+    printf '"pairing_window_s":%s,' "$(json_str "$(cfg_value window_s | sed 's/[^0-9]//g')")"
+    printf '"pairing":%s,"ha":%s,' "$(pairing_json)" "$(ha_json)"
     printf '"prefix":%s,"log":[' "$(json_str "$P")"
     sep=
     if [ -f "$LOG" ]; then
@@ -881,6 +950,58 @@ cmd_set_remote_off() {
     echo "remote-off is now $word (daemon: $d)" >&2
 }
 
+# set reply-volume N: the satellite's own setting. Writes etc/reply_volume
+# (atomically) and asks the running daemon to read it again; HA's media player
+# then follows. No sound is played.
+cmd_set_reply_volume() { # N, already validated: 0 to 100 without leading zeros
+    want=$1
+    installed || die "not installed (ctl.sh install)"
+    locked
+    f=$(volume_file)
+    before=$(sed -n '1{s/[^0-9]//g;p;}' "$f" 2>/dev/null || true)
+    case $before in '' | *[!0-9]*) before= ;; esac
+    if [ -z "$before" ]; then
+        # Nothing stored: the daemon runs at the config's sink.volume.
+        before=$(cfg_value volume | sed 's/[^0-9]//g')
+    fi
+    if [ "$before" = "$want" ]; then
+        volume_emit "$want" "$before" "$want" already "" none
+        return 0
+    fi
+    mkdir -p "$(dirname "$f")"
+    if (umask 077 && echo "$want" >"$f.new.$$") && mv -f "$f.new.$$" "$f"; then
+        :
+    else
+        rm -f "$f.new.$$"
+        volume_emit "$want" "$before" "$before" failed "cannot write the file" unknown
+        return 1
+    fi
+    chmod 600 "$f" 2>/dev/null || true
+    history_add "reply-volume result from=${before:-unknown} to=$want read=$want outcome=applied source=ctl" || true
+    d="not running"
+    mkdir -p "$RUN_DIR"
+    : >"$RUN_DIR/reply-volume-reload"
+    if running; then
+        d=pending
+        i=0
+        while [ "$i" -lt 6 ]; do
+            if [ ! -e "$RUN_DIR/reply-volume-reload" ]; then
+                d=applied
+                break
+            fi
+            sleep 0.5 2>/dev/null || sleep 1
+            i=$((i + 1))
+        done
+    fi
+    volume_emit "$want" "$before" "$want" applied "" "$d"
+    echo "reply-volume is now $want % (daemon: $d)" >&2
+}
+
+volume_emit() { # REQUESTED BEFORE AFTER RESULT ERROR DAEMON
+    printf '{"schema":1,"setting":"reply-volume","requested":%s,"before":%s,"after":%s,"result":%s,"daemon":%s,"error":%s}\n' \
+        "$(json_str "$1")" "$(json_str "$2")" "$(json_str "$3")" "$(json_str "$4")" "$(json_str "$6")" "$(json_str "$5")"
+}
+
 cmd_set() {
     [ $# -eq 2 ] || usage
     case "$1 $2" in
@@ -895,6 +1016,206 @@ cmd_set() {
         need_root
         cmd_set_remote_off "$2"
         ;;
+    reply-volume\ *)
+        # Whole percent, 0 to 100, no sign, no leading zeros.
+        case $2 in
+        0 | [1-9] | [1-9][0-9] | 100) ;;
+        *) usage ;;
+        esac
+        need_root
+        cmd_set_reply_volume "$2"
+        ;;
+    *) usage ;;
+    esac
+}
+
+# --- setup (docs/design/phone-setup.md, ADR 0009) ------------------------------
+# The phone setup web server `webos-satellite-setup` is started only here, on
+# an explicit call (the app's "Set up with your phone" button, or by hand),
+# never by the boot hook or `ctl.sh start`. It makes its own one-time token
+# and writes it to $SETUP_DIR/state.json (volatile, mode 0700): nothing
+# secret is passed to it, and nothing reaches an argument, the environment,
+# a log or the flash. Files (design 4.1): setup.pid, state.json (the server),
+# heartbeat (touched by `setup status`), answer.json (`setup answer`).
+
+# The state JSON for "no session" and for states ctl.sh itself found
+# (STATE REASON), with every key of the server's state.json.
+setup_json() { # STATE REASON: fixed words of this script, no escaping needed
+    printf '{"schema":1,"state":"%s","reason":"%s","port":null,"expires_in_s":null,"peer":null,"peer_other_subnet":null,"pending":null,"last_result":null}\n' "$1" "$2"
+}
+
+# Prints a file with shell built-ins (no cat: the status poll runs once a second).
+print_file() {
+    while IFS= read -r pf_line || [ -n "$pf_line" ]; do
+        printf '%s\n' "$pf_line"
+    done <"$1"
+}
+
+# The top-level "state" word of state.json ("" when unreadable). Not by
+# position in the text: pending and last_result are objects of their own and
+# may carry a "state" too. python3 (json) when there is one; otherwise the
+# nested objects, which are flat, are cut out first and the first "state"
+# left is the top-level one.
+setup_state_word() {
+    w=
+    if command -v python3 >/dev/null 2>&1; then
+        w=$(python3 -c 'import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    print(d.get("state", "") if isinstance(d, dict) else "")
+except Exception:
+    pass' "$SETUP_DIR/state.json" 2>/dev/null) || w=
+    else
+        w=$(sed -e 's/{[^{}]*}//g' "$SETUP_DIR/state.json" 2>/dev/null |
+            sed -n 's/.*"state"[[:space:]]*:[[:space:]]*"\([a-z_-]*\)".*/\1/p' | head -n 1)
+    fi
+    case $w in *[!a-z_-]*) w= ;; esac
+    echo "$w"
+}
+
+# One state.json, the server's content while it runs. The poll path (a live
+# server, or one that said "ended") only reads and prints: built-ins, no
+# luna, no daemon, no `ctl.sh status`. A server that is gone without having
+# written "ended" has crashed: state.json (which may still hold the one-time
+# path) is replaced by an ended state with reason "crashed".
+setup_print_state() {
+    if setup_alive; then
+        if [ -s "$SETUP_DIR/state.json" ]; then
+            print_file "$SETUP_DIR/state.json"
+        else
+            setup_json starting ""
+        fi
+        return 0
+    fi
+    if [ ! -e "$SETUP_DIR/state.json" ] && [ ! -e "$SETUP_PID" ]; then
+        setup_json none ""
+        return 0
+    fi
+    st=
+    if [ -f "$SETUP_DIR/state.json" ]; then IFS= read -r st <"$SETUP_DIR/state.json" || true; fi
+    # The server's own end marker: the compact JSON it writes ("state" of
+    # pending is only pending or running, so this text is the top-level one).
+    case $st in
+    *'"state":"ended"'*) print_file "$SETUP_DIR/state.json"; return 0 ;;
+    esac
+    if setup_json ended crashed >"$SETUP_DIR/state.json.new.$$" 2>/dev/null; then
+        mv -f "$SETUP_DIR/state.json.new.$$" "$SETUP_DIR/state.json"
+    else
+        rm -f "$SETUP_DIR/state.json.new.$$"
+    fi
+    rm -f "$SETUP_DIR/answer.json" "$SETUP_PID"
+    note "the setup server ended without saying so (see $SETUP_LOG)" >&2
+    if [ -s "$SETUP_DIR/state.json" ]; then
+        print_file "$SETUP_DIR/state.json"
+    else
+        setup_json ended crashed
+    fi
+}
+
+cmd_setup_start() {
+    need_root
+    installed || die "not installed (ctl.sh install)"
+    [ -x "$SETUP_BIN" ] || die "the setup server is missing: $SETUP_BIN (reinstall the package)"
+    locked
+    if setup_alive; then
+        case $(setup_state_word) in
+        waiting) # the app was reopened: hand out the same session again
+            touch "$SETUP_DIR/heartbeat" 2>/dev/null || true
+            setup_print_state
+            return 0
+            ;;
+        *) die "a phone setup session is already active (setup stop ends it)" ;;
+        esac
+    fi
+    # A leftover directory (a finished or crashed session) is replaced.
+    rm -rf "${SETUP_DIR:?}"
+    (umask 077 && mkdir -p "$(dirname "$SETUP_DIR")" && mkdir -m 700 "$SETUP_DIR" && : >"$SETUP_DIR/heartbeat") ||
+        die "cannot create $SETUP_DIR"
+    mkdir -p "$P/log"
+    if [ -f "$SETUP_LOG" ] && [ "$(wc -c <"$SETUP_LOG" 2>/dev/null || echo 0)" -gt 65536 ]; then
+        (umask 077 && : >"$SETUP_LOG")
+    fi
+    # Own session, no inherited descriptors (a Homebrew Channel exec waits for
+    # them), no stdin, the server's own log. The environment names only the
+    # session directory and the install directory.
+    close_inherited_fds "$0"
+    (
+        umask 077
+        unset WEBOS_SAT_LOCK_HELD
+        WEBOS_SAT_SETUP_DIR=$SETUP_DIR WEBOS_SAT_PREFIX=$P
+        export WEBOS_SAT_SETUP_DIR WEBOS_SAT_PREFIX
+        # shellcheck disable=SC2086 # $SETSID is empty or one word
+        $SETSID nohup "$SETUP_BIN" --ctl "$P/bin/ctl.sh" </dev/null >>"$SETUP_LOG" 2>&1 &
+        echo $! >"$SETUP_PID"
+    )
+    i=0
+    while [ "$i" -lt 25 ]; do
+        if [ -s "$SETUP_DIR/state.json" ] && [ "$(setup_state_word)" = waiting ]; then
+            setup_print_state
+            return 0
+        fi
+        # Gone? Only the pid decides here: right after the fork the process
+        # is still a copy of this script until it execs the server, so its
+        # command line does not name the server yet (setup_alive would say no).
+        sp=
+        if [ -f "$SETUP_PID" ]; then read -r sp <"$SETUP_PID" || true; fi
+        case $sp in '' | *[!0-9]*) ;; *) kill -0 "$sp" 2>/dev/null || break ;; esac
+        sleep 0.2 2>/dev/null || sleep 1
+        i=$((i + 1))
+    done
+    err=$(tail -n 3 "$SETUP_LOG" 2>/dev/null | tr '\n' ' ') || err=
+    stop_setup_server
+    die "the setup server did not start${err:+: $err}"
+}
+
+cmd_setup_status() {
+    [ $# -eq 1 ] && [ "$1" = --json ] || usage
+    # The app polls this once a second through exec and it is the heartbeat,
+    # so it stays light (EXP-012: `ctl.sh status --json` costs about 950 ms
+    # and 0.57 CPU-seconds on c3-a, `--help` 80 ms): no root check (a
+    # non-root caller cannot read the 0700 directory and gets "none"), no
+    # luna, no daemon, no touch/cat/tr/grep processes; the heartbeat is a
+    # truncating write of the empty file, which sets its mtime.
+    if setup_alive; then
+        : >"$SETUP_DIR/heartbeat" 2>/dev/null || true
+    fi
+    setup_print_state
+}
+
+cmd_setup_answer() {
+    [ $# -eq 2 ] || usage
+    case $1 in
+    [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
+    *) usage ;;
+    esac
+    case $2 in allow | refuse) ;; *) usage ;; esac
+    need_root
+    setup_alive || die "no phone setup session is running"
+    (
+        umask 077
+        printf '{"id":"%s","verdict":"%s"}\n' "$1" "$2" >"$SETUP_DIR/answer.json.new.$$" &&
+            mv -f "$SETUP_DIR/answer.json.new.$$" "$SETUP_DIR/answer.json"
+    ) || { rm -f "$SETUP_DIR/answer.json.new.$$"; die "cannot write the answer"; }
+    note "answer $2 recorded for request $1; the server reads it within a second"
+}
+
+cmd_setup_stop() {
+    need_root
+    # stdout is the JSON alone: the notes go to stderr.
+    setup_alive || note "no phone setup session was running" >&2
+    stop_setup_server >&2
+    setup_json none ""
+}
+
+cmd_setup() {
+    [ $# -ge 1 ] || usage
+    sub=$1
+    shift
+    case $sub in
+    start) [ $# -eq 0 ] || usage; cmd_setup_start ;;
+    status) cmd_setup_status "$@" ;;
+    answer) cmd_setup_answer "$@" ;;
+    stop) [ $# -eq 0 ] || usage; cmd_setup_stop ;;
     *) usage ;;
     esac
 }
@@ -924,6 +1245,7 @@ selfcheck) [ $# -eq 0 ] || usage; cmd_selfcheck ;;
 ack-firmware) [ $# -eq 0 ] || usage; cmd_ack_firmware ;;
 tv-settings) cmd_tv_settings "$@" ;;
 set) cmd_set "$@" ;;
+setup) cmd_setup "$@" ;;
 clear-crashloop) [ $# -eq 0 ] || usage; need_root; rm -f "$CRASHLOOP"; note "crash-loop marker removed" ;;
 uninstall) [ $# -eq 0 ] || usage; cmd_uninstall ;;
 purge) [ $# -eq 0 ] || usage; cmd_purge ;;

@@ -19,13 +19,18 @@
 #                   build that does not run falls back to armv7. Builds are
 #                   webos-satellite-armv7 and webos-satellite-aarch64 next to
 #                   this script (a lone ./webos-satellite is used as is)
-#   --binary FILE   install this binary instead (no selection)
+#   --binary FILE   install this binary instead (no selection; the phone
+#                   setup server is then not installed)
 #   --psk-file FILE Noise key; installed as etc/noise_psk (config key
 #                   device.noise_psk_file = "noise_psk" resolves to it)
 #
 # The chosen binary is copied into DIR/bin under a temporary name and must
 # answer --version before it replaces the installed one. If nothing runs, an
-# existing install is left unchanged.
+# existing install is left unchanged. The phone setup server
+# (webos-satellite-setup-armv7 and -aarch64 next to this script, optional) is
+# installed the same way, for the build that was chosen (aarch64 falls back to
+# armv7); one that does not run is skipped with a warning, the daemon is not
+# affected and `ctl.sh setup start` then says the server is missing.
 #
 # Layout: DIR/{bin,etc,run,log,out}; DIR/.webos-satellite-install marks it.
 # Files are replaced by rename, so a script that runs from DIR/bin keeps
@@ -93,6 +98,7 @@ if [ -e "$PREFIX" ]; then
         had_install=1
         pid=$(read_pid "$PIDFILE")
         ! is_ours "$pid" || die "the daemon is running (pid $pid); run stop.sh first"
+        stop_setup_server
         note "re-installing over $PREFIX"
     elif [ -n "$(ls -A "$PREFIX")" ]; then
         die "$PREFIX exists, is not empty and is not a webos-satellite install"
@@ -144,6 +150,38 @@ else
     note "uname -m: $machine, --arch $arch: installing the $chosen build"
 fi
 mv -f "$new" "$PREFIX/bin/webos-satellite"
+
+# The phone setup server (ADR 0009): never fatal.
+snew=$PREFIX/bin/.webos-satellite-setup.new
+try_setup() { # ARCH
+    rm -f "$snew"
+    cp "$here/webos-satellite-setup-$1" "$snew" && chmod 700 "$snew" &&
+        binary_runs "$snew" "$(triple_of_arch "$1")" webos-satellite-setup
+}
+setup_chosen=
+if [ -n "$binary" ]; then
+    note "--binary: the phone setup server is not installed"
+elif [ ! -f "$here/webos-satellite-setup-armv7" ] && [ ! -f "$here/webos-satellite-setup-aarch64" ]; then
+    note "no phone setup server in this package"
+else
+    for a in $chosen armv7; do
+        [ -f "$here/webos-satellite-setup-$a" ] || continue
+        if try_setup "$a"; then
+            setup_chosen=$a
+            break
+        fi
+        note "the $a phone setup server does not run here (--version failed)"
+    done
+    if [ -n "$setup_chosen" ]; then
+        # A running server holds the old file open; the rename leaves it alone.
+        mv -f "$snew" "$PREFIX/bin/webos-satellite-setup"
+        note "phone setup server: the $setup_chosen build"
+    else
+        rm -f "$snew"
+        note "WARNING: no phone setup server runs here; the phone setup is unavailable (the daemon is not affected)"
+    fi
+fi
+[ -n "$setup_chosen" ] || rm -f "$PREFIX/bin/webos-satellite-setup"
 for f in lib.sh start.sh stop.sh status.sh uninstall.sh rotate.sh supervise.sh autostart.sh ctl.sh; do
     # ctl.sh is part of the webOS app package; older trees lack it.
     [ -f "$here/$f" ] || [ "$f" = ctl.sh ] || die "missing $here/$f"

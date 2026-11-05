@@ -49,6 +49,28 @@ impl Mic {
     }
 }
 
+/// The Home Assistant API connection, as the app shows it. Only the state:
+/// no address, name or version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Ha {
+    /// Home Assistant has an open API session.
+    Connected,
+    /// Paired (or no pairing needed) but no session now.
+    Disconnected,
+    /// Pairing is on and no key is stored yet: nobody has paired.
+    Unpaired,
+}
+
+impl Ha {
+    fn word(self) -> &'static str {
+        match self {
+            Self::Connected => "connected",
+            Self::Disconnected => "disconnected",
+            Self::Unpaired => "unpaired",
+        }
+    }
+}
+
 /// The content of `voice.json`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct VoiceStatus {
@@ -60,19 +82,32 @@ pub(crate) struct VoiceStatus {
     pub(crate) remote_off_active: bool,
     /// The last settled TV power state (`Active`, `Screen Off`, ...), if known.
     pub(crate) power_state: Option<String>,
+    /// When the open pairing window closes, in seconds since the Unix epoch;
+    /// `None` while it is closed. Written on open and close only, so the
+    /// reader (ctl.sh, the TV app, the phone page) computes the countdown.
+    pub(crate) pairing_until: Option<u64>,
+    /// The Home Assistant connection.
+    pub(crate) ha: Ha,
+    /// When `ha` last changed, in seconds since the Unix epoch (the daemon's
+    /// start for the first state). Written on a change only.
+    pub(crate) ha_since: u64,
 }
 
 impl VoiceStatus {
     /// One JSON line (schema 1).
     pub(crate) fn to_json(&self) -> String {
         format!(
-            "{{\"schema\":1,\"mic\":{},\"remote_off\":{},\"remote_off_active\":{},\"power_state\":{}}}\n",
+            "{{\"schema\":1,\"mic\":{},\"remote_off\":{},\"remote_off_active\":{},\"power_state\":{},\"pairing_until\":{},\"ha\":{},\"ha_since\":{}}}\n",
             json_str(self.mic.word()),
             json_str(darken::file_word(self.remote_off)),
             self.remote_off_active,
             self.power_state
                 .as_deref()
                 .map_or_else(|| "null".to_owned(), json_str),
+            self.pairing_until
+                .map_or_else(|| "null".to_owned(), |t| t.to_string()),
+            json_str(self.ha.word()),
+            self.ha_since,
         )
     }
 }
@@ -147,6 +182,9 @@ mod tests {
             remote_off: RemoteOff::KeepListening,
             remote_off_active: true,
             power_state: Some("Active".to_owned()),
+            pairing_until: None,
+            ha: Ha::Connected,
+            ha_since: 1_762_000_000,
         }
     }
 
@@ -160,17 +198,20 @@ mod tests {
     fn json_has_exactly_the_documented_fields() {
         assert_eq!(
             status(Mic::Listening).to_json(),
-            "{\"schema\":1,\"mic\":\"listening\",\"remote_off\":\"keep_listening\",\"remote_off_active\":true,\"power_state\":\"Active\"}\n"
+            "{\"schema\":1,\"mic\":\"listening\",\"remote_off\":\"keep_listening\",\"remote_off_active\":true,\"power_state\":\"Active\",\"pairing_until\":null,\"ha\":\"connected\",\"ha_since\":1762000000}\n"
         );
         let s = VoiceStatus {
             mic: Mic::Busy,
             remote_off: RemoteOff::Normal,
             remote_off_active: false,
             power_state: None,
+            pairing_until: Some(1_762_345_678),
+            ha: Ha::Unpaired,
+            ha_since: 5,
         };
         assert_eq!(
             s.to_json(),
-            "{\"schema\":1,\"mic\":\"busy\",\"remote_off\":\"normal\",\"remote_off_active\":false,\"power_state\":null}\n"
+            "{\"schema\":1,\"mic\":\"busy\",\"remote_off\":\"normal\",\"remote_off_active\":false,\"power_state\":null,\"pairing_until\":1762345678,\"ha\":\"unpaired\",\"ha_since\":5}\n"
         );
         for (m, w) in [(Mic::Muted, "muted"), (Mic::Closed, "closed")] {
             assert!(status(m).to_json().contains(&format!("\"mic\":\"{w}\"")));

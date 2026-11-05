@@ -235,6 +235,51 @@ sel_install aarch64 --binary "$HOST_BIN"
 check "--binary installs that binary without selection" '[ "$rc" -eq 0 ] && cmp -s "$dir/bin/webos-satellite" "$HOST_BIN"'
 check "status.sh names the installed build" 'sh "$dir/bin/status.sh" | grep -q "binary: webos-satellite "'
 
+echo "== install.sh: the phone setup server =="
+setup_stand_in() { # ARCH ok|bad|ARCH_REPORTED
+    f=$SEL/webos-satellite-setup-$1
+    if [ "$2" != bad ]; then
+        reported=$1
+        [ "$2" = ok ] || reported=$2
+        printf '#!/bin/sh\n[ "$1" != --version ] || { echo "webos-satellite-setup 0.0.1 (%s)"; exit 0; }\nexit 0\n' \
+            "$(triple_of_arch "$reported")" >"$f"
+    else
+        printf '#!/bin/sh\necho "Exec format error" >&2\nexit 126\n' >"$f"
+    fi
+    chmod 755 "$f"
+}
+setup_is() { # TRIPLE: the installed setup server is that build
+    "$dir/bin/webos-satellite-setup" --version | grep -q "^webos-satellite-setup .*($1)"
+}
+stand_in armv7 ok
+stand_in aarch64 ok
+setup_stand_in armv7 ok
+setup_stand_in aarch64 ok
+sel_install aarch64
+check "uname aarch64: the aarch64 daemon and the aarch64 setup server, mode 0700, no temporary file" '[ "$rc" -eq 0 ] && installed $A64 && setup_is $A64 && [ "$(stat -c %a "$dir/bin/webos-satellite-setup")" = 700 ] && [ ! -e "$dir/bin/.webos-satellite-setup.new" ]'
+sel_install armv7l
+check "uname armv7l: the armv7 setup server" '[ "$rc" -eq 0 ] && installed $A32 && setup_is $A32'
+sel_install aarch64 --arch armv7
+check "--arch armv7: the armv7 setup server follows the daemon" '[ "$rc" -eq 0 ] && setup_is $A32'
+setup_stand_in aarch64 bad
+sel_install aarch64
+check "the aarch64 setup server does not run: the armv7 one, the daemon is aarch64" '[ "$rc" -eq 0 ] && installed $A64 && setup_is $A32 && echo "$out" | grep -q "aarch64 phone setup server does not run"'
+setup_stand_in aarch64 armv7
+sel_install aarch64
+check "a setup file named aarch64 that reports another target: the armv7 one" '[ "$rc" -eq 0 ] && setup_is $A32'
+setup_stand_in armv7 bad
+setup_stand_in aarch64 bad
+sel_install aarch64
+check "no setup server runs: install still succeeds with a warning, no setup binary left" '[ "$rc" -eq 0 ] && installed $A64 && [ ! -e "$dir/bin/webos-satellite-setup" ] && [ ! -e "$dir/bin/.webos-satellite-setup.new" ] && echo "$out" | grep -q "phone setup is unavailable"'
+rm -f "$SEL"/webos-satellite-setup-*
+sel_install aarch64
+check "no setup server in the package: noted, none installed" '[ "$rc" -eq 0 ] && [ ! -e "$dir/bin/webos-satellite-setup" ] && echo "$out" | grep -q "no phone setup server in this package"'
+setup_stand_in armv7 ok
+setup_stand_in aarch64 ok
+sel_install aarch64 --binary "$HOST_BIN"
+check "--binary: no setup server installed" '[ "$rc" -eq 0 ] && [ ! -e "$dir/bin/webos-satellite-setup" ]'
+rm -f "$SEL"/webos-satellite-setup-*
+
 if [ "$fails" -eq 0 ]; then
     echo "all checks passed"
 else

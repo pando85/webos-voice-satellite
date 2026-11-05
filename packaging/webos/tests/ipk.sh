@@ -33,7 +33,8 @@ WEBOS_SAT_PREFIX=$S
 WEBOS_SAT_INITD=$T/initd
 WEBOS_SAT_LOCK=$T/lock
 WEBOS_SAT_KILL_SWITCH=$T/kill
-export WEBOS_SAT_PREFIX WEBOS_SAT_INITD WEBOS_SAT_LOCK WEBOS_SAT_KILL_SWITCH
+WEBOS_SAT_SETUP_DIR=$T/setup
+export WEBOS_SAT_PREFIX WEBOS_SAT_INITD WEBOS_SAT_LOCK WEBOS_SAT_KILL_SWITCH WEBOS_SAT_SETUP_DIR
 export WEBOS_SAT_ALLOW_NONROOT=1 WEBOS_SAT_TEST_ANY_TRIPLE=1 WEBOS_SAT_UNAME_M=aarch64
 CTL="sh $APP/payload/ctl.sh"
 fails=0
@@ -70,11 +71,35 @@ mkbin() { # OUT TAG
     printf '\n# test build %s\n' "$2" >>"$1"
     chmod 755 "$1"
 }
+# Stand-in phone setup server: answers --version, otherwise writes a waiting
+# state.json in WEBOS_SAT_SETUP_DIR and idles until the stop file appears (as
+# the real one does).
+mksetup() { # OUT TAG
+    cat >"$1" <<SETUPEOF
+#!/bin/sh
+# test build $2
+[ "\$1" != --version ] || { echo "webos-satellite-setup 0.0.1 (test)"; exit 0; }
+D=\${WEBOS_SAT_SETUP_DIR:?}
+printf '{"schema":1,"state":"waiting","reason":"","port":1,"path":"/s/x","expires_in_s":5,"peer":null,"peer_other_subnet":null,"pending":null,"last_result":null}\n' >"\$D/state.json"
+while [ ! -e "\$D/stop" ]; do sleep 0.1; done
+SETUPEOF
+    chmod 755 "$1"
+}
 build() { # VERSION TAG OUTDIR
     mkbin "$T/a32-$2" "$2"
     mkbin "$T/a64-$2" "$2"
+    mksetup "$T/s32-$2" "$2"
+    mksetup "$T/s64-$2" "$2"
     SOURCE_DATE_EPOCH=1700000000 python3 "$BUILD" build --no-elf-check --version "$1" \
-        --armv7 "$T/a32-$2" --aarch64 "$T/a64-$2" --out "$3" >/dev/null
+        --armv7 "$T/a32-$2" --aarch64 "$T/a64-$2" --setup-armv7 "$T/s32-$2" --setup-aarch64 "$T/s64-$2" \
+        --out "$3" >/dev/null
+}
+setup_servers() { # number of live processes of the installed setup server
+    n=0
+    for d in /proc/[0-9]*; do
+        { tr '\0' ' ' <"$d/cmdline"; } 2>/dev/null | grep -qF "$S/bin/webos-satellite-setup" && n=$((n + 1))
+    done
+    echo "$n"
 }
 # Lays the package out as the TV's installer does: the app directory is
 # replaced as a whole on every install.
@@ -110,10 +135,25 @@ build 0.0.1 one "$T/v1"
 IPK1=$T/v1/${ID}_0.0.1_all.ipk
 check "ipk built with the standard name" '[ -f "$IPK1" ] && [ -f "$T/v1/$ID.manifest.json" ]'
 check "check: structure, control, appinfo, payload sums" 'python3 "$BUILD" check --no-elf-check --app-id $ID --version 0.0.1 "$IPK1" >/dev/null'
+check "check: with --require-setup the package passes; the setup builds are in SHA256SUMS" 'python3 "$BUILD" check --no-elf-check --require-setup "$IPK1" >/dev/null && python3 -c "
+import sys
+sys.path.insert(0, sys.argv[1])
+import build_ipk as b
+m = dict(b.ar_members(open(sys.argv[2], \"rb\").read()))
+d = b.untar(m[\"data.tar.gz\"])
+base = \"usr/palm/applications/\" + sys.argv[3] + \"/payload/\"
+sums = d[base + \"SHA256SUMS\"][1].decode()
+names = (\"webos-satellite-setup-armv7\", \"webos-satellite-setup-aarch64\")
+sys.exit(0 if all(base + n in d and d[base + n][0].mode == 0o755 and n in sums for n in names) else 1)" "$PKG/ipk" "$IPK1" "$ID"'
+SOURCE_DATE_EPOCH=1700000000 python3 "$BUILD" build --no-elf-check --version 0.0.1 \
+    --armv7 "$T/a32-one" --aarch64 "$T/a64-one" --out "$T/nosetup" >/dev/null
+check "check: a package without the setup server passes, and is refused with --require-setup" 'python3 "$BUILD" check --no-elf-check "$T/nosetup/${ID}_0.0.1_all.ipk" >/dev/null && ! python3 "$BUILD" check --no-elf-check --require-setup "$T/nosetup/${ID}_0.0.1_all.ipk" >/dev/null 2>&1'
+check "build: only one setup server build is refused" '! python3 "$BUILD" build --no-elf-check --version 0.0.1 --armv7 "$T/a32-one" --aarch64 "$T/a64-one" --setup-armv7 "$T/s32-one" --out "$T/bad" >/dev/null 2>&1'
 check "check: a wrong expected version is refused" '! python3 "$BUILD" check --no-elf-check --version 9.9.9 "$IPK1" >/dev/null 2>&1'
 check "check: host binaries are refused as TV builds without --no-elf-check" '! python3 "$BUILD" check "$IPK1" >/dev/null 2>&1'
 SOURCE_DATE_EPOCH=1700000000 python3 "$BUILD" build --no-elf-check --version 0.0.1 \
-    --armv7 "$T/a32-one" --aarch64 "$T/a64-one" --out "$T/v1b" >/dev/null
+    --armv7 "$T/a32-one" --aarch64 "$T/a64-one" --setup-armv7 "$T/s32-one" --setup-aarch64 "$T/s64-one" \
+    --out "$T/v1b" >/dev/null
 check "reproducible: a second build is byte-identical" 'cmp -s "$IPK1" "$T/v1b/${ID}_0.0.1_all.ipk"'
 check "manifest: HBC fields and the ipk hash" 'python3 -c "
 import json,hashlib,sys
@@ -132,6 +172,8 @@ check "install: generated config with a random name and MAC seed, mode 0600" 'gr
 check "install: the generated config passes --check-config" 'grep -q "config is valid" "$T/out"'
 check "install: no boot hook unless asked (opt-in)" '[ ! -e "$T/initd/webos-satellite" ]'
 check "install: does not start the daemon" '! json "s[\"running\"]"'
+check "install: the setup server comes from the aarch64 build (uname aarch64), mode 0700, answers --version" 'cmp -s "$S/bin/webos-satellite-setup" "$T/s64-one" && [ "$(stat -c %a "$S/bin/webos-satellite-setup")" = 700 ] && "$S/bin/webos-satellite-setup" --version | grep -q "^webos-satellite-setup "'
+check "install: no temporary setup file, no session directory, no setup process" '[ ! -e "$S/bin/.webos-satellite-setup.new" ] && [ ! -e "$T/setup" ] && [ "$(setup_servers)" = 0 ]'
 mac1=$(grep '^mac_seed' "$S/etc/config.toml")
 
 # A host-runnable config (file mic, null sink, plaintext on 127.0.0.1) and a
@@ -182,6 +224,7 @@ done
 check "daemon, supervisor and rotator keep no descriptor of the caller" '[ "$leaks" -eq 0 ] && [ -n "$(pgrep -f "$S/bin/supervise.sh")" ]'
 check "no start.sh process stays behind; the supervisor pidfile names supervise.sh" '[ -z "$(pgrep -f "$S/bin/start.sh")" ] && tr "\0" " " </proc/$(cat "$S/run/supervise.pid")/cmdline | grep -q supervise.sh'
 check "start: one supervised daemon" 'json "s[\"running\"] and s[\"supervised\"] and s[\"firmware_ok\"]" && [ "$(daemons)" = 1 ] && [ "$(supervisors)" = 1 ]'
+check "start: the phone setup server is not started (only by ctl.sh setup start)" '[ "$(setup_servers)" = 0 ] && [ ! -e "$T/setup" ]'
 check "status --json: firmware_ok means may start, firmware_verified and compat are present" 'json "s[\"firmware_ok\"] is True and s[\"firmware_verified\"] is True and \"compat\" in s"'
 check "status --json: no key material" '! $CTL status --json | grep -q "$(cat "$T/psk")"'
 check "status text: reply volume names the default, never 'default %'" '! $CTL status | grep -q "default %" && $CTL status | grep -q "reply volume: .*none stored yet" && json "\"reply_volume_default\" in s and s[\"reply_volume\"]==\"\""'
@@ -261,8 +304,11 @@ pid_v1=$(running_pid)
 build 0.0.2 two "$T/v2"
 unpack "$T/v2/${ID}_0.0.2_all.ipk"
 check "new package unpacked: update pending, old daemon still running" 'json "s[\"update_pending\"] and s[\"installed_version\"]==\"0.0.1\" and s[\"package_version\"]==\"0.0.2\" and s[\"running\"]"'
+$CTL setup start >"$T/out" 2>&1
+check "setup start from the installed package: a session is up, JSON waiting" '[ "$(setup_servers)" = 1 ] && $CTL setup status --json | grep -q "\"state\":\"waiting\""'
 $CTL install >"$T/out" 2>&1
 pid_v2=$(running_pid)
+check "update: ends a running phone setup session, installs the new setup server build" '[ "$(setup_servers)" = 0 ] && [ ! -e "$T/setup" ] && cmp -s "$S/bin/webos-satellite-setup" "$T/s64-two"' 
 check "update: restarted with the new build (new pid, one daemon, one supervisor)" '[ -n "$pid_v2" ] && [ "$pid_v2" != "$pid_v1" ] && ! kill -0 "$pid_v1" 2>/dev/null && [ "$(daemons)" = 1 ] && [ "$(supervisors)" = 1 ]'
 check "update: installed binary is the new one" 'cmp -s "$S/bin/webos-satellite" "$T/a64-two" && [ "$(cat "$S/VERSION")" = 0.0.2 ] && ! json "s[\"update_pending\"]"'
 check "update: config and key unchanged" '[ "$(sha256sum <"$S/etc/config.toml")" = "$cfg_sum" ] && [ "$(sha256sum <"$S/etc/noise_psk")" = "$psk_sum" ]'
@@ -306,16 +352,18 @@ mv "$T/app-away" "$APP"
 
 echo "== uninstall (keep data), reinstall, purge =="
 $CTL start >/dev/null
+$CTL setup start >/dev/null 2>&1
 $CTL uninstall >/dev/null
-check "uninstall: hook gone, daemon stopped and removed" '[ ! -e "$H" ] && [ "$(daemons)" = 0 ] && [ ! -e "$S/bin" ]'
+check "uninstall: hook gone, daemon and setup session stopped, binaries removed" '[ ! -e "$H" ] && [ "$(daemons)" = 0 ] && [ ! -e "$S/bin" ] && [ "$(setup_servers)" = 0 ] && [ ! -e "$T/setup" ]'
 check "uninstall: config, key and logs kept" '[ "$(sha256sum <"$S/etc/config.toml")" = "$cfg_sum" ] && [ -f "$S/etc/noise_psk" ] && [ -f "$S/log/webos-satellite.log" ]'
 check "status after uninstall: not installed" 'json "s[\"installed\"] is False"'
 $CTL install >/dev/null
 check "reinstall: keeps the config (same identity) and key" '[ "$(sha256sum <"$S/etc/config.toml")" = "$cfg_sum" ] && grep -q "keep-me" "$S/etc/config.toml" && [ "$(sha256sum <"$S/etc/noise_psk")" = "$psk_sum" ]'
 $CTL start >/dev/null
 $CTL autostart on >/dev/null
+$CTL setup start >/dev/null 2>&1
 $CTL purge >/dev/null
-check "purge: everything removed (install directory, hook), nothing running" '[ ! -e "$S" ] && [ ! -e "$H" ] && [ "$(daemons)" = 0 ]'
+check "purge: everything removed (install directory, hook, setup session), nothing running" '[ ! -e "$S" ] && [ ! -e "$H" ] && [ "$(daemons)" = 0 ] && [ "$(setup_servers)" = 0 ] && [ ! -e "$T/setup" ]'
 check "purge: unrelated directory is refused" 'mkdir -p "$S" && : >"$S/x" && ! $CTL purge >/dev/null 2>&1 && [ -e "$S/x" ]'
 rm -rf "$S"
 
