@@ -13,6 +13,7 @@ Record decisions once supported by evidence or by an explicit owner decision. Us
 | [0005](0005-tv-control-entities.md) | TV control from Home Assistant through separate satellite entities | Accepted (2026-11-04, owner); decision 3 amended by 0007 |
 | [0006](0006-soft-firmware-policy-and-compatibility-reports.md) | Soft firmware policy, self-checks and one-click compatibility reports | Accepted (2026-11-04, owner); not implemented |
 | [0007](0007-tv-media-player.md) | The TV as a control-only media player, next to the separate TV entities | Accepted (2026-11-04, owner); implemented on the PC, not run on a TV |
+| [0008](0008-user-initiated-lg-settings.md) | User-initiated changes of two LG settings (Always Ready, LG hands-free) from the TV app | Accepted (2026-11-05, owner); design only, writes `pending EXP-011` |
 
 These ADRs record **owner decisions** supported by discovery on c3-a (ADR 0005 and 0007 also by checks on c3-b). They do not claim that the chosen route has been verified end to end; open verification work is in the [roadmap](../project/roadmap.md).
 

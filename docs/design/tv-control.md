@@ -22,7 +22,7 @@ Labels follow [AGENTS.md](../../AGENTS.md): `documented`, `observed-on-other-dev
 
 - No toasts, notifications or on-screen indicators (owner 2026-11-04). No controllable status LED exists (research 2026-11-04).
 - No real power-off into LG standby or Suspend from HA (section 4). No Wake-on-LAN from the satellite: a TV in Suspend cannot run it. Waking from Suspend stays HA's job (its `wake_on_lan` integration), outside this project.
-- No TV settings writes: no picture or sound mode, no sound output change, no Always Ready, Quick Start+, energy saving or auto-off changes. The daemon's existing rule stands ([always-on section 7](always-on.md#7-exposing-power-options-in-the-ui-design)).
+- No TV settings writes: no picture or sound mode, no sound output change, no Quick Start+, energy saving or auto-off changes. The daemon's existing rule stands ([always-on section 7](always-on.md#7-exposing-power-options-in-the-ui-design)). **Exception (owner 2026-11-05, [ADR 0008](../decisions/0008-user-initiated-lg-settings.md)):** the TV app, not the daemon and not HA, may change Always Ready and LG hands-free on an explicit press ([Voice and power screen](voice-and-power-screen.md)); HA gets two read-only sensors for them.
 - ~~No TV `media_player` entity~~ Changed the same day by [ADR 0007](../decisions/0007-tv-media-player.md): a second, control-only media player "TV" is added (section 3.5). The satellite's own media player keeps meaning "reply volume" (owner 2026-11-04).
 - No channel control, no playback control (play/pause), no remote-key injection beyond the existing power key path.
 - No replacement of HA's `webostv` integration. The satellite **complements** it (section 2).
@@ -212,7 +212,7 @@ All calls are `luna-send -n 1 -w 3000 <uri> <payload>` as root (the existing `po
 | Apps | `com.webos.applicationManager/listLaunchPoints {}` (about 35 KB on c3-b, 43 entries) | verified-on-target (c3-b, 2026-11-04) | `com.webos.applicationManager/launch {"id": <appId>}` → `{returnValue:true}`, 130 ms; unknown id → `returnValue:false, errorCode:-101, errorText:"not exist"`. Also `apiadapter/system_launcher/launch {"id":...}` (adds a `sessionId`) | verified-on-target (c3-b, 2026-11-04) for the satellite's own app ([EXP-009](../experiments/EXP-009-ipk-install-update.md)) **and** for a built-in silent app (foreground matched, restored). **c3-b-only** |
 | Play state | `com.webos.media/getForegroundAppInfo {}` → `playState` | verified-on-target (c3-b, 2026-11-04) | n/a | |
 
-**Never called:** `com.webos.service.apiadapter/system/getSystemInfo` (its reply carries the serial number), `tvpower/power/powerOff`, `power2/*`, the tvpower request registration methods, `micomservice/*`, any settings setter (`setSystemSettings`), `/dev/uinput`. c3-a (`03.30.74`): none of the getters or setters in this table has been called there except the power ones.
+**Never called:** `com.webos.service.apiadapter/system/getSystemInfo` (its reply carries the serial number), `tvpower/power/powerOff`, `power2/*`, the tvpower request registration methods, `micomservice/*`, any settings setter (`setSystemSettings`; the TV app's `ctl.sh set` for Always Ready and Hi LG is the one exception, [ADR 0008](../decisions/0008-user-initiated-lg-settings.md), and is not the daemon), `/dev/uinput`. c3-a (`03.30.74`): none of the getters or setters in this table has been called there except the power ones.
 
 ## 6. Capability detection at startup
 
@@ -295,7 +295,7 @@ Every control is also gated at run time by section 6. **Firmware guard (owner de
 ## 10. Safety
 
 1. **User-initiated only.** A setter runs only in response to an HA command on an entity the owner enabled. The daemon never changes volume, input, app or screen by itself. The only automatic action stays the existing, opt-in wake-and-darken on a remote power-off.
-2. **No silent settings writes.** v1 writes no TV setting. Volume and mute are the normal user controls (the TV keeps them as the remote would).
+2. **No silent settings writes.** v1 writes no TV setting. *(ADR 0008, 2026-11-05: the TV app may write Always Ready and LG hands-free on a user's press; the daemon and these entities never do.)* Volume and mute are the normal user controls (the TV keeps them as the remote would).
 3. **Read back every write** (section 6); a mismatch is reported, never retried with other parameters.
 4. **Never a write at startup**, not even a probe.
 5. **Risk per action:**

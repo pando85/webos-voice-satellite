@@ -1,6 +1,6 @@
 # ADR 0005: TV control from Home Assistant through separate satellite entities
 
-- **Status:** Accepted (2026-11-04, owner). **Decision 3 amended by [ADR 0007](0007-tv-media-player.md)** (same day, owner): a control-only TV `media_player` is added next to the separate entities, so HA's built-in volume, mute and turn on/off intents reach the TV.
+- **Status:** Accepted (2026-11-04, owner). **Decision 3 amended by [ADR 0007](0007-tv-media-player.md)** (same day, owner): a control-only TV `media_player` is added next to the separate entities, so HA's built-in volume, mute and turn on/off intents reach the TV. **Note (2026-11-05, [ADR 0008](0008-user-initiated-lg-settings.md)):** the "no TV settings writes" limit of the design is relaxed for Always Ready and LG hands-free only, written by the TV app on a user's press, never by the daemon or these entities.
 - **Scope:** whether and how the satellite exposes TV controls (power, screen, volume, mute, input, apps) to Home Assistant. Design: [TV control](../design/tv-control.md). Not implemented; setters untested ([EXP-010](../experiments/EXP-010-tv-control-setters.md)).
 - **Related:** [ADR 0001](0001-esphome-native-api.md), [backlog #11](../project/backlog.md#11-tv-control-from-home-assistant-via-the-satellite), [always-on design](../design/always-on.md)
 
