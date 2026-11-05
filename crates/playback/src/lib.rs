@@ -5,8 +5,12 @@
 //! to the sink's format then [`Sink::play`] ([`PacatSink`] on the TV).
 //! [`play_url`] runs all four and reports per-stage timings.
 //!
+//! The [`music`] module is the music engine (second `pacat`, gain, ducking, pacer).
+//!
 //! Everything is pure Rust except the external `pacat` process, so the crate
 //! builds as a static musl binary for the TV.
+
+pub mod music;
 
 mod decode;
 mod error;
