@@ -1,6 +1,6 @@
 # AEC front-end: echo cancellation in the satellite
 
-- **Status:** implemented in the daemon, **off by default** (`[aec] enabled = false`). Verified on the PC only: unit tests with synthetic echo, the fake-HA end-to-end harness with a file mic and file reference, and real c3-a recordings processed offline through the daemon's exact front-end. On c3-a (2026-11-02, [P3 TV verification](../discovery/c3-a/P3-tv-verify-aec-pairing.md)): the CPU benchmark (section 9 step 1) and a silent 10-minute daemon smoke (step 2, without a reference signal) are done; the live A/B (step 3) is pending. The rest of this document is PC evidence unless labelled **verified-on-target**.
+- **Status:** implemented in the daemon, **off by default** (`[aec] enabled = false`). Verified on the PC only: unit tests with synthetic echo, the fake-HA end-to-end harness with a file mic and file reference, and real c3-a recordings processed offline through the daemon's exact front-end. On c3-a (2026-11-02, [P3 TV verification](../discovery/c3-a/P3-tv-verify-aec-pairing.md)): the CPU benchmark (section 9 step 1) and a silent 10-minute daemon smoke (step 2, without a reference signal) are done. On 2026-11-05 the work was un-parked for a live session on c3-a ([EXP-018](../experiments/EXP-018-aec-live-c3-a.md)): delay lock, ERLE, CPU with content and a simplified live A/B (step 3) are done; the result is directional, not conclusive (section 12). The rest of this document is PC evidence unless labelled **verified-on-target**.
 - **Date:** 2026-11-02.
 - **Scope:** [backlog item 1](../project/backlog.md#1-professional-audio-front-end), the audio front-end (owner priority 1). Device facts are from c3-a (LG C3, webOS TV 8.3.0, firmware 03.30.74, TV speaker, power state "Screen Saver"). Other models, firmware, outputs and power states are **not** covered.
 - **Related:** [AEC candidates research](../research/aec-candidates.md) (why `sonora`), [P2 session 1](../discovery/c3-a/P2-session1-audible-and-echo.md) (the reference taps), [EXP-006](../experiments/EXP-006-aec-reference.md), [D3 mic identification](../discovery/c3-a/D3-mic-identification.md), [ADR 0002](../decisions/0002-rust-implementation.md), [ADR 0004](../decisions/0004-mvp-capture-device-and-lg-handsfree-off.md), [development](../development.md).
@@ -209,7 +209,7 @@ python3 tools/audio-rig/aec_eval/chain_eval.py --tool target/release/examples/ae
 
 ## 9. On-TV verification plan (pending)
 
-**Status (2026-11-02):** step 1 done; step 2 done except the delay lock and ERLE, which need a reference signal (the TV played nothing); step 3 pending. Results: [P3 TV verification](../discovery/c3-a/P3-tv-verify-aec-pairing.md). Each step needs the owner's authorization for that TV session ([AGENTS.md](../../AGENTS.md)). Order: after Phase 2 session 2 has finished with the TV. Nothing is installed persistently; binaries go to `/tmp` and are removed. Opening `hw:LGSIC,3` was done in P2 session 1 without side effects; LG hands-free must stay off ([ADR 0004](../decisions/0004-mvp-capture-device-and-lg-handsfree-off.md)). Do not read ASoC/DAPM sysfs or debugfs nodes.
+**Status (2026-11-05):** steps 1 and 2 done (the delay lock and ERLE with content in [EXP-018](../experiments/EXP-018-aec-live-c3-a.md): 7 of 8 opens locked at 15 to 19 ms, one at 9.8 ms, 0 underruns, the aarch64 daemon at 5 to 7 % of one core with the canceller against 2 % without); step 3 run in a simplified form (JBL talker, HA's real pipeline, 20 trials per cell): inconclusive, see section 12. Results: [P3 TV verification](../discovery/c3-a/P3-tv-verify-aec-pairing.md). Each step needs the owner's authorization for that TV session ([AGENTS.md](../../AGENTS.md)). Order: after Phase 2 session 2 has finished with the TV. Nothing is installed persistently; binaries go to `/tmp` and are removed. Opening `hw:LGSIC,3` was done in P2 session 1 without side effects; LG hands-free must stay off ([ADR 0004](../decisions/0004-mvp-capture-device-and-lg-handsfree-off.md)). Do not read ASoC/DAPM sysfs or debugfs nodes.
 
 ### Step 1: CPU benchmark (no audio device opened)
 
@@ -281,6 +281,19 @@ From the [P2 offline A/B](../experiments/P2-aec-offline-ab.md) (2026-11-02): cor
 ## 12. Tuning results and parked state
 
 **Status (2026-11-03): PARKED** by the owner. The echo-cancellation work and TV session 3 stop here. The shipped default stays **`[aec] enabled = false`**, and every key below is experimental with unchanged defaults.
+
+**Update (2026-11-05): un-parked** for live tests on c3-a ([EXP-018](../experiments/EXP-018-aec-live-c3-a.md), **verified-on-target**, one session, synthetic voices through a JBL loudspeaker at the level the owner confirmed as his natural voice, about -49 dBFS at the mic, 12 dB above P2's reference level). Wake rates through HA, 20 paired trials per cell:
+
+| Arm | Quiet | Content, volume 10 | Content, volume 15, talker +8 dB | False wakes during content |
+| --- | --- | --- | --- | --- |
+| No AEC | 75 % | 40 % | 30 % | 0 in 8.7 min |
+| AEC3 default | 55 % | 40 % | 60 % | 0 in 9.7 min |
+| B | 70 % | 55 % | 65 % | 0 in 15.9 min |
+| B + NS (run last) | not run | 75 % | not run | 0 in 5.7 min |
+
+- Every gain is directional; none is significant at this size (best: B + NS against no AEC at volume 10, p 0.09; B at volume 15, p 0.12), and the same quiet condition varied by up to 25 points between blocks. The proposed pass criterion (misses halved at volume 10) is not met by B (9 misses against 12) and met numerically by B + NS (5), which was not counterbalanced.
+- On the TV the canceller is cheap on aarch64 (sonora 0.3 to 0.5 ms per frame; daemon 5 to 7 % of one core against 2 % without, +1 MB) and removes the +24 dB stream's clipping during content. The satellite's own music reaches the reference (lock 18.8 ms).
+- Suggested decision input: an opt-in setting with B (B + NS as its candidate), not on by default, until a larger counterbalanced OFF against B + NS run and a false-wake soak decide the default (EXP-018 follow-ups).
 
 From the [P2 AEC tuning](../experiments/P2-aec-tuning.md) (offline, semi-synthetic, c3-a recordings; **observed-on-other-device**): parameters were chosen on four corpus voices and reported on three other voices plus the two MLS voices.
 

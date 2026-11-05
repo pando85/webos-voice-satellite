@@ -54,6 +54,7 @@ This file starts with the install record. Earlier c3-a results (capture, playbac
 | Music pause timeout (10 minutes) | Active | PASS (`pause_timeout` at 600.0 s, `idle`, no `pacat`) | EXP-016 |
 | Music and `Active Standby` (D6), `Screen Off`, suspend and resume, HA disconnect during music, whether an open `pacat` #2 keeps the TV from standby | n/a | NOT TESTED (no power-state change allowed in the run) | EXP-017 |
 | False wakes and "stop" success with music (EXP-015, gate G4) | n/a | NOT RUN (not authorized) | EXP-015 (not written) |
+| Echo cancellation (`[aec]`, reference `SoundEngineCapture`), aarch64 daemon 0.4.2 | Active, TV speaker, HDMI content at volume 10 and 15, LG hands-free off | PASS for open, link, delay lock (15 to 19 ms on 7 of 8 opens, 9.8 ms once), 0 underruns, CPU 5 to 7 % of one core; wake-word benefit INCONCLUSIVE (directional gains over content, n = 20 per cell); the satellite's own music reaches the reference | [EXP-018](../experiments/EXP-018-aec-live-c3-a.md) |
 
 ## Notes and redacted evidence
 
