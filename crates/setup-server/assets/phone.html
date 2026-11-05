@@ -3,20 +3,98 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>TV voice satellite setup</title>
+<meta name="color-scheme" content="dark">
+<meta name="referrer" content="no-referrer">
+<title>Voice Satellite setup</title>
+<link rel="icon" href="data:,">
 <link rel="stylesheet" href="/assets/phone.css">
 </head>
 <body>
-<!-- Placeholder page (setup server step P4). The real phone page is step P6
-     of docs/design/phone-setup.md. -->
-<main>
-<h1>TV voice satellite</h1>
-<p id="line">Loading...</p>
-<section id="actions"></section>
-<p id="result"></p>
-<pre id="state"></pre>
-<button id="done" type="button">Done</button>
-</main>
+<div class="ph">
+  <header class="p-head">
+    <h1 class="p-title">Voice Satellite</h1>
+    <div class="p-sub">Set up from your phone</div>
+  </header>
+
+  <div class="p-wait" id="p-wait" role="status" hidden>
+    <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><rect x="7" y="2.5" width="10" height="19" rx="2.5" fill="none" stroke="currentColor" stroke-width="2"/><circle cx="12" cy="18" r="1" fill="currentColor"/></svg>
+    <div><div id="p-wait-main"></div><div class="p-wait-sub" id="p-wait-sub"></div></div>
+  </div>
+  <div class="p-result" id="p-result" role="status" hidden></div>
+  <div class="p-warn" id="p-warn" hidden></div>
+
+  <p class="p-land" id="p-loading">Connecting to the TV...</p>
+
+  <main class="p-main" id="p-main" hidden>
+    <section>
+      <h2>Status</h2>
+      <div class="p-cards">
+        <div class="p-card" id="c-listen"><span class="dot"></span><div class="k">Listening</div><div class="v"></div><div class="d"></div></div>
+        <div class="p-card" id="c-ha"><span class="dot"></span><div class="k">Home Assistant</div><div class="v"></div><div class="d"></div></div>
+        <div class="p-card" id="c-power"><span class="dot"></span><div class="k">Power button</div><div class="v"></div><div class="d"></div></div>
+      </div>
+    </section>
+
+    <section id="s-ha">
+      <h2>Add to Home Assistant</h2>
+      <div class="p-box">
+        <div class="p-line" id="ha-state-line"><div class="grow p-rsub" id="ha-state"></div></div>
+        <div id="ha-add" hidden>
+          <div class="p-line">
+            <div class="grow"><label class="p-k" for="ha-addr">Address</label><input class="p-v" id="ha-addr" type="text" readonly spellcheck="false" autocomplete="off"></div>
+            <button type="button" class="p-btn small" id="copy-addr">Copy</button>
+          </div>
+          <div class="p-line">
+            <div class="grow"><label class="p-k" for="ha-port">Port</label><input class="p-v" id="ha-port" type="text" readonly spellcheck="false" autocomplete="off"></div>
+            <button type="button" class="p-btn small" id="copy-port">Copy</button>
+          </div>
+          <div class="p-note muted" id="ha-copy-hint" hidden>Copy did not work here. The text is selected: touch and hold it, then choose Copy.</div>
+          <div class="p-actions">
+            <button type="button" class="p-btn" id="pair-btn" hidden>Start pairing</button>
+            <a class="p-btn primary" id="ha-link" target="_blank" rel="noopener noreferrer">Open Home Assistant</a>
+            <p class="p-rsub">The button opens the Add integration page of your Home Assistant, through my.home-assistant.io. If it does not open the ESPHome setup, follow these steps.</p>
+            <p class="p-rsub" id="ha-steps"></p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Voice and power</h2>
+      <div class="p-box">
+        <div class="p-out" id="p-out"><b id="o-head"></b><span id="o-detail"></span><span id="o-listen"></span><div id="o-notes"></div></div>
+        <div id="p-rows"></div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Satellite</h2>
+      <div class="p-box">
+        <div class="p-line">
+          <div class="grow"><div class="p-lbl" id="mic-label">Microphone</div><div class="p-rsub" id="mic-sub"></div></div>
+          <button type="button" class="p-sw" id="mic-sw" role="switch" aria-labelledby="mic-label" aria-checked="false" disabled></button>
+        </div>
+        <div class="p-line vol">
+          <div class="vol-head"><label class="p-lbl" for="vol">Reply volume</label><span class="p-word" id="vol-out"></span></div>
+          <input type="range" id="vol" min="0" max="100" step="5" value="40" disabled>
+          <div class="p-rsub" id="vol-sub"></div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <section class="p-land" id="p-ended" hidden>
+    <h2 id="end-title">Session ended</h2>
+    <p id="end-text"></p>
+    <p>To change more, open Set up with your phone on the TV and scan the code again.</p>
+    <p id="end-cookie" hidden>If you opened the link inside a QR scanner app, open it in your browser instead: this page needs cookies.</p>
+  </section>
+
+  <footer class="p-foot" id="p-foot" hidden>
+    <div class="row"><span>Session ends in <b class="clock" id="clock">--:--</b></span><button type="button" class="p-btn small" id="end-btn">End session</button></div>
+    <p>Every change except turning the microphone off needs OK on the TV. This page never asks for keys, passwords or your Home Assistant login.</p>
+  </footer>
+</div>
 <script src="/assets/voicepower.js"></script>
 <script src="/assets/phone.js"></script>
 </body>

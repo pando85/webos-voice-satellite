@@ -1,12 +1,12 @@
 //! The embedded phone page and its assets (section 11): served from the
 //! binary, never from the filesystem, through this fixed table.
 //!
-//! The files under `crates/setup-server/assets/` are **placeholders** until
-//! the phone page (step P6) and the shared `voicepower.js` (step P5) exist.
-//! To switch, point the `include_bytes!` paths below at
-//! `packaging/webos/app/phone/{phone.html,phone.js,phone.css}` and
-//! `packaging/webos/app/voicepower.js`, and keep the names: the page loads
-//! them as `/assets/<name>`. Nothing else in the server changes.
+//! The phone page (`phone.html`, `phone.js`, `phone.css`, step P6) lives in
+//! `crates/setup-server/assets/`. `voicepower.js`, the string tables and the
+//! outcome matrix shared with the TV app (step P5), is **not copied**: it is
+//! included from `packaging/webos/app/voicepower.js`, so the TV app and the
+//! phone page always run the same file. The page loads every asset as
+//! `/assets/<name>`.
 
 pub(crate) struct Asset {
     pub(crate) name: &'static str,
@@ -32,7 +32,7 @@ pub(crate) const ASSETS: &[Asset] = &[
     Asset {
         name: "voicepower.js",
         content_type: "text/javascript; charset=utf-8",
-        body: include_bytes!("../assets/voicepower.js"),
+        body: include_bytes!("../../../packaging/webos/app/voicepower.js"),
     },
 ];
 
@@ -41,7 +41,9 @@ pub(crate) const NO_SESSION_PAGE: &[u8] = include_bytes!("../assets/no-session.h
 /// A second use of the QR link (410).
 pub(crate) const LINK_USED_PAGE: &[u8] = include_bytes!("../assets/link-used.html");
 
-/// Responses are at most 128 KiB (section 6.4); assets 60 KB in total.
+/// Responses are at most 128 KiB (section 6.4). The budget is 80 KiB of assets
+/// in total (the design said 60 KB before the shared `voicepower.js` grew to
+/// about 26 KB).
 const fn total() -> usize {
     let mut n = PAGE.len();
     let mut i = 0;
@@ -51,7 +53,7 @@ const fn total() -> usize {
     }
     n
 }
-const _: () = assert!(total() <= 60 * 1024, "phone assets over the 60 KB budget");
+const _: () = assert!(total() <= 80 * 1024, "phone assets over the 80 KiB budget");
 
 pub(crate) fn find(name: &str) -> Option<&'static Asset> {
     ASSETS.iter().find(|a| a.name == name)

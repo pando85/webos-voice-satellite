@@ -630,3 +630,95 @@ fn twenty_bad_requests_end_the_session() {
     assert!(s.wait_exit(Duration::from_secs(3)).success());
     assert_eq!(s.state()["reason"], "too-many-bad-requests");
 }
+
+fn source(rel: &str) -> Vec<u8> {
+    let p = Path::new(env!("CARGO_MANIFEST_DIR")).join(rel);
+    fs::read(&p).unwrap_or_else(|e| panic!("{}: {e}", p.display()))
+}
+
+#[test]
+fn serves_the_phone_page_and_its_assets() {
+    let s = Server::start(&[]);
+    let (cookie, _csrf) = s.login();
+
+    // The page: HTML, never cached, with the strict CSP, byte for byte the file.
+    let page = s.get("/", Some(&cookie));
+    assert_eq!(page.status, 200);
+    assert_eq!(
+        page.header("content-type"),
+        Some("text/html; charset=utf-8")
+    );
+    assert_eq!(page.header("cache-control"), Some("no-store"));
+    assert_eq!(page.header("x-content-type-options"), Some("nosniff"));
+    assert_eq!(page.header("x-frame-options"), Some("DENY"));
+    let csp = page.header("content-security-policy").unwrap();
+    assert!(csp.contains("script-src 'self'") && csp.contains("style-src 'self'"));
+    assert!(!csp.contains("unsafe-inline") && !csp.contains("unsafe-eval"));
+    assert_eq!(page.body, source("assets/phone.html"));
+    let text = String::from_utf8(page.body.clone()).unwrap();
+
+    // Every asset the page names is served from the binary, equal to its
+    // source file; voicepower.js is the TV app's own file (one copy).
+    let sources = [
+        (
+            "phone.js",
+            "text/javascript; charset=utf-8",
+            "assets/phone.js",
+        ),
+        ("phone.css", "text/css; charset=utf-8", "assets/phone.css"),
+        (
+            "voicepower.js",
+            "text/javascript; charset=utf-8",
+            "../../packaging/webos/app/voicepower.js",
+        ),
+    ];
+    let mut total = page.body.len();
+    for (name, ctype, file) in sources {
+        assert!(
+            text.contains(&format!("/assets/{name}")),
+            "{name} not in the page"
+        );
+        let r = s.get(&format!("/assets/{name}"), Some(&cookie));
+        assert_eq!(r.status, 200, "{name}");
+        assert_eq!(r.header("content-type"), Some(ctype), "{name}");
+        assert_eq!(r.header("cache-control"), Some("no-store"), "{name}");
+        assert_eq!(
+            r.header("x-content-type-options"),
+            Some("nosniff"),
+            "{name}"
+        );
+        assert!(r.header("content-security-policy").is_none(), "{name}");
+        assert!(r.header("access-control-allow-origin").is_none(), "{name}");
+        assert_eq!(r.body, source(file), "{name}");
+        assert_eq!(
+            r.header("content-length")
+                .and_then(|v| v.parse::<usize>().ok()),
+            Some(r.body.len())
+        );
+        assert!(r.body.len() < 128 * 1024, "{name}");
+        total += r.body.len();
+    }
+    assert!(total <= 80 * 1024, "assets are {total} bytes");
+
+    // Unknown assets and paths outside the table; assets need the session.
+    assert_eq!(s.get("/assets/nope.js", Some(&cookie)).status, 404);
+    assert_eq!(s.get("/assets/", Some(&cookie)).status, 404);
+    assert_eq!(s.get("/assets/phone.js", None).status, 403);
+    assert_eq!(s.get("/assets/voicepower.js", None).status, 403);
+}
+
+/// The page's pure logic and static checks run under node (no DOM): skipped,
+/// with a message, when node is not installed.
+#[test]
+fn phone_page_logic_in_node() {
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/phone_logic.js");
+    match Command::new("node").arg(&script).output() {
+        Ok(out) => assert!(
+            out.status.success(),
+            "node tests/phone_logic.js failed:\n{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        ),
+        Err(e) => eprintln!("skipped: node is not available ({e})"),
+    }
+}
