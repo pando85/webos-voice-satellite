@@ -1,7 +1,7 @@
 # ADR 0007: The TV as a control-only media player, next to the separate TV entities
 
 - **Status:** Accepted (2026-11-04, owner). **Supersedes decision 3 of [ADR 0005](0005-tv-control-entities.md)** ("separate entities, not a TV `media_player`") in part: the separate entities stay, and a TV `media_player` is added. The rest of ADR 0005 stands.
-- **Scope:** how Home Assistant's own voice intents (volume, mute, turn on and off) reach the TV. Design: [TV control section 3.5](../design/tv-control.md#35-the-tv-media-player-adr-0007). Implemented on the PC (fake-HA and fake `luna-send` tests); **not yet run on a TV or against the owner's HA**.
+- **Scope:** how Home Assistant's own voice intents (volume, mute, turn on and off) reach the TV. Design: [TV control section 3.5](../design/tv-control.md#35-the-tv-media-player-adr-0007). Implemented on the PC (fake-HA and fake `luna-send` tests); **run on both TVs and against the owner's HA 2026.10.4 as 0.2.3 on 2026-11-04**: the volume, mute and turn on/off sentences reach the TV by its alias ([results table](../design/tv-control.md#35-the-tv-media-player-adr-0007)).
 - **Related:** [ADR 0001](0001-esphome-native-api.md), [ADR 0005](0005-tv-control-entities.md), [P4 sound session on c3-b](../discovery/c3-b/P4-sound-session.md), [ESPHome API crate](../development/esphome-api.md)
 
 ## Context
@@ -23,11 +23,11 @@
 
 ## Consequences
 
-- HA's built-in volume, mute and turn on/off sentences can target the TV by its alias with no custom sentences or scripts. Not yet verified on the owner's HA (the Spanish phrasings of P4 are the test).
-- Two media players on one device: an unnamed "baja el volumen" in the satellite's area matches both; HA then keeps only the `playing` ones, so it reaches the TV while something plays on it, and fails ("nothing playing") otherwise. Naming the TV ("de la tele") avoids this. Not verified on HA.
+- HA's built-in volume, mute and turn on/off sentences can target the TV by its alias with no custom sentences or scripts. Verified on the owner's HA 2026.10.4 with the Spanish phrasings of P4 (2026-11-04, text).
+- Two media players on one device: an unnamed "baja el volumen" in the satellite's area matches both; HA then keeps only the `playing` ones, so it reaches the TV while something plays on it, and fails ("nothing playing") otherwise. Naming the TV ("de la tele") avoids this. Verified on HA 2026.10.4 (2026-11-04): on c3-b the unnamed command reached the TV while it was `playing` (screen saver); on c3-a (`on`, not `playing`) it failed with `no_valid_targets`, nothing changed.
 - "Volume down" by voice is one TV step (1 of 60 on c3-b), as with the remote and HA's `webostv` integration; a relative amount or an absolute value uses the set.
 - `off` covers `Screen Off`, where an app's sound may still play (LG documents "Screen is turned off and only sound is played"); `playing` is only shown while lit.
-- One extra read-only poll (`com.webos.media/getForegroundAppInfo`, 10 s, lit only) by default; checked on c3-b only (getter answered, 2026-11-04).
+- One extra read-only poll (`com.webos.media/getForegroundAppInfo`, 10 s, lit only) by default; getter answered on c3-b, and on c3-a (HDMI 1, an empty `foregroundAppInfo` list, so `on`); in 0.2.3 the cost is inside the run-to-run noise of the daemon's CPU (1.0 to 1.5 % of one core, RSS about 1.7 MB, [c3-a P4](../discovery/c3-a/P4-permanent-install.md#update-to-023-2026-11-04-tv-media-player-wake-session-fix)). The screen saver reports `playing`, so the player shows `playing` there (c3-b).
 - With the default `power_off = false`, an HA "turn off the TV" is a screen off: the running app keeps playing sound. The owner's rule from ADR 0005 (no real power-off from HA) is kept.
 
 ## Alternatives considered

@@ -135,6 +135,25 @@ Never offered: `PLAY_MEDIA`, `MEDIA_ANNOUNCE`, `BROWSE_MEDIA`, `MEDIA_ENQUEUE`, 
 
 ## 4. Power-off: which state, and the way back
 
+**Result on the TVs and the owner's HA 2026.10.4 (0.2.3, 2026-11-04, text through `conversation/process`, agent `conversation.home_assistant`, language `es`; the satellite device as context; each read back with `luna-send`).** Label: verified-on-target (c3-a `03.30.74`, c3-b `03.30.73`) with HA 2026.10.4. HA aliases: "tele del despacho" and "televisión del despacho" (c3-a), "tele del hall" and "televisión del hall" (c3-b) on the TV media player; the screen switch keeps only "pantalla de la tele del ..." and "pantalla del ...". Entity: features 1420 (VOLUME_SET, VOLUME_MUTE, TURN_ON, TURN_OFF, VOLUME_STEP), no play, announce or stop; state `on` (c3-a, `Active`, no foreground media), `playing` (c3-b `Screen Saver`: the screen saver reports `playState` `playing`), `off` (c3-b `Screen Off`, volume level hidden by HA), `unavailable` while the TV is suspended.
+
+| Sentence | TV | HA intent and target | Result on the TV (luna) |
+| --- | --- | --- | --- |
+| "baja el volumen de la tele del despacho" | c3-a | relative volume, the TV player | 89 to 88 |
+| "sube el volumen de la tele del despacho" | c3-a | same | 88 to 89 |
+| "silencia la tele del despacho" | c3-a | mute, the TV player | `muteStatus true` |
+| "quita el silencio de la tele del despacho" | c3-a | unmute, the TV player | `muteStatus false`, volume 89 |
+| "baja el volumen" (unnamed, satellite context) | c3-a | `no_valid_targets` (the TV player is `on`, the satellite player `idle`; HA keeps only `playing` ones) | nothing changed |
+| "baja el volumen de la tele del hall" / "sube ..." | c3-b | relative volume, the TV player | 12 to 11, 11 to 12 |
+| "silencia la tele del hall" / "quita el silencio de la tele del hall" | c3-b | mute / unmute, the TV player | `muteStatus true`, then `false`, volume 12 kept |
+| "pon el volumen de la tele del hall a 20" | c3-b | set volume 20 %, the TV player | 12 (= 20 % of 60, equal to the current level) |
+| "pon el volumen de la tele del hall a 30" | c3-b | same | 18 (30 % of 60), then "a 20" back to 12 |
+| "apaga la tele del hall" | c3-b | turn off, the TV player (answer "Se ha apagado el reproductor") | `Screen Saver` to `Screen Off` (a screen off: `power_off` is off by default); media player `off` |
+| "enciende la tele del hall" | c3-b | turn on, the TV player | `Screen Off` to `Active`; media player `on`, volume level back |
+| "baja el volumen" / "sube el volumen" (unnamed, satellite context) | c3-b | relative volume; the TV player was `playing` (screen saver), so it was the only match | 12 to 11, 11 to 12 |
+
+Notes: the named commands reached the TV player with no ambiguity against the mute switch ("silenciar la tele del hall" alias) or the turn-on button, whose aliases stay. Power off and screen off were not run on c3-a (owner's rule). Unnamed volume commands work only while the TV player is `playing` (c3-b: during the screen saver; c3-a: not while it shows a PC input with no media service state), as the ADR predicted; naming the TV avoids it. HA's answer to "apaga la tele" is "Se ha apagado el reproductor" although only the screen went off. Not tested: sentences by voice (STT), the sound path, a real power-off.
+
 ### 4.1 The owner's rule and the chosen mapping
 
 Owner, 2026-11-04: *support power off only if the satellite can keep running in that state (the always-on mode), and only if it is enabled.*
