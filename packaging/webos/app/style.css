@@ -59,3 +59,16 @@ code { font-size: 22px; }
 .report-side { flex: 1; }
 .url { font-size: 20px; word-break: break-all; color: var(--text); }
 .report-text { font-size: 18px; color: var(--text); max-height: 12em; overflow-y: auto; white-space: pre-wrap; word-break: break-all; }
+.vrows { padding: 8px 16px; }
+.vrow { display: block; width: 100%; text-align: left; margin: 8px 0; }
+.vline { display: flex; justify-content: space-between; gap: 24px; }
+.v-state { font-weight: bold; }
+.v-state.armed { color: var(--bad); }
+.v-sub { display: block; color: var(--muted); font-size: 18px; margin-top: 4px; }
+.vrow.armed { background: #5a2a2a; }
+.vrow.disabled { opacity: 0.75; }
+.notes, .v-warning { white-space: pre-line; }
+.v-warning { min-height: 3.2em; }
+.message.ok { color: var(--ok); }
+.message.bad { color: var(--bad); }
+.message.warn { color: var(--warn); }

@@ -37,6 +37,7 @@
         <button id="b-boot-off" data-cmd="autostart off">Start at boot: turn off</button>
         <button id="b-mic-off" data-cmd="mic off">Microphone off</button>
         <button id="b-mic-on" data-cmd="mic on">Microphone on</button>
+        <button id="b-voice" data-cmd="voice">Voice and power</button>
         <button id="b-report" data-cmd="report --json">Report compatibility</button>
         <button id="b-selfcheck" data-cmd="selfcheck">Re-run microphone check</button>
         <button id="b-ack" data-cmd="ack-firmware">Firmware change: acknowledge</button>
@@ -54,7 +55,7 @@
     <h2>Adding it to Home Assistant</h2>
     <p id="ha-hint">In Home Assistant: Settings, Devices &amp; services, Add integration, ESPHome. Host: this TV's address, port 6053. With Home Assistant 2026.9 or newer no key is needed while the pairing window is open (10 minutes after the first start, or after "Open pairing window").</p>
     <h2>Not available yet</h2>
-    <p class="muted">Pairing window countdown, power options (screen off, Always Ready) and settings such as microphone gain are not shown here yet. Settings are edited in <code>/var/lib/webos-satellite/etc/config.toml</code> over SSH.</p>
+    <p class="muted">Pairing window countdown and settings such as microphone gain are not shown here yet. Settings are edited in <code>/var/lib/webos-satellite/etc/config.toml</code> over SSH.</p>
   </section>
 
   <section class="panel">
@@ -86,6 +87,41 @@
     <pre id="report-text" class="report-text"></pre>
   </section>
 </main>
+<main id="voice-view" hidden>
+  <header>
+    <h1>Voice and power</h1>
+    <p class="sub">What the remote's power button does and whether the satellite can hear you.</p>
+  </header>
+  <section id="v-summary" class="panel" aria-live="polite">
+    <p id="v-headline" class="headline">Checking&hellip;</p>
+    <p id="v-detail" class="detail"></p>
+    <p id="v-listening" class="detail"></p>
+    <p id="v-notes" class="detail notes"></p>
+  </section>
+  <section class="panel vrows">
+    <button id="v-row-ar" class="vrow" role="switch" aria-checked="false">
+      <span class="vline"><span class="v-label">Always Ready (LG setting)</span><span id="v-ar-state" class="v-state muted">Checking...</span></span>
+      <span class="v-sub">Keeps the TV in standby for LG's own features. Uses more standby power.</span>
+    </button>
+    <button id="v-row-hl" class="vrow" role="switch" aria-checked="false">
+      <span class="vline"><span class="v-label">Hi LG hands-free (LG setting)</span><span id="v-hl-state" class="v-state muted">Checking...</span></span>
+      <span class="v-sub">LG's own voice assistant. When it is on, the satellite may not be able to use the microphone.</span>
+    </button>
+    <button id="v-row-keep" class="vrow" role="switch" aria-checked="false">
+      <span class="vline"><span class="v-label">Keep listening after the power button</span><span id="v-keep-state" class="v-state muted">Checking...</span></span>
+      <span class="v-sub">A satellite setting. The TV stays on with the screen dark after the power button.</span>
+    </button>
+  </section>
+  <section class="panel">
+    <p id="v-warning" class="warn v-warning" aria-live="polite"></p>
+    <p id="v-message" class="message" aria-live="polite"></p>
+    <div class="actions">
+      <button id="v-refresh">Refresh</button>
+      <button id="v-back">Back</button>
+    </div>
+  </section>
+</main>
+
 <script src="qrcodegen.js"></script>
 <script src="app.js"></script>
 </body>

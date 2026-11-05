@@ -80,6 +80,7 @@ test-packaging:
 	sh $(PKG)/tests/run.sh
 	sh $(PKG)/tests/ipk.sh
 	node $(PKG)/tests/app_smoke.js
+	node $(PKG)/tests/app_matrix.js
 
 test:
 	cargo test --workspace
