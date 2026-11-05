@@ -18,7 +18,7 @@ How to build, test, package and run the Rust workspace. Status: Phase 1 plus the
 | `crates/tv-control` | `webos-tv-control`: TV control (screen, power, volume, mute, input, apps) as a sans-IO state machine: luna reply parsers, input and app lists, rate limits, the entity table, per-power-state availability, the power-off preconditions. No tokio, no process spawning; the daemon runs its calls ([design](design/tv-control.md)) |
 | `config/example.toml` | Commented configuration with all defaults |
 | `packaging/webos/` | POSIX sh install, start, stop, status, uninstall and supervisor scripts for a TV ([below](#install-on-a-tv-non-persistent)); `ctl.sh`, `app/`, `config.default.toml` and `ipk/build_ipk.py` make the installable webOS app package ([below](#install-the-app-package-on-a-rooted-tv-persistent), [packaging design](design/packaging.md)); `init.d/` holds the boot hook template ([autostart design](design/autostart.md)); `tv/appinstall.sh` runs appinstalld on the TV; `tests/` tests all of it on the host |
-| `tools/esphome-fake-ha/` | Fake-HA harnesses (`run.sh`) and the HA bridge (`ha_bridge.py`) |
+| `tools/esphome-fake-ha/` | Fake-HA harnesses (`run.sh`), the HA bridge (`ha_bridge.py`) and the fake music servers for HA's ffmpeg proxy and Music Assistant's flow stream (`fake_proxy.py`, tested by `tools/test_fake_proxy.py`) |
 | `tools/dogfood_report.py` | PC-side real-use health report from the TV logs (read-only ssh) and HA's Assist debug runs, stdlib only, with `tools/test_dogfood_report.py` ([usage](development/dogfood-report.md)) |
 | `tools/lifecycle/` | Microphone-gate check of the real binary (`local_check.py`), an HA-side client for mute cycles, state watching and reconnect loops against a TV (`lifecycle_client.py`), `run.sh` for both host checks |
 
@@ -318,6 +318,8 @@ Home Assistant's ESPHome integration opens the connection: HA must be able to re
 
 `tools/esphome-fake-ha/run.sh` runs the protocol harness and an end-to-end check of the real binary (file mic, WAV sink, wake and push-to-talk runs, SIGTERM, log policy, and pairing: HA's provisioning flow, restart, reset file, window timeout and pair file). Everything stays on 127.0.0.1.
 
+**Music test servers (M1 of the [music plan](design/music-playback.md), 2026-11-05).** `tools/esphome-fake-ha/fake_proxy.py` (stdlib only) models where a `play_media` URL points: `HaProxy` (mode `ha-proxy`: HA's ffmpeg proxy, 2048-byte chunks, no length, `Range` ignored, a new request restarts the conversion, at most 2 conversions per device with the oldest unfinished one killed by a third URL, unfetched URLs hold a slot) and `MaFlow` (mode `ma-flow`: Music Assistant's flow stream on its own port, no length, several tracks in one stream, endless or ending at close, any rate and channel count). The audio is generated (tones plus noise), never a music file; `backend="ffmpeg"` (flac, wav, mp3) or `backend="python"` (wav, no ffmpeg needed). `Fault` injects a stall, an early close or a status code. `fake_ha.py` has the matching `FakeHA` helpers (`play_media`, `enqueue_media`, `media_pause`, `media_resume`, `media_stop`, `volume_set`, `media_flags`, `media_formats`, `play_media_like_ha`, `play_media_like_ma`) and scenario P, which runs them against `fake_device` with music off and with `--music`. The behaviours are the plan's reading of HA 2026.10.4 and Music Assistant 2.10.9 and are not yet checked against a real HA (M2b); checks that need the satellite fetching a URL print as `PEND` until M5. Try it by hand: `python3 tools/esphome-fake-ha/fake_proxy.py --mode ma-flow --rate 44100 --endless` prints a URL.
+
 **Pairing against a real HA on the PC (2026-11-02).** HA 2026.10.4 from PyPI in a scratch venv (Python 3.14.7), onboarded through its REST API, with only `config`, `onboarding` and `http` in its configuration; the satellite (debug build of commit 849a1dd) with a file mic and `[pairing] enabled = true` on 127.0.0.1. Observed (label: `observed-on-other-device`, a PC, not a TV):
 
 - The ESPHome config flow by host and port created the entry without asking for a key.
@@ -344,6 +346,7 @@ Actions are pinned to commit SHAs with the version in a comment. Update them del
 make lint test
 python3 tools/check_docs.py
 python3 -m unittest discover -s tools -p 'test_dogfood*.py'
+python3 -m unittest discover -s tools -p 'test_fake_proxy.py'   # skips the ffmpeg and openssl checks where those are missing
 sh -n tools/probe/probe.sh
 for f in packaging/webos/*.sh packaging/webos/init.d/* packaging/webos/tests/*.sh packaging/webos/tv/*.sh tools/lifecycle/*.sh; do sh -n "$f"; done
 shellcheck -x -P SCRIPTDIR -s sh packaging/webos/*.sh packaging/webos/init.d/* packaging/webos/tests/*.sh packaging/webos/tv/*.sh   # if installed

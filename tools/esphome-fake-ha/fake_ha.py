@@ -62,9 +62,33 @@ from aioesphomeapi import (
 )
 from aioesphomeapi.model import APIVersion, VoiceAssistantCommandFlag
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import fake_proxy  # noqa: E402  (HA's ffmpeg proxy and Music Assistant's flow stream; milestone M1)
+
 USE_WAKE_WORD = int(VoiceAssistantCommandFlag.USE_WAKE_WORD)
 TIMEOUT = 5.0
 RESULTS: list[tuple[str, bool, str]] = []
+# Checks that need satellite features that do not exist yet (music playback,
+# milestones M2 to M5 of docs/design/music-playback.md). Printed, never failed.
+PENDING: list[tuple[str, str]] = []
+
+# Feature flags of the satellite's media player (design section B).
+MEDIA_FLAGS_MUSIC_OFF = 5124  # STOP + VOLUME_SET + VOLUME_STEP (today, and `[music] enabled = false`)
+MEDIA_FLAGS_MUSIC_ON = 153093  # + PLAY_MEDIA, PAUSE, PLAY, BROWSE_MEDIA
+MEDIA_FLAGS_MUSIC_ANNOUNCE = 1201669  # + MEDIA_ANNOUNCE (`[music] announce = true`)
+# What HA 2026.10.4's ESPHome media player maps (everything else is unmapped).
+HA_MEDIA_STATES = {
+    MediaPlayerState.IDLE: "idle",
+    MediaPlayerState.PLAYING: "playing",
+    MediaPlayerState.PAUSED: "paused",
+    MediaPlayerState.ON: "on",
+    MediaPlayerState.OFF: "off",
+}
+
+
+def pending(name: str, why: str) -> None:
+    PENDING.append((name, why))
+    print(f"PEND  {name}  -- {why}", flush=True)
 
 
 def check(name: str, ok: bool, detail: str = "") -> None:
@@ -159,6 +183,11 @@ class FakeHA:
     # of audio chunks received so far.
     session_open: bool = False
     audio_count: int = 0
+    # The satellite's media player entity and the states HA received for it
+    # (filled by `load_media_player` and `track_media_state`).
+    media: MediaPlayerInfo | None = None
+    media_states: list = field(default_factory=list)
+    device_name: str = "fake-device"
 
     async def connect(self) -> APIClient:
         self.cli = APIClient("127.0.0.1", self.port, "", client_info="fake-ha", noise_psk=self.psk)
@@ -243,6 +272,98 @@ class FakeHA:
             self.cli.send_voice_assistant_audio(bytes([i % 256]) * 1024)
             await asyncio.sleep(0.005)
         self.event(Ev.VOICE_ASSISTANT_TTS_STREAM_END)
+
+    # -- media player: what HA's ESPHome integration reads and sends ----------
+
+    async def load_media_player(self, object_id: str = "media_player") -> MediaPlayerInfo:
+        """Lists the entities like HA does and keeps the satellite's media player."""
+        info, entities, _ = await self.cli.device_info_and_list_entities()
+        self.device_name = info.name
+        self.media = next(e for e in entities if isinstance(e, MediaPlayerInfo) and e.object_id == object_id)
+        return self.media
+
+    def media_flags(self) -> MediaPlayerEntityFeature:
+        """The feature flags as HA 2026.10.4 (API 1.14) computes them."""
+        return MediaPlayerEntityFeature(self.media.feature_flags_compat(APIVersion(1, 14)))
+
+    def media_formats(self) -> list:
+        """`supported_formats` in the advertised order (format, sample_rate,
+        num_channels, purpose, sample_bytes)."""
+        return list(self.media.supported_formats)
+
+    def track_media_state(self) -> None:
+        """Records every state of the satellite player in `media_states`."""
+        def on_state(st) -> None:
+            if isinstance(st, MediaPlayerEntityState) and st.key == self.media.key:
+                self.media_states.append(st)
+
+        self.cli.subscribe_states(on_state)
+
+    @property
+    def media_state(self) -> MediaPlayerEntityState | None:
+        return self.media_states[-1] if self.media_states else None
+
+    async def wait_media_state(self, state: MediaPlayerState, timeout: float = TIMEOUT) -> bool:
+        return await until_true(lambda: self.media_state is not None and self.media_state.state == state, timeout)
+
+    @staticmethod
+    def ha_state_name(state: MediaPlayerState) -> str | None:
+        """HA's entity state for an ESPHome state; None where HA has no mapping
+        (`ANNOUNCING` is never sent by the satellite)."""
+        return HA_MEDIA_STATES.get(state)
+
+    def play_media(self, url: str, announce: bool | None = None) -> None:
+        """`media_player.play_media`; `announce` None leaves the field out like HA does."""
+        self.cli.media_player_command(self.media.key, media_url=url, announcement=announce)
+
+    def enqueue_media(self, url: str, announce: bool | None = None) -> None:
+        """`media_player.play_media` with `enqueue: add`: HA sends ENQUEUE plus the URL
+        even when MEDIA_ENQUEUE is not offered (it only checks PLAY_MEDIA)."""
+        self.cli.media_player_command(self.media.key, command=MediaPlayerCommand.ENQUEUE, media_url=url,
+                                      announcement=announce)
+
+    def media_pause(self) -> None:
+        self.cli.media_player_command(self.media.key, command=MediaPlayerCommand.PAUSE)
+
+    def media_resume(self) -> None:
+        self.cli.media_player_command(self.media.key, command=MediaPlayerCommand.PLAY)
+
+    def media_stop(self) -> None:
+        self.cli.media_player_command(self.media.key, command=MediaPlayerCommand.STOP)
+
+    def volume_set(self, level: float) -> None:
+        self.cli.media_player_command(self.media.key, volume=level)
+
+    def volume_up(self) -> None:
+        self.cli.media_player_command(self.media.key, command=MediaPlayerCommand.VOLUME_UP)
+
+    def volume_down(self) -> None:
+        self.cli.media_player_command(self.media.key, command=MediaPlayerCommand.VOLUME_DOWN)
+
+    def send_unadvertised(self) -> list[MediaPlayerCommand]:
+        """Mute, unmute, toggle, repeat and clear-playlist: not offered, HA does not
+        send them; sent once to prove the satellite ignores them."""
+        sent = [MediaPlayerCommand.MUTE, MediaPlayerCommand.UNMUTE, MediaPlayerCommand.TOGGLE,
+                MediaPlayerCommand.REPEAT_ONE, MediaPlayerCommand.REPEAT_OFF, MediaPlayerCommand.CLEAR_PLAYLIST]
+        for c in sent:
+            self.cli.media_player_command(self.media.key, command=c)
+        return sent
+
+    def play_media_like_ha(self, proxy: "fake_proxy.HaProxy", announce: bool = False,
+                           signal: "fake_proxy.Signal | None" = None) -> str:
+        """`media_player.play_media` from the HA UI or a script: the format comes from the
+        advertised list (first DEFAULT entry, or first ANNOUNCEMENT when announcing), HA's
+        proxy gets a conversion (and a slot), the satellite gets the proxy URL."""
+        url = proxy.url_for_play_media(self.device_name, self.media_formats(), announce, signal)
+        self.play_media(url, announce=True if announce else None)
+        return url
+
+    def play_media_like_ma(self, flow: "fake_proxy.MaFlow", source_rate: int = 44100, **kw) -> str:
+        """Music Assistant's `play_media`: its own flow-mode URL (`bypass_proxy`) in the format it
+        picks from the advertised list; `kw` goes to `MaFlow.create_stream` (tracks, endless ...)."""
+        url = flow.url_for_play_media(self.media_formats(), source_rate, **kw)
+        self.play_media(url)
+        return url
 
 
 async def until_true(pred, timeout: float = TIMEOUT) -> bool:
@@ -1304,6 +1425,136 @@ async def scenario_music(binary: str) -> None:
         await dev.stop()
 
 
+async def scenario_music_harness(binary: str) -> None:
+    """The M1 helpers (media player commands, flags, formats, the fake proxies) against
+    fake_device: first music off (flags 5124, one ANNOUNCEMENT format), then `--music` over
+    an encrypted session (M2). What needs the satellite fetching the URL is pending (M5)."""
+    print("\n== scenario P: music harness helpers (music off, then --music) ==")
+    dev = Device(binary, ["--mode", "none", "--mac", "02:00:00:00:00:10"], None)
+    await dev.start()
+    ha = FakeHA(dev.port)
+    try:
+        cli = await ha.connect()
+        await ha.load_media_player()
+        ha.track_media_state()
+        feat = MediaPlayerEntityFeature
+        flags = ha.media_flags()
+        check("P1 the helper reads the entity flags: 5124 = STOP + VOLUME_SET + VOLUME_STEP, no PLAY_MEDIA",
+              int(flags) == MEDIA_FLAGS_MUSIC_OFF and not flags & (feat.PLAY_MEDIA | feat.PAUSE | feat.PLAY
+                                                                    | feat.BROWSE_MEDIA | feat.MEDIA_ANNOUNCE),
+              repr(flags))
+        fmts = ha.media_formats()
+        check("P2 supported_formats: one ANNOUNCEMENT entry (flac 22050 Hz mono 16 bit), no DEFAULT",
+              [(f.format, f.sample_rate, f.num_channels, int(f.purpose), f.sample_bytes) for f in fmts]
+              == [("flac", 22050, 1, int(MediaPlayerFormatPurpose.ANNOUNCEMENT), 2)], str(fmts))
+        check("P3 HA's choice: announce takes that entry, play_media finds no DEFAULT entry",
+              fake_proxy.ha_pick_format(fmts, announce=True) is fmts[0] and fake_proxy.ha_pick_format(fmts) is None)
+        check("P4 the initial state is idle and HA maps it to 'idle'",
+              await ha.wait_media_state(MediaPlayerState.IDLE)
+              and ha.ha_state_name(ha.media_state.state) == "idle"
+              and ha.ha_state_name(MediaPlayerState.ANNOUNCING) is None)
+
+        start = len(dev.events)
+        ha.volume_set(0.4)
+        ev = await dev.wait_event("VolumeChanged")
+        ok = await until_true(lambda: ha.media_state is not None and abs(ha.media_state.volume - 0.4) < 1e-6)
+        check("P5 volume set reaches the app (VolumeChanged) and the state follows", ev == "VolumeChanged(40)" and ok, ev)
+        ha.volume_up()
+        ev = await dev.wait_event("VolumeChanged")
+        ha.volume_down()
+        ev2 = await dev.wait_event("VolumeChanged")
+        check("P6 volume up and down are 5 % steps of the same volume", ev == "VolumeChanged(45)" and ev2 == "VolumeChanged(40)",
+              f"{ev} {ev2}")
+        ha.media_stop()
+        ev = await dev.wait_event("MediaStop")
+        check("P7 stop is MediaStop", ev == "MediaStop", ev)
+
+        # Music off: everything else is ignored. The proxy side still behaves like HA's.
+        async with fake_proxy.HaProxy() as proxy:
+            mark = len(dev.events)
+            url = ha.play_media_like_ha(proxy, announce=True, signal=fake_proxy.Signal((fake_proxy.Track(1.0),)))
+            ha.enqueue_media(url)
+            ha.media_pause()
+            ha.media_resume()
+            sent = ha.send_unadvertised()
+            await asyncio.sleep(0.5)
+            check("P8 play_media (announce), ENQUEUE, pause, play and the unadvertised commands are ignored with music off",
+                  len(dev.events) == mark and len(sent) == 6, str(dev.events[mark:]))
+            conv = proxy.conversion_of(url)
+            check("P9 the proxy URL HA created was never fetched and holds a slot (the satellite must open and close it: M5 S13)",
+                  conv.fetches == 0 and proxy.slot_count(ha.device_name) == 1)
+            ha.play_media_like_ha(proxy, announce=True)
+            ha.play_media_like_ha(proxy, announce=True)
+            check("P10 HA's proxy kills the oldest conversion when a third URL is created",
+                  conv.killed and proxy.slot_count(ha.device_name) == 2)
+        async with fake_proxy.MaFlow() as flow:
+            url = flow.url_for_play_media(fmts + [fake_proxy.AdvertisedFormat("flac", 48000, 2)], 44100, endless=True)
+            s = flow.stream_of(url)
+            check("P11 Music Assistant's URL is on another port than HA's proxy and follows MA's format rule",
+                  (s.fmt, s.rate, s.channels) == ("flac", 48000, 2) and "/ffmpeg_proxy/" not in url)
+        await cli.disconnect()
+    finally:
+        await dev.stop()
+    # Music on (M2): the same helpers against `fake_device --music` over a Noise session
+    # (a plaintext session never gets a media URL through).
+    psk = base64.b64encode(os.urandom(32)).decode()
+    dev = Device(binary, ["--mode", "none", "--music", "--mac", "02:00:00:00:00:12"], psk)
+    await dev.start()
+    try:
+        ha = FakeHA(dev.port, psk)
+        cli = await ha.connect()
+        await ha.load_media_player()
+        ha.track_media_state()
+        fmts = ha.media_formats()
+        default, ann = fake_proxy.ha_pick_format(fmts), fake_proxy.ha_pick_format(fmts, announce=True)
+        check("P12 music on: flags 1201669 (helper constant), DEFAULT format flac 48000 Hz stereo, ANNOUNCEMENT unchanged",
+              int(ha.media_flags()) == MEDIA_FLAGS_MUSIC_ANNOUNCE and default is not None and ann is not None
+              and (default.format, default.sample_rate, default.num_channels) == ("flac", 48000, 2)
+              and (ann.format, ann.sample_rate, ann.num_channels) == ("flac", 22050, 1), str(fmts))
+        async with fake_proxy.HaProxy() as proxy, fake_proxy.MaFlow() as flow:
+            sig = fake_proxy.Signal((fake_proxy.Track(1.0),))
+            url = ha.play_media_like_ha(proxy, signal=sig)
+            ev = await dev.wait_event("MusicPlay")
+            c = proxy.conversion_of(url)
+            check("P13 play_media: HA's proxy URL (format from the DEFAULT entry) reaches the app",
+                  ev == f'MusicPlay {{ url: "{url}", announce: false }}' and (c.fmt, c.rate, c.channels) == ("flac", 48000, 2), ev)
+            url2 = ha.play_media_like_ha(proxy, announce=True, signal=sig)
+            ev = await dev.wait_event("MusicPlay")
+            c2 = proxy.conversion_of(url2)
+            check("P14 announce: the proxy URL has the ANNOUNCEMENT format and the flag reaches the app",
+                  ev == f'MusicPlay {{ url: "{url2}", announce: true }}' and (c2.fmt, c2.rate, c2.channels) == ("flac", 22050, 1), ev)
+            url3 = proxy.url_for_play_media(ha.device_name, fmts, False, sig)  # a third URL: the first is evicted
+            ha.enqueue_media(url3)
+            ev = await dev.wait_event("MusicEnqueueRefused")
+            check("P15 enqueue: ENQUEUE plus the URL arrives and is refused; HA's proxy had evicted the oldest conversion",
+                  ev == f'MusicEnqueueRefused {{ url: Some("{url3}") }}' and c.killed and proxy.slot_count(ha.device_name) == 2, ev)
+            ha.media_pause()
+            ev1 = await dev.wait_event("MusicPause")
+            ha.media_resume()
+            ev2 = await dev.wait_event("MusicResume")
+            ha.volume_set(0.5)
+            ev3 = await dev.wait_event("VolumeChanged")
+            ha.media_stop()
+            ev4 = await dev.wait_event("MediaStop")
+            check("P16 pause, resume, volume and stop reach the app", (ev1, ev2, ev3, ev4) ==
+                  ("MusicPause", "MusicResume", "VolumeChanged(50)", "MediaStop"), str((ev1, ev2, ev3, ev4)))
+            mark = len(dev.events)
+            ha.send_unadvertised()
+            await asyncio.sleep(0.4)
+            check("P17 mute, unmute, toggle, repeat and clear-playlist are ignored", len(dev.events) == mark, str(dev.events[mark:]))
+            url4 = ha.play_media_like_ma(flow, endless=True)
+            ev = await dev.wait_event("MusicPlay")
+            check("P18 Music Assistant's URL (its own port, MA's format rule, no HA proxy path) reaches the app unchanged",
+                  ev == f'MusicPlay {{ url: "{url4}", announce: false }}' and f":{flow.port}/" in url4
+                  and f":{proxy.port}/" not in url4 and flow.stream_of(url4).rate == 48000, ev)
+        await cli.disconnect()
+    finally:
+        await dev.stop()
+    pending("P-music-on the satellite fetches the URLs from fake_proxy (ha-proxy slot count back to its start, ma-flow endless) and plays them",
+            "needs M3 and M5 (scenarios S1 to S15)")
+    pending("P-music-on a refused URL (ENQUEUE, plaintext) is opened and closed, freeing HA's proxy slot", "needs M5 (S13)")
+
+
 async def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--device", required=True, help="path to the fake_device binary")
@@ -1312,13 +1563,15 @@ async def main() -> int:
     for scenario in (scenario_plaintext_speaker, scenario_capture_live, scenario_noise_url, scenario_timers,
                      scenario_pairing, scenario_pairing_window, scenario_window_behind_router,
                      scenario_key_clear, scenario_entities, scenario_generic_entities,
-                     scenario_two_media_players, scenario_music):
+                     scenario_two_media_players, scenario_music, scenario_music_harness):
         try:
             await scenario(args.device)
         except Exception as err:  # noqa: BLE001
             failed = True
             print(f"FAIL  {scenario.__name__}: {type(err).__name__}: {err}", flush=True)
     passed = sum(1 for _, ok, _ in RESULTS if ok)
+    if PENDING:
+        print(f"\n{len(PENDING)} checks pending (need unbuilt satellite features): " + "; ".join(n for n, _ in PENDING))
     print(f"\n{passed} checks passed, {'FAILED' if failed else 'all scenarios OK'} (device logs: {LOG_DIR})")
     return 1 if failed else 0
 

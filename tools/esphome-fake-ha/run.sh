@@ -1,7 +1,8 @@
 #!/bin/sh
 # Builds the fake_device example and the webos-satellite binary and runs the
 # fake-HA harnesses against them:
-#   1. fake_ha.py       protocol scenarios against the fake_device example
+#   1. fake_ha.py       protocol scenarios against the fake_device example (with
+#                       the music harness helpers over fake_proxy.py, scenario P)
 #   2. satellite_e2e.py the real daemon with a file mic and the wav sink
 # Usage (from anywhere): tools/esphome-fake-ha/run.sh [--device-only | --satellite-only]
 # Creates tools/esphome-fake-ha/.venv (gitignored) with aioesphomeapi==46.6.0
