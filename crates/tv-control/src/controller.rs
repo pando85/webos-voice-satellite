@@ -54,6 +54,9 @@ pub const POLL_FOREGROUND: Duration = Duration::from_secs(5);
 pub const PUSH_GRACE: Duration = Duration::from_secs(3);
 /// Minimum time between two list refreshes.
 pub const REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+/// Poll interval of the two LG settings sensors (Always Ready, LG
+/// hands-free): two short read-only calls a minute.
+pub const POLL_LG_SETTINGS: Duration = Duration::from_secs(60);
 
 /// Which lists and controls are on, and the guards that are decided outside.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,6 +90,10 @@ pub struct Config {
     /// native volume, mute and turn on/off intents work. Its features follow
     /// the other flags; it reads the play state (polled) for `playing`.
     pub media_player: bool,
+    /// The read-only sensors `lg_always_ready` and `lg_hands_free`
+    /// (ADR 0008 decision 4): two getters, no setter, polled every 60 s while
+    /// the TV is lit.
+    pub lg_settings: bool,
     /// `Some(reason)` while every setter is refused (the firmware guard).
     /// Getters and sensors still report.
     pub setters_blocked: Option<String>,
@@ -112,6 +119,7 @@ impl Default for Config {
             app_limit: 30,
             play_state: false,
             media_player: true,
+            lg_settings: true,
             setters_blocked: None,
             own_app_ids: Vec::new(),
         }
@@ -241,6 +249,10 @@ pub enum Topic {
     Apps,
     /// The media play state.
     PlayState,
+    /// Always Ready (`lifeOnScreenMode`), read-only.
+    AlwaysReady,
+    /// LG hands-free (`getActivation`), read-only.
+    HandsFree,
 }
 
 impl Topic {
@@ -252,6 +264,8 @@ impl Topic {
             Self::Inputs => "input list",
             Self::Apps => "app list",
             Self::PlayState => "play state",
+            Self::AlwaysReady => "Always Ready setting",
+            Self::HandsFree => "LG hands-free setting",
         }
     }
 
@@ -263,6 +277,16 @@ impl Topic {
             Self::Inputs => setters::URI_INPUT_LIST,
             Self::Apps => setters::URI_LAUNCH_POINTS,
             Self::PlayState => setters::URI_PLAY_STATE,
+            Self::AlwaysReady => setters::URI_GET_SYSTEM_SETTINGS,
+            Self::HandsFree => setters::URI_GET_ACTIVATION,
+        }
+    }
+
+    /// The payload of the getter.
+    fn payload(self) -> &'static str {
+        match self {
+            Self::AlwaysReady => setters::PAYLOAD_LIFE_ON_SCREEN_MODE,
+            _ => setters::PAYLOAD_EMPTY,
         }
     }
 
@@ -523,6 +547,8 @@ pub struct Controller {
     inputs: Vec<Input>,
     apps: Vec<App>,
     play: Option<String>,
+    always_ready: Option<luna::AlwaysReady>,
+    hands_free: Option<luna::HandsFree>,
 
     /// Options HA was told (what the selects list), `Other` last.
     listed_inputs: Vec<String>,
@@ -559,6 +585,27 @@ pub struct Controller {
     /// of the reads of it that failed (for the one summary line).
     refresh_pending: Vec<Topic>,
     refresh_failed: Vec<String>,
+}
+
+/// An LG setting value as the log shows it: the label in lower case, and an
+/// unknown Always Ready word (printable, at most 32 characters).
+trait LgValue: PartialEq {
+    fn describe(&self) -> String;
+}
+
+impl LgValue for luna::AlwaysReady {
+    fn describe(&self) -> String {
+        match self {
+            Self::Other(word) => format!("other ({word})"),
+            other => other.label().to_lowercase(),
+        }
+    }
+}
+
+impl LgValue for luna::HandsFree {
+    fn describe(&self) -> String {
+        self.label().to_lowercase()
+    }
 }
 
 fn log(level: Level, msg: impl Into<String>) -> Effect {
@@ -606,6 +653,8 @@ impl Controller {
             inputs: Vec::new(),
             apps: Vec::new(),
             play: None,
+            always_ready: None,
+            hands_free: None,
             listed_inputs: vec![OTHER.to_owned()],
             listed_apps: vec![OTHER.to_owned()],
             pending_options: HashMap::new(),
@@ -665,6 +714,7 @@ impl Controller {
             Topic::Inputs => self.cfg.input,
             Topic::Apps => self.cfg.apps,
             Topic::PlayState => self.play_reader(),
+            Topic::AlwaysReady | Topic::HandsFree => self.cfg.lg_settings,
         }
     }
 
@@ -691,14 +741,19 @@ impl Controller {
         self.cfg.media_player && self.media_features().any()
     }
 
-    const TOPICS: [Topic; 6] = [
+    const TOPICS: [Topic; 8] = [
         Topic::Power,
         Topic::Volume,
         Topic::Foreground,
         Topic::Inputs,
         Topic::Apps,
         Topic::PlayState,
+        Topic::AlwaysReady,
+        Topic::HandsFree,
     ];
+
+    /// The two LG settings sensors' getters.
+    const LG_TOPICS: [Topic; 2] = [Topic::AlwaysReady, Topic::HandsFree];
 
     /// The entities of the current configuration, in display order. Select
     /// options and the volume range are those HA was told.
@@ -841,6 +896,23 @@ impl Controller {
                 Kind::TextSensor,
             );
         }
+        if self.cfg.lg_settings {
+            // Read-only (ADR 0008 decision 4): no switch, select or button.
+            add(
+                ent::LG_ALWAYS_READY,
+                "Always Ready",
+                "mdi:television-ambient-light",
+                Category::Diagnostic,
+                Kind::TextSensor,
+            );
+            add(
+                ent::LG_HANDS_FREE,
+                "LG hands-free",
+                "mdi:account-voice",
+                Category::Diagnostic,
+                Kind::TextSensor,
+            );
+        }
         v
     }
 
@@ -976,6 +1048,20 @@ impl Controller {
                 }
                 _ => Want::Set(S::Text(None)),
             },
+            ent::LG_ALWAYS_READY | ent::LG_HANDS_FREE => {
+                let label = if id == ent::LG_ALWAYS_READY {
+                    self.always_ready.as_ref().map(luna::AlwaysReady::label)
+                } else {
+                    self.hands_free.map(luna::HandsFree::label)
+                };
+                match class {
+                    Pwr::Transition => Want::Hold,
+                    // The setting does not change with the power state and
+                    // is only read while lit or dark: the last value stays
+                    // in standby; a failed read leaves it missing.
+                    _ => Want::Set(S::Text(label.map(str::to_owned))),
+                }
+            }
             ent::TV_MEDIA_PLAYER => self.media_want(class),
             _ => Want::Hold,
         }
@@ -1064,6 +1150,8 @@ impl Controller {
             ent::TV_APP,
             ent::TV_SOUND_OUTPUT,
             ent::TV_PLAY_STATE,
+            ent::LG_ALWAYS_READY,
+            ent::LG_HANDS_FREE,
             ent::TV_MEDIA_PLAYER,
         ]
         .into_iter()
@@ -1076,7 +1164,8 @@ impl Controller {
             ent::TV_INPUT => self.cfg.input,
             ent::TV_APP => self.cfg.apps,
             ent::TV_SOUND_OUTPUT => self.cfg.volume || self.cfg.mute,
-            _ => self.cfg.play_state,
+            ent::TV_PLAY_STATE => self.cfg.play_state,
+            _ => self.cfg.lg_settings,
         })
     }
 
@@ -1165,7 +1254,7 @@ impl Controller {
         Effect::Call {
             purpose: Purpose::Read(topic),
             uri: topic.uri(),
-            payload: setters::PAYLOAD_EMPTY.to_owned(),
+            payload: topic.payload().to_owned(),
         }
     }
 
@@ -1236,6 +1325,23 @@ impl Controller {
                 ));
             }
         }
+        if self.cfg.lg_settings {
+            for topic in Self::LG_TOPICS {
+                caps.push(format!(
+                    "{}={}",
+                    if topic == Topic::AlwaysReady {
+                        "lg_always_ready"
+                    } else {
+                        "lg_hands_free"
+                    },
+                    if self.getter_ok.contains(&topic) {
+                        "ok"
+                    } else {
+                        "no state"
+                    }
+                ));
+            }
+        }
         out.push(log(
             Level::Info,
             format!(
@@ -1294,6 +1400,14 @@ impl Controller {
         if self.play_reader() && self.getter_ok.contains(&Topic::PlayState) {
             self.polling.insert(Topic::PlayState);
         }
+        // The two LG settings are polled whatever the startup read said: a
+        // read in standby may fail and the next one recovers (read-only,
+        // one warn line at most).
+        for topic in Self::LG_TOPICS {
+            if self.wanted(topic) {
+                self.polling.insert(topic);
+            }
+        }
         for topic in &self.polling {
             self.next_poll
                 .insert(*topic, now + Self::poll_every(*topic));
@@ -1303,10 +1417,10 @@ impl Controller {
     }
 
     fn poll_every(topic: Topic) -> Duration {
-        if topic == Topic::Foreground {
-            POLL_FOREGROUND
-        } else {
-            POLL_SLOW
+        match topic {
+            Topic::Foreground => POLL_FOREGROUND,
+            Topic::AlwaysReady | Topic::HandsFree => POLL_LG_SETTINGS,
+            _ => POLL_SLOW,
         }
     }
 
@@ -1357,7 +1471,13 @@ impl Controller {
             && matches!(after, Pwr::Lit | Pwr::Dark)
             && matches!(before, Pwr::Standby | Pwr::Other | Pwr::Unknown)
         {
-            for t in [Topic::Volume, Topic::Foreground, Topic::PlayState] {
+            for t in [
+                Topic::Volume,
+                Topic::Foreground,
+                Topic::PlayState,
+                Topic::AlwaysReady,
+                Topic::HandsFree,
+            ] {
                 if self.polling.contains(&t) && !self.reads_inflight.contains(&t) {
                     out.push(self.read_call(t));
                 }
@@ -1374,6 +1494,29 @@ impl Controller {
             out.push(self.read_call(Topic::PlayState));
         }
         out.extend(self.sync());
+        out
+    }
+
+    /// Reads the two LG settings now, outside the 60 s poll: a person or
+    /// `ctl.sh set` changed one and HA should show it within a second (the
+    /// daemon calls this when the `lg-settings-refresh` trigger file is
+    /// consumed). Only where the poll would read (`Active`, `Screen Saver`,
+    /// `Screen Off`); a read that is already running is followed by another
+    /// one on the next tick, so a reply that predates the change does not
+    /// stay. No effect without `lg_settings`.
+    pub fn refresh_lg_settings(&mut self, now: Instant) -> Vec<Effect> {
+        if !self.ready || !self.cfg.lg_settings || !matches!(self.class(), Pwr::Lit | Pwr::Dark) {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for topic in Self::LG_TOPICS {
+            if self.reads_inflight.contains(&topic) {
+                self.next_poll.insert(topic, now);
+            } else {
+                self.next_poll.insert(topic, now + POLL_LG_SETTINGS);
+                out.push(self.read_call(topic));
+            }
+        }
         out
     }
 
@@ -1517,6 +1660,8 @@ impl Controller {
             Topic::Volume => self.vol = None,
             Topic::Foreground => self.fg = Foreground::Unknown,
             Topic::PlayState => self.play = None,
+            Topic::AlwaysReady => self.always_ready = None,
+            Topic::HandsFree => self.hands_free = None,
             _ => {}
         }
         self.getter_ok.remove(&topic);
@@ -1541,6 +1686,16 @@ impl Controller {
                 self.fg = luna::foreground_app(v)?.map_or(Foreground::NoApp, Foreground::App);
             }
             Topic::PlayState => self.play = luna::play_state(v),
+            Topic::AlwaysReady => {
+                let now_value = luna::always_ready(v)?;
+                let before = self.always_ready.replace(now_value.clone());
+                return Ok(Self::lg_change("always-ready", before, &now_value));
+            }
+            Topic::HandsFree => {
+                let now_value = luna::hands_free(v)?;
+                let before = self.hands_free.replace(now_value);
+                return Ok(Self::lg_change("hands-free", before, &now_value));
+            }
             Topic::Inputs => {
                 self.raw_inputs = luna::external_inputs(v)?;
                 return Ok(self.lists_changed());
@@ -1551,6 +1706,22 @@ impl Controller {
             }
         }
         Ok(Vec::new())
+    }
+
+    /// The log line for a change of an LG setting seen by a read (never made
+    /// by the satellite, ADR 0008 decision 3); none for the first value.
+    fn lg_change<T: LgValue>(what: &str, before: Option<T>, now: &T) -> Vec<Effect> {
+        match before {
+            Some(b) if b != *now => vec![log(
+                Level::Info,
+                format!(
+                    "lg setting: {what} {} -> {} (not changed by the satellite)",
+                    b.describe(),
+                    now.describe()
+                ),
+            )],
+            _ => Vec::new(),
+        }
     }
 
     fn rebuild_lists(&mut self) {
@@ -2388,7 +2559,13 @@ impl Controller {
             out.push(Effect::Unsubscribe(topic));
         }
         // Polling, only where the TV is in a state it answers in.
-        for topic in [Topic::Volume, Topic::Foreground, Topic::PlayState] {
+        for topic in [
+            Topic::Volume,
+            Topic::Foreground,
+            Topic::PlayState,
+            Topic::AlwaysReady,
+            Topic::HandsFree,
+        ] {
             if !self.polling.contains(&topic) || self.reads_inflight.contains(&topic) {
                 continue;
             }

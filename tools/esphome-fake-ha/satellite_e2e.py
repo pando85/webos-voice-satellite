@@ -895,6 +895,8 @@ case "$uri" in
   */getPowerState) printf '{"returnValue":true,"state":"%s"}\n' "$(cat "$D/power")" ;;
   */getVolume) vol_json; echo ;;
   */getForegroundAppInfo) case "$uri" in *media*) echo '{"returnValue":true,"playState":"playing"}' ;; *) fg_json; echo ;; esac ;;
+  */getSystemSettings) printf '{"returnValue":true,"category":"general","settings":{"lifeOnScreenMode":"%s"}}\n' "$(cat "$D/lg_ar" 2>/dev/null || echo off)" ;;
+  */getActivation) printf '{"returnValue":true,"settingStatus":%s,"thinQ":{"settingStatus":%s},"amazon":{"settingStatus":false}}\n' "$(cat "$D/lg_hl" 2>/dev/null || echo false)" "$(cat "$D/lg_hl" 2>/dev/null || echo false)" ;;
   */getExternalInputList) echo '{"returnValue":true,"devices":[{"id":"HDMI_1","label":"CanaryInput 1","connected":true,"appId":"app.hdmi1"},{"id":"HDMI_2","label":"CanaryInput 2","connected":false,"appId":"app.hdmi2"}]}' ;;
   */listLaunchPoints) cat "$D/points"; echo ;;
   */setVolume) sed 's/.*"volume":\([0-9]*\).*/\1/' <<EOF2 > "$D/vol"
@@ -966,10 +968,13 @@ luna_send = "{luna}"
 power_off = true
 play_state = true
 volume_limit = 40
+[report]
+dir = "{tmp}/run-tv"
 [safety]
 validated_firmware = ["03.30.74"]
 firmware_info = "{os_info}"
 """)
+    os.mkdir(os.path.join(tmp, "run-tv"))
     calls_path = os.path.join(tv, "calls")
 
     def calls() -> str:
@@ -987,6 +992,7 @@ firmware_info = "{os_info}"
         by = {e.object_id: e for e in ents}
         want = {"tv_screen", "tv_power", "tv_mute", "tv_volume", "tv_volume_up", "tv_volume_down", "tv_turn_on",
                 "tv_input", "tv_app", "tv_refresh_lists", "tv_sound_output", "tv_play_state", "tv_power_state",
+                "lg_always_ready", "lg_hands_free",
                 "remote_power_off", "listening", "microphone_muted", "mute_microphone", "media_player",
                 "tv_media_player"}
         check("V1 entity list: every TV control entity, once", want <= set(by) and len(by) == len(ents),
@@ -1022,6 +1028,32 @@ firmware_info = "{os_info}"
         check("V6 firmware not verified: warning logged, TV control still on",
               "tv_control: firmware 99.99.99 is not verified; TV control runs anyway" in log
               and "SETTERS ARE OFF" not in log, "")
+
+        # The two read-only LG sensors (ADR 0008): diagnostic text sensors that
+        # follow the TV; ctl.sh set's trigger file makes the daemon read at once.
+        check("V6b the LG sensors are diagnostic text sensors, no command entity for them",
+              by["lg_always_ready"].entity_category.name == "DIAGNOSTIC"
+              and by["lg_hands_free"].entity_category.name == "DIAGNOSTIC"
+              and by["lg_always_ready"].name == "Always Ready" and by["lg_hands_free"].name == "LG hands-free"
+              and not any(o.startswith("lg_") and type(e).__name__ != "TextSensorInfo" for o, e in by.items()), "")
+        ok = await until_true(lambda: st("lg_always_ready") == "Off" and st("lg_hands_free") == "Off")
+        check("V6c LG sensors start from the TV's values (Off, Off)", ok,
+              f"{st('lg_always_ready')} {st('lg_hands_free')}")
+        with open(os.path.join(tv, "lg_ar"), "w") as f:
+            f.write("allEnabled\n")
+        with open(os.path.join(tv, "lg_hl"), "w") as f:
+            f.write("true\n")
+        with open(os.path.join(tmp, "run-tv", "lg-settings-refresh"), "w"):
+            pass
+        ok = await until_true(lambda: st("lg_always_ready") == "On with wallpaper" and st("lg_hands_free") == "On", 6)
+        check("V6d the lg-settings-refresh trigger makes both sensors read at once and is consumed",
+              ok and not os.path.exists(os.path.join(tmp, "run-tv", "lg-settings-refresh")),
+              f"{st('lg_always_ready')} {st('lg_hands_free')}")
+        check("V6e the LG sensors never write: only the two getters were called",
+              "setSystemSettings" not in calls() and "setActivation" not in calls()
+              and "getSystemSettings" in calls() and "getActivation" in calls()
+              and "lg setting: always-ready off -> on with wallpaper (not changed by the satellite)" in sat.text(),
+              "")
 
         # tv_power off while not in keep-listening: refused, no key.
         cli.switch_command(by["tv_power"].key, False)

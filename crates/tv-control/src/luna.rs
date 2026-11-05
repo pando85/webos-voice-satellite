@@ -301,6 +301,119 @@ pub fn play_state(v: &Value) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// The Always Ready setting (`general/lifeOnScreenMode`), reduced to what
+/// Home Assistant shows. The raw words are `verified-on-target` on c3-a
+/// (EXP-011, 2026-11-05): `off`, `none` (hidden, inactive), `lifeOnScreen`,
+/// `alwaysReady` (the dark variant) and `allEnabled` (with wallpaper).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AlwaysReady {
+    /// `off` or `none`.
+    Off,
+    /// `alwaysReady`.
+    On,
+    /// `allEnabled`.
+    OnWithWallpaper,
+    /// Any other word (`lifeOnScreen` included), kept short and printable
+    /// for the log; never shown in Home Assistant.
+    Other(String),
+}
+
+impl AlwaysReady {
+    /// What Home Assistant shows: only these four strings.
+    #[must_use]
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Off => "Off",
+            Self::On => "On",
+            Self::OnWithWallpaper => "On with wallpaper",
+            Self::Other(_) => "Other",
+        }
+    }
+}
+
+/// Parses `settingsservice/getSystemSettings` for `lifeOnScreenMode`
+/// (`settings.lifeOnScreenMode`, a string).
+///
+/// # Errors
+///
+/// [`ReplyError::Shape`] without that string.
+pub fn always_ready(v: &Value) -> Result<AlwaysReady, ReplyError> {
+    let raw = v
+        .get("settings")
+        .and_then(|s| s.get("lifeOnScreenMode"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| shape("settings.lifeOnScreenMode"))?;
+    Ok(match raw {
+        "off" | "none" => AlwaysReady::Off,
+        "alwaysReady" => AlwaysReady::On,
+        "allEnabled" => AlwaysReady::OnWithWallpaper,
+        other => AlwaysReady::Other(
+            if !other.is_empty()
+                && other.len() <= 32
+                && other
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            {
+                other.to_owned()
+            } else {
+                "(unprintable)".to_owned()
+            },
+        ),
+    })
+}
+
+/// LG hands-free ("Hi LG"), reduced to what Home Assistant shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandsFree {
+    /// Every `settingStatus` that is reported is `false`.
+    Off,
+    /// The top level or a provider reports `settingStatus: true`.
+    On,
+    /// A `settingStatus` that is not a boolean.
+    Other,
+}
+
+impl HandsFree {
+    /// What Home Assistant shows: only these three strings.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "Off",
+            Self::On => "On",
+            Self::Other => "Other",
+        }
+    }
+}
+
+/// The providers of `getActivation` (c3-a, EXP-011): the top level carries
+/// the same fields, one object per provider.
+const HANDS_FREE_PROVIDERS: [&str; 3] = ["thinQ", "amazon", "dangbei"];
+
+/// Parses `voiceinput/setting/getActivation`. Working rule (design 6.1,
+/// EXP-011): on when the top level or any provider reports `settingStatus:
+/// true`, off when all that are reported are `false`. Trigger words, other
+/// provider names and every other field are ignored.
+///
+/// # Errors
+///
+/// [`ReplyError::Shape`] when no `settingStatus` is reported at all.
+pub fn hands_free(v: &Value) -> Result<HandsFree, ReplyError> {
+    let statuses: Vec<&Value> = std::iter::once(v)
+        .chain(HANDS_FREE_PROVIDERS.iter().filter_map(|p| v.get(*p)))
+        .filter_map(|o| o.get("settingStatus"))
+        .collect();
+    if statuses.is_empty() {
+        return Err(shape("settingStatus"));
+    }
+    if statuses.iter().any(|s| s.as_bool() == Some(true)) {
+        Ok(HandsFree::On)
+    } else if statuses.iter().all(|s| s.as_bool() == Some(false)) {
+        Ok(HandsFree::Off)
+    } else {
+        Ok(HandsFree::Other)
+    }
+}
+
 /// One launch point, reduced to the three fields TV control keeps. Everything
 /// else in the reply (icons, paths, user data) is dropped here.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -514,6 +627,128 @@ mod tests {
             Some("playing")
         );
         assert_eq!(play_state(&ok(r#"{"returnValue":true}"#)), None);
+    }
+
+    #[test]
+    fn always_ready_reply() {
+        let r = |w: &str| {
+            always_ready(&ok(&format!(
+                r#"{{"returnValue":true,"category":"general","settings":{{"lifeOnScreenMode":"{w}"}}}}"#
+            )))
+        };
+        assert_eq!(r("off").unwrap(), AlwaysReady::Off);
+        assert_eq!(r("none").unwrap(), AlwaysReady::Off);
+        assert_eq!(r("alwaysReady").unwrap(), AlwaysReady::On);
+        assert_eq!(r("allEnabled").unwrap(), AlwaysReady::OnWithWallpaper);
+        assert_eq!(
+            r("lifeOnScreen").unwrap(),
+            AlwaysReady::Other("lifeOnScreen".to_owned())
+        );
+        // An unknown word never reaches Home Assistant as itself.
+        assert_eq!(r("brandNew").unwrap().label(), "Other");
+        assert_eq!(
+            r("a b").unwrap(),
+            AlwaysReady::Other("(unprintable)".to_owned())
+        );
+        assert_eq!(
+            r(&"x".repeat(40)).unwrap(),
+            AlwaysReady::Other("(unprintable)".to_owned())
+        );
+        let labels: Vec<&str> = [
+            AlwaysReady::Off,
+            AlwaysReady::On,
+            AlwaysReady::OnWithWallpaper,
+            AlwaysReady::Other("x".to_owned()),
+        ]
+        .iter()
+        .map(AlwaysReady::label)
+        .collect();
+        assert_eq!(labels, ["Off", "On", "On with wallpaper", "Other"]);
+        for bad in [
+            r#"{"returnValue":true}"#,
+            r#"{"returnValue":true,"settings":{}}"#,
+            r#"{"returnValue":true,"settings":{"lifeOnScreenMode":3}}"#,
+            r#"{"returnValue":true,"settings":{"lifeOnScreenMode":null}}"#,
+            r#"{"returnValue":true,"lifeOnScreenMode":"off"}"#,
+        ] {
+            assert!(
+                matches!(always_ready(&ok(bad)), Err(ReplyError::Shape(_))),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn hands_free_reply() {
+        let h = |t: &str| hands_free(&ok(t));
+        // c3-a shape, all off.
+        assert_eq!(
+            h(
+                r#"{"returnValue":true,"settingStatus":false,"activationState":false,
+                "systemStatus":true,"supportPlatform":["thinQ"],"supportLanguage":["en-US"],
+                "thinQ":{"settingStatus":false,"activationState":false},
+                "amazon":{"settingStatus":false,"activationState":false},
+                "dangbei":{"settingStatus":false,"activationState":false}}"#
+            )
+            .unwrap(),
+            HandsFree::Off
+        );
+        // On at the top level, with the trigger word fields.
+        assert_eq!(
+            h(
+                r#"{"returnValue":true,"settingStatus":true,"activationState":true,
+                "currentTriggerWord":"hiLG","availableTriggerWord":["hiLG"],
+                "thinQ":{"settingStatus":true,"currentTriggerWord":"hiLG"}}"#
+            )
+            .unwrap(),
+            HandsFree::On
+        );
+        // Any provider on is on, even when the top level says off.
+        assert_eq!(
+            h(
+                r#"{"returnValue":true,"settingStatus":false,"thinQ":{"settingStatus":false},
+                "amazon":{"settingStatus":true}}"#
+            )
+            .unwrap(),
+            HandsFree::On
+        );
+        // Only the top level, or only a provider.
+        assert_eq!(
+            h(r#"{"returnValue":true,"settingStatus":false}"#).unwrap(),
+            HandsFree::Off
+        );
+        assert_eq!(
+            h(r#"{"returnValue":true,"thinQ":{"settingStatus":false}}"#).unwrap(),
+            HandsFree::Off
+        );
+        // A status that is not a boolean is Other (never a guess); a true
+        // one still wins.
+        assert_eq!(
+            h(r#"{"returnValue":true,"settingStatus":"yes"}"#).unwrap(),
+            HandsFree::Other
+        );
+        assert_eq!(
+            h(r#"{"returnValue":true,"settingStatus":null,"thinQ":{"settingStatus":false}}"#)
+                .unwrap(),
+            HandsFree::Other
+        );
+        assert_eq!(
+            h(r#"{"returnValue":true,"settingStatus":"x","thinQ":{"settingStatus":true}}"#)
+                .unwrap(),
+            HandsFree::On
+        );
+        // Nothing reported: an error, not a default.
+        for bad in [
+            r#"{"returnValue":true}"#,
+            r#"{"returnValue":true,"activationState":true}"#,
+            r#"{"returnValue":true,"thinQ":{},"amazon":"x"}"#,
+        ] {
+            assert!(matches!(h(bad), Err(ReplyError::Shape(_))), "{bad}");
+        }
+        assert_eq!(
+            [HandsFree::Off, HandsFree::On, HandsFree::Other].map(HandsFree::label),
+            ["Off", "On", "Other"]
+        );
     }
 
     #[test]

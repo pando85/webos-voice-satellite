@@ -64,6 +64,8 @@ All entities belong to the satellite's existing ESPHome device. Object ids are s
 | TV power state | `text_sensor` | `tv_power_state` | exists since 0.1.0 | power watch on | on | diagnostic |
 | TV sound output | `text_sensor` | `tv_sound_output` | the TV's value, for example `external_arc`, `tv_speaker` | `volume` or `mute` on | on | diagnostic |
 | TV play state | `text_sensor` | `tv_play_state` | the media service's `playState` value | `[tv_control] play_state` | off | diagnostic |
+| Always Ready | `text_sensor` | `lg_always_ready` | `Off`, `On`, `On with wallpaper` or `Other` (an unknown word is only in the log); from `settingsservice/getSystemSettings` `general/lifeOnScreenMode`; read-only ([ADR 0008](../decisions/0008-user-initiated-lg-settings.md), [Voice and power screen 7](voice-and-power-screen.md#7-home-assistant-two-read-only-diagnostic-sensors)) | `[tv_control] lg_settings` | on | diagnostic |
+| LG hands-free | `text_sensor` | `lg_hands_free` | `Off`, `On` or `Other`; from `voiceinput/setting/getActivation` (on when the top level or a provider reports `settingStatus: true`); read-only | `[tv_control] lg_settings` | on | diagnostic |
 | Listening | `binary_sensor` | `listening` | on = capture PCM open | always (privacy) | on | none |
 | Microphone muted | `binary_sensor` | `microphone_muted` | on = a gate keeps the PCM closed | always (privacy) | on | none |
 
@@ -276,6 +278,7 @@ apps = true           # tv_app (passed on c3-b)
 app_limit = 30        # maximum apps in the tv_app select
 play_state = false    # tv_play_state sensor
 media_player = true   # tv_media_player "TV" (ADR 0007, section 3.5)
+lg_settings = true    # lg_always_ready and lg_hands_free read-only sensors (ADR 0008)
 follow_firmware_guard = false  # owner decision 2026-11-04: TV control is not gated by the firmware guard
 ```
 
@@ -288,6 +291,7 @@ follow_firmware_guard = false  # owner decision 2026-11-04: TV control is not ga
 | `volume_limit` | unset (no cap below `maxVolume`) | Section 7. The first default (40) blocked real use on c3-a (volume 89) |
 | `app_limit` | 30 | Keeps the select usable in HA and in voice |
 | `play_state` | false | Extra polling for a sensor no v1 feature needs (the TV media player polls the play state itself) |
+| `lg_settings` | **true** (owner, 2026-11-05, ADR 0008) | Two read-only diagnostic sensors, no setter. Costs two short luna reads a minute while the TV is lit (none in `Active Standby` or a transition) and one more pair when `ctl.sh set` creates the trigger `run/lg-settings-refresh`. A change seen by a read is logged once at `info` (`lg setting: always-ready off -> on (not changed by the satellite)`); a read that fails is logged once at `warn` and the sensor shows no state. Not gated by the firmware guard |
 | `media_player` | **true** (owner, 2026-11-04, ADR 0007) | HA's built-in volume, mute and turn on/off intents only target media players. Costs one read-only poll every 10 s while lit |
 
 Every control is also gated at run time by section 6. **Firmware guard (owner decision 2026-11-04): TV control is not gated by it.** On a firmware that is not in `safety.validated_firmware` (or whose version cannot be read) TV control keeps working and the daemon logs a warning at startup; since the same day the microphone is not hard-gated either ([firmware policy](firmware-policy-and-reports.md): it starts, warns and self-checks; the old microphone block exists only with `firmware_policy = "strict"`). The key `follow_firmware_guard` (default `false`) exists for an owner who wants the stricter behaviour: with `true` every setter is refused on an unvalidated firmware, while getters, sensors and states still report.

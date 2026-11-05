@@ -26,6 +26,10 @@ pub const TV_REFRESH_LISTS: &str = "tv_refresh_lists";
 pub const TV_SOUND_OUTPUT: &str = "tv_sound_output";
 /// Object id of `tv_play_state` (text sensor).
 pub const TV_PLAY_STATE: &str = "tv_play_state";
+/// Object id of the Always Ready sensor (text sensor, diagnostic, read-only).
+pub const LG_ALWAYS_READY: &str = "lg_always_ready";
+/// Object id of the LG hands-free sensor (text sensor, diagnostic, read-only).
+pub const LG_HANDS_FREE: &str = "lg_hands_free";
 /// Object id of `tv_media_player` (the TV as a media player, ADR 0007).
 pub const TV_MEDIA_PLAYER: &str = "tv_media_player";
 

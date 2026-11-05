@@ -38,6 +38,18 @@ const POINTS: &str = r#"{"returnValue":true,"launchPoints":[
     {"id":"app.b","title":"App B"}]}"#;
 
 const PLAY: &str = r#"{"returnValue":true,"playState":"playing"}"#;
+
+fn always_ready_reply(word: &str) -> String {
+    format!(
+        r#"{{"returnValue":true,"category":"general","settings":{{"lifeOnScreenMode":"{word}"}}}}"#
+    )
+}
+
+fn activation_reply(on: bool) -> String {
+    format!(
+        r#"{{"returnValue":true,"settingStatus":{on},"activationState":{on},"thinQ":{{"settingStatus":{on},"activationState":{on}}},"amazon":{{"settingStatus":false,"activationState":false}},"dangbei":{{"settingStatus":false,"activationState":false}}}}"#
+    )
+}
 const OK: &str = r#"{"returnValue":true}"#;
 
 fn all_on() -> Config {
@@ -64,6 +76,8 @@ struct Tv {
     inputs: String,
     points: String,
     play: String,
+    always_ready: String,
+    activation: String,
 }
 
 impl Tv {
@@ -77,6 +91,8 @@ impl Tv {
             inputs: INPUTS.to_owned(),
             points: POINTS.to_owned(),
             play: PLAY.to_owned(),
+            always_ready: always_ready_reply("off"),
+            activation: activation_reply(false),
         }
     }
 
@@ -88,6 +104,8 @@ impl Tv {
             Topic::Inputs => self.inputs.clone(),
             Topic::Apps => self.points.clone(),
             Topic::PlayState => self.play.clone(),
+            Topic::AlwaysReady => self.always_ready.clone(),
+            Topic::HandsFree => self.activation.clone(),
         }
     }
 }
@@ -99,6 +117,8 @@ struct Rig {
     t0: Instant,
     /// Every setter call made: (action, uri, payload).
     sets: Vec<(Action, &'static str, String)>,
+    /// Every getter call made: (topic, uri, payload).
+    reads: Vec<(Topic, &'static str, String)>,
     /// Every log line.
     logs: Vec<(Level, String)>,
     /// The last state per entity, as HA would see it.
@@ -122,6 +142,7 @@ impl Rig {
             tv,
             t0: Instant::now(),
             sets: Vec::new(),
+            reads: Vec::new(),
             logs: Vec::new(),
             states: HashMap::new(),
             own_wakes: 0,
@@ -168,8 +189,10 @@ impl Rig {
                     Effect::OwnWake => self.own_wakes += 1,
                     Effect::Call {
                         purpose: Purpose::Read(t),
-                        ..
+                        uri,
+                        payload,
                     } => {
+                        self.reads.push((t, uri, payload));
                         let text = self.tv.answer(t);
                         next.extend(self.c.on_reply(Purpose::Read(t), Ok(text), self.t0));
                     }
@@ -323,7 +346,9 @@ fn defaults_are_screen_power_on_and_the_checked_controls() {
             e::TV_INPUT,
             e::TV_APP,
             e::TV_REFRESH_LISTS,
-            e::TV_SOUND_OUTPUT
+            e::TV_SOUND_OUTPUT,
+            e::LG_ALWAYS_READY,
+            e::LG_HANDS_FREE
         ]
     );
     // Everything off: only the screen switch, the turn-on button and the
@@ -337,7 +362,16 @@ fn defaults_are_screen_power_on_and_the_checked_controls() {
     };
     let c = Controller::new(off.clone());
     let ids: Vec<_> = c.entities().iter().map(|e| e.id).collect();
-    assert_eq!(ids, [e::TV_MEDIA_PLAYER, e::TV_SCREEN, e::TV_TURN_ON]);
+    assert_eq!(
+        ids,
+        [
+            e::TV_MEDIA_PLAYER,
+            e::TV_SCREEN,
+            e::TV_TURN_ON,
+            e::LG_ALWAYS_READY,
+            e::LG_HANDS_FREE
+        ]
+    );
     assert_eq!(
         c.media_features(),
         MediaFeatures {
@@ -387,7 +421,9 @@ fn entity_table_follows_the_flags() {
             e::TV_APP,
             e::TV_REFRESH_LISTS,
             e::TV_SOUND_OUTPUT,
-            e::TV_PLAY_STATE
+            e::TV_PLAY_STATE,
+            e::LG_ALWAYS_READY,
+            e::LG_HANDS_FREE
         ]
     );
     let by = |id| ents.iter().find(|e| e.id == id).unwrap();
@@ -433,6 +469,7 @@ fn entity_table_follows_the_flags() {
         input: false,
         apps: false,
         play_state: false,
+        lg_settings: false,
         ..all_on()
     };
     let c = Controller::new(cfg);
@@ -1169,6 +1206,7 @@ fn boot_with(cfg: Config, topic: Topic, reply: Result<&str, &str>) -> Rig {
         tv: Tv::new(),
         t0: Instant::now(),
         sets: Vec::new(),
+        reads: Vec::new(),
         logs: Vec::new(),
         states: HashMap::new(),
         own_wakes: 0,
@@ -1289,7 +1327,10 @@ fn a_probe_that_runs_out_of_time_counts_as_failed() {
         .iter()
         .filter(|f| matches!(f, Effect::Log(Level::Warn, m) if m.contains("no answer in time")))
         .count();
-    assert_eq!(warns, 4, "volume, inputs, apps and play state");
+    assert_eq!(
+        warns, 6,
+        "volume, inputs, apps, play state and the two LG settings"
+    );
     assert!(!fx.iter().any(|f| matches!(f, Effect::Call { .. })));
 }
 
@@ -1611,7 +1652,7 @@ fn resume_reads_everything_before_any_state_is_sent() {
             )
         })
         .count();
-    assert_eq!(reads, 6);
+    assert_eq!(reads, 8, "six getters and the two LG settings");
     // While the reads are out nothing is sent.
     let mut states_before = 0;
     for f in &fx {
@@ -2155,4 +2196,268 @@ fn power_off_refusal_texts_are_readable() {
     ] {
         assert!(r.to_string().contains(text), "{r}");
     }
+}
+
+// ----- the two LG settings sensors (ADR 0008 decision 4, design 7) -----------
+
+fn lg_reads(r: &Rig) -> Vec<Topic> {
+    r.reads
+        .iter()
+        .map(|(t, _, _)| *t)
+        .filter(|t| matches!(t, Topic::AlwaysReady | Topic::HandsFree))
+        .collect()
+}
+
+#[test]
+fn lg_sensors_are_read_only_diagnostic_text_sensors_with_fixed_ids() {
+    let c = Controller::new(Config::default());
+    let ents = c.entities();
+    for (id, name) in [
+        (e::LG_ALWAYS_READY, "Always Ready"),
+        (e::LG_HANDS_FREE, "LG hands-free"),
+    ] {
+        let d = ents.iter().find(|d| d.id == id).unwrap();
+        assert_eq!(
+            (d.name, d.category, &d.kind),
+            (name, Category::Diagnostic, &Kind::TextSensor)
+        );
+    }
+    assert_eq!(e::LG_ALWAYS_READY, "lg_always_ready");
+    assert_eq!(e::LG_HANDS_FREE, "lg_hands_free");
+    // The switch is a config key: off removes both, and nothing is read.
+    let mut c = Controller::new(Config {
+        lg_settings: false,
+        ..Config::default()
+    });
+    assert!(!c.entities().iter().any(|d| d.id.starts_with("lg_")));
+    assert!(c.start().iter().all(|f| !matches!(
+        f,
+        Effect::Call {
+            purpose: Purpose::Read(Topic::AlwaysReady | Topic::HandsFree),
+            ..
+        }
+    )));
+}
+
+#[test]
+fn lg_sensors_read_the_documented_calls_and_show_only_the_listed_values() {
+    let mut r = Rig::boot(all_on(), Tv::new());
+    let calls: Vec<_> = r
+        .reads
+        .iter()
+        .filter(|(t, _, _)| matches!(t, Topic::AlwaysReady | Topic::HandsFree))
+        .map(|(_, u, p)| (*u, p.as_str()))
+        .collect();
+    assert_eq!(
+        calls,
+        [
+            (
+                "luna://com.webos.settingsservice/getSystemSettings",
+                r#"{"category":"general","keys":["lifeOnScreenMode"]}"#
+            ),
+            (
+                "luna://com.webos.service.voiceinput/setting/getActivation",
+                "{}"
+            )
+        ]
+    );
+    assert_eq!(r.text(e::LG_ALWAYS_READY).as_deref(), Some("Off"));
+    assert_eq!(r.text(e::LG_HANDS_FREE).as_deref(), Some("Off"));
+    // Every raw word maps to one of the four strings; an unknown word is
+    // Other and the word stays in the log.
+    for (word, label) in [
+        ("none", "Off"),
+        ("off", "Off"),
+        ("alwaysReady", "On"),
+        ("allEnabled", "On with wallpaper"),
+        ("lifeOnScreen", "Other"),
+        ("somethingNew", "Other"),
+    ] {
+        let mut tv = Tv::new();
+        tv.always_ready = always_ready_reply(word);
+        let r = Rig::boot(all_on(), tv);
+        assert_eq!(r.text(e::LG_ALWAYS_READY).as_deref(), Some(label), "{word}");
+    }
+    let mut tv = Tv::new();
+    tv.activation = activation_reply(true);
+    let r2 = Rig::boot(all_on(), tv);
+    assert_eq!(r2.text(e::LG_HANDS_FREE).as_deref(), Some("On"));
+    // Nothing was written and no command exists for either sensor.
+    r.cmd(sw_cmd(e::LG_ALWAYS_READY, true), 100)
+        .cmd(btn(e::LG_HANDS_FREE), 200)
+        .cmd(
+            Command::Select {
+                id: e::LG_ALWAYS_READY.to_owned(),
+                option: "On".to_owned(),
+            },
+            300,
+        );
+    assert!(r.sets.is_empty() && r2.sets.is_empty());
+}
+
+#[test]
+fn lg_sensors_poll_every_60_s_while_lit_or_dark_and_log_changes_made_elsewhere() {
+    let mut r = Rig::boot(all_on(), Tv::new());
+    let n0 = lg_reads(&r).len();
+    assert_eq!(n0, 2, "the startup check");
+    r.tick(59_000);
+    assert_eq!(lg_reads(&r).len(), n0, "not before 60 s");
+    // Changed at the TV (or by ctl.sh): seen by the next poll, logged once.
+    r.tv.always_ready = always_ready_reply("alwaysReady");
+    r.tv.activation = activation_reply(true);
+    r.tick(60_100);
+    assert_eq!(lg_reads(&r).len(), n0 + 2);
+    assert_eq!(r.text(e::LG_ALWAYS_READY).as_deref(), Some("On"));
+    assert_eq!(r.text(e::LG_HANDS_FREE).as_deref(), Some("On"));
+    assert!(r.logs.iter().any(|(l, m)| *l == Level::Info
+        && m == "lg setting: always-ready off -> on (not changed by the satellite)"));
+    assert!(r.logs.iter().any(|(l, m)| *l == Level::Info
+        && m == "lg setting: hands-free off -> on (not changed by the satellite)"));
+    // The same value again: no line.
+    let lines = r.logs.len();
+    r.tick(120_200);
+    assert_eq!(lg_reads(&r).len(), n0 + 4);
+    assert_eq!(r.logs.len(), lines);
+    // Screen Off is read too; standby and a transition are not, and the last
+    // value stays shown in standby.
+    r.power("ScreenOff", false, 121_000);
+    r.tv.always_ready = always_ready_reply("allEnabled");
+    r.tick(180_300);
+    assert_eq!(
+        r.text(e::LG_ALWAYS_READY).as_deref(),
+        Some("On with wallpaper")
+    );
+    assert!(r.logs.iter().any(|(_, m)| m
+        == "lg setting: always-ready on -> on with wallpaper (not changed by the satellite)"));
+    let reads = lg_reads(&r).len();
+    r.power("ActiveStandby", false, 181_000);
+    r.tv.always_ready = always_ready_reply("off");
+    r.tick(300_000);
+    r.power("Active", true, 301_000);
+    r.tick(420_000);
+    assert_eq!(
+        lg_reads(&r).len(),
+        reads,
+        "no read in standby or a transition"
+    );
+    assert_eq!(
+        r.text(e::LG_ALWAYS_READY).as_deref(),
+        Some("On with wallpaper")
+    );
+    // Lit again: the poll, long due, reads at the next tick.
+    r.power("Active", false, 421_000);
+    r.tick(421_100);
+    assert_eq!(r.text(e::LG_ALWAYS_READY).as_deref(), Some("Off"));
+    assert_eq!(lg_reads(&r).len(), reads + 2);
+}
+
+#[test]
+fn lg_sensor_shows_other_for_an_unknown_word_and_keeps_the_word_to_the_log() {
+    let mut r = Rig::boot(all_on(), Tv::new());
+    r.tv.always_ready = always_ready_reply("lifeOnScreen");
+    r.tick(60_100);
+    assert_eq!(r.text(e::LG_ALWAYS_READY).as_deref(), Some("Other"));
+    assert!(r.logged("always-ready off -> other (lifeOnScreen) (not changed by the satellite)"));
+    // The state HA was sent never carries the raw word.
+    let sent = format!("{:?}", r.c.sent_state(e::LG_ALWAYS_READY));
+    assert!(!sent.contains("lifeOnScreen"), "{sent}");
+}
+
+#[test]
+fn lg_sensor_without_an_answer_has_no_state_one_warn_and_recovers() {
+    for bad in [
+        r#"{"returnValue":false,"errorCode":-1,"errorText":"Denied"}"#,
+        r#"{"returnValue":true}"#,
+        "garbage",
+        "",
+    ] {
+        let mut r = boot_with(all_on(), Topic::AlwaysReady, Ok(bad));
+        assert_eq!(r.text(e::LG_ALWAYS_READY), None, "{bad}");
+        assert_eq!(
+            r.text(e::LG_HANDS_FREE).as_deref(),
+            Some("Off"),
+            "the other sensor is unaffected"
+        );
+        let warns = |r: &Rig| {
+            r.logs
+                .iter()
+                .filter(|(l, m)| *l == Level::Warn && m.contains("cannot read the Always Ready"))
+                .count()
+        };
+        assert_eq!(warns(&r), 1, "{bad}");
+        // A poll that fails again is not logged again; no body in the log.
+        r.tv.always_ready = bad.to_owned();
+        r.tick(60_100);
+        r.tick(120_200);
+        assert_eq!(warns(&r), 1, "{bad}");
+        // The TV answers again: the state returns without a change line.
+        r.tv.always_ready = always_ready_reply("alwaysReady");
+        r.tick(180_300);
+        assert_eq!(r.text(e::LG_ALWAYS_READY).as_deref(), Some("On"));
+        assert!(r.logged("the Always Ready setting answers again"));
+        assert!(!r.logged("always-ready"));
+    }
+    // A timed-out startup read counts as failed.
+    let mut c = Controller::new(all_on());
+    let fx = c.start();
+    assert!(!fx.is_empty());
+    let fx = c.finish_probe(Instant::now());
+    assert!(fx.iter().any(|f| matches!(f, Effect::Log(Level::Warn, m)
+        if m.contains("cannot read the LG hands-free setting"))));
+}
+
+#[test]
+fn lg_refresh_reads_both_at_once_only_where_the_poll_reads() {
+    let mut r = Rig::boot(all_on(), Tv::new());
+    let n0 = lg_reads(&r).len();
+    // ctl.sh set changed Always Ready: HA shows it within the same second.
+    r.tv.always_ready = always_ready_reply("alwaysReady");
+    let fx = r.c.refresh_lg_settings(ms(r.t0, 2_000));
+    assert_eq!(fx.len(), 2);
+    r.run(fx);
+    assert_eq!(lg_reads(&r).len(), n0 + 2);
+    assert_eq!(r.text(e::LG_ALWAYS_READY).as_deref(), Some("On"));
+    // The poll interval restarts from the refresh.
+    r.tick(61_000);
+    assert_eq!(lg_reads(&r).len(), n0 + 2);
+    r.tick(62_100);
+    assert_eq!(lg_reads(&r).len(), n0 + 4);
+    // A read still in flight is followed by another one on the next tick.
+    let fx = r.c.refresh_lg_settings(ms(r.t0, 70_000));
+    assert_eq!(fx.len(), 2);
+    let again = r.c.refresh_lg_settings(ms(r.t0, 70_100));
+    assert!(again.is_empty(), "already running");
+    r.run(fx);
+    r.tick(70_300);
+    assert_eq!(lg_reads(&r).len(), n0 + 8);
+    // Not in standby, a transition or a controller that is off.
+    r.power("ActiveStandby", false, 80_000);
+    assert!(r.c.refresh_lg_settings(ms(r.t0, 81_000)).is_empty());
+    r.power("Active", true, 82_000);
+    assert!(r.c.refresh_lg_settings(ms(r.t0, 83_000)).is_empty());
+    let mut off = Rig::boot(
+        Config {
+            lg_settings: false,
+            ..all_on()
+        },
+        Tv::new(),
+    );
+    assert!(off.c.refresh_lg_settings(ms(off.t0, 1_000)).is_empty());
+    assert!(lg_reads(&off).is_empty());
+    off.tick(61_000);
+    assert!(lg_reads(&off).is_empty());
+    assert_eq!(off.state(e::LG_ALWAYS_READY), None);
+    // Before the startup check nothing is read.
+    let mut c = Controller::new(all_on());
+    assert!(c.refresh_lg_settings(Instant::now()).is_empty());
+}
+
+#[test]
+fn lg_sensors_are_read_again_after_a_resume() {
+    let mut r = Rig::boot(all_on(), Tv::new());
+    r.tv.activation = activation_reply(true);
+    let fx = r.c.on_resume(ms(r.t0, 5_000));
+    r.run(fx);
+    assert_eq!(r.text(e::LG_HANDS_FREE).as_deref(), Some("On"));
+    assert_eq!(lg_reads(&r).len(), 4);
 }

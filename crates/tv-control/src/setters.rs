@@ -49,10 +49,21 @@ pub const URI_LAUNCH: &str = "luna://com.webos.applicationManager/launch";
 /// `media/getForegroundAppInfo` (verified on c3-b).
 pub const URI_PLAY_STATE: &str = "luna://com.webos.media/getForegroundAppInfo";
 
+/// `settingsservice/getSystemSettings`, read-only: the Always Ready value
+/// (`general/lifeOnScreenMode`). Verified on c3-a (EXP-011, 2026-11-05); no
+/// setter of the TV settings exists in this crate (ADR 0008 decision 3).
+pub const URI_GET_SYSTEM_SETTINGS: &str = "luna://com.webos.settingsservice/getSystemSettings";
+/// `voiceinput/setting/getActivation`, read-only: LG hands-free ("Hi LG").
+/// Verified on c3-a (EXP-011, 2026-11-05).
+pub const URI_GET_ACTIVATION: &str = "luna://com.webos.service.voiceinput/setting/getActivation";
+
 /// Payload of `powerOn` (verified on c3-b).
 pub const PAYLOAD_POWER_ON: &str = r#"{"reason":"remoteKey"}"#;
 /// An empty payload.
 pub const PAYLOAD_EMPTY: &str = "{}";
+/// Payload of the Always Ready getter.
+pub const PAYLOAD_LIFE_ON_SCREEN_MODE: &str =
+    r#"{"category":"general","keys":["lifeOnScreenMode"]}"#;
 /// Payload of a getter subscription.
 pub const PAYLOAD_SUBSCRIBE: &str = r#"{"subscribe":true}"#;
 
@@ -265,6 +276,9 @@ mod tests {
         let v: Value = serde_json::from_str(&payload_launch("a\"b\\c")).unwrap();
         assert_eq!(v["id"], "a\"b\\c");
         assert_eq!(PAYLOAD_POWER_ON, r#"{"reason":"remoteKey"}"#);
+        let v: Value = serde_json::from_str(PAYLOAD_LIFE_ON_SCREEN_MODE).unwrap();
+        assert_eq!(v["category"], "general");
+        assert_eq!(v["keys"], json!(["lifeOnScreenMode"]));
     }
 
     #[test]

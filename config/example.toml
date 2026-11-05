@@ -245,6 +245,11 @@ play_state = false        # sensor "TV play state"
 # the TV is lit to show "playing". The satellite's own media player (the reply
 # volume) is a separate entity and does not change.
 media_player = true
+# Two read-only diagnostic sensors (ADR 0008): "Always Ready" (lg_always_ready:
+# Off, On, On with wallpaper, Other) and "LG hands-free" (lg_hands_free: Off,
+# On, Other). Two short luna getters every 60 s while the TV is lit, and at
+# once after `ctl.sh set`. The satellite never writes either setting from here.
+lg_settings = true
 # Owner decision 2026-11-04: TV control is NOT gated by the firmware guard. On
 # a firmware that is not in safety.validated_firmware it keeps working and the
 # daemon logs a warning at startup (the microphone guard is separate). true

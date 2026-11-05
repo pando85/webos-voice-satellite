@@ -410,6 +410,11 @@ pub(crate) struct TvControlSection {
     /// to show `playing`. The satellite's own media player (the reply
     /// volume) is a different entity and is unchanged.
     pub(crate) media_player: bool,
+    /// The read-only diagnostic sensors "Always Ready" (`lg_always_ready`)
+    /// and "LG hands-free" (`lg_hands_free`) (ADR 0008 decision 4): two
+    /// getters polled every 60 s while the TV is lit; never a write, not
+    /// gated by the firmware guard.
+    pub(crate) lg_settings: bool,
     /// Refuse the TV control setters on firmware that is not in
     /// `safety.validated_firmware` (sensors and states still report). Default
     /// false: **owner decision 2026-11-04, TV control is not gated by the
@@ -438,6 +443,7 @@ impl Default for TvControlSection {
             app_limit: 30,
             play_state: false,
             media_player: true,
+            lg_settings: true,
             follow_firmware_guard: false,
         }
     }
@@ -454,7 +460,8 @@ impl TvControlSection {
                 || self.mute
                 || self.input
                 || self.apps
-                || self.play_state)
+                || self.play_state
+                || self.lg_settings)
     }
 }
 
@@ -1478,6 +1485,7 @@ impl Settings {
             (t.apps, "apps"),
             (t.play_state, "play_state"),
             (t.media_player, "media_player"),
+            (t.lg_settings, "lg_settings"),
         ] {
             if flag {
                 on.push(name);
@@ -2023,9 +2031,10 @@ level = "debug"
         assert!(def.volume && def.mute && def.input && def.apps);
         assert!(!def.power_off && !def.play_state);
         assert!(def.media_player, "the TV media player is on (ADR 0007)");
+        assert!(def.lg_settings, "the two read-only LG sensors are on");
         assert_eq!((def.volume_limit, def.app_limit), (None, 30));
         let s = Settings::from_toml(
-            "[tv_control]\nenabled = true\nscreen = false\npower_off = true\nvolume = true\nvolume_limit = 25\nmute = true\ninput = true\napps = true\napp_limit = 12\nplay_state = true\nmedia_player = false\nfollow_firmware_guard = false\n",
+            "[tv_control]\nenabled = true\nscreen = false\npower_off = true\nvolume = true\nvolume_limit = 25\nmute = true\ninput = true\napps = true\napp_limit = 12\nplay_state = true\nmedia_player = false\nlg_settings = false\nfollow_firmware_guard = false\n",
             base,
         )
         .unwrap();
@@ -2039,6 +2048,7 @@ level = "debug"
                 && tvc.input
                 && tvc.apps
                 && tvc.play_state
+                && !tvc.lg_settings
         );
         assert_eq!(
             (tvc.volume_limit, tvc.app_limit, tvc.follow_firmware_guard),
@@ -2091,7 +2101,7 @@ level = "debug"
         let s = Settings::default();
         assert!(
             s.summary()
-                .contains("tv_control=[on=screen,power_on,volume,mute,input,apps,media_player volume_limit=tv-max app_limit=30 firmware_guard=false]"),
+                .contains("tv_control=[on=screen,power_on,volume,mute,input,apps,media_player,lg_settings volume_limit=tv-max app_limit=30 firmware_guard=false]"),
             "{}",
             s.summary()
         );

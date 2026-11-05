@@ -48,6 +48,10 @@ const DECLARATION_MAX_BYTES: u64 = 1 << 20;
 pub(crate) const PROBE_BUDGET: Duration = Duration::from_secs(10);
 /// How often the controller's clock is driven.
 pub(crate) const TICK: Duration = Duration::from_millis(250);
+/// Trigger file (in the report directory) that `ctl.sh set` creates after a
+/// change of Always Ready or LG hands-free: the daemon reads both sensors'
+/// getters now instead of at the next 60 s poll (design 7).
+pub(crate) const LG_REFRESH_TRIGGER: &str = "lg-settings-refresh";
 
 /// A message from a running luna call or subscription.
 #[derive(Debug)]
@@ -262,6 +266,7 @@ pub(crate) fn controller_config(settings: &Settings, blocked: Option<String>) ->
         app_limit: t.app_limit as usize,
         play_state: t.play_state,
         media_player: t.media_player,
+        lg_settings: t.lg_settings,
         setters_blocked: blocked,
         own_app_ids: vec![OWN_APP_ID.to_owned()],
     }
@@ -467,6 +472,13 @@ impl Tv {
         self.exec(fx)
     }
 
+    /// `ctl.sh set` changed an LG setting (the refresh trigger file was
+    /// consumed): read the two sensors' getters now.
+    pub(crate) fn refresh_lg_settings(&mut self) -> Outcome {
+        let fx = self.ctl.refresh_lg_settings(Instant::now());
+        self.exec(fx)
+    }
+
     /// The system resumed from a suspend.
     pub(crate) fn on_resume(&mut self) -> Outcome {
         let fx = self.ctl.on_resume(Instant::now());
@@ -576,10 +588,13 @@ case "$uri" in
   */getExternalInputList) echo '{{"returnValue":true,"devices":[{{"id":"HDMI_1","label":"HDMI 1","connected":true,"appId":"app.hdmi1"}}]}}' ;;
   */listLaunchPoints) echo '{{"returnValue":true,"launchPoints":[{{"id":"app.a","title":"App A"}},{{"id":"app.b","title":"App B"}}]}}' ;;
   */setVolume) echo '{{"returnValue":true,"volume":20,"soundOutput":""}}' ;;
+  */getSystemSettings) cat '{lg}/lg_always_ready' 2>/dev/null || echo '{{"returnValue":true,"category":"general","settings":{{"lifeOnScreenMode":"off"}}}}' ;;
+  */getActivation) cat '{lg}/lg_hands_free' 2>/dev/null || echo '{{"returnValue":true,"settingStatus":false,"activationState":false,"thinQ":{{"settingStatus":false}},"amazon":{{"settingStatus":false}}}}' ;;
   *) echo '{{"returnValue":true}}' ;;
 esac
 "#,
-            calls = calls.display()
+            calls = calls.display(),
+            lg = dir.display()
         );
         let p = dir.join("luna-send");
         crate::testutil::write_script(&p, &script);
@@ -900,6 +915,8 @@ esac
             "getForegroundAppInfo",
             "getExternalInputList",
             "listLaunchPoints",
+            r#"getSystemSettings {"category":"general","keys":["lifeOnScreenMode"]}"#,
+            "getActivation {}",
         ] {
             assert!(log.contains(uri), "{uri} not called: {log}");
         }
@@ -912,6 +929,8 @@ esac
             "turnOnScreen",
             "powerOn",
             "controls/power",
+            "setSystemSettings",
+            "setActivation",
         ] {
             assert!(
                 !log.contains(write),
@@ -943,6 +962,35 @@ esac
             }
         }));
         assert_eq!(st.entities.media_players.len(), 1);
+        // The two read-only LG sensors: diagnostic text sensors with their
+        // first states (nothing else is listed for them).
+        let lg: Vec<_> = st
+            .entities
+            .text_sensors
+            .iter()
+            .filter(|t| t.object_id.starts_with("lg_"))
+            .map(|t| (t.object_id.as_str(), t.name.as_str(), t.entity_category))
+            .collect();
+        assert_eq!(
+            lg,
+            [
+                (
+                    "lg_always_ready",
+                    "Always Ready",
+                    EntityCategory::Diagnostic
+                ),
+                ("lg_hands_free", "LG hands-free", EntityCategory::Diagnostic)
+            ]
+        );
+        for (id, state) in [("lg_always_ready", "Off"), ("lg_hands_free", "Off")] {
+            assert!(
+                out.commands.contains(&AppCommand::SetTextSensor {
+                    object_id: id.into(),
+                    state: Some(state.into())
+                }),
+                "{id}"
+            );
+        }
         // Subscription children run and their first lines come back as messages.
         let mut got = 0;
         while got < 2 {
@@ -1103,5 +1151,74 @@ esac
         );
         st.tv.shutdown().await;
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn lg_sensors_follow_the_tv_on_a_refresh_and_never_write() {
+        let d = tempdir("lg");
+        let luna = fake_luna(&d, false);
+        let mut st = start(&all_on(), luna, None, &d.join("no-declarations")).await;
+        let _ = st.tv.exec(std::mem::take(&mut st.effects));
+        // ctl.sh set changed both (synthetic replies in the fake's files).
+        std::fs::write(
+            d.join("lg_always_ready"),
+            r#"{"returnValue":true,"settings":{"lifeOnScreenMode":"allEnabled"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            d.join("lg_hands_free"),
+            r#"{"returnValue":true,"settingStatus":true,"thinQ":{"settingStatus":true}}"#,
+        )
+        .unwrap();
+        let before = calls(&d).matches("getSystemSettings").count();
+        let out = st.tv.refresh_lg_settings();
+        assert!(out.commands.is_empty(), "the states come with the replies");
+        let mut seen = Vec::new();
+        while seen.len() < 2 {
+            let m = tokio::time::timeout(Duration::from_secs(10), st.rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            if matches!(
+                m,
+                TvMsg::Reply(Purpose::Read(Topic::AlwaysReady | Topic::HandsFree), _)
+            ) {
+                seen.extend(st.tv.on_msg(m).commands);
+            } else {
+                st.tv.on_msg(m);
+            }
+        }
+        assert!(seen.contains(&AppCommand::SetTextSensor {
+            object_id: "lg_always_ready".into(),
+            state: Some("On with wallpaper".into())
+        }));
+        assert!(seen.contains(&AppCommand::SetTextSensor {
+            object_id: "lg_hands_free".into(),
+            state: Some("On".into())
+        }));
+        assert_eq!(calls(&d).matches("getSystemSettings").count(), before + 1);
+        // No command event reaches either sensor, and no setter was called.
+        assert!(
+            st.tv
+                .on_event(&AppEvent::SelectChanged {
+                    object_id: "lg_always_ready".into(),
+                    option: "On".into(),
+                })
+                .is_none(),
+            "not a TV control command"
+        );
+        let log = calls(&d);
+        assert!(!log.contains("setSystemSettings") && !log.contains("setActivation"));
+        assert!(!log.contains("NOT-A-TTY"));
+        st.tv.shutdown().await;
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn lg_settings_follow_the_config() {
+        let mut s = Settings::default();
+        assert!(controller_config(&s, None).lg_settings);
+        s.tv_control.lg_settings = false;
+        assert!(!controller_config(&s, None).lg_settings);
     }
 }

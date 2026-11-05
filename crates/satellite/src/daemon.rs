@@ -614,9 +614,21 @@ impl Daemon {
             self.acknowledge_firmware("ctl.sh").await;
         }
         let reload = consume_trigger(&self.report_dir.join(darken::RELOAD_TRIGGER), &mut warned);
+        let lg_refresh = consume_trigger(
+            &self.report_dir.join(tv_control::LG_REFRESH_TRIGGER),
+            &mut warned,
+        );
         self.trigger_warned = warned;
         if reload {
             self.reload_remote_off("ctl.sh").await;
+        }
+        if lg_refresh {
+            // Read-only: the sensors show what the TV holds now. Without TV
+            // control the file is only removed.
+            let out = self.tv.as_mut().map(Tv::refresh_lg_settings);
+            if let Some(out) = out {
+                self.apply_tv(out).await;
+            }
         }
         self.publish_voice_status();
     }
@@ -2105,6 +2117,92 @@ mod tests {
         d.reload_remote_off("test").await;
         assert_eq!(d.darkener.mode(), RemoteOff::Normal);
         assert_eq!(select_option(rx.try_recv().unwrap()), "Turn off normally");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The refresh trigger of `ctl.sh set`: consumed once a second, both LG
+    /// sensors are read at once and HA gets the new values. Read-only.
+    #[tokio::test]
+    async fn the_lg_refresh_trigger_reads_both_sensors_and_is_consumed() {
+        let dir = test_dir("lg-refresh");
+        let (mut d, mut rx) = test_daemon(&dir, RemoteOff::Normal, true);
+        let calls = dir.join("calls");
+        let luna = dir.join("luna-send");
+        crate::testutil::write_script(
+            &luna,
+            &format!(
+                r#"echo "$5 $6" >> '{calls}'
+case "$5" in
+  */getPowerState) echo '{{"returnValue":true,"state":"Active"}}' ;;
+  */getSystemSettings) cat '{d}/ar' 2>/dev/null || echo '{{"returnValue":true,"settings":{{"lifeOnScreenMode":"off"}}}}' ;;
+  */getActivation) cat '{d}/hl' 2>/dev/null || echo '{{"returnValue":true,"settingStatus":false}}' ;;
+  *) echo '{{"returnValue":true}}' ;;
+esac
+"#,
+                calls = calls.display(),
+                d = dir.display()
+            ),
+        );
+        let mut settings = Settings::default();
+        let t = &mut settings.tv_control;
+        (t.screen, t.power_on, t.volume, t.mute, t.input, t.apps) =
+            (false, false, false, false, false, false);
+        let mut st = tv_control::start(&settings, luna, None, &dir.join("no-declarations")).await;
+        let startup = st.tv.exec(std::mem::take(&mut st.effects));
+        let mut tv_rx = st.rx;
+        d.tv = Some(st.tv);
+        d.apply_tv(startup).await;
+        let text = |cmd: AppCommand| match cmd {
+            AppCommand::SetTextSensor { object_id, state } => (object_id, state),
+            other => panic!("unexpected {other:?}"),
+        };
+        let mut first = Vec::new();
+        while let Ok(c) = rx.try_recv() {
+            first.push(text(c));
+        }
+        assert!(first.contains(&("lg_always_ready".to_owned(), Some("Off".to_owned()))));
+        assert!(first.contains(&("lg_hands_free".to_owned(), Some("Off".to_owned()))));
+        // What `ctl.sh set` does after a change: the TV holds new values and
+        // the trigger file is created.
+        std::fs::write(
+            dir.join("ar"),
+            r#"{"returnValue":true,"settings":{"lifeOnScreenMode":"alwaysReady"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("hl"),
+            r#"{"returnValue":true,"settingStatus":true}"#,
+        )
+        .unwrap();
+        let trigger = dir.join("run").join(tv_control::LG_REFRESH_TRIGGER);
+        std::fs::write(&trigger, b"").unwrap();
+        for _ in 0..4 {
+            d.poll_compat_triggers().await;
+        }
+        assert!(!trigger.exists(), "consumed");
+        let mut got = Vec::new();
+        for _ in 0..2 {
+            let msg = tokio::time::timeout(Duration::from_secs(10), tv_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            d.on_tv_msg(msg).await;
+        }
+        while let Ok(c) = rx.try_recv() {
+            got.push(text(c));
+        }
+        assert!(got.contains(&("lg_always_ready".to_owned(), Some("On".to_owned()))));
+        assert!(got.contains(&("lg_hands_free".to_owned(), Some("On".to_owned()))));
+        let log = std::fs::read_to_string(&calls).unwrap();
+        assert!(!log.contains("setSystemSettings") && !log.contains("setActivation"));
+        // Without TV control the trigger file is only removed.
+        d.tv = None;
+        std::fs::write(&trigger, b"").unwrap();
+        for _ in 0..4 {
+            d.poll_compat_triggers().await;
+        }
+        assert!(!trigger.exists());
+        assert!(rx.try_recv().is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
