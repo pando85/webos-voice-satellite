@@ -3,10 +3,13 @@
 # docs/design/voice-and-power-screen.md section 6) against a fake luna-send.
 # The fake keeps its state in files and serves synthetic JSON written by hand
 # (no TV output). It can answer nothing (a timeout), refuse (returnValue
-# false), ignore a write (mismatch), or print only on a terminal. No binary,
-# no network, nothing outside a temporary directory.
+# false), ignore a write (mismatch), or print only on a terminal. Nothing
+# outside a temporary directory. `config aec|music` (config keys and a daemon
+# restart) runs against the host build of webos-satellite: its own
+# --check-config judges every changed config, and a real daemon (file mic,
+# null sink, plaintext on 127.0.0.1) is restarted.
 #
-# usage: sh packaging/webos/tests/tv_settings.sh
+# usage: sh packaging/webos/tests/tv_settings.sh [BINARY]   (default: builds it)
 # The checks are strings run with eval, so single quotes are intended.
 # shellcheck disable=SC2016,SC2034,SC1091,SC2086,SC2126
 set -eu
@@ -15,8 +18,13 @@ PKG=$(cd "$HERE/.." && pwd)
 T=$(mktemp -d "${TMPDIR:-/tmp}/webos-sat-tvset.XXXXXX")
 P=$T/prefix
 F=$T/fake
+Q=$T/cfg
 fails=0
-trap 'rm -rf "$T"' EXIT INT TERM
+cleanup() {
+    [ ! -f "$Q/.webos-satellite-install" ] || cq stop >/dev/null 2>&1 || true
+    rm -rf "$T"
+}
+trap cleanup EXIT INT TERM
 
 check() {
     if eval "$2"; then
@@ -310,6 +318,184 @@ kill "$fake_pid" 2>/dev/null || true
 wait "$fake_pid" 2>/dev/null || true
 rm -f "$P/run/webos-satellite.pid" "$P/run/voice.json"
 printf '#!/bin/sh\nexit 0\n' >"$P/bin/webos-satellite"
+
+echo "== config aec / music (config keys, daemon restart) =="
+ROOT=$(cd "$PKG/../.." && pwd)
+HOST_BIN=${1:-}
+if [ -z "$HOST_BIN" ]; then
+    (cd "$ROOT" && cargo build --quiet -p webos-satellite)
+    HOST_BIN=${CARGO_TARGET_DIR:-$ROOT/target}/debug/webos-satellite
+fi
+[ -x "$HOST_BIN" ] || { echo "binary not found: $HOST_BIN" >&2; exit 2; }
+mkdir -p "$Q/bin" "$Q/etc" "$Q/run" "$Q/log"
+: >"$Q/.webos-satellite-install"
+cp "$PKG"/*.sh "$Q/bin/"
+cp "$HOST_BIN" "$Q/bin/webos-satellite"
+head -c 96000 /dev/zero >"$T/mic.raw"
+qport=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')
+cq() {
+    WEBOS_SAT_PREFIX=$Q WEBOS_SAT_ALLOW_NONROOT=1 WEBOS_SAT_LOCK=$T/lock WEBOS_SAT_KILL_SWITCH=$T/kill \
+        WEBOS_SAT_LUNA_SEND=$T/luna-send WEBOS_SAT_SETUP_DIR=$T/setup FAKE_DIR=$F sh "$PKG/ctl.sh" "$@"
+}
+QC=$Q/etc/config.toml
+# A config with tuning in [aec] (no enabled key: on by default), an [aec.aec3]
+# override, comments, a [music] table with a comment on its enabled line, and
+# pairing off (plaintext): enabled keys of three tables.
+cat >"$T/base.toml" <<EOF
+# webos-satellite test config
+mode = "wake"
+
+[device]
+name = "cfg-test"
+bind = "127.0.0.1"
+port = $qport
+allow_plaintext = true
+
+[mic]
+source = "file"
+path = "$T/mic.raw"
+loop = true
+
+[sink]
+type = "null"
+
+[aec]
+# tuned by hand: these lines must survive every toggle
+ns = false
+delay_ms = 20
+
+[aec.aec3]
+"linear_mix" = 0.3   # tuned
+
+[safety]
+kill_switch = "$T/kill"
+mute_file = "$T/muted"
+
+[pairing]
+enabled = false
+
+[music]
+# music comment
+enabled = false  # keep this comment
+duck_db = -12.0
+EOF
+cp "$T/base.toml" "$QC"
+chmod 600 "$QC"
+qsum() { "$Q/bin/webos-satellite" --config "$QC" --check-config 2>/dev/null; }
+leftovers() { # temporary config files left in etc/
+    n=0
+    for f in "$Q"/etc/*.new.* "$Q"/etc/*.prev.*; do [ ! -e "$f" ] || n=$((n + 1)); done
+    echo "$n"
+}
+
+out=$(cq status --json)
+check "status --json: aec_enabled true (no key), music_enabled false" 'echo "$out" | grep -q "\"aec_enabled\":true,\"music_enabled\":false,"'
+check "status: the pairing key word reads [pairing] enabled, not another table's enabled" 'echo "$out" | grep -q "\"key\":\"none\""'
+check "status text: echo cancellation and music" 'cq status 2>/dev/null | grep -q "echo cancellation: on, music: off"'
+
+out=$(cq config aec off 2>"$T/err") && rc=0 || rc=$?
+check "aec off (daemon stopped): applied, exit 0, JSON line" '[ "$rc" -eq 0 ] && [ "$out" = "{\"schema\":1,\"setting\":\"aec\",\"requested\":\"off\",\"before\":\"on\",\"after\":\"off\",\"result\":\"applied\",\"daemon\":\"not running\",\"error\":\"\"}" ]'
+check "aec off: a human line on stderr" 'grep -q "aec is now off (was on; daemon: not running)" "$T/err"'
+check "aec off: enabled = false added under [aec]; every other line unchanged" 'sed -n "/^\[aec\]\$/{n;p;}" "$QC" | grep -qx "enabled = false" && sed "/^\[aec\]\$/{n;d;}" "$QC" | cmp -s - "$T/base.toml"'
+check "aec off: the daemon reads it (check-config aec=[off]), tuning kept, mode 0600, no temporary file" 'qsum | grep -q " aec=\[off\] " && grep -qx "ns = false" "$QC" && grep -qx "delay_ms = 20" "$QC" && [ "$(stat -c %a "$QC")" = 600 ] && [ "$(leftovers)" = 0 ]'
+check "aec off: status reports it, history line" 'cq status --json | grep -q "\"aec_enabled\":false," && grep -q " aec result from=on to=off read=off outcome=applied source=ctl\$" "$Q/etc/tv-settings.log"'
+cp "$QC" "$T/off.toml"
+out=$(cq config aec off 2>/dev/null) && rc=0 || rc=$?
+check "aec off again: already, daemon none, exit 0, config untouched" '[ "$rc" -eq 0 ] && echo "$out" | grep -q "\"result\":\"already\",\"daemon\":\"none\"" && cmp -s "$QC" "$T/off.toml"'
+out=$(cq config aec on 2>/dev/null) && rc=0 || rc=$?
+check "aec on: applied, the same line now says true, everything else unchanged" '[ "$rc" -eq 0 ] && echo "$out" | grep -q "\"before\":\"off\",\"after\":\"on\",\"result\":\"applied\"" && sed -n "/^\[aec\]\$/{n;p;}" "$QC" | grep -qx "enabled = true" && sed "/^\[aec\]\$/{n;d;}" "$QC" | cmp -s - "$T/base.toml"'
+check "aec on: check-config shows it enabled (file mic: off for lack of a reference), tuning kept" 'qsum | grep -q " aec=\[off (file mic" && grep -qx "ns = false" "$QC" && grep -qx "\"linear_mix\" = 0.3   # tuned" "$QC" && cq status --json | grep -q "\"aec_enabled\":true,"'
+
+out=$(cq config music on 2>/dev/null) && rc=0 || rc=$?
+check "music on: applied, value changed in place, its comment kept, nothing else changed" '[ "$rc" -eq 0 ] && echo "$out" | grep -q "\"setting\":\"music\",\"requested\":\"on\",\"before\":\"off\",\"after\":\"on\",\"result\":\"applied\"" && grep -qx "enabled = true  # keep this comment" "$QC" && [ "$(diff "$T/base.toml" "$QC" | grep -c "^[<>]")" -eq 3 ]'
+check "music on: the daemon reads it with the tuned duck_db, status says so" 'qsum | grep -q " music=\[on .*duck_db=-12" && cq status --json | grep -q "\"music_enabled\":true,"'
+out=$(cq config music off 2>/dev/null) && rc=0 || rc=$?
+check "music off: applied; the [music] table is byte for byte the original again" '[ "$rc" -eq 0 ] && echo "$out" | grep -q "\"after\":\"off\",\"result\":\"applied\"" && sed "/^\[aec\]\$/{n;d;}" "$QC" | cmp -s - "$T/base.toml" && qsum | grep -q " music=\[off\]"'
+
+# Tables that are not there: appended at the end (also after a last line without a newline).
+grep -v "^\[music\]\$\|^# music comment\$\|^enabled = false  # keep this comment\$\|^duck_db = -12.0\$" "$T/base.toml" |
+    sed -e '/^\[aec\]$/,/^delay_ms/d' | sed -e '$!b' -e '/^$/d' >"$T/bare.toml"
+printf '%s' "$(cat "$T/bare.toml")" >"$QC"
+out=$(cq config music on 2>/dev/null) && rc=0 || rc=$?
+check "music on without a [music] table (no final newline): table appended, valid" '[ "$rc" -eq 0 ] && tail -n 2 "$QC" | tr "\n" "|" | grep -q "^\[music\]|enabled = true|\$" && qsum | grep -q " music=\[on "'
+out=$(cq config aec off 2>/dev/null) && rc=0 || rc=$?
+check "aec off without an [aec] table but with [aec.aec3]: [aec] appended, valid" '[ "$rc" -eq 0 ] && tail -n 2 "$QC" | tr "\n" "|" | grep -q "^\[aec\]|enabled = false|\$" && qsum | grep -q " aec=\[off\] "'
+out=$(cq config music off 2>/dev/null) && rc=0 || rc=$?
+check "music off after that: enabled = false in place (the default value, written)" '[ "$rc" -eq 0 ] && sed -n "/^\[music\]\$/{n;p;}" "$QC" | grep -qx "enabled = false" && qsum | grep -q " music=\[off\]"'
+
+# A changed config that does not pass the daemon's check is never installed.
+{ echo 'aec.enabled = false'; cat "$T/bare.toml"; } >"$QC"
+cp "$QC" "$T/dotted.toml"
+check "dotted-key config passes as it is (aec off)" 'qsum | grep -q " aec=\[off\] "'
+: >"$Q/etc/tv-settings.log"
+out=$(cq config aec on 2>/dev/null) && rc=0 || rc=$?
+check "bad changed config: failed, exit 1, the check's reason, config byte for byte unchanged, no temporary file" '[ "$rc" -eq 1 ] && echo "$out" | grep -q "\"before\":\"off\",\"after\":\"off\",\"result\":\"failed\",\"daemon\":\"none\",\"error\":\"the changed config did not pass the check, nothing changed: " && cmp -s "$QC" "$T/dotted.toml" && [ "$(leftovers)" = 0 ]'
+check "bad changed config: history says failed" 'grep -q " aec result from=off to=on read=off outcome=failed source=ctl\$" "$Q/etc/tv-settings.log"'
+printf 'mode = "nonsense"\n' >"$QC"
+out=$(cq config music on 2>/dev/null) && rc=0 || rc=$?
+check "a config that is invalid already: refused, untouched" '[ "$rc" -eq 1 ] && echo "$out" | grep -q "\"result\":\"refused\",\"daemon\":\"none\",\"error\":\"the config does not pass the check now: " && [ "$(cat "$QC")" = "mode = \"nonsense\"" ]'
+
+for bad in yes ON "on;id" "" true enabled; do
+    cq config aec "$bad" >/dev/null 2>&1 && rc=0 || rc=$?
+    check "config aec '$bad': usage, exit 2" '[ "$rc" -eq 2 ]'
+    cq config music "$bad" >/dev/null 2>&1 && rc=0 || rc=$?
+    check "config music '$bad': usage, exit 2" '[ "$rc" -eq 2 ]'
+done
+for w in "aec off" "music on"; do
+    # shellcheck disable=SC2086 # two words on purpose
+    cq set $w >/dev/null 2>&1 && rc=0 || rc=$?
+    check "set $w: usage, exit 2 (it is config $w: nothing under set may restart, review C7)" '[ "$rc" -eq 2 ] && [ "$(cat "$QC")" = "mode = \"nonsense\"" ]'
+done
+cq config aec on extra >/dev/null 2>&1 && rc=0 || rc=$?
+check "config aec with an extra argument: exit 2, config untouched" '[ "$rc" -eq 2 ] && [ "$(cat "$QC")" = "mode = \"nonsense\"" ]'
+if [ "$(id -u)" != 0 ]; then
+    cp "$T/base.toml" "$QC"
+    out=$(WEBOS_SAT_PREFIX=$Q WEBOS_SAT_LOCK=$T/lock sh "$PKG/ctl.sh" config aec off 2>&1) && rc=0 || rc=$?
+    check "not root: exit 1, needs root, config untouched" '[ "$rc" -eq 1 ] && echo "$out" | grep -q "needs root" && cmp -s "$QC" "$T/base.toml"'
+fi
+
+# A running daemon is restarted with the new config (on -> off -> on).
+cp "$T/base.toml" "$QC"
+rm -f "$Q/log/webos-satellite.log"
+cq start >/dev/null 2>&1
+qpid() { read_pid "$Q/run/webos-satellite.pid"; }
+. "$PKG/lib.sh"
+set_paths "$Q"
+p0=$(qpid)
+check "daemon started (real build, supervised)" 'is_ours "$p0" && supervisor_alive'
+out=$(cq config aec off 2>/dev/null) && rc=0 || rc=$?
+p1=$(qpid)
+check "aec off while running: applied, daemon restarted, a new pid, the old one gone" '[ "$rc" -eq 0 ] && echo "$out" | grep -q "\"after\":\"off\",\"result\":\"applied\",\"daemon\":\"restarted\"" && is_ours "$p1" && [ "$p1" != "$p0" ] && ! kill -0 "$p0" 2>/dev/null'
+check "the restarted daemon logged aec=[off]" 'grep " config: " "$LOG" | tail -n 1 | grep -q " aec=\[off\] "'
+out=$(cq config aec on 2>/dev/null) && rc=0 || rc=$?
+p2=$(qpid)
+check "aec on while running: restarted again, its config line has the tuned aec back" '[ "$rc" -eq 0 ] && echo "$out" | grep -q "\"daemon\":\"restarted\"" && is_ours "$p2" && [ "$p2" != "$p1" ] && grep " config: " "$LOG" | tail -n 1 | grep -q " aec=\[off (file mic"'
+out=$(cq config music on 2>/dev/null) && rc=0 || rc=$?
+p3=$(qpid)
+check "music on while running: restarted, the daemon runs with music on" '[ "$rc" -eq 0 ] && echo "$out" | grep -q "\"daemon\":\"restarted\"" && is_ours "$p3" && grep " config: " "$LOG" | tail -n 1 | grep -q " music=\[on "'
+out=$(cq config music off 2>/dev/null) && rc=0 || rc=$?
+p4=$(qpid)
+check "music off while running: restarted, music off, one daemon and one supervisor" '[ "$rc" -eq 0 ] && is_ours "$p4" && grep " config: " "$LOG" | tail -n 1 | grep -q " music=\[off\]" && [ "$(pgrep -f "$Q/bin/supervise.sh" | wc -l)" -eq 1 ]'
+check "after on, off, on: the config is the original plus enabled = true under [aec]" 'sed "/^\[aec\]\$/{n;d;}" "$QC" | cmp -s - "$T/base.toml" && [ "$(leftovers)" = 0 ]'
+cq stop >/dev/null 2>&1
+
+# The daemon does not come back with the new config: the previous config is
+# put back and started again. A stand-in runs --check-config with the host
+# build and fails as a daemon; a sleeping script named supervise.sh stands in
+# for the running supervisor.
+printf '#!/bin/sh\ncase "$3" in --check-config) exec "%s" "$@" ;; esac\n[ "$1" != --version ] || exec "%s" --version\nexit 1\n' "$HOST_BIN" "$HOST_BIN" >"$Q/bin/webos-satellite"
+chmod 755 "$Q/bin/webos-satellite"
+mkdir -p "$T/fakesup"
+printf 'sleep 30\n' >"$T/fakesup/supervise.sh"
+sh "$T/fakesup/supervise.sh" &
+echo $! >"$Q/run/supervise.pid"
+cp "$QC" "$T/before-rollback.toml"
+out=$(cq config music on 2>/dev/null) && rc=0 || rc=$?
+check "no daemon after the restart: failed, exit 1, the previous setting is back" '[ "$rc" -eq 1 ] && echo "$out" | grep -q "\"requested\":\"on\",\"before\":\"off\",\"after\":\"off\",\"result\":\"failed\",\"daemon\":\"failed\",\"error\":\"the satellite did not start with the new setting; the previous setting is back\"" && cmp -s "$QC" "$T/before-rollback.toml" && [ "$(leftovers)" = 0 ]'
+check "rollback: history says failed" 'tail -n 1 "$Q/etc/tv-settings.log" | grep -q " music result from=off to=on read=off outcome=failed source=ctl\$"'
+cq stop >/dev/null 2>&1
+rm -f "$Q/crashloop"
+cp "$HOST_BIN" "$Q/bin/webos-satellite"
 
 echo "== not installed, uninstall keeps the log, purge removes it =="
 out=$(WEBOS_SAT_PREFIX=$T/none WEBOS_SAT_ALLOW_NONROOT=1 WEBOS_SAT_LUNA_SEND=$T/luna-send sh "$PKG/ctl.sh" tv-settings --json 2>&1) && rc=0 || rc=$?

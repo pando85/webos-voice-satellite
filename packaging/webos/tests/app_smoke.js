@@ -59,7 +59,7 @@ function exec(args) {
 }
 const T = load({ exec });
 const { byId, doc, settle, advance, step, execs, key, click, ok, calls } = T;
-const ALLOWED = /^sh '\/media\/developer\/apps\/usr\/palm\/applications\/io\.github\.pando85\.voicesatellite\/payload\/ctl\.sh' (status --json|install|start|stop|autostart on|autostart off|mic off|mic on|pair|reset-pairing|clear-crashloop|uninstall|purge|report --json|selfcheck|ack-firmware|tv-settings --json|setup start|setup status --json|setup stop|setup answer [0-9a-f]{8} (allow|refuse)) 2>&1$/;
+const ALLOWED = /^sh '\/media\/developer\/apps\/usr\/palm\/applications\/io\.github\.pando85\.voicesatellite\/payload\/ctl\.sh' (status --json|install|start|stop|autostart on|autostart off|mic off|mic on|pair|reset-pairing|clear-crashloop|uninstall|purge|report --json|selfcheck|ack-firmware|tv-settings --json|config (aec|music) (on|off)|setup start|setup status --json|setup stop|setup answer [0-9a-f]{8} (allow|refuse)) 2>&1$/;
 const shown = (ids) => ids.filter((id) => !byId[id].hidden).sort().join();
 const polls = () => execs().filter((c) => c === 'setup status --json').length;
 // The 10 s refresh (the status read) without waiting for it.
@@ -71,7 +71,7 @@ const refresh = async () => { const t = T.timers.filter((x) => x.live && x.inter
   check('starting: one setup status read; no session, so no further polls', polls() === 1 && !T.timers.some((t) => t.live && !t.interval && t.ms === 1000));
   check('not installed: Home says so and offers Set up', !byId.home.hidden && !byId['h-notice'].hidden
     && /^Not set up yet/.test(byId['h-notice-text'].textContent) && byId['h-notice-btn'].textContent === 'Set up' && !byId['h-notice-btn'].hidden
-    && byId['h-ha-value'].textContent === 'Not set up' && byId['h-voice'].hidden && !byId['h-mic'].hidden);
+    && byId['h-ha-value'].textContent === 'Not set up' && byId['h-voice'].hidden && byId['h-sound'].hidden && !byId['h-mic'].hidden);
   check('address from the connection manager on the Home Assistant tile', byId['h-ha-sub'].textContent === '192.0.2.10, port 6053');
   check('Home: the focus starts on a tile; no Back hint on Home', doc.activeElement === byId['h-mic'] && byId['key-back-box'].hidden);
   key(38);
@@ -109,11 +109,12 @@ const refresh = async () => { const t = T.timers.filter((x) => x.live && x.inter
   check('Home Assistant card: back to the connection when the window closes', (await haCard({ state: 'connected', since_s: 3 }, { pairing: { open: false, ends_in_s: null } })) === 'Connected|ok|' + VP.HA_CONN.connected.full);
   status = Object.assign({}, status, { ha: undefined, pairing: undefined });
   await refresh();
-  check('four tiles', ['h-mic', 'h-voice', 'h-ha', 'h-diag'].every((id) => !byId[id].hidden) && byId['h-mic-pill'].textContent === 'On');
+  check('five tiles', ['h-mic', 'h-voice', 'h-sound', 'h-ha', 'h-diag'].every((id) => !byId[id].hidden) && byId['h-mic-pill'].textContent === 'On');
   byId['h-mic'].focus();
-  key(39); const r1 = doc.activeElement.id; key(39); const r2 = doc.activeElement.id; key(39); const r3 = doc.activeElement.id; key(39); const r4 = doc.activeElement.id;
+  const rights = [];
+  for (let i = 0; i < 5; i++) { key(39); rights.push(doc.activeElement.id); }
   key(37);
-  check('Right moves along the tiles and stops at the last; Left goes back', [r1, r2, r3, r4].join() === 'h-voice,h-ha,h-diag,h-diag' && doc.activeElement === byId['h-ha']);
+  check('Right moves along the tiles and stops at the last; Left goes back', rights.join() === 'h-voice,h-sound,h-ha,h-diag,h-diag' && doc.activeElement === byId['h-ha']);
   calls.length = 0;
   click('h-mic');
   await settle();
@@ -517,7 +518,7 @@ const refresh = async () => { const t = T.timers.filter((x) => x.live && x.inter
   key(461);
   await settle();
   check('not root: explains and hides the microphone and Voice and power tiles', /not running as root/.test(byId['h-notice-text'].textContent)
-    && byId['h-mic'].hidden && byId['h-voice'].hidden);
+    && byId['h-mic'].hidden && byId['h-voice'].hidden && byId['h-sound'].hidden);
 
   // ---- the whitelist ----
   check('every exec command is whitelisted', calls.length >= 0 && T.calls.filter((c) => c.uri.endsWith('/exec')).every((c) => ALLOWED.test(c.p.command)));

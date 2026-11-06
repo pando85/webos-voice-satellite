@@ -42,8 +42,9 @@ watch = true
 level = "info"
 
 # Echo cancellation (removes the TV's own sound from the microphone) is on by
-# default since 0.4.3. To turn it off, uncomment both lines and restart
-# (ctl.sh restart). Every key: config/example.toml ([aec]).
+# default since 0.4.3. To turn it off: the app's Sound screen, or
+# `ctl.sh config aec off` (changes only that key and restarts), or uncomment
+# both lines and restart (ctl.sh restart). Every key: config/example.toml ([aec]).
 # [aec]
 # enabled = false
 
@@ -80,5 +81,6 @@ open_on_start = true
 # Music from Home Assistant and Music Assistant on the satellite's media
 # player (experimental, not yet evaluated on a TV). Off: the media player
 # plays replies, announcements and the timer alarm only. Every key:
-# config/example.toml ([music]). Restart after a change.
+# config/example.toml ([music]). Restart after a change; the app's Sound
+# screen and `ctl.sh config music on|off` change this key and restart.
 enabled = false

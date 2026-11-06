@@ -10,7 +10,12 @@
 // direction, Back to Home, the two-press rule (and one press to turn Keep
 // listening off), arming timeout and disarm keys, pending rows, the result
 // lines (applied, already, failed, refused, mismatch), the delayed re-read
-// that catches a revert, and that only whitelisted commands are sent.
+// that catches a revert, and that only whitelisted commands are sent. Part 3
+// checks the Sound screen (echo cancellation and music, config keys whose
+// change restarts the daemon): its model, two presses in both directions,
+// on -> off -> on for both, the pending row, the result lines (restarted,
+// not running, already, failed with the previous setting back), an older
+// status without the fields, and that the phone has no request for them.
 // usage: node packaging/webos/tests/app_matrix.js
 'use strict';
 const path = require('path');
@@ -267,7 +272,7 @@ check('rows before the first read say Checking... and cannot be pressed', VP.row
 const STATUS = { uid: 0, installed: true, installed_version: '0.4.0', package_version: '0.4.0', update_pending: false, running: true,
   pid: 42, supervised: true, autostart: true, disabled: false, crashloop: false, mic_off: false, firmware: 'firmware 03.30.74',
   firmware_ok: true, key: 'paired', name: 'webos-satellite-test', port: '6053', prefix: '/var/lib/webos-satellite',
-  machine: 'aarch64', build: '', log: [], remote_off: 'normal' };
+  machine: 'aarch64', build: '', log: [], remote_off: 'normal', aec_enabled: true, music_enabled: false };
 // What the fake ctl.sh answers: `tv` is the tv-settings reply, `setReply(cmd)` the reply of a set command.
 const fake = { tv: state({}), setReply: null, tvFails: false };
 const T = load({
@@ -275,6 +280,7 @@ const T = load({
     if (args === 'status --json') return JSON.stringify(STATUS) + '\n';
     if (args === 'tv-settings --json') return fake.tvFails ? 'ctl.sh: broken\n' : JSON.stringify(fake.tv) + '\n';
     if (args === 'setup status --json') return '{"schema":1,"state":"none","reason":"","port":null,"expires_in_s":null,"peer":null,"peer_other_subnet":null,"pending":null,"last_result":null}\n';
+    if (/^config (aec|music) /.test(args)) return fake.soundReply(args);
     if (/^set /.test(args)) return fake.setReply(args);
     return 'webos-satellite: done\n';
   },
@@ -282,7 +288,7 @@ const T = load({
 const { byId, doc, settle, advance, execs, key, click, calls } = T;
 const indexHtml = require('fs').readFileSync(require('path').join(__dirname, '..', 'app', 'index.html'), 'utf8');
 check('index.html row sub-lines are the voicepower.js ones', VP.ROWS.every((r) => indexHtml.indexOf('<span class="vr-sub">' + r.sub + '</span>') > 0));
-const CTL_ALLOWED = /^sh '\/media\/developer\/apps\/usr\/palm\/applications\/io\.github\.pando85\.voicesatellite\/payload\/ctl\.sh' (status --json|tv-settings --json|setup status --json|set always-ready (on|off)|set hi-lg (on|off)|set remote-off (normal|keep)) 2>&1$/;
+const CTL_ALLOWED = /^sh '\/media\/developer\/apps\/usr\/palm\/applications\/io\.github\.pando85\.voicesatellite\/payload\/ctl\.sh' (status --json|tv-settings --json|setup status --json|set always-ready (on|off)|set hi-lg (on|off)|set remote-off (normal|keep)|config (aec|music) (on|off)) 2>&1$/;
 const press = async (id) => { click(id); await settle(); };
 const word = (r) => byId[`v-${r}-state`].textContent;
 const sets = () => execs().filter((c) => c !== 'tv-settings --json' && c !== 'status --json');
@@ -523,6 +529,118 @@ const nextTick = () => T.timers.filter((t) => t.live && t.interval && t.ms === 1
   await settle();
   check('Home cards use the same model: listening and power-button short forms', byId['h-listen-value'].textContent === 'Yes'
     && byId['h-power-value'].textContent === VP.POWER.P1.short && byId['chip-text'].textContent === 'Listening');
+
+  // ---- Part 3: the Sound screen ----------------------------------------------
+  const SR = VP.soundRows;
+  check('sound rows before a status say Checking... and cannot be pressed', SR(null).every((r) => r.word === 'Checking...' && !r.can));
+  check('sound rows from an older status without the fields: Not known, not pressable, says to update', SR({ installed: true }).every((r) => r.word === 'Not known' && !r.can && /Apply the update/.test(r.warn)));
+  const sr = SR({ aec_enabled: true, music_enabled: false });
+  check('sound rows: echo cancellation On turns off, music Off turns on, both with two presses',
+    sr[0].word === 'On' && sr[0].checked === 'true' && sr[0].cmd === 'config aec off' && sr[1].word === 'Off' && sr[1].checked === 'false' && sr[1].cmd === 'config music on'
+    && sr.every((r) => r.can && r.confirm === r.warn + VP.CONFIRM_TAIL && /restarts the voice service/.test(r.warn)));
+  check('sound confirm texts: plain words, CPU for echo cancellation, the encrypted-only fetch and Experimental for music',
+    /^Turn off echo cancellation\?/.test(sr[0].warn) && /little more CPU/.test(VP.soundConfirm('aec', true))
+    && /^Turn on music\?/.test(sr[1].warn) && /encrypted connection, never from the TV itself/.test(sr[1].warn) && /Experimental/.test(sr[1].warn)
+    && /only replies, announcements and timer alarms/.test(VP.soundConfirm('music', false)));
+  check('sound summary for the Home tile', VP.soundSummary({ aec_enabled: false, music_enabled: true }) === 'Echo cancellation off, music on'
+    && VP.soundSummary({}) === 'Echo cancellation, music' && VP.soundSummary(null) === 'Echo cancellation, music');
+  const res = (o) => Object.assign({ schema: 1, setting: 'aec', requested: 'off', before: 'on', after: 'off', result: 'applied', daemon: 'restarted', error: '' }, o);
+  check('sound result: applied and restarted', JSON.stringify(VP.soundResult('aec', res({}))) === JSON.stringify(['Echo cancellation is now Off. The voice service restarted.', 'ok']));
+  check('sound result: applied while stopped', VP.soundResult('music', res({ setting: 'music', requested: 'on', before: 'off', after: 'on', daemon: 'not running' }))[0]
+    === 'Music is now On. The satellite is not running; it uses this when it starts.');
+  check('sound result: already', VP.soundResult('aec', res({ result: 'already', before: 'off', daemon: 'none' }))[0] === 'Already Off. Nothing changed.');
+  check('sound result: failed with the previous setting back (restarted) and with the daemon down',
+    JSON.stringify(VP.soundResult('music', res({ setting: 'music', result: 'failed', after: 'off', before: 'off', error: 'the satellite did not start with the new setting; the previous setting is back' })))
+      === JSON.stringify(['Could not change Music: the satellite did not start with the new setting; the previous setting is back.', 'bad'])
+    && / The satellite is not running: see Diagnostics\.$/.test(VP.soundResult('music', res({ setting: 'music', result: 'failed', daemon: 'failed', error: 'x' }))[0]));
+  check('sound result: no or another reply', VP.soundResult('aec', null)[1] === 'bad' && /Could not confirm the change of Echo cancellation/.test(VP.soundResult('aec', res({ setting: 'music' }))[0]));
+  check('the phone has no request for these two settings (a restart ends its session)', VP.requestText('aec', 'off') === null && VP.requestText('music', 'on') === null
+    && !('aec' in VP.REQUEST) && !('music' in VP.REQUEST));
+  check('index.html Sound sub-lines and the side note are the voicepower.js ones', VP.SOUND_ROWS.every((r) => indexHtml.indexOf('<span class="vr-sub">' + r.sub + '</span>') > 0)
+    && indexHtml.indexOf('>' + VP.SOUND_NOTE.head + '<') > 0 && indexHtml.indexOf('>' + VP.SOUND_NOTE.detail + '<') > 0);
+
+  // The fake ctl.sh for `config aec|music on|off`: what it answers and whether it changes the status.
+  const sound = { mode: 'applied' };
+  fake.soundReply = (args) => {
+    const m = /^config (aec|music) (on|off)$/.exec(args);
+    const k = m[1] + '_enabled';
+    const before = STATUS[k] ? 'on' : 'off';
+    if (sound.mode === 'rollback') {
+      return 'webos-satellite: stopping pid 42\n' + JSON.stringify(res({ setting: m[1], requested: m[2], before, after: before, result: 'failed', daemon: 'restarted',
+        error: 'the satellite did not start with the new setting; the previous setting is back' })) + '\n';
+    }
+    if (before === m[2]) return JSON.stringify(res({ setting: m[1], requested: m[2], before, after: before, result: 'already', daemon: 'none' })) + '\n';
+    STATUS[k] = m[2] === 'on';
+    return 'webos-satellite: stopping pid 42\nwebos-satellite: started pid 43\n' + JSON.stringify(res({ setting: m[1], requested: m[2], before, after: m[2] })) + '\n';
+  };
+  const sword = (r) => byId[`s-${r}-state`].textContent;
+  check('the Sound tile is shown with the current state', !byId['h-sound'].hidden && byId['h-sound-sub'].textContent === 'Echo cancellation on, music off');
+  calls.length = 0;
+  click('h-sound');
+  await settle();
+  check('Sound opens: crumb, focus on the first row, rows from the status, its warning shown, a status read',
+    !byId.sound.hidden && byId.home.hidden && byId.crumb.textContent === '/ Sound' && doc.activeElement === byId['s-row-aec']
+    && sword('aec') === 'On' && sword('music') === 'Off' && byId['s-aec-sw'].className === 'sw on' && byId['s-music-sw'].className === 'sw'
+    && byId['s-warning'].textContent === sr[0].warn && execs().indexOf('status --json') >= 0);
+  key(40);
+  const downOk = doc.activeElement === byId['s-row-music'] && byId['s-warning'].textContent === sr[1].warn;
+  key(40);
+  const noWrap = doc.activeElement === byId['s-row-music'];
+  key(38);
+  check('Sound focus: Down to Music (its text on the right), no wrap, Up back', downOk && noWrap && doc.activeElement === byId['s-row-aec']);
+  calls.length = 0;
+  await press('s-row-aec');
+  check('first OK arms the row, shows the confirm text in it, sends nothing', execs().length === 0 && sword('aec') === 'Press OK again'
+    && !byId['s-aec-confirm'].hidden && byId['s-aec-confirm-text'].textContent === sr[0].confirm && byId['s-warning'].textContent === '');
+  nextTick().f();
+  await settle();
+  check('no periodic status read while a Sound row is armed', execs().length === 0);
+  advance(5000);
+  check('the arming ends after 5 s', sword('aec') === 'On' && byId['s-aec-confirm'].hidden);
+  await press('s-row-aec');
+  key(40);
+  check('a focus move disarms', sword('aec') === 'On' && byId['s-aec-confirm'].hidden && execs().length === 0);
+  key(38);
+  await press('s-row-aec');
+  click('s-row-aec');
+  check('the second OK sends config aec off; the row says Restarting... and both rows are inert', sword('aec') === 'Restarting...'
+    && /is-disabled/.test(byId['s-row-aec'].className) && /is-disabled/.test(byId['s-row-music'].className) && /restarts/.test(byId['s-msg'].textContent));
+  click('s-row-music');
+  await settle();
+  check('aec off: applied, Off, the result line, nothing else sent meanwhile', execs().filter((c) => /^config /.test(c)).join() === 'config aec off'
+    && sword('aec') === 'Off' && byId['s-msg'].textContent === 'Echo cancellation is now Off. The voice service restarted.' && /ok/.test(byId['s-msg'].className));
+  await press('s-row-aec'); await press('s-row-aec');
+  check('aec on again: two presses send config aec on, On', execs().filter((c) => /^config /.test(c)).join() === 'config aec off,config aec on' && sword('aec') === 'On'
+    && byId['s-msg'].textContent === 'Echo cancellation is now On. The voice service restarted.');
+  byId['s-row-music'].focus();
+  await press('s-row-music');
+  check('music on is armed with its own confirm text', byId['s-music-confirm-text'].textContent === sr[1].confirm);
+  await press('s-row-music');
+  check('music on: applied, On', sword('music') === 'On' && byId['s-msg'].textContent === 'Music is now On. The voice service restarted.');
+  await press('s-row-music'); await press('s-row-music');
+  check('music off: applied, Off; on, off, on in order', sword('music') === 'Off'
+    && execs().filter((c) => /^config /.test(c)).join() === 'config aec off,config aec on,config music on,config music off');
+  sound.mode = 'rollback';
+  await press('s-row-music'); await press('s-row-music');
+  check('a failed change with the previous setting back: still Off, the reason in red', sword('music') === 'Off'
+    && byId['s-msg'].textContent === 'Could not change Music: the satellite did not start with the new setting; the previous setting is back.' && /bad/.test(byId['s-msg'].className));
+  sound.mode = 'applied';
+  key(461);
+  await settle();
+  check('Back returns to Home with the focus on the Sound tile, the tile shows the state', !byId.home.hidden && byId.sound.hidden
+    && doc.activeElement === byId['h-sound'] && byId['h-sound-sub'].textContent === 'Echo cancellation on, music off');
+  delete STATUS.aec_enabled;
+  delete STATUS.music_enabled;
+  click('h-sound');
+  await settle();
+  calls.length = 0;
+  await press('s-row-aec'); await press('s-row-aec');
+  check('an older status without the fields: Not known, nothing is sent', sword('aec') === 'Not known' && sword('music') === 'Not known'
+    && execs().filter((c) => /^config /.test(c)).length === 0 && /Apply the update/.test(byId['s-warning'].textContent));
+  key(461);
+  await settle();
+  STATUS.aec_enabled = true;
+  STATUS.music_enabled = false;
 
   check('only whitelisted commands were sent in the whole run', calls.filter((c) => c.uri.endsWith('/exec')).every((c) => CTL_ALLOWED.test(c.p.command)));
   done();

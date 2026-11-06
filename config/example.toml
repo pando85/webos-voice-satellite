@@ -355,7 +355,8 @@ output = "full"
 # for the wake word, replies, announcements and the timer alarm. Off by
 # default and experimental: built and tested on a PC only, not yet evaluated
 # on a TV (CPU, mixing, false wakes). Changing it needs a restart; Home
-# Assistant reads the entity's features when it connects.
+# Assistant reads the entity's features when it connects. The TV app's Sound
+# screen and `ctl.sh config music on|off` change this key and restart.
 enabled = false
 # Format HA's ffmpeg proxy converts music to: "flac" or "wav" (MP3 is never
 # advertised). rate (8000 to 96000) and channels (1 or 2) are advertised

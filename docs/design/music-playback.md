@@ -341,13 +341,17 @@ The thresholds in G2, G4 and the experiments are proposals set before any measur
 
 ## K. UI/UX integration (later)
 
+**Built 2026-11-06 (the on/off toggle only; verified-on-host, not yet run on a TV).** The TV app's Home has a **Sound** tile; its screen has a **Music** row ("Lets Home Assistant or Music Assistant play music on this TV. Experimental.") that runs `ctl.sh config music on|off` after two presses (named `config`, not the `set music` proposed below: it restarts the daemon, and nothing under `set` may do that, [phone setup 9.1](phone-setup.md#91-the-table)). `ctl.sh status --json` reports the config value as `music_enabled` (true only when `[music] enabled = true`). The command changes only `[music] enabled` (in place, or one line under the `[music]` header, or an appended `[music]` table; the other `[music]` keys and every other line are copied unchanged), checks the new file with `--check-config` before it replaces `etc/config.toml`, and restarts a running daemon (a few seconds without listening; HA reconnects and reads the new media-player flags, 5124 off and 1201669 on); if the daemon does not come back, the previous config is put back. The phone setup page does not offer it (a restart ends the phone session). The other proposed settings below (duck mode, depth, trim) and the status block are not built.
+
+**What turning music on means** (the confirm text on the TV says the short form): the satellite's media player starts accepting `play_media` from Home Assistant and Music Assistant, and the daemon, which runs as root, then **fetches the stream URL it is sent and decodes it** (FLAC, WAV, MP3, Ogg Vorbis). The fetch guard of `crates/playback/src/guard.rs` applies to every such fetch: `http` and `https` only, at most 3 redirects, no `https` to `http` downgrade, and loopback, link-local, multicast, broadcast and the TV's own addresses refused (private LAN addresses allowed, because HA and MA live there); `play_media` from an **unencrypted** API session is refused unless `[music] allow_plaintext = true` (D14). Music is ducked for the wake word, replies, announcements and the timer alarm, shares the reply volume, stops in `Active Standby` and never wakes the TV (D6). It is **experimental**: c3-a passed the direct HA path, resources, mixing and ducking (M6 and M7 in section E), Music Assistant, the wake-word duck, the standby entry and the false-wake soak (EXP-015) are not done, which is why the default stays off (D7).
+
 **Handoff for the TV app and phone setup redesign (another session, [voice-and-power screen](voice-and-power-screen.md), [ADR 0009](../decisions/0009-phone-setup-web-server.md)). This plan designs no screens, menus or layouts.** It only lists what the backend will offer so the redesign can use it. Everything here is a **proposal**, nothing is implemented, and the names are not final until the redesign agrees them. The channels already exist: `ctl.sh status --json`, the daemon's `run/voice.json` status file (schema 1, written atomically, rewritten on change plus a 30 s keep-alive) and `ctl.sh set ...` for the satellite's own settings (the `reply-volume` pattern: write a file under `etc/`, the daemon picks it up).
 
 **Settings the UI may expose** (config keys from section C; none is needed to use music from HA):
 
 | Setting | Config key | How a change would be applied | Via |
 | --- | --- | --- | --- |
-| Music on or off | `[music] enabled` | needs a daemon restart or reconnect, because HA reads the entity flags (5124 or 153093) when it connects; same class as other settings that change the entity list | `ctl.sh set music on\|off` (proposed) |
+| Music on or off | `[music] enabled` | needs a daemon restart or reconnect, because HA reads the entity flags (5124 or 153093) when it connects; same class as other settings that change the entity list | `ctl.sh config music on\|off` (**built 2026-11-06**, restarts the daemon; the TV app's Sound screen) |
 | Duck mode on wake | `[music] on_wake` (`duck`, `pause`, `none`) | picked up by the running daemon within a second | `ctl.sh set music-on-wake MODE` (proposed) |
 | Duck depth | `[music] duck_db` (default -20) | same | `ctl.sh set music-duck-db N` (proposed) |
 | Music level trim | `[music] gain_db` | same | `ctl.sh set music-gain-db N` (proposed) |
@@ -358,7 +362,7 @@ The shared volume is already the existing `reply-volume` setting (`ctl.sh set re
 
 | Field | Meaning | Carried in |
 | --- | --- | --- |
-| `music.enabled` | `[music] enabled` of the running daemon | `status --json` (`music_enabled`) and `run/voice.json` |
+| `music.enabled` | `[music] enabled` of the running daemon | `run/voice.json`; `status --json` has `music_enabled` since 2026-11-06, read from the **config file** (equal to the daemon's value except between a hand edit and the restart) |
 | `music.state` | `idle`, `playing` or `paused` (the state HA also sees) | `run/voice.json`, `status --json` under `music` |
 | `music.ducked` | true while a duck is held, with `music.duck_db` the current depth | `run/voice.json` |
 | `music.format` | the format in use, for example `flac 48000 Hz 2 ch` | `run/voice.json` |

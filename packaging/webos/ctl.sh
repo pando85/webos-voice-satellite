@@ -43,6 +43,14 @@
 #                     reply-volume (N = 0 to 100) are the satellite's own
 #                     settings, written to etc/ and picked up by the running
 #                     daemon within a second. The daemon never does this
+#   config aec on|off | music on|off
+#                     the config keys [aec] enabled (echo cancellation) and
+#                     [music] enabled, read by the daemon at start only:
+#                     rewrites only that line of etc/config.toml (checked with
+#                     --check-config first, never installed when the check
+#                     fails) and restarts a running daemon, which ends a
+#                     phone setup session (so it is not a `set`: nothing the
+#                     setup server runs may stop it). One JSON line
 #   setup start|status --json|answer ID allow|refuse|stop
 #                     the phone setup web server (ADR 0009): start runs it
 #                     (only on this explicit call, never at boot), status is
@@ -70,7 +78,7 @@ here=$(cd "$(dirname "$0")" && pwd)
 . "$here/lib.sh"
 
 usage() {
-    sed -n '2,66p' "$0" >&2
+    sed -n '2,73p' "$0" >&2
     exit 2
 }
 
@@ -367,6 +375,29 @@ cfg_value() {
         head -n 1 | sed 's/[[:space:]]*$//'
 }
 
+# The header line of TOML table $1 (a plain name: letters, digits, _ and -),
+# as a basic regular expression: "[aec]", "[ aec ]", "[aec]  # note".
+# "[aec.aec3]" and "[[aec]]" are other tables.
+cfg_header_re() {
+    printf '^[[:space:]]*\\[[[:space:]]*%s[[:space:]]*\\][[:space:]]*\\(#.*\\)\\{0,1\\}$' "$1"
+}
+
+# The bare value of `$2 = value` inside table [$1] of config file $3
+# (default $CFG): from the table's header to the next header; "" when the
+# table or the key is not there. One sed, no loop (the status runs every 10 s).
+cfg_section_value() {
+    sed -n "/$(cfg_header_re "$1")/,/^[[:space:]]*\\[/{
+s/^[[:space:]]*$2[[:space:]]*=[[:space:]]*\"\\{0,1\\}\\([^\"#[:space:]]*\\).*/\\1/p
+}" "${3:-$CFG}" 2>/dev/null | head -n 1
+}
+
+# Whether [aec] enabled and [music] enabled are on in the config file, as
+# true or false: echo cancellation is on unless the key says false (the
+# daemon's default since 0.4.3, ADR 0011), music only when it says true
+# (default off, ADR 0010). The daemon reads both at start only.
+aec_enabled_json() { if [ "$(cfg_section_value aec enabled)" = false ]; then printf false; else printf true; fi; }
+music_enabled_json() { if [ "$(cfg_section_value music enabled)" = true ]; then printf true; else printf false; fi; }
+
 # The reply volume file: sink.volume_file of the config, relative to etc/
 # (the daemon's default is etc/reply_volume).
 volume_file() {
@@ -429,7 +460,7 @@ key_state() {
         echo paired
     elif [ -f "$PAIR_DIR/noise_psk.cleared" ]; then
         echo cleared
-    elif [ -d "$PAIR_DIR" ] || [ "$(cfg_value enabled)" = true ]; then
+    elif [ -d "$PAIR_DIR" ] || [ "$(cfg_section_value pairing enabled)" = true ]; then
         echo unpaired
     else
         echo none
@@ -495,6 +526,8 @@ cmd_status() {
     reply_volume_default=$(cfg_value volume | sed 's/[^0-9]//g')
     name=$(cfg_value name)
     port=$(cfg_value port)
+    aec_on=$(aec_enabled_json)
+    music_on=$(music_enabled_json)
     if [ "$json" -eq 0 ]; then
         note "package: ${pkg_version:-none} ($PAYLOAD)"
         note "installed: $is_inst ${inst_version:+$inst_version }in $P${build:+ ($build)}"
@@ -523,6 +556,8 @@ cmd_status() {
             vol_text="default (none stored yet)"
         fi
         note "reply volume: $vol_text, remote power-off: ${remote_off:-normal}"
+        on_off() { if [ "$1" = true ]; then echo on; else echo off; fi; }
+        note "echo cancellation: $(on_off "$aec_on"), music: $(on_off "$music_on") (config; ctl.sh config aec|music on|off)"
         return 0
     fi
     printf '{"package_version":%s,' "$(json_str "$pkg_version")"
@@ -539,6 +574,7 @@ cmd_status() {
     printf '"key":%s,"name":%s,"port":%s,' "$(json_str "$keys")" "$(json_str "$name")" "$(json_str "${port:-6053}")"
     printf '"remote_off":%s,"reply_volume":%s,' "$(json_str "${remote_off:-normal}")" "$(json_str "$reply_volume")"
     printf '"reply_volume_default":%s,' "$(json_str "$reply_volume_default")"
+    printf '"aec_enabled":%s,"music_enabled":%s,' "$aec_on" "$music_on"
     printf '"pairing_window_s":%s,' "$(json_str "$(cfg_value window_s | sed 's/[^0-9]//g')")"
     printf '"pairing":%s,"ha":%s,' "$(pairing_json)" "$(ha_json)"
     printf '"prefix":%s,"log":[' "$(json_str "$P")"
@@ -1002,6 +1038,138 @@ volume_emit() { # REQUESTED BEFORE AFTER RESULT ERROR DAEMON
         "$(json_str "$1")" "$(json_str "$2")" "$(json_str "$3")" "$(json_str "$4")" "$(json_str "$6")" "$(json_str "$5")"
 }
 
+# --- config aec|music: one config key and a restart (ADR 0011, ADR 0010) ---
+# [aec] enabled and [music] enabled are read by the daemon at start only, so
+# a change rewrites etc/config.toml and restarts a running daemon. The new
+# config is built in a temporary file next to it (only the one key's line
+# changes, or one line or table is added; comments, other keys and other
+# tables are copied byte for byte), checked with the daemon's own
+# --check-config, and renamed over the config only when the check passes and
+# the daemon reports the requested state. A daemon that does not come back
+# with the new config gets the previous config back and is started again.
+
+# The daemon's view of config file $1: prints the --check-config summary line
+# (without "config ok: "); when the check fails, its last output line and
+# status 1.
+cfg_check() {
+    co=$("$BIN" --config "$1" --check-config 2>&1) && crc=0 || crc=$?
+    cs=$(printf '%s\n' "$co" | sed -n 's/^config ok: //p' | head -n 1)
+    if [ "$crc" -eq 0 ] && [ -n "$cs" ]; then
+        printf '%s\n' "$cs"
+        return 0
+    fi
+    printf '%s\n' "$co" | sed '/^[[:space:]]*$/d' | tail -n 1 | cut -c 1-200
+    return 1
+}
+
+# on or off for setting $1 (aec | music) in summary line $2, "" when the
+# line does not say. "aec=[off (file mic without ...)]" is enabled.
+cfg_state() {
+    case "$1 $2" in
+    "aec "*" aec=[off]"*) echo off ;;
+    "aec "*" aec=["*) echo on ;;
+    "music "*" music=[off]"*) echo off ;;
+    "music "*" music=[on"*) echo on ;;
+    *) echo "" ;;
+    esac
+}
+
+# Writes $CFG with `enabled = $2` in table [$1] to file $3: the key's line is
+# changed in place (indent and trailing comment kept), or the line is added
+# right under the table's header, or the table is appended at the end.
+cfg_write_enabled() { # TABLE true|false OUT
+    hre=$(cfg_header_re "$1")
+    if [ -n "$(cfg_section_value "$1" enabled)" ]; then
+        sed "/$hre/,/^[[:space:]]*\\[/s/^\\([[:space:]]*\\)enabled[[:space:]]*=[[:space:]]*[^#[:space:]]*/\\1enabled = $2/" "$CFG" >"$3"
+    elif grep -q "$hre" "$CFG"; then
+        sed "/$hre/a\\
+enabled = $2" "$CFG" >"$3"
+    else
+        {
+            cat "$CFG"
+            [ -z "$(tail -c 1 "$CFG")" ] || echo
+            printf '\n[%s]\nenabled = %s\n' "$1" "$2"
+        } >"$3"
+    fi
+}
+
+# Stops the daemon (and a phone setup session) and starts it supervised;
+# status 1 when it is not running afterwards. Notes go to stderr.
+cfg_restart() {
+    (stop_daemon 10) >&2 || return 1
+    sh "$P/bin/start.sh" --supervise >&2 || return 1
+}
+
+cfg_emit() { # SETTING REQUESTED BEFORE AFTER RESULT ERROR DAEMON
+    printf '{"schema":1,"setting":%s,"requested":%s,"before":%s,"after":%s,"result":%s,"daemon":%s,"error":%s}\n' \
+        "$(json_str "$1")" "$(json_str "$2")" "$(json_str "$3")" "$(json_str "$4")" "$(json_str "$5")" "$(json_str "$7")" "$(json_str "$6")"
+    case $5 in
+    applied) echo "$1 is now $4 (was $3; daemon: $7)" >&2 ;;
+    already) echo "$1 is already $4; nothing changed" >&2 ;;
+    *) echo "$1: $5${6:+: $6}" >&2 ;;
+    esac
+    case $5 in applied | already) return 0 ;; *) return 1 ;; esac
+}
+
+cmd_config_set() { # aec|music on|off, already validated
+    st=$1
+    want=$2
+    installed || die "not installed (ctl.sh install)"
+    locked
+    [ -f "$CFG" ] || { cfg_emit "$st" "$want" "" "" refused "no config file" none; return; }
+    if ! sum=$(cfg_check "$CFG"); then
+        cfg_emit "$st" "$want" "" "" refused "the config does not pass the check now: $sum" none
+        return
+    fi
+    before=$(cfg_state "$st" "$sum")
+    [ -n "$before" ] || { cfg_emit "$st" "$want" "" "" refused "the daemon does not report this setting" none; return; }
+    if [ "$before" = "$want" ]; then
+        cfg_emit "$st" "$want" "$before" "$before" already "" none
+        return
+    fi
+    v=false
+    [ "$want" != on ] || v=true
+    new=$CFG.new.$$
+    prev=$CFG.prev.$$
+    err=
+    if ! (umask 077 && cfg_write_enabled "$st" "$v" "$new"); then
+        err="cannot write the config"
+    elif ! sum=$(cfg_check "$new"); then
+        err="the changed config did not pass the check, nothing changed: $sum"
+    elif [ "$(cfg_state "$st" "$sum")" != "$want" ]; then
+        err="the config could not be changed automatically, nothing changed: set [$st] enabled = $v by hand"
+    elif ! chmod 600 "$new" || ! cp -p "$CFG" "$prev"; then
+        err="cannot keep a copy of the config"
+    elif ! mv -f "$new" "$CFG"; then
+        err="cannot replace the config"
+    fi
+    if [ -n "$err" ]; then
+        rm -f "$new" "$prev"
+        history_add "$st result from=$before to=$want read=$before outcome=failed source=ctl" || true
+        cfg_emit "$st" "$want" "$before" "$before" failed "$err" none
+        return
+    fi
+    res=applied
+    after=$want
+    d="not running"
+    if running; then
+        if cfg_restart; then
+            d=restarted
+        else
+            # Back to the config the daemon ran with, and start it again.
+            mv -f "$prev" "$CFG"
+            res=failed
+            after=$before
+            err="the satellite did not start with the new setting; the previous setting is back"
+            d=failed
+            if cfg_restart; then d=restarted; fi
+        fi
+    fi
+    rm -f "$prev"
+    history_add "$st result from=$before to=$want read=$after outcome=$res source=ctl" || true
+    cfg_emit "$st" "$want" "$before" "$after" "$res" "$err" "$d"
+}
+
 cmd_set() {
     [ $# -eq 2 ] || usage
     case "$1 $2" in
@@ -1027,6 +1195,19 @@ cmd_set() {
         ;;
     *) usage ;;
     esac
+}
+
+# config aec|music on|off. Not part of `set` on purpose: it restarts the
+# daemon, which ends a phone setup session, and nothing the setup server may
+# run reaches that (review C7, tests/no_self_stop.py).
+cmd_config() {
+    [ $# -eq 2 ] || usage
+    case "$1 $2" in
+    "aec on" | "aec off" | "music on" | "music off") ;;
+    *) usage ;;
+    esac
+    need_root
+    cmd_config_set "$1" "$2"
 }
 
 # --- setup (docs/design/phone-setup.md, ADR 0009) ------------------------------
@@ -1254,6 +1435,7 @@ selfcheck) [ $# -eq 0 ] || usage; cmd_selfcheck ;;
 ack-firmware) [ $# -eq 0 ] || usage; cmd_ack_firmware ;;
 tv-settings) cmd_tv_settings "$@" ;;
 set) cmd_set "$@" ;;
+config) cmd_config "$@" ;;
 setup) cmd_setup "$@" ;;
 clear-crashloop) [ $# -eq 0 ] || usage; need_root; rm -f "$CRASHLOOP"; note "crash-loop marker removed" ;;
 uninstall) [ $# -eq 0 ] || usage; cmd_uninstall ;;

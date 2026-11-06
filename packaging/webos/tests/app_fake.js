@@ -16,7 +16,8 @@ const CTL_PREFIX = "sh '/media/developer/apps/usr/palm/applications/io.github.pa
 // [left, top, width, height] at 1920x1080, from style.css.
 const LAYOUT = {
   'h-notice-btn': [1560, 480, 260, 76],
-  'h-mic': [96, 594, 413, 284], 'h-voice': [541, 594, 413, 284], 'h-ha': [986, 594, 413, 284], 'h-diag': [1431, 594, 413, 284],
+  'h-mic': [96, 594, 320, 284], 'h-voice': [448, 594, 320, 284], 'h-sound': [800, 594, 320, 284], 'h-ha': [1152, 594, 320, 284], 'h-diag': [1504, 594, 320, 284],
+  's-row-aec': [96, 156, 1060, 150], 's-row-music': [96, 328, 1060, 150],
   'v-row-ar': [96, 156, 1060, 150], 'v-row-hl': [96, 328, 1060, 150], 'v-row-keep': [96, 500, 1060, 150], 'v-refresh': [96, 676, 220, 94], 'v-hint-btn': [1212, 640, 380, 84],
   'a-pair': [1184, 156, 640, 130], 'a-phone': [1184, 308, 640, 130], 'a-reset': [1184, 460, 640, 130], 'a-endphone': [1184, 612, 640, 130],
   'q-done': [768, 820, 170, 94], 'q-again': [962, 820, 270, 94],
@@ -123,7 +124,7 @@ function load(opts) {
   // OK on the remote: the browser turns Enter on a focused button into a click.
   const ok = () => { key(13); doc.activeElement.listeners.click(); };
   const visible = (ids) => ids.filter((id) => !byId[id].hidden);
-  const screen = () => ['home', 'voice', 'ha', 'setup', 'diag', 'report', 'more'].filter((s) => !byId[s].hidden);
+  const screen = () => ['home', 'voice', 'sound', 'ha', 'setup', 'diag', 'report', 'more'].filter((s) => !byId[s].hidden);
   return { byId, doc, window, calls, timers, clock, settle, advance, step, execs, key, click, ok, visible, screen,
     VP: window.voicePower, app: window.voiceSatelliteApp, CTL_PREFIX };
 }

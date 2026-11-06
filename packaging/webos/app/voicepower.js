@@ -9,6 +9,7 @@
  *   - the outcome matrix (what the remote's power button does, the listening
  *     line, the notes): docs/design/voice-and-power-screen.md sections 3 and 4;
  *   - the three Voice and power rows, their confirm texts and result lines;
+ *   - the two Sound rows (echo cancellation, music), TV app only;
  *   - short card wording next to the full wording, in the same table entry
  *     (LISTEN, POWER, KEY, COMPAT), for the Home cards and the phone page;
  *   - the phone-request texts keyed by action and value
@@ -394,6 +395,81 @@
       full: e.full.replace('%s', c.selfcheck || 'no details') };
   }
 
+  // ---- Sound screen: echo cancellation and music ----------------------------
+  // Two keys of the satellite's config file, [aec] enabled (on by default,
+  // ADR 0011) and [music] enabled (off by default, ADR 0010), from the
+  // `aec_enabled` and `music_enabled` booleans of `ctl.sh status --json`.
+  // The daemon reads them at start only, so `ctl.sh config aec|music on|off`
+  // rewrites the config and restarts it. TV app only: the phone page does not
+  // offer them (a restart ends the phone session), so REQUEST has no entry.
+
+  var RESTART = 'Applying it restarts the voice service: the satellite stops listening for a few seconds.';
+  var SOUND_NOTE = {
+    head: 'A change restarts the voice service briefly.',
+    detail: 'The satellite stops listening for a few seconds, then Home Assistant reconnects by itself. An open phone setup session ends.'
+  };
+  var SOUND_ROWS = [
+    { id: 'aec', label: 'Echo cancellation', key: 'aec_enabled', action: 'aec',
+      sub: 'Lets the TV hear you while it plays sound. Uses a little more CPU.' },
+    { id: 'music', label: 'Music', key: 'music_enabled', action: 'music',
+      sub: 'Lets Home Assistant or Music Assistant play music on this TV. Experimental.' }
+  ];
+
+  function soundIndex(id) { return id === 'music' ? 1 : 0; }
+
+  function soundConfirm(id, turningOn) {
+    if (id === 'music') {
+      return turningOn
+        ? 'Turn on music? Home Assistant and Music Assistant can then play music on this TV through the satellite. The satellite fetches the music from the address Home Assistant sends, only over its encrypted connection, never from the TV itself. Experimental: not yet tested on a TV. ' + RESTART
+        : 'Turn off music? The satellite then plays only replies, announcements and timer alarms. ' + RESTART;
+    }
+    return turningOn
+      ? 'Turn on echo cancellation? The satellite removes the TV\'s own sound from what it hears, so it can hear you while the TV plays. It uses a little more CPU. ' + RESTART
+      : 'Turn off echo cancellation? While the TV plays sound, the satellite may hear you less well. ' + RESTART;
+  }
+
+  // The two rows from `ctl.sh status --json`: { word, cls, checked, can, cmd,
+  // confirm, warn }. Both directions take two presses (a restart each time).
+  function soundRows(st) {
+    var out = [];
+    for (var i = 0; i < SOUND_ROWS.length; i++) {
+      var d = SOUND_ROWS[i];
+      var v = st ? st[d.key] : undefined;
+      if (!st) {
+        out.push({ word: 'Checking...', cls: 'muted', checked: 'false', can: false, cmd: '', confirm: '', warn: '' });
+      } else if (typeof v !== 'boolean') {
+        out.push({ word: 'Not known', cls: 'warn', checked: 'false', can: false, cmd: '', confirm: '',
+          warn: d.label + ' is not reported by this version of the satellite. Apply the update first.' });
+      } else {
+        var c = soundConfirm(d.id, !v);
+        out.push({ word: v ? 'On' : 'Off', cls: '', checked: v ? 'true' : 'false', can: true,
+          cmd: 'config ' + d.action + (v ? ' off' : ' on'), confirm: c + CONFIRM_TAIL, warn: c });
+      }
+    }
+    return out;
+  }
+
+  // The Home tile's second line: "Echo cancellation on, music off".
+  function soundSummary(st) {
+    if (!st || typeof st.aec_enabled !== 'boolean' || typeof st.music_enabled !== 'boolean') { return 'Echo cancellation, music'; }
+    return 'Echo cancellation ' + (st.aec_enabled ? 'on' : 'off') + ', music ' + (st.music_enabled ? 'on' : 'off');
+  }
+
+  // One line for the JSON result of `ctl.sh config aec|music`, as [text, class].
+  function soundResult(id, r) {
+    var row = SOUND_ROWS[soundIndex(id)];
+    var w = function (v) { return v === 'on' ? 'On' : (v === 'off' ? 'Off' : 'not known'); };
+    if (!r || r.setting !== row.action) { return ['Could not confirm the change of ' + row.label + '. The screen shows the state again in a few seconds.', 'bad']; }
+    if (r.result === 'applied') {
+      var tail = r.daemon === 'restarted' ? ' The voice service restarted.'
+        : (r.daemon === 'not running' ? ' The satellite is not running; it uses this when it starts.' : '');
+      return [row.label + ' is now ' + w(r.after) + '.' + tail, 'ok'];
+    }
+    if (r.result === 'already') { return ['Already ' + w(r.after || r.before) + '. Nothing changed.', 'ok']; }
+    var why = r.error ? r.error : 'no reason given';
+    return ['Could not change ' + row.label + ': ' + why + '.' + (r.daemon === 'failed' ? ' The satellite is not running: see Diagnostics.' : ''), 'bad'];
+  }
+
   // ---- phone requests (docs/design/phone-setup.md sections 7 and 9) ---------
 
   function strip(t) { return t.replace(/^[^?]*\?\s*/, ''); }
@@ -506,6 +582,9 @@
     AR_MENU: AR_MENU, HL_MENU: HL_MENU, CONFIRM_TAIL: CONFIRM_TAIL,
     // cards
     haSummary: haSummary, haCard: haCard, SETUP_UNAVAILABLE: SETUP_UNAVAILABLE, HA_CONN: HA_CONN, compat: compat, KEY: KEY, COMPAT: COMPAT, HA_STEPS: HA_STEPS, HA_CLEANUP: HA_CLEANUP, HA_DELETE_PATH: HA_DELETE_PATH,
+    // Sound screen (TV app only)
+    soundRows: soundRows, soundSummary: soundSummary, soundResult: soundResult, soundConfirm: soundConfirm, soundIndex: soundIndex,
+    SOUND_ROWS: SOUND_ROWS, SOUND_NOTE: SOUND_NOTE,
     // phone requests
     requestText: requestText, phoneResult: phoneResult, endedText: endedText, isIPv4: isIPv4,
     REQUEST: REQUEST, ENDED: ENDED

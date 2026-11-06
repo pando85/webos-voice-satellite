@@ -11,9 +11,9 @@
  * ever put into a command, except the 8-hex-digit id of a phone request,
  * checked by a regular expression (docs/design/phone-setup.md, ADR 0009).
  *
- * Screens (design "Calm dark", 2026-11-05): Home, Voice and power, Home
- * Assistant (with the phone setup QR), Diagnostics (with Report
- * compatibility and More actions). Back returns to the parent screen, to Home from the others, and leaves the app from Home. The arrow
+ * Screens (design "Calm dark", 2026-11-05): Home, Voice and power, Sound
+ * (echo cancellation and music), Home Assistant (with the phone setup QR),
+ * Diagnostics (with Report compatibility and More actions). Back returns to the parent screen, to Home from the others, and leaves the app from Home. The arrow
  * keys move the focus to the nearest element in that direction.
  */
 (function () {
@@ -31,6 +31,8 @@
     // Voice and power screen: one read and six fixed changes, no typed text.
     'tv-settings --json', 'set always-ready on', 'set always-ready off', 'set hi-lg on', 'set hi-lg off',
     'set remote-off normal', 'set remote-off keep',
+    // Sound screen: two config keys; each change restarts the daemon.
+    'config aec on', 'config aec off', 'config music on', 'config music off',
     // Phone setup (ADR 0009): start, the poll (also the heartbeat), stop.
     'setup start', 'setup status --json', 'setup stop'];
   var ANSWER_RE = /^setup answer [0-9a-f]{8} (allow|refuse)$/;
@@ -135,7 +137,7 @@
 
   // ---- the message line ---------------------------------------------------------
 
-  var MSG_IDS = ['h-msg', 'ha-msg', 'd-msg', 'x-msg'];
+  var MSG_IDS = ['h-msg', 's-msg', 'ha-msg', 'd-msg', 'x-msg'];
   function setMsg(t, cls) {
     msg = { text: t || '', cls: cls || '' };
     for (var i = 0; i < MSG_IDS.length; i++) {
@@ -147,8 +149,9 @@
   // ---- focus: nearest element in the pressed direction ---------------------------
 
   var FOCUS = {
-    home: ['h-notice-btn', 'h-mic', 'h-voice', 'h-ha', 'h-diag'],
+    home: ['h-notice-btn', 'h-mic', 'h-voice', 'h-sound', 'h-ha', 'h-diag'],
     voice: ['v-row-ar', 'v-row-hl', 'v-row-keep', 'v-refresh', 'v-hint-btn'],
+    sound: ['s-row-aec', 's-row-music'],
     ha: ['a-pair', 'a-phone', 'a-reset', 'a-endphone'],
     setup: ['q-done', 'q-again'],
     diag: ['d-check', 'd-report', 'd-ack', 'd-more'],
@@ -230,12 +233,14 @@
   }
 
   function disarmAll() {
-    var changed = !!armedBtn || !!vArmed;
+    var changed = !!armedBtn || !!vArmed || !!sArmed;
     armedBtn = null;
     armToken++;
     vArmed = null;
     vArmToken++;
-    if (changed) { renderArmed(); renderVoice(); }
+    sArmed = null;
+    sArmToken++;
+    if (changed) { renderArmed(); renderVoice(); renderSound(); }
   }
 
   // ---- status, Home and the screens built from it --------------------------------
@@ -373,6 +378,8 @@
     var micOff = !!s && !!s.mic_off;
     show('h-mic', root());
     show('h-voice', installed());
+    show('h-sound', installed());
+    text($('h-sound-sub'), VP.soundSummary(installed() ? s : null));
     show('h-mic-on', !micOff);
     show('h-mic-off', micOff);
     text($('h-mic-pill'), micOff ? 'Off' : 'On');
@@ -461,6 +468,7 @@
 
   function renderAll() {
     renderHome();
+    renderSound();
     renderHA();
     renderDiag();
     renderMore();
@@ -470,10 +478,10 @@
 
   // ---- screens -----------------------------------------------------------------------
 
-  var CRUMB = { home: '', voice: 'Voice and power', ha: 'Home Assistant', setup: 'Home Assistant / Phone setup',
+  var CRUMB = { home: '', voice: 'Voice and power', sound: 'Sound', ha: 'Home Assistant', setup: 'Home Assistant / Phone setup',
     diag: 'Diagnostics', report: 'Diagnostics / Report', more: 'Diagnostics / More actions' };
-  var SECTIONS = ['home', 'voice', 'ha', 'setup', 'diag', 'report', 'more'];
-  var FIRST = { home: 'h-mic', voice: 'v-row-ar', ha: 'a-pair', setup: 'q-done', diag: 'd-check', report: 'r-back', more: 'x-stop' };
+  var SECTIONS = ['home', 'voice', 'sound', 'ha', 'setup', 'diag', 'report', 'more'];
+  var FIRST = { home: 'h-mic', voice: 'v-row-ar', sound: 's-row-aec', ha: 'a-pair', setup: 'q-done', diag: 'd-check', report: 'r-back', more: 'x-stop' };
 
   function renderChrome() {
     text($('crumb'), CRUMB[screen] ? '/ ' + CRUMB[screen] : '');
@@ -500,7 +508,7 @@
     }
   }
 
-  var HOME_FOCUS = { voice: 'h-voice', ha: 'h-ha', setup: 'h-ha', diag: 'h-diag', report: 'h-diag', more: 'h-diag' };
+  var HOME_FOCUS = { voice: 'h-voice', sound: 'h-sound', ha: 'h-ha', setup: 'h-ha', diag: 'h-diag', report: 'h-diag', more: 'h-diag' };
   function goHome() {
     var from = screen;
     go('home', HOME_FOCUS[from]);
@@ -774,6 +782,81 @@
     go('voice', 'v-row-ar');
     renderVoice();
     readVoice(null);
+  }
+
+  // ---- Sound screen -----------------------------------------------------------------------
+  // Echo cancellation ([aec] enabled) and music ([music] enabled): two keys of
+  // the satellite's config, shown from `aec_enabled` and `music_enabled` of
+  // `status --json`. The daemon reads them at start only, so `ctl.sh config
+  // aec|music on|off` rewrites the config (checked with --check-config first)
+  // and restarts the daemon. Every change takes two presses; while it runs
+  // the row says Restarting... and nothing else is sent. The texts come from
+  // voicepower.js.
+
+  var SROWS = [
+    { id: 'aec', btn: 's-row-aec', state: 's-aec-state', sw: 's-aec-sw', confirm: 's-aec-confirm' },
+    { id: 'music', btn: 's-row-music', state: 's-music-state', sw: 's-music-sw', confirm: 's-music-confirm' }
+  ];
+  var sArmed = null;    // id of the row waiting for the second press
+  var sArmToken = 0;
+  var sPending = null;  // id of the row whose command runs
+
+  function sModels() { return VP.soundRows(installed() ? st : null); }
+
+  function renderSound() {
+    var m = sModels();
+    var f = -1;
+    for (var i = 0; i < SROWS.length; i++) {
+      var r = SROWS[i];
+      var b = $(r.btn);
+      var armed = sArmed === r.id;
+      var busyRow = sPending === r.id;
+      var inert = !m[i].can || !!sPending;
+      if (document.activeElement === b) { f = i; }
+      text($(r.state), busyRow ? 'Restarting...' : (armed ? 'Press OK again' : m[i].word));
+      $(r.state).className = 'vr-state ' + (busyRow ? 'muted' : (armed ? 'armed' : m[i].cls));
+      $(r.sw).className = 'sw' + (m[i].checked === 'true' ? ' on' : '') + (m[i].can ? '' : ' na');
+      b.className = 'vrow' + (armed ? ' armed' : '') + (inert ? ' is-disabled' : '');
+      b.setAttribute('aria-checked', m[i].checked);
+      b.setAttribute('aria-disabled', inert ? 'true' : 'false');
+      show(r.confirm, armed);
+      text($(r.confirm + '-text'), armed ? m[i].confirm : '');
+    }
+    text($('s-warning'), !sArmed && !sPending && f >= 0 ? m[f].warn : '');
+    if (screen === 'sound') { ensureFocus('s-row-aec'); }
+  }
+
+  function pressSound(id) {
+    if (sPending || busy || overlayOpen()) { return; }
+    var m = sModels()[VP.soundIndex(id)];
+    if (!m.can) { renderSound(); return; }
+    if (sArmed !== id) {
+      sArmed = id;
+      sArmToken++;
+      var token = sArmToken;
+      renderSound();
+      setTimeout(function () { if (sArmToken === token && sArmed === id) { sArmed = null; renderSound(); } }, ARM_MS);
+      return;
+    }
+    sArmed = null;
+    sArmToken++;
+    sPending = id;
+    busy = true;
+    setMsg(VP.SOUND_ROWS[VP.soundIndex(id)].label + ': changing, the voice service restarts...', '');
+    renderSound();
+    ctl(m.cmd, function (r) {
+      busy = false;
+      sPending = null;
+      var res = parseJsonLine(r.out);
+      var key = VP.SOUND_ROWS[VP.soundIndex(id)].key;
+      if (res && st && (res.result === 'applied' || res.result === 'already' || res.result === 'failed') && (res.after === 'on' || res.after === 'off')) {
+        st[key] = res.after === 'on';
+      }
+      var t = VP.soundResult(id, res);
+      setMsg(t[0], t[1]);
+      renderSound();
+      refresh();
+    });
   }
 
   // ---- phone setup (docs/design/phone-setup.md, ADR 0009) -----------------------------
@@ -1123,6 +1206,7 @@
         if (next) { next.focus(); }
       }
       if (screen === 'voice') { renderVoice(); }
+      if (screen === 'sound') { renderSound(); }
       ev.preventDefault();
       return;
     }
@@ -1132,7 +1216,9 @@
   function onClick(id, f) {
     $(id).addEventListener('click', f);
     // The pointer of the Magic Remote moves the focus like the arrows.
-    $(id).addEventListener('mouseover', function () { if (inLayer($(id))) { $(id).focus(); if (screen === 'voice') { renderVoice(); } } });
+    $(id).addEventListener('mouseover', function () {
+      if (inLayer($(id))) { $(id).focus(); if (screen === 'voice') { renderVoice(); } if (screen === 'sound') { renderSound(); } }
+    });
   }
 
   onClick('h-notice-btn', function () {
@@ -1146,6 +1232,7 @@
     else { run('mic off', 'Turning the microphone off...', null, 'Microphone off. The satellite cannot hear.'); }
   });
   onClick('h-voice', openVoice);
+  onClick('h-sound', function () { go('sound'); refresh(); });
   onClick('h-ha', function () { go('ha'); });
   onClick('h-diag', function () { go('diag'); });
 
@@ -1157,6 +1244,7 @@
     $('v-row-ar').focus();
     pressRow('ar');
   });
+  SROWS.forEach(function (r) { onClick(r.btn, function () { pressSound(r.id); }); });
   onClick('v-refresh', function () {
     vDisarm();
     if (vPending) { return; }
@@ -1222,7 +1310,7 @@
   function tick() {
     if (screen === 'voice') { if (!vPending && !vArmed) { readVoice(null); } return; }
     if (screen === 'report') { return; }
-    if (busy) { return; }
+    if (busy || sArmed) { return; }
     refresh();
     refreshTicks++;
     if (screen === 'home' && installed() && refreshTicks % HOME_TV_EVERY === 0) { readTv(); }

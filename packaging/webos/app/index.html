@@ -43,6 +43,10 @@
           <span class="ttop"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 3v8"/><path d="M6.3 6.8a8 8 0 1 0 11.4 0"/></svg></span>
           <span class="tile-text"><span class="tile-t">Voice and power</span><span class="tile-s">Always Ready, Hi LG, Keep listening</span></span>
         </button>
+        <button id="h-sound" class="tile">
+          <span class="ttop"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9h4l5-4v14l-5-4H4z"/><path d="M16.5 8.5a5 5 0 0 1 0 7"/><path d="M19 6a8.5 8.5 0 0 1 0 12"/></svg></span>
+          <span class="tile-text"><span class="tile-t">Sound</span><span id="h-sound-sub" class="tile-s">Echo cancellation, music</span></span>
+        </button>
         <button id="h-ha" class="tile">
           <span class="ttop"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path d="M3 11l9-7 9 7"/><path d="M5 10v10h14V10"/><circle cx="12" cy="14" r="2"/></svg></span>
           <span class="tile-text"><span class="tile-t">Home Assistant</span><span id="h-ha-sub" class="tile-s">Port 6053</span></span>
@@ -92,6 +96,35 @@
             <button id="v-hint-btn" class="btn" hidden>Turn on Always Ready</button>
           </div>
           <p id="v-warning" class="help"></p>
+        </div>
+      </div>
+    </section>
+
+    <!-- Sound: echo cancellation and music (config keys; a change restarts the daemon) -->
+    <section id="sound" class="screen" hidden>
+      <div class="vgrid">
+        <div class="vrows">
+          <button id="s-row-aec" class="vrow" role="switch" aria-checked="false">
+            <span class="vr-label">Echo cancellation<span class="vr-tag">Satellite</span></span>
+            <span id="s-aec-state" class="vr-state muted">Checking...</span><span id="s-aec-sw" class="sw na"></span>
+            <span class="vr-sub">Lets the TV hear you while it plays sound. Uses a little more CPU.</span>
+            <span id="s-aec-confirm" class="vr-confirm" hidden><span id="s-aec-confirm-text"></span><span class="bar"><i></i></span></span>
+          </button>
+          <button id="s-row-music" class="vrow" role="switch" aria-checked="false">
+            <span class="vr-label">Music<span class="vr-tag">Satellite</span></span>
+            <span id="s-music-state" class="vr-state muted">Checking...</span><span id="s-music-sw" class="sw na"></span>
+            <span class="vr-sub">Lets Home Assistant or Music Assistant play music on this TV. Experimental.</span>
+            <span id="s-music-confirm" class="vr-confirm" hidden><span id="s-music-confirm-text"></span><span class="bar"><i></i></span></span>
+          </button>
+          <p id="s-msg" class="msg" aria-live="polite"></p>
+        </div>
+        <div class="vside">
+          <div class="outcome">
+            <div class="sc-label">Applying a change</div>
+            <div id="s-note-head" class="oc-head">A change restarts the voice service briefly.</div>
+            <div id="s-note-detail" class="oc-detail">The satellite stops listening for a few seconds, then Home Assistant reconnects by itself. An open phone setup session ends.</div>
+          </div>
+          <p id="s-warning" class="help"></p>
         </div>
       </div>
     </section>
