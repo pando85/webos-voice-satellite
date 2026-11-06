@@ -270,7 +270,6 @@ impl Music {
     }
 
     /// Something is loaded, playing or paused.
-    #[cfg(test)]
     pub(crate) fn is_active(&self) -> bool {
         self.current.is_some()
     }

@@ -448,6 +448,16 @@ pub enum AppCommand {
         /// The state, or `None` for unknown.
         state: Option<bool>,
     },
+    /// Sends the stored state of a generic switch entity again, even though
+    /// it did not change. For a command the application refused or could not
+    /// carry out: HA does not set the state itself, so this gives it the real
+    /// state again. Whether HA's UI then reverts is unverified (HA may drop a
+    /// state equal to the one it holds). Nothing is sent without a
+    /// subscribed session; an unknown id is ignored.
+    ResendSwitch {
+        /// The switch's object id.
+        object_id: String,
+    },
     /// The state of a text sensor entity ([`crate::Config::text_sensors`]).
     /// `None` means no valid state (HA shows "unknown"). An unchanged state is
     /// not repeated.
@@ -648,6 +658,10 @@ impl fmt::Debug for AppCommand {
                 .debug_struct("SetNumber")
                 .field("object_id", object_id)
                 .field("value", value)
+                .finish(),
+            Self::ResendSwitch { object_id } => f
+                .debug_struct("ResendSwitch")
+                .field("object_id", object_id)
                 .finish(),
             Self::SetBinarySensor { object_id, state } => f
                 .debug_struct("SetBinarySensor")

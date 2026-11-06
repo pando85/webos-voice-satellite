@@ -60,6 +60,12 @@ if [ -f "$LOG" ] && [ "$(wc -c <"$LOG")" -gt "$max" ]; then
 fi
 
 cd "$PREFIX"
+# The install lock (lib.sh lock_take) is held by whoever called us, and
+# WEBOS_SAT_LOCK_HELD tells that caller's children so. The daemon (and the
+# supervisor) outlive that operation and must not pass the claim on to a
+# later `ctl.sh` it starts (the config switches of ADR 0012): that one would
+# skip the lock and run beside an update.
+unset WEBOS_SAT_LOCK_HELD
 # New session (setsid when present, see lib.sh): the daemon must not depend
 # on the caller's session, for example a Homebrew Channel exec from the app.
 # shellcheck disable=SC2086 # $SETSID is empty or one word

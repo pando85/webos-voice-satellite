@@ -466,6 +466,12 @@
       return [row.label + ' is now ' + w(r.after) + '.' + tail, 'ok'];
     }
     if (r.result === 'already') { return ['Already ' + w(r.after || r.before) + '. Nothing changed.', 'ok']; }
+    // Refused by a guard of ctl.sh (the same for Home Assistant's switch):
+    // nothing was changed, and it is no failure.
+    if (r.result === 'refused' && r.reason === 'cooldown') {
+      return [row.label + ' was changed moments ago. Try again in ' + (r.retry_in_s || 30) + ' s. Nothing changed.', 'warn'];
+    }
+    if (r.result === 'refused' && r.reason === 'busy') { return ['Not now: ' + r.error + '. Nothing changed.', 'warn']; }
     var why = r.error ? r.error : 'no reason given';
     return ['Could not change ' + row.label + ': ' + why + '.' + (r.daemon === 'failed' ? ' The satellite is not running: see Diagnostics.' : ''), 'bad'];
   }

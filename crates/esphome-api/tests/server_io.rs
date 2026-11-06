@@ -948,6 +948,17 @@ async fn switch_text_sensor_and_app_owned_select_entities() {
     assert_eq!((s.state, s.missing_state), (true, false));
     let s: pb::SwitchStateResponse = c.recv_as().await;
     assert_eq!((s.state, s.missing_state), (false, false), "no duplicate");
+    // ResendSwitch repeats the stored state (for a refused command); an
+    // unknown id is ignored.
+    for id in ["tv_screen", "nope"] {
+        cmds.send(AppCommand::ResendSwitch {
+            object_id: id.into(),
+        })
+        .await
+        .unwrap();
+    }
+    let s: pb::SwitchStateResponse = c.recv_as().await;
+    assert_eq!((s.key, s.state, s.missing_state), (sw.key, false, false));
     cmds.send(AppCommand::SetTextSensor {
         object_id: "tv_sound_output".into(),
         state: Some("external_arc".into()),

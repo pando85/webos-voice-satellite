@@ -1340,6 +1340,7 @@ impl Ctx {
             AppCommand::SetSwitch { object_id, state } => {
                 self.set_switch(&object_id, state).await;
             }
+            AppCommand::ResendSwitch { object_id } => self.resend_switch(&object_id).await,
             AppCommand::SetTextSensor { object_id, state } => {
                 self.set_text_sensor(&object_id, state).await;
             }
@@ -1431,6 +1432,22 @@ impl Ctx {
             return;
         }
         self.switches[i] = state;
+        if let Err(err) = self.send_switch_state(i).await {
+            self.close(&err.to_string());
+        }
+    }
+
+    /// `ResendSwitch`: the stored state again (see [`AppCommand::ResendSwitch`]).
+    async fn resend_switch(&mut self, object_id: &str) {
+        let Some(i) = self
+            .cfg
+            .switches
+            .iter()
+            .position(|sw| sw.object_id == object_id)
+        else {
+            log::warn!("esphome-api: ResendSwitch for unknown switch {object_id:?} ignored");
+            return;
+        };
         if let Err(err) = self.send_switch_state(i).await {
             self.close(&err.to_string());
         }

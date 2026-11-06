@@ -50,7 +50,13 @@
 #                     --check-config first, never installed when the check
 #                     fails) and restarts a running daemon, which ends a
 #                     phone setup session (so it is not a `set`: nothing the
-#                     setup server runs may stop it). One JSON line
+#                     setup server runs may stop it). The guards live here, so
+#                     the TV app and Home Assistant's switch behave the same:
+#                     a change within 30 s of the previous one is refused
+#                     (run/config-change.stamp), and so is one while the
+#                     daemon reports a voice request, music or the timer
+#                     alarm in run/voice.json. One JSON line (result,
+#                     daemon, error, reason cooldown|busy, retry_in_s)
 #   setup start|status --json|answer ID allow|refuse|stop
 #                     the phone setup web server (ADR 0009): start runs it
 #                     (only on this explicit call, never at boot), status is
@@ -70,7 +76,9 @@
 # WEBOS_SAT_LOCK, WEBOS_SAT_ALLOW_NONROOT=1 (skip the root check),
 # WEBOS_SAT_LUNA_SEND (default luna-send), WEBOS_SAT_SETTLE (seconds before a
 # read-back, default 0.5), WEBOS_SAT_SETUP_DIR (the setup session directory,
-# default /tmp/webos-satellite-setup), WEBOS_SAT_SETUP_BIN (the setup server).
+# default /tmp/webos-satellite-setup), WEBOS_SAT_SETUP_BIN (the setup server),
+# WEBOS_SAT_SOURCE (ha: the daemon asked for `config`, for the history line;
+# anything else is logged as ctl).
 # Exit status: 0 done, 1 failed (message on stderr), 2 usage.
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
@@ -78,7 +86,7 @@ here=$(cd "$(dirname "$0")" && pwd)
 . "$here/lib.sh"
 
 usage() {
-    sed -n '2,73p' "$0" >&2
+    sed -n '2,82p' "$0" >&2
     exit 2
 }
 
@@ -1100,9 +1108,13 @@ cfg_restart() {
     sh "$P/bin/start.sh" --supervise >&2 || return 1
 }
 
-cfg_emit() { # SETTING REQUESTED BEFORE AFTER RESULT ERROR DAEMON
-    printf '{"schema":1,"setting":%s,"requested":%s,"before":%s,"after":%s,"result":%s,"daemon":%s,"error":%s}\n' \
-        "$(json_str "$1")" "$(json_str "$2")" "$(json_str "$3")" "$(json_str "$4")" "$(json_str "$5")" "$(json_str "$7")" "$(json_str "$6")"
+# The one JSON line (schema 1) and a note on stderr. REASON is cooldown or
+# busy for a refusal by a guard, else empty; RETRY is a number of seconds
+# (cooldown) or empty (null). Both are appended last.
+cfg_emit() { # SETTING REQUESTED BEFORE AFTER RESULT ERROR DAEMON [REASON [RETRY]]
+    printf '{"schema":1,"setting":%s,"requested":%s,"before":%s,"after":%s,"result":%s,"daemon":%s,"error":%s,"reason":%s,"retry_in_s":%s}\n' \
+        "$(json_str "$1")" "$(json_str "$2")" "$(json_str "$3")" "$(json_str "$4")" "$(json_str "$5")" "$(json_str "$7")" "$(json_str "$6")" \
+        "$(json_str "${8:-}")" "${9:-null}"
     case $5 in
     applied) echo "$1 is now $4 (was $3; daemon: $7)" >&2 ;;
     already) echo "$1 is already $4; nothing changed" >&2 ;;
@@ -1110,6 +1122,62 @@ cfg_emit() { # SETTING REQUESTED BEFORE AFTER RESULT ERROR DAEMON
     esac
     case $5 in applied | already) return 0 ;; *) return 1 ;; esac
 }
+
+# The cooldown between two config changes, whoever asks (the TV app, Home
+# Assistant's switch, a shell): a change restarts the daemon, which ends a
+# phone setup session and interrupts listening. The stamp holds the unix time
+# of the last change, written just before the config is replaced. It blocks
+# while t <= now+30 and now < t+30; a missing, garbled or far-future stamp
+# (a clock set back) blocks nothing, so a wrong file cannot lock the
+# settings for long.
+CFG_COOLDOWN=30
+
+# Prints the seconds left of the cooldown (0 when it does not run).
+cfg_cooldown_left() {
+    t=
+    IFS= read -r t 2>/dev/null <"$RUN_DIR/config-change.stamp" || true
+    case $t in '' | 0* | *[!0-9]*) echo 0; return 0 ;; esac
+    [ ${#t} -le 12 ] || { echo 0; return 0; }
+    now=$(date +%s)
+    case $now in '' | *[!0-9]*) echo 0; return 0 ;; esac
+    if [ "$t" -le $((now + CFG_COOLDOWN)) ] && [ "$now" -lt $((t + CFG_COOLDOWN)) ]; then
+        echo $((t + CFG_COOLDOWN - now))
+    else
+        echo 0
+    fi
+}
+
+# Writes the stamp (now, mode 0600) through a temporary file and a rename.
+cfg_stamp_write() {
+    sf=$RUN_DIR/config-change.stamp
+    mkdir -p "$RUN_DIR" 2>/dev/null || return 1
+    now=$(date +%s)
+    case $now in '' | *[!0-9]*) return 1 ;; esac
+    if (umask 077 && echo "$now" >"$sf.new.$$") && mv -f "$sf.new.$$" "$sf"; then
+        chmod 600 "$sf" 2>/dev/null || true
+        return 0
+    fi
+    rm -f "$sf.new.$$"
+    return 1
+}
+
+# Prints voice, music or alarm when the running daemon reports that activity
+# in a fresh run/voice.json (the daemon's one definition of busy). A missing,
+# stale or null field, a daemon that is not running or one that does not
+# write the field yet (an older version) prints nothing: proceed.
+cfg_busy() {
+    running && voice_fresh || return 0
+    bz=$(voice_field busy)
+    case $bz in voice | music | alarm) echo "$bz" ;; esac
+    return 0
+}
+
+# Who asked, for the history line: the daemon sets WEBOS_SAT_SOURCE=ha when
+# it runs this for Home Assistant's switch (ADR 0012); anything else is ctl.
+case ${WEBOS_SAT_SOURCE:-} in
+ha) CFG_SOURCE=ha ;;
+*) CFG_SOURCE=ctl ;;
+esac
 
 cmd_config_set() { # aec|music on|off, already validated
     st=$1
@@ -1127,6 +1195,13 @@ cmd_config_set() { # aec|music on|off, already validated
         cfg_emit "$st" "$want" "$before" "$before" already "" none
         return
     fi
+    left=$(cfg_cooldown_left)
+    if [ "$left" -gt 0 ]; then
+        ago=$((CFG_COOLDOWN - left))
+        [ "$ago" -ge 0 ] || ago=0
+        cfg_emit "$st" "$want" "$before" "$before" refused "the last change was $ago s ago; try again in $left s" none cooldown "$left"
+        return
+    fi
     v=false
     [ "$want" != on ] || v=true
     new=$CFG.new.$$
@@ -1140,12 +1215,36 @@ cmd_config_set() { # aec|music on|off, already validated
         err="the config could not be changed automatically, nothing changed: set [$st] enabled = $v by hand"
     elif ! chmod 600 "$new" || ! cp -p "$CFG" "$prev"; then
         err="cannot keep a copy of the config"
-    elif ! mv -f "$new" "$CFG"; then
-        err="cannot replace the config"
     fi
     if [ -n "$err" ]; then
         rm -f "$new" "$prev"
-        history_add "$st result from=$before to=$want read=$before outcome=failed source=ctl" || true
+        history_add "$st result from=$before to=$want read=$before outcome=failed source=$CFG_SOURCE" || true
+        cfg_emit "$st" "$want" "$before" "$before" failed "$err" none
+        return
+    fi
+    bz=$(cfg_busy)
+    if [ -n "$bz" ]; then
+        rm -f "$new" "$prev"
+        case $bz in
+        voice) err="a voice request is in progress" ;;
+        music) err="music is loaded (playing or paused)" ;;
+        *) err="a timer alarm is active" ;;
+        esac
+        cfg_emit "$st" "$want" "$before" "$before" refused "$err" none busy
+        return
+    fi
+    # The stamp goes first, so a restart that follows cannot lose it. Without
+    # it the cooldown is void, so a stamp that cannot be written stops here.
+    if ! cfg_stamp_write; then
+        err="cannot write the cooldown file"
+    elif ! mv -f "$new" "$CFG"; then
+        err="cannot replace the config"
+        # Nothing changed, so the cooldown must not run either.
+        rm -f "$RUN_DIR/config-change.stamp"
+    fi
+    if [ -n "$err" ]; then
+        rm -f "$new" "$prev"
+        history_add "$st result from=$before to=$want read=$before outcome=failed source=$CFG_SOURCE" || true
         cfg_emit "$st" "$want" "$before" "$before" failed "$err" none
         return
     fi
@@ -1166,7 +1265,7 @@ cmd_config_set() { # aec|music on|off, already validated
         fi
     fi
     rm -f "$prev"
-    history_add "$st result from=$before to=$want read=$after outcome=$res source=ctl" || true
+    history_add "$st result from=$before to=$want read=$after outcome=$res source=$CFG_SOURCE" || true
     cfg_emit "$st" "$want" "$before" "$after" "$res" "$err" "$d"
 }
 

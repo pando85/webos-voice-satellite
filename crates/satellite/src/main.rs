@@ -17,6 +17,7 @@ mod alarm;
 mod capture;
 mod compat;
 mod config;
+mod config_switch;
 mod daemon;
 mod darken;
 mod firmware;

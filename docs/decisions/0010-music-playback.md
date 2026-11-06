@@ -1,6 +1,7 @@
 # ADR 0010: Music playback through the Home Assistant integration
 
 - **Status:** **Accepted for option B (owner, 2026-11-05).** AirPlay (option A) **rejected by the owner**. The owner accepted the plan's defaults D1 to D14 on 2026-11-05. Built and tested on the PC up to the daemon integration (milestones M1 to M5, behind `[music] enabled = false`); nothing run on a TV yet.
+- **Amended 2026-11-06:** the `[music] enabled` setting can also be changed from Home Assistant's `music_enabled` switch ([ADR 0012](0012-config-switches-in-ha.md)); the default stays off.
 - **Scope:** how music reaches the TV speaker under Home Assistant control. Plan, evidence and milestones: [music playback design](../design/music-playback.md).
 - **Related:** [ADR 0001](0001-esphome-native-api.md), [ADR 0003](0003-server-side-wake-word-for-mvp.md), [ADR 0007](0007-tv-media-player.md), [requirements](../project/requirements.md) (F8 and the MVP non-goal "writing AirPlay or a music player", lifted for this feature below), [backlog #5](../project/backlog.md#5-music-playback-through-the-satellites-esphome-media_player), [AEC front-end](../design/aec-frontend.md).
 

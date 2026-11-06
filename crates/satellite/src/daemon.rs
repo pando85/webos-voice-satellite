@@ -37,6 +37,7 @@ use crate::capture::{
 };
 use crate::compat::{self, Compat, ModelState};
 use crate::config::{Hang, MicSource, Mode, RemoteOff, Settings, TestTriggers};
+use crate::config_switch::{self, ConfigSwitches};
 use crate::darken::{self, Action, Darkener};
 use crate::firmware::{self, Model, Verdict};
 use crate::music::{End, Music};
@@ -44,7 +45,7 @@ use crate::player::{Done, Kind, Player, redact_url};
 use crate::power::{self, PowerUpdate};
 use crate::selfcheck::Note;
 use crate::tv_control::{self, Tv, TvMsg};
-use crate::voice_status::{Ha, Mic, VoiceFile, VoiceStatus};
+use crate::voice_status::{Busy, Ha, Mic, VoiceFile, VoiceStatus};
 use crate::volume::{self, SharedGain};
 use crate::watchdog::{self, Beats};
 use crate::{resume, volume::Origin};
@@ -562,6 +563,9 @@ struct Daemon {
     voice_file: VoiceFile,
     /// Music on the media player (`[music] enabled`).
     music: Option<Music>,
+    /// HA's `aec_enabled` and `music_enabled` switches (ADR 0012), when
+    /// `ctl.sh` is found.
+    config_switches: Option<ConfigSwitches>,
 }
 
 impl Daemon {
@@ -668,6 +672,27 @@ impl Daemon {
         }
     }
 
+    /// What keeps the daemon from a restart now, in this order: a voice run
+    /// (a conversation, or a reply or announcement playing), music loaded,
+    /// the timer alarm queued or ringing. The one definition for
+    /// `run/voice.json` (`busy`, read by `ctl.sh config`) and for HA's config
+    /// switches.
+    fn busy(&self) -> Option<Busy> {
+        // The alarm chime plays through the player: it is the alarm, not a
+        // voice run (a reply taking the speaker from it counts as voice).
+        let voice_playback =
+            self.player.is_active() && self.player.current_kind() != Some(Kind::Alarm);
+        if self.in_run || voice_playback {
+            Some(Busy::Voice)
+        } else if self.music.as_ref().is_some_and(Music::is_active) {
+            Some(Busy::Music)
+        } else if self.alarm.phase() != Phase::Idle {
+            Some(Busy::Alarm)
+        } else {
+            None
+        }
+    }
+
     /// Writes `run/voice.json` if its content changed (or the keep-alive is
     /// due).
     fn publish_voice_status(&mut self) {
@@ -690,6 +715,7 @@ impl Daemon {
             pairing_until: self.pairing_until_epoch(),
             ha,
             ha_since: self.ha_since,
+            busy: self.busy(),
             music: Some(self.music.as_ref().map_or_else(
                 || crate::music::DISABLED_JSON.to_owned(),
                 |m| m.status_json(Instant::now()),
@@ -948,6 +974,20 @@ impl Daemon {
                 "cannot store the reply volume in {}: {e} (it is lost at the next restart)",
                 self.volume_file.display()
             );
+        }
+    }
+
+    /// HA flipped `aec_enabled` or `music_enabled` (ADR 0012): `ctl.sh
+    /// config` runs detached unless a guard refuses; a refusal or failure
+    /// sends the real state again.
+    async fn on_config_switch(&mut self, setting: config_switch::Setting, want: bool) {
+        let busy = self.busy();
+        let cmd_tx = self.cmd_tx.clone();
+        let Some(cs) = self.config_switches.as_mut() else {
+            return;
+        };
+        if let Some(cmd) = cs.on_request(setting, want, busy, &cmd_tx) {
+            self.send(cmd).await;
         }
     }
 
@@ -1394,6 +1434,12 @@ impl Daemon {
                 compat::FIRMWARE_ACK => self.acknowledge_firmware("Home Assistant").await,
                 other => log::debug!("button {other} pressed (no action)"),
             },
+            AppEvent::SwitchChanged { object_id, state } => {
+                match config_switch::Setting::from_object_id(&object_id) {
+                    Some(setting) => self.on_config_switch(setting, state).await,
+                    None => log::debug!("switch {object_id} changed (no action)"),
+                }
+            }
             AppEvent::VolumeChanged(percent) => self.on_volume(percent),
             AppEvent::SelectChanged { object_id, option } => self.on_select(&object_id, &option),
             AppEvent::MuteChanged(muted) => {
@@ -1628,6 +1674,14 @@ pub(crate) async fn run(mut settings: Settings, triggers: TestTriggers) -> Resul
     let status = firmware::evaluate(&settings, info.clone(), model_arg);
     let mut compat = Compat::new(&settings, info, model_state, status.clone());
     compat::add_entities(&mut esp, settings.safety.self_check);
+    // HA's two config switches, after the TV control and compatibility
+    // entities so the built-in mute switch stays first and the others keep
+    // their order (ADR 0012). Absent when ctl.sh is not found.
+    let config_switches = ConfigSwitches::new(&settings);
+    if let Some(cs) = &config_switches {
+        esp.switches.extend(config_switch::entities());
+        cs.spawn_last_change_log();
+    }
     // Reply volume.
     let (reply_volume, origin) = volume::load(&settings.sink.volume_file, settings.sink.volume);
     match origin {
@@ -1758,6 +1812,11 @@ pub(crate) async fn run(mut settings: Settings, triggers: TestTriggers) -> Resul
             })
             .await;
     }
+    if let Some(cs) = &config_switches {
+        for cmd in cs.initial_commands() {
+            let _ = cmd_tx.send(cmd).await;
+        }
+    }
     let server_task = tokio::spawn(server.run(ev_tx, cmd_rx));
 
     let (done_tx, mut done_rx) = mpsc::unbounded_channel();
@@ -1825,6 +1884,7 @@ pub(crate) async fn run(mut settings: Settings, triggers: TestTriggers) -> Resul
         compat_poll: 0,
         voice_file: VoiceFile::new(&settings.report.dir_or_default()),
         music,
+        config_switches,
     };
     d.publish_voice_status();
     d.publish_timers().await;
@@ -2272,6 +2332,7 @@ mod tests {
             compat_poll: 0,
             voice_file: VoiceFile::new(&dir.join("run")),
             music: None,
+            config_switches: None,
         };
         (d, cmd_rx)
     }
@@ -2292,6 +2353,42 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn config_switch_requests_follow_the_guards() {
+        use webos_esphome_api::AppEvent;
+        let dir = test_dir("cfgsw");
+        let (mut d, mut rx) = test_daemon(&dir, RemoteOff::Normal, false);
+        let ev = |id: &str, state: bool| AppEvent::SwitchChanged {
+            object_id: id.to_owned(),
+            state,
+        };
+        // Without ctl.sh the switches do not exist: nothing happens.
+        d.on_event(ev(config_switch::AEC_ID, false)).await;
+        assert!(rx.try_recv().is_err());
+        d.config_switches = Some(ConfigSwitches::fixture(
+            true,
+            false,
+            Path::new("/nonexistent"),
+            &dir.join("run"),
+        ));
+        // Another switch id is not a config switch.
+        d.on_event(ev("tv_screen", true)).await;
+        assert!(rx.try_recv().is_err());
+        // The state in force: nothing to do, nothing sent.
+        d.on_event(ev(config_switch::AEC_ID, true)).await;
+        assert!(rx.try_recv().is_err());
+        // A conversation is running: refused, the stored state is sent again.
+        d.in_run = true;
+        d.on_event(ev(config_switch::AEC_ID, false)).await;
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            AppCommand::ResendSwitch {
+                object_id: config_switch::AEC_ID.to_owned()
+            }
+        );
+        d.in_run = false;
     }
 
     #[tokio::test]
@@ -2711,6 +2808,7 @@ esac
                 "\"pairing_until\"",
                 "\"ha\"",
                 "\"ha_since\"",
+                "\"busy\"",
                 "\"music\""
             ]
         );
@@ -2823,6 +2921,143 @@ esac
             Some(Duration::from_secs(20)),
         );
         d.music.as_mut().unwrap().play_test_source(Box::new(src));
+    }
+
+    /// Every command in `rx` now.
+    fn drain(rx: &mut mpsc::Receiver<AppCommand>) -> Vec<AppCommand> {
+        let mut v = Vec::new();
+        while let Ok(c) = rx.try_recv() {
+            v.push(c);
+        }
+        v
+    }
+
+    #[tokio::test]
+    async fn config_switch_is_refused_for_each_kind_of_activity() {
+        use webos_esphome_api::AppEvent;
+        let resend = AppCommand::ResendSwitch {
+            object_id: config_switch::AEC_ID.to_owned(),
+        };
+        let flip = AppEvent::SwitchChanged {
+            object_id: config_switch::AEC_ID.to_owned(),
+            state: false,
+        };
+        // 0: music, 1: the timer alarm, 2: the player (a reply streaming in).
+        for (n, what) in ["music", "alarm", "player"].into_iter().enumerate() {
+            let dir = test_dir(&format!("cfgsw-busy-{what}"));
+            let (mut d, mut rx, mut mrx, mut drx) = music_daemon(&dir);
+            d.config_switches = Some(ConfigSwitches::fixture(
+                true,
+                false,
+                Path::new("/nonexistent"),
+                &dir.join("run"),
+            ));
+            match n {
+                0 => tone(&mut d),
+                1 => assert!(d.alarm.on_finished("t1", std::time::Instant::now())),
+                _ => {
+                    d.player.start_stream(16_000, 1);
+                    assert!(d.player.is_active());
+                }
+            }
+            drive(&mut d, &mut mrx, &mut drx, 50).await;
+            let _ = drain(&mut rx);
+            let want = [Busy::Music, Busy::Alarm, Busy::Voice][n];
+            assert_eq!(d.busy(), Some(want), "{what}: the reason produced");
+            assert_eq!(
+                config_switch::decide(true, false, d.busy(), false),
+                config_switch::Decision::Refuse(want.reason()),
+                "{what}: the refusal text"
+            );
+            d.on_event(flip.clone()).await;
+            assert!(
+                drain(&mut rx).contains(&resend),
+                "{what}: refused with the stored state sent again"
+            );
+        }
+        // Control: the same request with nothing active is accepted: it
+        // starts bin/ctl.sh of the install, here a script that records its
+        // arguments.
+        let dir = test_dir("cfgsw-busy-none");
+        let (mut d, mut rx, _mrx, _drx) = music_daemon(&dir);
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        std::fs::write(
+            dir.join("bin").join("ctl.sh"),
+            "#!/bin/sh\necho \"$@\" > \"$WEBOS_SAT_PREFIX/marker\"\n",
+        )
+        .unwrap();
+        d.config_switches = Some(ConfigSwitches::fixture(true, false, &dir, &dir.join("run")));
+        let _ = drain(&mut rx);
+        d.on_event(flip).await;
+        let marker = dir.join("marker");
+        for _ in 0..100 {
+            if marker.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap().trim(),
+            "config aec off"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_ringing_alarm_is_busy_alarm_not_voice() {
+        let dir = test_dir("busy-ringing");
+        let (mut d, _rx, _mrx, _drx) = music_daemon(&dir);
+        let file = dir.join("run").join(crate::voice_status::FILE);
+        assert!(d.alarm.on_finished("t1", std::time::Instant::now()));
+        d.alarm_poll().await;
+        assert_eq!(d.alarm.phase(), Phase::Ringing, "the chime started");
+        assert_eq!(d.player.current_kind(), Some(Kind::Alarm));
+        assert!(d.player.is_active());
+        assert_eq!(d.busy(), Some(Busy::Alarm));
+        d.publish_voice_status();
+        assert!(
+            std::fs::read_to_string(&file)
+                .unwrap()
+                .contains("\"busy\":\"alarm\"")
+        );
+        assert_eq!(
+            config_switch::decide(true, false, d.busy(), false),
+            config_switch::Decision::Refuse("a timer alarm is active")
+        );
+        // A reply that takes the speaker is a voice run again.
+        d.player.start_stream(16_000, 1);
+        assert_eq!(d.busy(), Some(Busy::Voice));
+        d.halt_chime();
+    }
+
+    #[tokio::test]
+    async fn busy_follows_run_music_and_alarm() {
+        let dir = test_dir("busy-word");
+        let (mut d, _rx, mut mrx, mut drx) = music_daemon(&dir);
+        let file = dir.join("run").join(crate::voice_status::FILE);
+        let read = |d: &mut Daemon| {
+            d.publish_voice_status();
+            std::fs::read_to_string(&file).unwrap()
+        };
+        assert_eq!(d.busy(), None);
+        assert!(read(&mut d).contains("\"ha_since\":1762000000,\"busy\":null,\"music\":"));
+        // Alarm alone.
+        assert!(d.alarm.on_finished("t1", std::time::Instant::now()));
+        assert_eq!(d.busy(), Some(Busy::Alarm));
+        assert!(read(&mut d).contains("\"busy\":\"alarm\""));
+        // Music is listed before the alarm.
+        tone(&mut d);
+        drive(&mut d, &mut mrx, &mut drx, 50).await;
+        assert_eq!(d.busy(), Some(Busy::Music));
+        assert!(read(&mut d).contains("\"busy\":\"music\""));
+        // A voice run wins over both.
+        d.in_run = true;
+        assert_eq!(d.busy(), Some(Busy::Voice));
+        assert!(read(&mut d).contains("\"busy\":\"voice\""));
+        d.in_run = false;
+        assert_eq!(d.busy(), Some(Busy::Music));
+        // The player (a reply streaming in) is a voice run too.
+        d.player.start_stream(16_000, 1);
+        assert_eq!(d.busy(), Some(Busy::Voice));
     }
 
     #[tokio::test]

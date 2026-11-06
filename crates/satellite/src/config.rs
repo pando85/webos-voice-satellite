@@ -52,6 +52,12 @@ pub(crate) struct Settings {
     pub(crate) report: ReportSection,
     /// Music on the satellite's media player (off by default; ADR 0010).
     pub(crate) music: MusicSection,
+    /// The install directory (the parent of `etc/`), when the config sits in
+    /// an `etc/` directory (like the default `report.dir`). Not a config key.
+    /// HA's two config switches (ADR 0012) run `bin/ctl.sh` of it with
+    /// `WEBOS_SAT_PREFIX` set to it; `None` off the TV.
+    #[serde(skip)]
+    pub(crate) install_prefix: Option<PathBuf>,
 }
 
 /// How pipeline runs start.
@@ -1125,6 +1131,13 @@ impl Settings {
             }
             None => {}
         }
+        if base.file_name().is_some_and(|n| n == "etc") {
+            // Absolute; `std::path::absolute` keeps any `..` of `base`.
+            // ctl.sh's `check_prefix` validates the prefix it is given.
+            s.install_prefix = std::path::absolute(base)
+                .ok()
+                .and_then(|b| b.parent().map(Path::to_path_buf));
+        }
         resolve(base, &mut s.pairing.state_dir);
         if let Some(p) = s.aec.reference_path.as_mut() {
             resolve(base, p);
@@ -2064,6 +2077,19 @@ level = "debug"
         expected.pairing.state_dir = base.join("pairing");
         expected.safety.firmware_seen_file = Some(base.join("firmware_seen"));
         assert_eq!(s, expected);
+    }
+
+    #[test]
+    fn install_prefix_is_known_only_for_a_config_in_an_etc_directory() {
+        let s = Settings::from_toml("", Path::new("/var/lib/webos-satellite/etc")).unwrap();
+        assert_eq!(
+            s.install_prefix,
+            Some(PathBuf::from("/var/lib/webos-satellite"))
+        );
+        let s = Settings::from_toml("", Path::new("/cfg")).unwrap();
+        assert_eq!(s.install_prefix, None);
+        // Not a config key.
+        assert!(Settings::from_toml("install_prefix = \"x\"\n", Path::new("/cfg")).is_err());
     }
 
     #[test]

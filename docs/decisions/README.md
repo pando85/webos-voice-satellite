@@ -17,6 +17,7 @@ Record decisions once supported by evidence or by an explicit owner decision. Us
 | [0009](0009-phone-setup-web-server.md) | A phone setup web server on the TV, started from the TV app (QR code, one-time URL, every change approved on the TV) | Accepted (2026-11-05, owner); design only, not implemented, TV network probe pending |
 | [0010](0010-music-playback.md) | Music playback through the Home Assistant integration | Accepted for option B (2026-11-05, owner); AirPlay rejected; design only, not implemented, defaults to confirm |
 | [0011](0011-aec-on-by-default.md) | Echo cancellation on by default (B + NS), as a user setting | Accepted (2026-11-05, owner); implemented in 0.4.3; benefit not significant in the live A/Bs |
+| [0012](0012-config-switches-in-ha.md) | Echo cancellation and music as HA config switches that run `ctl.sh config` | Accepted (2026-11-06, owner); implemented on the host, not run on a TV |
 
 These ADRs record **owner decisions** supported by discovery on c3-a (ADR 0005 and 0007 also by checks on c3-b). They do not claim that the chosen route has been verified end to end; open verification work is in the [roadmap](../project/roadmap.md).
 

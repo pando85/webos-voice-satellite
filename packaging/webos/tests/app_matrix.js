@@ -553,6 +553,15 @@ const nextTick = () => T.timers.filter((t) => t.live && t.interval && t.ms === 1
     JSON.stringify(VP.soundResult('music', res({ setting: 'music', result: 'failed', after: 'off', before: 'off', error: 'the satellite did not start with the new setting; the previous setting is back' })))
       === JSON.stringify(['Could not change Music: the satellite did not start with the new setting; the previous setting is back.', 'bad'])
     && / The satellite is not running: see Diagnostics\.$/.test(VP.soundResult('music', res({ setting: 'music', result: 'failed', daemon: 'failed', error: 'x' }))[0]));
+  const cd = (o) => res(Object.assign({ result: 'refused', after: 'on', before: 'on', daemon: 'none', error: 'the last change was 5 s ago; try again in 25 s', reason: 'cooldown', retry_in_s: 25 }, o));
+  check('sound result: refused by the cooldown, with and without retry_in_s (warn, nothing changed)',
+    JSON.stringify(VP.soundResult('aec', cd({}))) === JSON.stringify(['Echo cancellation was changed moments ago. Try again in 25 s. Nothing changed.', 'warn'])
+    && JSON.stringify(VP.soundResult('music', cd({ setting: 'music', retry_in_s: null }))) === JSON.stringify(['Music was changed moments ago. Try again in 30 s. Nothing changed.', 'warn']));
+  check('sound result: refused while busy, for each kind (the reason text from ctl.sh)',
+    [['a voice request is in progress'], ['music is loaded (playing or paused)'], ['a timer alarm is active']].every(([e]) =>
+      JSON.stringify(VP.soundResult('aec', cd({ reason: 'busy', error: e, retry_in_s: null }))) === JSON.stringify(['Not now: ' + e + '. Nothing changed.', 'warn'])));
+  check('sound result: a refusal without a reason (an older ctl.sh) keeps the generic text',
+    JSON.stringify(VP.soundResult('aec', res({ result: 'refused', error: 'no config file', daemon: 'none' }))) === JSON.stringify(['Could not change Echo cancellation: no config file.', 'bad']));
   check('sound result: no or another reply', VP.soundResult('aec', null)[1] === 'bad' && /Could not confirm the change of Echo cancellation/.test(VP.soundResult('aec', res({ setting: 'music' }))[0]));
   check('the phone has no request for these two settings (a restart ends its session)', VP.requestText('aec', 'off') === null && VP.requestText('music', 'on') === null
     && !('aec' in VP.REQUEST) && !('music' in VP.REQUEST));

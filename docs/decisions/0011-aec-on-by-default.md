@@ -14,6 +14,7 @@
 1. `[aec]` is **on by default** with the B + NS configuration: `enabled = true`, `render_channels = 2`, `ns = true`, `[aec.aec3]` `"linear_mix" = 0.4`, `"ep_strength.default_len" = 0.0`. These are the compiled-in defaults, so configs without an `[aec]` section (the TV app's `config.default.toml` included) run B + NS.
 2. **Explicit values override every default**; `[aec.aec3]` is merged key by key over its two defaults.
 3. **`[aec] enabled = false` turns it off** (the reference PCM is then never opened). It is the one key a settings toggle maps to; the daemon reads it at start, so a change needs a restart.
+   Since 2026-11-06 the toggle is `ctl.sh config aec on|off` (TV app Sound screen) and, per [ADR 0012](0012-config-switches-in-ha.md), the `aec_enabled` switch in Home Assistant.
 4. **The reference never costs the microphone:** if the reference cannot be opened or fails, the mic runs alone with a `warn aec: … WITHOUT echo cancellation` line; if the mic does not start together with the reference, or fails twice in a row with it, the plain mic is opened instead and the reference is tried again later.
 
 ## Consequences

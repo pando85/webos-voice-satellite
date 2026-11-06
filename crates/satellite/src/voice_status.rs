@@ -71,6 +71,39 @@ impl Ha {
     }
 }
 
+/// What keeps the daemon from a restart now. One definition for everything
+/// that must not restart it mid-activity: HA's config switches (the daemon
+/// checks it first) and `ctl.sh config` (reads `busy` from this file).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Busy {
+    /// A conversation is in progress or a reply or announcement plays.
+    Voice,
+    /// Music is loaded, playing or paused.
+    Music,
+    /// The timer alarm is queued or ringing.
+    Alarm,
+}
+
+impl Busy {
+    /// The word in `voice.json`.
+    pub(crate) fn word(self) -> &'static str {
+        match self {
+            Self::Voice => "voice",
+            Self::Music => "music",
+            Self::Alarm => "alarm",
+        }
+    }
+
+    /// Human text for a log line.
+    pub(crate) fn reason(self) -> &'static str {
+        match self {
+            Self::Voice => "a voice run is active",
+            Self::Music => "music is active",
+            Self::Alarm => "a timer alarm is active",
+        }
+    }
+}
+
 /// The content of `voice.json`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct VoiceStatus {
@@ -91,6 +124,9 @@ pub(crate) struct VoiceStatus {
     /// When `ha` last changed, in seconds since the Unix epoch (the daemon's
     /// start for the first state). Written on a change only.
     pub(crate) ha_since: u64,
+    /// What is going on (`null` when nothing). `ctl.sh config` refuses a
+    /// change while it is set.
+    pub(crate) busy: Option<Busy>,
     /// The `music` object (`crate::music`, design music-playback section K):
     /// `{"enabled":false}` with music off. `None` leaves the key out.
     pub(crate) music: Option<String>,
@@ -100,7 +136,7 @@ impl VoiceStatus {
     /// One JSON line (schema 1).
     pub(crate) fn to_json(&self) -> String {
         format!(
-            "{{\"schema\":1,\"mic\":{},\"remote_off\":{},\"remote_off_active\":{},\"power_state\":{},\"pairing_until\":{},\"ha\":{},\"ha_since\":{}{}}}\n",
+            "{{\"schema\":1,\"mic\":{},\"remote_off\":{},\"remote_off_active\":{},\"power_state\":{},\"pairing_until\":{},\"ha\":{},\"ha_since\":{},\"busy\":{}{}}}\n",
             json_str(self.mic.word()),
             json_str(darken::file_word(self.remote_off)),
             self.remote_off_active,
@@ -111,6 +147,8 @@ impl VoiceStatus {
                 .map_or_else(|| "null".to_owned(), |t| t.to_string()),
             json_str(self.ha.word()),
             self.ha_since,
+            self.busy
+                .map_or_else(|| "null".to_owned(), |b| json_str(b.word())),
             self.music
                 .as_deref()
                 .map_or_else(String::new, |m| format!(",\"music\":{m}")),
@@ -191,6 +229,7 @@ mod tests {
             pairing_until: None,
             ha: Ha::Connected,
             ha_since: 1_762_000_000,
+            busy: None,
             music: None,
         }
     }
@@ -205,7 +244,7 @@ mod tests {
     fn json_has_exactly_the_documented_fields() {
         assert_eq!(
             status(Mic::Listening).to_json(),
-            "{\"schema\":1,\"mic\":\"listening\",\"remote_off\":\"keep_listening\",\"remote_off_active\":true,\"power_state\":\"Active\",\"pairing_until\":null,\"ha\":\"connected\",\"ha_since\":1762000000}\n"
+            "{\"schema\":1,\"mic\":\"listening\",\"remote_off\":\"keep_listening\",\"remote_off_active\":true,\"power_state\":\"Active\",\"pairing_until\":null,\"ha\":\"connected\",\"ha_since\":1762000000,\"busy\":null}\n"
         );
         let s = VoiceStatus {
             mic: Mic::Busy,
@@ -215,19 +254,35 @@ mod tests {
             pairing_until: Some(1_762_345_678),
             ha: Ha::Unpaired,
             ha_since: 5,
+            busy: Some(Busy::Alarm),
             music: None,
         };
         assert_eq!(
             s.to_json(),
-            "{\"schema\":1,\"mic\":\"busy\",\"remote_off\":\"normal\",\"remote_off_active\":false,\"power_state\":null,\"pairing_until\":1762345678,\"ha\":\"unpaired\",\"ha_since\":5}\n"
+            "{\"schema\":1,\"mic\":\"busy\",\"remote_off\":\"normal\",\"remote_off_active\":false,\"power_state\":null,\"pairing_until\":1762345678,\"ha\":\"unpaired\",\"ha_since\":5,\"busy\":\"alarm\"}\n"
         );
         // The music block (design music-playback section K) goes last.
         let mut m = status(Mic::Listening);
         m.music = Some("{\"enabled\":false}".to_owned());
         assert!(
-            m.to_json()
-                .ends_with(",\"ha_since\":1762000000,\"music\":{\"enabled\":false}}\n")
+            m.to_json().ends_with(
+                ",\"ha_since\":1762000000,\"busy\":null,\"music\":{\"enabled\":false}}\n"
+            )
         );
+        for (b, w) in [
+            (Busy::Voice, "voice"),
+            (Busy::Music, "music"),
+            (Busy::Alarm, "alarm"),
+        ] {
+            let mut s = status(Mic::Listening);
+            s.busy = Some(b);
+            assert!(
+                s.to_json()
+                    .contains(&format!("\"ha_since\":1762000000,\"busy\":\"{w}\"")),
+                "{w}"
+            );
+            assert!(!b.reason().is_empty());
+        }
         for (m, w) in [(Mic::Muted, "muted"), (Mic::Closed, "closed")] {
             assert!(status(m).to_json().contains(&format!("\"mic\":\"{w}\"")));
         }

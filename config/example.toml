@@ -286,7 +286,8 @@ open_on_start = true     # open the window when started without a stored key
 # decision (2026-11-05): two live A/Bs on an LG C3 showed no harm and about
 # 5 % of one core, but NO significant wake word gain (EXP-018, EXP-021).
 # Turn it off with `enabled = false` (the settings toggle maps to this key;
-# the daemon reads it at start, so restart it after a change). If the
+# the daemon reads it at start, so restart it after a change; the HA switch
+# "Echo cancellation" (aec_enabled) and the TV app do both). If the
 # reference cannot be opened or fails, the mic runs without echo
 # cancellation (logged as "aec: ... WITHOUT echo cancellation").
 # Every key here is optional: a missing key keeps its default, a key set
@@ -356,7 +357,8 @@ output = "full"
 # default and experimental: built and tested on a PC only, not yet evaluated
 # on a TV (CPU, mixing, false wakes). Changing it needs a restart; Home
 # Assistant reads the entity's features when it connects. The TV app's Sound
-# screen and `ctl.sh config music on|off` change this key and restart.
+# screen, the HA switch "Music playback" (music_enabled) and
+# `ctl.sh config music on|off` change this key and restart.
 enabled = false
 # Format HA's ffmpeg proxy converts music to: "flac" or "wav" (MP3 is never
 # advertised). rate (8000 to 96000) and channels (1 or 2) are advertised
