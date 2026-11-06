@@ -243,6 +243,7 @@ fn missing_reference_never_blocks_the_mic() {
 }
 
 #[test]
+#[ignore = "slow: 12 s of audio through two cancellers (the bypass is off by default and the daemon default turns NS on, which disables it; the shorter bypass tests below stay in the default run); run with cargo test -p webos-dsp -- --include-ignored"]
 fn bypass_saves_work_and_keeps_the_output_continuous() {
     // Reference: loud for 6 s, silent for 4 s, then very quiet (about -75
     // dBFS: "active" for the bypass, below AEC3's render activity level, so
@@ -569,10 +570,17 @@ fn double_talk(cfg: AecConfig) -> (f64, f64) {
     (erle, keep)
 }
 
+/// [`double_talk`] with the default configuration, run once and shared by
+/// the tests that compare a variant against it (it is deterministic).
+fn double_talk_default() -> (f64, f64) {
+    static BASELINE: std::sync::OnceLock<(f64, f64)> = std::sync::OnceLock::new();
+    *BASELINE.get_or_init(|| double_talk(cfg16()))
+}
+
 #[test]
 fn linear_output_cancels_echo_and_keeps_the_near_end() {
     let (erle_lin, keep_lin) = double_talk(linear16());
-    let (erle_full, keep_full) = double_talk(cfg16());
+    let (erle_full, keep_full) = double_talk_default();
     assert!(erle_lin > 15.0, "linear ERLE {erle_lin:.1} dB");
     // The near-end passes the linear output nearly unchanged (residual echo
     // adds a little), and never less than through the full output.
@@ -624,6 +632,7 @@ fn linear_output_bypass_matches_its_latency() {
 }
 
 #[test]
+#[ignore = "slow: engine equivalence, 6 s sample by sample (a_tuning_equal_to_the_defaults_is_sample_identical keeps a short one in the default run); run with cargo test -p webos-dsp -- --include-ignored"]
 fn direct_engine_matches_sonora_audio_processing() {
     // The direct engine with AEC3's default configuration must reproduce
     // sonora's AudioProcessing output sample for sample, so the Linear and
@@ -661,7 +670,7 @@ fn nearend_tuning_cancels_and_keeps_the_talker_no_worse() {
     // On this synthetic double talk both keep the same share of the talker
     // (the c3-a recordings are where the tuning is evaluated); it must not
     // cancel less than 20 dB or keep less of the talker than the default.
-    let (erle_full, keep_full) = double_talk(cfg16());
+    let (erle_full, keep_full) = double_talk_default();
     let (erle_ne, keep_ne) = double_talk(AecConfig {
         output: AecOutput::Nearend,
         ..cfg16()
@@ -677,6 +686,7 @@ fn nearend_tuning_cancels_and_keeps_the_talker_no_worse() {
 }
 
 #[test]
+#[ignore = "slow: engine equivalence, 8 s stereo sample by sample; run with cargo test -p webos-dsp -- --include-ignored"]
 fn direct_engine_matches_sonora_with_a_stereo_render() {
     // Stereo content (two different channels) makes AEC3 switch to its
     // multichannel configuration with two render channels; the direct
@@ -781,12 +791,14 @@ fn aec3_tuning_is_named_range_checked_and_empty_by_default() {
 fn a_tuning_equal_to_the_defaults_is_sample_identical() {
     // Any override moves AEC3 to the direct engine; with values equal to
     // AEC3's defaults the output must not change at all.
-    let n = 16_000 * 5;
+    // 3 s: far end alone, then double talk from 1.5 s (the longer engine
+    // equivalence runs are the ignored direct_engine_matches_* tests).
+    let n = 16_000 * 3;
     let reference = noise(n, 0.05, 74);
     let e = echo(&reference, 240, 0.3);
     let talk = noise(n, 0.01, 75);
     let mic: Vec<f32> = (0..n)
-        .map(|i| e[i] + if i > 48_000 { talk[i] } else { 0.0 })
+        .map(|i| e[i] + if i > 24_000 { talk[i] } else { 0.0 })
         .collect();
     let mut t = Aec3Tuning::default();
     t.set(Aec3Param::NormalLfEnrSuppress, 0.4)
@@ -804,7 +816,7 @@ fn transparent_masks_and_the_linear_mix_keep_more_of_the_talker() {
     // Higher masking thresholds let more of the near end through the
     // suppressor and the linear mix bounds its attenuation; both still
     // cancel the (perfectly linear) synthetic echo.
-    let (erle_full, keep_full) = double_talk(cfg16());
+    let (erle_full, keep_full) = double_talk_default();
     let tuned = |assignments: &[&str]| {
         let mut t = Aec3Tuning::default();
         for a in assignments {
@@ -829,6 +841,7 @@ fn transparent_masks_and_the_linear_mix_keep_more_of_the_talker() {
 }
 
 #[test]
+#[ignore = "slow: two 12 s stereo runs of the experimental linear output (stereo_render_cancels_two_different_echo_paths covers the stereo render); run with cargo test -p webos-dsp -- --include-ignored"]
 fn linear_output_works_with_a_stereo_render() {
     let n = 16_000 * 12;
     let l = noise(n, 0.05, 76);

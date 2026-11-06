@@ -20,8 +20,8 @@ jobs:
         run: cargo fmt --all --check
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: cargo test (host)
-        run: cargo test --workspace
+      - name: cargo test (host, with the doc tests and the ignored slow tests)
+        run: make test-full
       - name: Ops scripts (supervisor, crash-loop guard, autostart gating)
         run: sh packaging/webos/tests/run.sh
       - name: webOS app package lifecycle (install, update, boot hook, uninstall)

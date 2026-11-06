@@ -82,12 +82,26 @@ ctl() {
 }
 setup_pid() { sed -n '1p' "$D/setup.pid" 2>/dev/null; }
 servers() { # number of live fake servers of this test
-    n=0
-    for d in /proc/[0-9]*; do
-        { tr '\0' ' ' <"$d/cmdline"; } 2>/dev/null | grep -qF "$P/bin/webos-satellite-setup" && n=$((n + 1))
-    done
-    echo "$n"
+    # One python3 process (itself excluded) instead of a tr and a grep per
+    # pid: that shell loop cost about 20 s and 30 s of CPU per call on a
+    # machine with 1000 processes. Command lines are read with NULs as spaces.
+    python3 -c '
+import os, sys
+n = 0
+for p in os.listdir("/proc"):
+    if not p.isdigit() or int(p) == os.getpid():
+        continue
+    try:
+        with open(f"/proc/{p}/cmdline", "rb") as f:
+            n += sys.argv[1] in f.read().replace(b"\0", b" ").decode("utf-8", "replace")
+    except OSError:
+        pass
+print(n)' "$P/bin/webos-satellite-setup"
 }
+# No fake server left. A killed server can take a moment to vanish from
+# /proc on a loaded machine (stop_setup_server does not wait after KILL), so
+# poll for up to 10 s instead of looking once.
+gone() { wait_for 10 '[ "$(servers)" = 0 ]'; }
 wait_for() { # SECONDS CONDITION
     i=0
     while [ "$i" -lt "$(($1 * 10))" ]; do
@@ -235,13 +249,14 @@ pid2=$(setup_pid)
 check "start after a crash: a new session replaces the old directory" '[ "$rc" -eq 0 ] && [ "$pid2" != "$pid" ] && jq "$out" "s[\"state\"]==\"waiting\"" && [ "$(servers)" = 1 ]'
 rm -f "$F/stopseen"
 out=$(ctl setup stop 2>/dev/null) && rc=0 || rc=$?
-check "stop: the stop file asks the server, which ends; exit 0, state none, directory removed" '[ "$rc" -eq 0 ] && jq "$out" "s[\"state\"]==\"none\"" && [ "$(servers)" = 0 ] && [ ! -e "$D" ] && [ -e "$F/stopseen" ]'
+check "stop: the stop file asks the server, which ends; exit 0, state none, directory removed" '[ "$rc" -eq 0 ] && jq "$out" "s[\"state\"]==\"none\"" && gone && [ ! -e "$D" ] && [ -e "$F/stopseen" ]'
 ctl setup start >/dev/null 2>&1
 : >"$F/ignorestop"
 rm -f "$F/stopseen"
 t0=$(date +%s)
 out=$(ctl setup stop 2>/dev/null) && rc=0 || rc=$?
-check "stop with a server that ignores the stop file: TERM after about 2 s, still ends" '[ "$rc" -eq 0 ] && [ "$(servers)" = 0 ] && [ ! -e "$D" ] && [ $(($(date +%s) - t0)) -le 6 ]'
+t1=$(date +%s)
+check "stop with a server that ignores the stop file: TERM after about 2 s, still ends" '[ "$rc" -eq 0 ] && gone && [ ! -e "$D" ] && [ $((t1 - t0)) -le 6 ]'
 rm -f "$F/ignorestop"
 ctl setup answer a1b2c3d4 allow >/dev/null 2>&1 && rc=0 || rc=$?
 check "answer without a session: exit 1" '[ "$rc" -eq 1 ]'
@@ -286,13 +301,13 @@ echo "== stop, uninstall and purge end a session =="
 ctl setup start >/dev/null 2>&1
 check "setup: a session is up" '[ "$(servers)" = 1 ]'
 ctl stop >/dev/null 2>&1
-check "ctl.sh stop ends the session and removes the directory" '[ "$(servers)" = 0 ] && [ ! -e "$D" ]'
+check "ctl.sh stop ends the session and removes the directory" 'gone && [ ! -e "$D" ]'
 ctl setup start >/dev/null 2>&1
 WEBOS_SAT_SETUP_DIR=$D sh "$PKG/stop.sh" --prefix "$P" >/dev/null 2>&1 || true
-check "stop.sh ends the session too" '[ "$(servers)" = 0 ] && [ ! -e "$D" ]'
+check "stop.sh ends the session too" 'gone && [ ! -e "$D" ]'
 ctl setup start >/dev/null 2>&1
 ctl uninstall >/dev/null 2>&1 || true
-check "uninstall ends the session" '[ "$(servers)" = 0 ] && [ ! -e "$D" ]'
+check "uninstall ends the session" 'gone && [ ! -e "$D" ]'
 # uninstall removed bin/ and run/: rebuild what the next checks need.
 mkdir -p "$P/bin" "$P/run" "$P/etc"
 printf '#!/bin/sh\nexit 0\n' >"$P/bin/webos-satellite"
@@ -301,7 +316,7 @@ write_fake
 ctl setup start >/dev/null 2>&1
 check "setup: a session is up again" '[ "$(servers)" = 1 ]'
 ctl purge >/dev/null 2>&1 || true
-check "purge ends the session and removes the install" '[ "$(servers)" = 0 ] && [ ! -e "$D" ] && [ ! -e "$P" ]'
+check "purge ends the session and removes the install" 'gone && [ ! -e "$D" ] && [ ! -e "$P" ]'
 
 echo "== set reply-volume =="
 mkdir -p "$P/bin" "$P/etc" "$P/run" "$P/log"
@@ -397,11 +412,14 @@ cp "$(command -v sleep)" "$P/bin/webos-satellite"
 "$P/bin/webos-satellite" 120 &
 HOLD=$!
 echo "$HOLD" >"$P/run/webos-satellite.pid"
-now=$(date +%s)
 for st in connected disconnected unpaired; do
+    # The time per state, and the slack grows by what ctl.sh status took (a
+    # loaded machine took longer than the 3 s of slack).
+    now=$(date +%s)
     voice null "$st" "$((now - 90))"
     out=$(ctl status --json)
-    check "ha $st, began 90 s ago" 'jq "$out" "s[\"ha\"][\"state\"]==\"$st\" and 90 <= s[\"ha\"][\"since_s\"] <= 93"'
+    took=$(($(date +%s) - now))
+    check "ha $st, began 90 s ago" 'jq "$out" "s[\"ha\"][\"state\"]==\"$st\" and 90 <= s[\"ha\"][\"since_s\"] <= 93 + $took"'
 done
 voice null bogus "$now"
 out=$(ctl status --json)

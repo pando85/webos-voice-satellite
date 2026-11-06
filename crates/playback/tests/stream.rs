@@ -212,9 +212,49 @@ fn consume_bytes(total: u64) {
     assert!(s.close(Duration::from_secs(1)));
 }
 
+/// Set by [`consume_alone`] for the child process: the byte count.
+const ENDLESS_BYTES_VAR: &str = "STREAM_ENDLESS_BYTES";
+
+/// Runs [`consume_bytes`] in a child process (this test binary again,
+/// running the ignored `endless_stream_child`), so the RSS it measures is
+/// that of one stream only: the other tests of this binary run in the same
+/// process at the same time and their allocations showed up as growth.
+fn consume_alone(total: u64) {
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "endless_stream_child",
+            "--exact",
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(ENDLESS_BYTES_VAR, total.to_string())
+        .output()
+        .unwrap();
+    let (stdout, stderr) = (
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    eprint!("{stderr}");
+    assert!(
+        out.status.success() && stdout.contains("1 passed"),
+        "child failed:\n{stdout}\n{stderr}"
+    );
+}
+
+/// The child: `STREAM_ENDLESS_BYTES` bytes through the decoder.
+#[test]
+#[ignore = "run by the endless_stream tests in a child process"]
+fn endless_stream_child() {
+    let Ok(total) = std::env::var(ENDLESS_BYTES_VAR) else {
+        return;
+    };
+    consume_bytes(total.parse().unwrap());
+}
+
 #[test]
 fn endless_stream_plays_with_bounded_memory() {
-    consume_bytes(64 << 20);
+    consume_alone(64 << 20);
 }
 
 /// The 1 GiB variant of the plan (M3a acceptance 3); run in release:
@@ -222,7 +262,7 @@ fn endless_stream_plays_with_bounded_memory() {
 #[test]
 #[ignore = "1 GiB through the decoder; run with --release --ignored"]
 fn endless_stream_one_gib() {
-    consume_bytes(1 << 30);
+    consume_alone(1 << 30);
 }
 
 #[test]
@@ -230,16 +270,26 @@ fn slow_consumer_bounds_what_is_read_from_the_socket() {
     let srv = endless_flac(48_000, 2);
     let c = cfg();
     let s = stream::open(&srv.url("/bp"), &c).unwrap();
-    std::thread::sleep(Duration::from_millis(1500));
-    let a = s.stats();
-    std::thread::sleep(Duration::from_millis(500));
-    let b = s.stats();
     // Nothing is consumed: the reads stop once the ring and the queue are
-    // full (plus one socket read and symphonia's 64 KiB read-ahead).
-    assert_eq!(
-        a.bytes_received, b.bytes_received,
-        "still reading: {a:?} {b:?}"
-    );
+    // full (plus one socket read and symphonia's 64 KiB read-ahead). The
+    // fill takes about a second when the machine is idle and longer under
+    // load, so wait until the count holds still for 500 ms (bounded), then
+    // check how much was read.
+    let start = Instant::now();
+    let mut before = s.stats();
+    let b = loop {
+        std::thread::sleep(Duration::from_millis(500));
+        let now = s.stats();
+        if now.bytes_received == before.bytes_received && now.queued_samples > 0 {
+            break now;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "still reading after {:?}: {before:?} {now:?}",
+            start.elapsed()
+        );
+        before = now;
+    };
     let bound = (c.ring_bytes + 16 * 1024 + 64 * 1024 + stream::MAX_QUEUE_BYTES) as u64;
     assert!(b.bytes_received <= bound, "{b:?}");
     assert!(b.queued_samples * 2 <= stream::MAX_QUEUE_BYTES, "{b:?}");

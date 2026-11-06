@@ -17,4 +17,6 @@ jobs:
       - name: Check research files and Markdown links
         run: python3 tools/check_docs.py
       - name: Unit tests of the PC-side report tool
+        env:
+          WEBOS_SAT_SLOW_TESTS: "1"
         run: python3 -m unittest discover -s tools -p 'test_*.py'

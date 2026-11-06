@@ -527,6 +527,10 @@ fn tls_hellos_and_prefetches_end_nothing() {
     // No cookie on `/`: refused, logged with the reason, not an end.
     assert_eq!(s.get("/", None).status, 403);
     assert_eq!(s.state()["state"], "active");
+    // The log line of the refusal can land just after the response.
+    s.wait_for("the no-cookie log line", || {
+        s.log().contains("rejected no-cookie page")
+    });
     let log = s.log();
     assert!(log.contains("rejected tls peer=127.0.0.1"), "{log}");
     assert!(

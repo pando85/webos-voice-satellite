@@ -49,8 +49,8 @@ IPK_BUILD     := python3 $(PKG)/ipk/build_ipk.py
 TV_APP_DIR    ?= /media/developer/apps/usr/palm/applications/$(APP_ID)
 
 .PHONY: build-setup build-setup64 build-setup-all
-.PHONY: build-tv build-tv64 build-tv-all package-tv test lint fmt deploy-tv run-tv-selftest clean-tv tv-install-tmp tv-uninstall-tmp
-.PHONY: ipk ipk-check test-packaging tv-install-ipk tv-remove-ipk
+.PHONY: build-tv build-tv64 build-tv-all package-tv test test-full lint fmt deploy-tv run-tv-selftest clean-tv tv-install-tmp tv-uninstall-tmp
+.PHONY: ipk ipk-check test-packaging test-ipk tv-install-ipk tv-remove-ipk
 
 # Static 32-bit ARM EABI5 binary (flags come from .cargo/config.toml). Runs on
 # every supported TV; the build verified on c3-a.
@@ -107,17 +107,32 @@ ipk: build-tv-all
 ipk-check:
 	$(IPK_BUILD) check --app-id $(APP_ID) --version $(VERSION) $(IPK)
 
-# Host tests of the scripts, the package lifecycle and the status app.
+# Host tests of the scripts, ctl.sh and the status app.
 test-packaging:
 	sh $(PKG)/tests/run.sh
-	sh $(PKG)/tests/ipk.sh
 	sh $(PKG)/tests/tv_settings.sh
 	sh $(PKG)/tests/setup.sh
 	node $(PKG)/tests/app_smoke.js
 	node $(PKG)/tests/app_matrix.js
 
+# The package lifecycle (opt-in: it builds several .ipk files with gzip -9 in
+# Python, about 1 minute of one core each). Before a release or when touching
+# packaging; CI runs it.
+test-ipk:
+	sh $(PKG)/tests/ipk.sh
+
+# Fast default: unit and integration tests; skips the ignored slow ones and
+# the doc tests (rustdoc rebuilds them on every run, about 16 s of one core
+# for one example). Low CPU: CARGO_BUILD_JOBS=4 RUST_TEST_THREADS=4 make test
 test:
-	cargo test --workspace
+	cargo test --workspace --lib --bins --tests
+
+# Before a release or when touching DSP, playback or packaging: everything
+# `test` runs plus the doc tests and the ignored slow tests (#[ignore =
+# "slow: ..."]), except the two that only hold in --release
+# (fuzz_findings_do_not_panic_in_release, endless_stream_one_gib). CI runs this.
+test-full:
+	cargo test --workspace -- --include-ignored --skip fuzz_findings_do_not_panic_in_release --skip endless_stream_one_gib
 
 fmt:
 	cargo fmt --all

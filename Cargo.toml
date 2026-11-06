@@ -98,3 +98,31 @@ opt-level = 3
 opt-level = 3
 [profile.dev.package.sonora-common-audio]
 opt-level = 3
+# The decoders (symphonia) and the playback crate (resampler, gain, stream
+# ring) as well: at opt-level 0 webos-playback's tests took about 15 minutes
+# of one to four cores (the decoder mutation harness, the 64 MiB endless
+# stream, the resampler checks); at 3 they take about 20 s. Overflow checks
+# and debug assertions stay on (they are separate profile settings). An
+# incremental rebuild after a playback edit costs about the same at 1 and 3.
+[profile.dev.package.webos-playback]
+opt-level = 3
+[profile.dev.package.symphonia]
+opt-level = 3
+[profile.dev.package.symphonia-bundle-flac]
+opt-level = 3
+[profile.dev.package.symphonia-bundle-mp3]
+opt-level = 3
+[profile.dev.package.symphonia-codec-pcm]
+opt-level = 3
+[profile.dev.package.symphonia-codec-vorbis]
+opt-level = 3
+[profile.dev.package.symphonia-common]
+opt-level = 3
+[profile.dev.package.symphonia-core]
+opt-level = 3
+[profile.dev.package.symphonia-format-ogg]
+opt-level = 3
+[profile.dev.package.symphonia-format-riff]
+opt-level = 3
+[profile.dev.package.symphonia-metadata]
+opt-level = 3

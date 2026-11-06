@@ -818,12 +818,20 @@ mod fake_pacat {
         let (e, mut ev) =
             MusicEngine::spawn(MusicConfig::default(), Box::new(f), MusicVolume::new(1.0));
         e.play(endless(48_000, 2, Wave::Dc, 100));
-        tokio::time::sleep(MS(300)).await;
-        let pid: u32 = std::fs::read_to_string(dir.join("pid"))
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
+        // Wait for the fake pacat to start and write its pid (about 300 ms
+        // when idle, longer under load; the file may be seen half written).
+        let mut waited = 0;
+        let pid: u32 = loop {
+            tokio::time::sleep(MS(50)).await;
+            waited += 50;
+            if let Some(p) = std::fs::read_to_string(dir.join("pid"))
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+            {
+                break p;
+            }
+            assert!(waited < 20_000, "the fake pacat never started");
+        };
         assert!(std::path::Path::new(&format!("/proc/{pid}")).exists());
         e.stop();
         assert_eq!(next_end(&mut ev).await.1, EndReason::Stopped);

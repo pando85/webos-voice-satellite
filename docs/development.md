@@ -6,7 +6,7 @@ How to build, test, package and run the Rust workspace. Status: Phase 1 plus the
 
 | Path | Purpose |
 | --- | --- |
-| `Cargo.toml` | Workspace, shared `[workspace.dependencies]`, lint config, size-tuned `[profile.release]` (opt-level 3 for `webos-dsp` and the `sonora` crates, which run per 10 ms frame) |
+| `Cargo.toml` | Workspace, shared `[workspace.dependencies]`, lint config, size-tuned `[profile.release]` (opt-level 3 for `webos-dsp` and the `sonora` crates, which run per 10 ms frame); the dev profile (used by `cargo test`) builds `webos-dsp`, `sonora`, `webos-playback` and `symphonia` at opt-level 3 so the DSP and decoder tests run in seconds ([Tests](#tests)) |
 | `rust-toolchain.toml` | Pinned toolchain (`1.99.1`), `rustfmt`, `clippy`, the two TV cross targets |
 | `.cargo/config.toml` | Softfp codegen flags for `armv7-unknown-linux-musleabi` |
 | `Makefile` | Entry points listed below |
@@ -60,7 +60,8 @@ Versions used for the recorded builds: rustc 1.99.1, cargo-zigbuild 0.24.0, zig 
 | `make build-tv64` | Static aarch64 musl release build (for TVs with a 64-bit kernel) |
 | `make build-tv-all` | Both builds |
 | `make package-tv` | Both builds plus the ops scripts in `target/webos-package/` (binaries named `webos-satellite-armv7` and `webos-satellite-aarch64`, `SHA256SUMS`) and as `target/webos-satellite-package.tar.gz` |
-| `make test` | `cargo test --workspace` on the host |
+| `make test` | Fast host tests: `cargo test --workspace --lib --bins --tests` (no doc tests, ignored slow tests skipped; [Tests](#tests)) |
+| `make test-full` | Everything `make test` runs plus the doc tests and the ignored slow tests (what CI runs; [Tests](#tests)) |
 | `make lint` | `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings` |
 | `make fmt` | `cargo fmt` |
 | `make deploy-tv` | Builds both, then `scp` to the TV's `/tmp` as `webos-satellite-armv7` and `webos-satellite-aarch64` |
@@ -70,7 +71,8 @@ Versions used for the recorded builds: rustc 1.99.1, cargo-zigbuild 0.24.0, zig 
 | `make tv-uninstall-tmp` | Runs the installed `uninstall.sh` (stop, remove the prefix) and removes the staging directory |
 | `make ipk` | Both builds, then the webOS app package `target/ipk/<APP_ID>_<VERSION>_all.ipk` with its `.sha256` and an HBC manifest, and the structure check. `VERSION` defaults to the workspace version in `Cargo.toml`; `APP_ID` to `io.github.pando85.voicesatellite`. Reproducible: the same inputs and commit give the same bytes ([packaging design](design/packaging.md)) |
 | `make ipk-check` | Structure check of the built ipk (ar/tar layout, control fields, appinfo.json, icons, payload sums, ELF of both builds) |
-| `make test-packaging` | Host tests: `tests/run.sh` (ops scripts), `tests/ipk.sh` (package lifecycle), `tests/app_smoke.js` (status app; needs `node`) |
+| `make test-packaging` | Host tests: `tests/run.sh` (ops scripts), `tests/tv_settings.sh` and `tests/setup.sh` (`ctl.sh`), `tests/app_smoke.js` and `tests/app_matrix.js` (status app; needs `node`) |
+| `make test-ipk` | Host test of the package lifecycle, `tests/ipk.sh` (opt-in: several package builds, about 8 minutes of one core on a loaded machine; [Tests](#tests)) |
 | `make tv-install-ipk` | Builds the ipk, copies it to the TV's `/tmp`, installs it with appinstalld (`dev/install`, waits for the result), deletes the copy and prints `ctl.sh status`. Starts nothing. Persistent: owner authorization |
 | `make tv-remove-ipk` | Removes the app with appinstalld (`dev/remove`); run `ctl.sh uninstall` or `purge` first |
 
@@ -334,24 +336,70 @@ To repeat: `pip install homeassistant==2026.10.4` in a venv, start `hass -c <dir
 
 When HA cannot open a connection to the satellite (the situation on the owner's network as of 2026-11-02), `tools/esphome-fake-ha/ha_bridge.py` plays HA's ESPHome integration from the PC. It connects to the satellite and runs HA's real pipeline over the WebSocket API with an access token read from a file. `--synthetic-reply-every SECS` (with `--reply-on-intent-failure TEXT`) is a soak aid that answers every device run with a real TTS-only reply instead of running a wake word or STT. See its docstring and [P1 HA integration](discovery/c3-a/P1-ha-integration.md#bridge-stands-in-for-has-esphome-integration) for what it does and does not cover.
 
+## Tests
+
+The default run is the fast one; the expensive checks are opt-in and CI runs them.
+
+| What | Command | Runs |
+| --- | --- | --- |
+| Fast (every change) | `make test` = `cargo test --workspace --lib --bins --tests` | Unit and integration tests of every crate, including one end-to-end echo cancellation check per level (`webos-dsp` `cancels_a_synthetic_echo_and_finds_its_delay`, satellite `capture::tests::file_pair_with_aec_cancels_the_echo`) and the 64 MiB endless-stream memory bound |
+| Full (before a release, or when touching DSP, playback or packaging) | `make test-full` = `cargo test --workspace -- --include-ignored --skip fuzz_findings_do_not_panic_in_release --skip endless_stream_one_gib` | The fast set, the doc tests and every `#[ignore = "slow: ..."]` test. CI runs this |
+| Python tools | `python3 -m unittest discover -s tools -p 'test_*.py'` | The tool tests; add `WEBOS_SAT_SLOW_TESTS=1` for the real-ffmpeg checks of the fake music servers (CI sets it) |
+| Packaging | `make test-packaging`; `make test-ipk` before a release or when touching packaging | The ops scripts, `ctl.sh` and the status app against the host build; `test-ipk` adds the package lifecycle (`tests/ipk.sh`). CI runs both |
+
+Opt-in tests (`#[ignore = "slow: ..."]` in Rust, `WEBOS_SAT_SLOW_TESTS=1` in Python):
+
+| Test | Why it is opt-in | Run alone |
+| --- | --- | --- |
+| `webos-playback` `reply_memory::long_reply_memory_is_bounded` | Memory measurement: 270 s of replies in three child processes, about 50 s | `cargo test -p webos-playback --test reply_memory -- --include-ignored` |
+| `webos-dsp` `aec::tests::direct_engine_matches_sonora_audio_processing`, `..._with_a_stereo_render` | Engine equivalence over 6 and 8 s, sample by sample. `a_tuning_equal_to_the_defaults_is_sample_identical` (3 s) keeps a short equivalence check in the fast set | `cargo test -p webos-dsp -- --include-ignored direct_engine` |
+| `webos-dsp` `aec::tests::bypass_saves_work_and_keeps_the_output_continuous` | 12 s through two cancellers; the bypass is off by default (and NS, on in the daemon's default, disables it). The shorter bypass checks stay in the fast set | `cargo test -p webos-dsp -- --include-ignored bypass_saves` |
+| `webos-dsp` `aec::tests::linear_output_works_with_a_stereo_render` | Two 12 s stereo runs of the experimental linear output; `stereo_render_cancels_two_different_echo_paths` covers the stereo render | `cargo test -p webos-dsp -- --include-ignored linear_output_works` |
+| `tools/test_fake_proxy.py` `HaProxyFfmpegTests`, `MaFlowFfmpegTests` | Real ffmpeg conversions of 30 s signals generated in Python, about 50 s | `WEBOS_SAT_SLOW_TESTS=1 python3 -m unittest discover -s tools -p 'test_fake_proxy.py'` |
+
+Two ignored tests are not part of `make test-full`: `fuzz_findings_do_not_panic_in_release` holds only without overflow checks, and `endless_stream_one_gib` is the 1 GiB stream; run both with `cargo test -p webos-playback --release -- --ignored`.
+
+**Low CPU on a shared machine.** Cap the build jobs and the test threads:
+
+```sh
+CARGO_BUILD_JOBS=4 RUST_TEST_THREADS=4 make test
+```
+
+Peaks still go above 4 cores while linking: rustc links host binaries with rust-lld, which uses every hardware thread (8 to 11 cores measured at `-j 4`). To cap it too, set it locally and do not commit it (a changed `RUSTFLAGS` rebuilds everything once):
+
+```toml
+# ~/.cargo/config.toml (yours only)
+[build]
+jobs = 4
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-Wl,--threads=4"]
+```
+
+Notes:
+
+- `cargo test -p <crate>` resolves dependency features for that crate alone, so after a `--workspace` build the first `-p` run rebuilds shared dependencies (139 s for `-p webos-capture`, whose tests take 0.1 s). Prefer `cargo test --workspace --lib --bins --tests <filter>`, or stay with `-p` once you use it.
+- The dev profile builds `webos-dsp`, the `sonora` crates, `webos-playback` and the `symphonia` decoders at opt-level 3 (root `Cargo.toml`). At opt-level 0, `webos-playback`'s tests took about 15 minutes and the DSP tests about 5. Overflow checks and debug assertions stay on.
+- The packaging tests copy the 130 MB debug daemon into `${TMPDIR:-/tmp}` (`tests/ipk.sh` a stripped 17 MB copy). The Rust tests write there too. If `/tmp` is a small or full tmpfs, point `TMPDIR` elsewhere.
+- Tests that wait for a process or a stream use bounded polls rather than fixed sleeps, so they pass on a loaded machine. A fixed `sleep` followed by one look is a flake: poll with a deadline instead.
+
 ## CI
 
-- [`.github/workflows/validate.yml`](../.github/workflows/validate.yml): documentation checks (`sh -n tools/probe/probe.sh`, `sh -n` of the packaging and lifecycle scripts, `python3 tools/check_docs.py`, the dogfood report unit tests).
-- [`.github/workflows/rust.yml`](../.github/workflows/rust.yml): `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test`, `packaging/webos/tests/run.sh`, `tests/ipk.sh` and `tests/app_smoke.js` on the host; then the armv7 and aarch64 cross-builds, ELF checks, a run of the armv7 binary under `qemu-user-static`, `make ipk` (built and checked, not uploaded), and the armv7 binary uploaded as a short-lived workflow artifact.
+- [`.github/workflows/validate.yml`](../.github/workflows/validate.yml): documentation checks (`sh -n tools/probe/probe.sh`, `sh -n` of the packaging and lifecycle scripts, `python3 tools/check_docs.py`, the Python tool tests with `WEBOS_SAT_SLOW_TESTS=1`).
+- [`.github/workflows/rust.yml`](../.github/workflows/rust.yml): `cargo fmt --check`, `cargo clippy -D warnings`, `make test-full` (the doc tests and the ignored slow tests included, [Tests](#tests)), `packaging/webos/tests/run.sh`, `tests/ipk.sh` and `tests/app_smoke.js` on the host; then the armv7 and aarch64 cross-builds, ELF checks, a run of the armv7 binary under `qemu-user-static`, `make ipk` (built and checked, not uploaded), and the armv7 binary uploaded as a short-lived workflow artifact.
 
 Actions are pinned to commit SHAs with the version in a comment. Update them deliberately.
 
 ## Quality gates before a PR
 
 ```sh
-make lint test
+make lint test                   # fast set; make test-full before a release or when touching DSP, playback or packaging
 python3 tools/check_docs.py
-python3 -m unittest discover -s tools -p 'test_dogfood*.py'
-python3 -m unittest discover -s tools -p 'test_fake_proxy.py'   # skips the ffmpeg and openssl checks where those are missing
+python3 -m unittest discover -s tools -p 'test_*.py'   # WEBOS_SAT_SLOW_TESTS=1 adds the real-ffmpeg checks; openssl checks skip where it is missing
 sh -n tools/probe/probe.sh
 for f in packaging/webos/*.sh packaging/webos/init.d/* packaging/webos/tests/*.sh packaging/webos/tv/*.sh tools/lifecycle/*.sh; do sh -n "$f"; done
 shellcheck -x -P SCRIPTDIR -s sh packaging/webos/*.sh packaging/webos/init.d/* packaging/webos/tests/*.sh packaging/webos/tv/*.sh   # if installed
-make test-packaging              # ops scripts, ipk lifecycle, status app (node)
+make test-packaging              # ops scripts, ctl.sh, status app (node)
+make test-ipk                    # package lifecycle (slow; before a release or when touching packaging)
 make ipk                         # cross builds, package and its structure check
 tools/esphome-fake-ha/run.sh     # protocol and daemon e2e harness
 tools/lifecycle/run.sh           # microphone gate and ops scripts on the host

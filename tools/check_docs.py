@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Offline repository structure checks with no dependencies."""
 from pathlib import Path
+import os
 import re
 import sys
 import tomllib
@@ -20,24 +21,48 @@ RESEARCH = [
     "04-activation.md", "05-home-assistant.md", "06-media.md",
     "07-deployment.md", "08-security-quality.md",
 ]
-errors = []
-for name in REQUIRED + [f"docs/research/{n}" for n in RESEARCH]:
-    if not (ROOT / name).is_file():
-        errors.append(f"missing: {name}")
+# Directories never scanned for Markdown. They are pruned while walking:
+# target/ alone holds millions of build files, and .claude/ holds local agent
+# worktrees (full copies of the repository, not its content).
+SKIP_DIRS = {".claude", ".venv", "artifacts", "node_modules", "target"}
 
-for path in ROOT.rglob("*.md"):
-    rel_parts = path.relative_to(ROOT).parts
-    if any(part.startswith(".git") or part in {".venv", "artifacts", "node_modules", "target"} for part in rel_parts):
-        continue
-    content = path.read_text(encoding="utf-8")
-    if not content.startswith("# ") and not (path.name == "SKILL.md" and content.startswith("---")):
-        errors.append(f"missing title: {path.relative_to(ROOT)}")
-    for link in re.findall(r"\]\(([^)#]+)(?:#[^)]*)?\)", content):
-        if link.startswith(("https://", "http://", "mailto:")) or "://" in link:
-            continue
-        target = (path.parent / link).resolve()
-        if not target.exists():
-            errors.append(f"broken relative link: {path.relative_to(ROOT)} -> {link}")
+
+def skipped(name):
+    return name.startswith(".git") or name in SKIP_DIRS
+
+
+def check_required(root):
+    """The required files exist."""
+    return [
+        f"missing: {name}"
+        for name in REQUIRED + [f"docs/research/{n}" for n in RESEARCH]
+        if not (root / name).is_file()
+    ]
+
+
+def markdown_files(root):
+    """Every *.md under root outside the skipped directories, in a stable order."""
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(d for d in dirnames if not skipped(d))
+        for name in sorted(filenames):
+            if name.endswith(".md") and not skipped(name):
+                yield Path(dirpath) / name
+
+
+def check_markdown(root):
+    """Every Markdown file has a title and no broken relative link."""
+    errs = []
+    for path in markdown_files(root):
+        content = path.read_text(encoding="utf-8")
+        if not content.startswith("# ") and not (path.name == "SKILL.md" and content.startswith("---")):
+            errs.append(f"missing title: {path.relative_to(root)}")
+        for link in re.findall(r"\]\(([^)#]+)(?:#[^)]*)?\)", content):
+            if link.startswith(("https://", "http://", "mailto:")) or "://" in link:
+                continue
+            target = (path.parent / link).resolve()
+            if not target.exists():
+                errs.append(f"broken relative link: {path.relative_to(root)} -> {link}")
+    return errs
 
 
 def verified_table_rows(text):
@@ -132,6 +157,7 @@ def check_issue_form(root):
 
 
 if __name__ == "__main__":
+    errors = check_required(ROOT) + check_markdown(ROOT)
     errors += check_verified_list(ROOT)
     errors += check_issue_form(ROOT)
     if errors:

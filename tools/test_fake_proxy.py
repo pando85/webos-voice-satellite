@@ -1,9 +1,11 @@
 """Self-tests of the fake music servers (tools/esphome-fake-ha/fake_proxy.py, milestone M1).
 
-Stdlib only; the ffprobe/ffmpeg checks are skipped where ffmpeg is missing,
-and the HTTPS check where openssl is missing. No network beyond 127.0.0.1.
+Stdlib only; the ffprobe/ffmpeg checks are skipped where ffmpeg is missing
+or WEBOS_SAT_SLOW_TESTS=1 is not set, and the HTTPS check where openssl is
+missing. No network beyond 127.0.0.1.
 
 Run: python3 -m unittest discover -s tools -p 'test_fake_proxy.py'
+With the ffmpeg checks: WEBOS_SAT_SLOW_TESTS=1 python3 -m unittest discover -s tools -p 'test_fake_proxy.py'
 """
 import asyncio
 import os
@@ -18,6 +20,11 @@ import fake_proxy as fp  # noqa: E402
 
 HAVE_FFMPEG = fp.ffmpeg_available()
 HAVE_OPENSSL = subprocess.run(["which", "openssl"], capture_output=True).returncode == 0
+# The real-ffmpeg classes take about 50 s of one core (30 s signals generated
+# in Python and converted by ffmpeg): opt-in, like the other slow tests
+# (docs/development.md#tests). CI sets it.
+SLOW = os.environ.get("WEBOS_SAT_SLOW_TESTS") == "1"
+SLOW_REASON = "slow: real ffmpeg conversions, about 50 s; set WEBOS_SAT_SLOW_TESTS=1"
 SHORT = fp.Signal((fp.Track(0.5, 440.0),), rate=44100, channels=2)  # ~88 KB of PCM
 LONG = fp.Signal((fp.Track(30.0, 440.0),), rate=44100, channels=2)  # never fits in the socket buffers
 
@@ -257,6 +264,7 @@ class HaProxyTests(unittest.IsolatedAsyncioTestCase):
         w2.transport.abort()
 
 
+@unittest.skipUnless(SLOW, SLOW_REASON)
 @unittest.skipUnless(HAVE_FFMPEG, "ffmpeg/ffprobe not installed")
 class HaProxyFfmpegTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -283,9 +291,12 @@ class HaProxyFfmpegTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_restart_and_eviction_with_real_ffmpeg(self):
         a = self.proxy.create_url("dev", "flac", 48000, 2, signal=LONG)
-        first = await fp.fetch(a, max_bytes=30000)
-        self.assertTrue(await until(lambda: self.proxy.conversion_of(a).finished))
-        second = await fp.fetch(a, max_bytes=30000)
+        # LONG is generated in Python before ffmpeg starts: on a loaded
+        # machine that took longer than fetch's default 15 s (not what this
+        # test is about).
+        first = await fp.fetch(a, max_bytes=30000, timeout=60)
+        self.assertTrue(await until(lambda: self.proxy.conversion_of(a).finished, timeout=60))
+        second = await fp.fetch(a, max_bytes=30000, timeout=60)
         self.assertEqual(first.body[:30000], second.body[:30000])
         # a blocked (slow client) conversion is killed by the third URL
         r, w, _head = await open_stream(a)
@@ -371,6 +382,7 @@ class MaFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(r.truncated)
 
 
+@unittest.skipUnless(SLOW, SLOW_REASON)
 @unittest.skipUnless(HAVE_FFMPEG, "ffmpeg/ffprobe not installed")
 class MaFlowFfmpegTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):

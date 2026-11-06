@@ -44,6 +44,13 @@ cleanup() {
     rm -rf "$T"
 }
 trap cleanup EXIT INT TERM
+# The host debug build carries debug info and symbols that these checks never
+# use; with them, each package build below compressed about 260 MB at gzip -9
+# in Python (minutes per build). Package a stripped copy (same code, 131 MB
+# down to 17 MB for 0.4.3); the full binary if objcopy is missing.
+if command -v objcopy >/dev/null 2>&1 && objcopy --strip-all "$HOST_BIN" "$T/host-bin" 2>/dev/null; then
+    HOST_BIN=$T/host-bin
+fi
 
 check() {
     if eval "$2"; then
@@ -94,12 +101,31 @@ build() { # VERSION TAG OUTDIR
         --armv7 "$T/a32-$2" --aarch64 "$T/a64-$2" --setup-armv7 "$T/s32-$2" --setup-aarch64 "$T/s64-$2" \
         --out "$3" >/dev/null
 }
+# Number of live processes (this one excluded) whose command line, NULs read
+# as spaces, contains (`in`) or starts with (`start`) TEXT, or whose
+# executable is the path TEXT (`exe`). One python3 process instead of a tr
+# and a grep (or a readlink) per pid: that shell loop cost about 20 s and
+# 30 s of CPU per call on a machine with 1000 processes.
+procs() { # in|start|exe TEXT
+    python3 -c '
+import os, sys
+mode, text, n = sys.argv[1], sys.argv[2], 0
+for p in os.listdir("/proc"):
+    if not p.isdigit() or int(p) == os.getpid():
+        continue
+    try:
+        if mode == "exe":
+            n += os.readlink(f"/proc/{p}/exe") == text
+            continue
+        with open(f"/proc/{p}/cmdline", "rb") as f:
+            c = f.read().replace(b"\0", b" ").decode("utf-8", "replace")
+    except OSError:
+        continue
+    n += c.startswith(text) if mode == "start" else text in c
+print(n)' "$1" "$2"
+}
 setup_servers() { # number of live processes of the installed setup server
-    n=0
-    for d in /proc/[0-9]*; do
-        { tr '\0' ' ' <"$d/cmdline"; } 2>/dev/null | grep -qF "$S/bin/webos-satellite-setup" && n=$((n + 1))
-    done
-    echo "$n"
+    procs in "$S/bin/webos-satellite-setup"
 }
 # Lays the package out as the TV's installer does: the app directory is
 # replaced as a whole on every install.
@@ -115,18 +141,10 @@ json() { # PYTHON_EXPR on the status JSON as `s`
     $CTL status --json | python3 -c "import json,sys; s=json.load(sys.stdin); sys.exit(0 if ($1) else 1)"
 }
 daemons() { # number of live processes running the installed binary
-    n=0
-    for d in /proc/[0-9]*; do
-        [ "$(readlink "$d/exe" 2>/dev/null)" != "$S/bin/webos-satellite" ] || n=$((n + 1))
-    done
-    echo "$n"
+    procs exe "$S/bin/webos-satellite"
 }
 supervisors() {
-    n=0
-    for d in /proc/[0-9]*; do
-        { tr '\0' ' ' <"$d/cmdline"; } 2>/dev/null | grep -q "^sh $S/bin/supervise.sh" && n=$((n + 1))
-    done
-    echo "$n"
+    procs start "sh $S/bin/supervise.sh"
 }
 running_pid() { read -r p <"$S/run/webos-satellite.pid" 2>/dev/null && echo "$p"; }
 

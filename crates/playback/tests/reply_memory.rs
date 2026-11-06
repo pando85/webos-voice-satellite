@@ -206,7 +206,13 @@ fn measure(spec: &str) -> u64 {
 /// A 120 s announcement must not grow the process by more than a few MiB,
 /// and no more than a 30 s one does. The whole-file pipeline is measured as
 /// the reference (it shows the method sees the growth the TV saw).
+///
+/// Opt-in (about 50 s of one core: 270 s of audio resampled and played in
+/// three child processes). Run it before a release or when touching the
+/// reply path (`play_url`, the sink, the resampler):
+/// `cargo test -p webos-playback --test reply_memory -- --include-ignored`.
 #[test]
+#[ignore = "slow: memory measurement, about 50 s; run with -- --include-ignored"]
 fn long_reply_memory_is_bounded() {
     let stream_30 = measure("stream:30");
     let stream_120 = measure("stream:120");
