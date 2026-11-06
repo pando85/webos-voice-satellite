@@ -45,7 +45,7 @@ import aec_live_lib as L
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
 SSH_OPTS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "LogLevel=ERROR"]
-AEC_LOG_RE = r"aec:|capture:|streaming mic|config: name"
+AEC_LOG_RE = r"aec:|capture:|streaming mic|wake word detected|ESPHome API on|config: name"
 
 
 def sh(cmd, input_bytes=None, timeout=120):
@@ -107,8 +107,16 @@ class Tv:
         if rc != 0:
             raise RuntimeError("could not move the new config into place")
 
+    def pid(self):
+        """The daemon's PID from its pid file when that process is alive, else None."""
+        rc, out = self.ssh(f"P=$(cat {self.pidf} 2>/dev/null); [ -n \"$P\" ] && [ -d /proc/$P ] && echo $P")
+        f = out.split()
+        return int(f[0]) if rc == 0 and f and f[0].isdigit() else None
+
     def restart(self):
-        """Returns the TV clock (epoch s) just before the restart, for the log filter."""
+        """Returns the TV clock (epoch s) just before the restart, for the log filter. The PID before
+        the restart is kept in `old_pid`, so the wait can insist on a new process."""
+        self.old_pid = self.pid()
         t = self.now()
         self.ssh(f"sh {self.ctl} restart 2>&1 | tail -2", timeout=90)
         return t
@@ -126,12 +134,18 @@ class Tv:
         rc, out = self.ssh(f"cat {self.log}.1 {self.log} 2>/dev/null | grep -E '{AEC_LOG_RE}'", timeout=60)
         return out.decode(errors="replace").splitlines()
 
-    def wait_streaming(self, t_restart, timeout=90):
+    def wait_streaming(self, t_restart, old_pid=None, timeout=90):
+        """Wait for the new process: a live PID other than `old_pid` (default: the one `restart` saw)
+        and, in the log, its start banner (at or after the restart) followed by its own
+        `streaming mic audio to HA (wake word stage)` line. The old process's streaming line never counts."""
+        old_pid = getattr(self, "old_pid", None) if old_pid is None else old_pid
         end = time.monotonic() + timeout
         while time.monotonic() < end:
-            ents, _ = self.log_entries(600)
-            if any(e["kind"] == "streaming" and e["t"] >= t_restart - 1 for e in ents):
-                return True
+            pid = self.pid()
+            if pid is not None and pid != old_pid:
+                ents, _ = self.log_entries(600)
+                if L.streaming_after_start(ents, t_restart):
+                    return True
             time.sleep(2)
         return False
 
@@ -139,7 +153,7 @@ class Tv:
         end = time.monotonic() + timeout
         while time.monotonic() < end:
             ents, _ = self.log_entries(600)
-            locks = [e for e in ents if e["kind"] in ("lock", "change") and e["t"] >= t_restart - 1]
+            locks = [e for e in L.since_start(ents, t_restart) if e["kind"] in ("lock", "change")]
             if locks:
                 return locks[-1]["delay_ms"]
             time.sleep(2)
@@ -299,6 +313,74 @@ def prior_runs(runs):
     return {r["pipeline_run_id"] for r in runs if r is not newest}
 
 
+async def own_runs(ctx):
+    """HA's pipeline debug list (the last 10 runs of the pipeline) restricted to this satellite's runs.
+    Another satellite on the same pipeline (EXP-021: c3-b in a continued-conversation loop) would
+    otherwise fill the list. A run's owner is the `satellite_id` of its `run-start` event, fetched once
+    per run and cached; a run with no events yet is decided on a later call."""
+    owner = ctx.run_owner
+    out = []
+    for r in await ctx.ha.pipeline_runs(ctx.pid):
+        rid = r["pipeline_run_id"]
+        if rid not in owner:
+            full = await ctx.ha.pipeline_run(ctx.pid, rid)
+            if not full.get("events"):
+                continue
+            owner[rid] = L.run_satellite(full)
+        if owner[rid] == ctx.args.entity:
+            out.append(r)
+    return out
+
+
+async def armed(ctx):
+    """The satellite's newest own run waits for the wake word. When none of its runs is left in HA's
+    list (pushed out by another satellite's runs), it counts as armed: the satellite re-arms whenever
+    it is idle, and `wait_ready` also requires the entity to be idle."""
+    runs = await own_runs(ctx)
+    if not runs:
+        return True
+    newest = max(runs, key=lambda r: r.get("timestamp", ""))
+    return L.run_armed(await ctx.ha.pipeline_run(ctx.pid, newest["pipeline_run_id"]))
+
+
+async def wait_ready(ctx, settle, timeout=120):
+    """Entity idle and its wake word run armed, twice `settle` seconds apart (as p2_runner.wait_ready,
+    but on this satellite's runs only); collects the TV log while it waits."""
+    t_end = time.monotonic() + timeout
+    while time.monotonic() < t_end:
+        if ctx.watch.state == "idle" and await armed(ctx):
+            await asyncio.sleep(settle)
+            if ctx.watch.state == "idle" and await armed(ctx):
+                return True
+        await maybe_collect_log(ctx)
+        await asyncio.sleep(0.5)
+    return False
+
+
+async def maybe_collect_log(ctx, force=False):
+    """collect_log at most every `log_every_s` (plan timing, default 60 s), in a thread so the HA event
+    loop keeps time-stamping state changes. Errors are logged, never raised."""
+    every = ctx.plan["timing"].get("log_every_s", L.LOG_EVERY_S)
+    now = time.monotonic()
+    if not force and now - getattr(ctx, "log_t", -1e9) < every:
+        return False
+    ctx.log_t = now
+    try:
+        await asyncio.to_thread(collect_log, ctx)
+        return True
+    except Exception as e:
+        log(f"could not fetch the TV log: {e}")
+        return False
+
+
+async def sleep_collecting(ctx, seconds):
+    """asyncio.sleep that keeps collecting the TV log during long waits."""
+    end = time.monotonic() + seconds
+    while (left := end - time.monotonic()) > 0:
+        await maybe_collect_log(ctx)
+        await asyncio.sleep(min(left, 5.0))
+
+
 async def run_trial(ctx, item, blk):
     """One played item. Returns the raw trial record (see aec_live_lib.trial_row)."""
     pr = ctx.p2r
@@ -306,11 +388,11 @@ async def run_trial(ctx, item, blk):
     tm = plan["timing"]
     rec = {"arm": blk["arm"], "condition": blk["condition"], "block": blk["index"], "set": blk["set"],
            "item": ctx.item_fields(item), "detections_s": [], "stt_text": None, "valid": True, "notes": []}
-    if not await pr.wait_ready(ctx.ha, ctx.pid, ctx.watch, tm["settle_s"]):
+    if not await wait_ready(ctx, tm["settle_s"]):
         rec.update(valid=False, t_play=time.time(), lead_s=tm["lead_s"], sink_latency_s=tm["sink_latency_s"])
         rec["notes"].append("satellite_not_ready")
         return rec
-    seen = ctx.seen | prior_runs(await ctx.ha.pipeline_runs(ctx.pid))
+    seen = ctx.seen | prior_runs(await own_runs(ctx))
     ctx.seen = seen
     sf, np = ctx.sf, ctx.np
     x, sr = sf.read(str(Path(a.corpus) / item["file_48k_stereo"]), dtype="float64", always_2d=True)
@@ -333,7 +415,7 @@ async def run_trial(ctx, item, blk):
     runs = []
     for _ in range(20):
         runs = []
-        for r in await ctx.ha.pipeline_runs(ctx.pid):
+        for r in await own_runs(ctx):
             if r["pipeline_run_id"] in seen:
                 continue
             full = await ctx.ha.pipeline_run(ctx.pid, r["pipeline_run_id"])
@@ -388,23 +470,24 @@ async def run_ab(ctx):
             ctx.touched_levels = True
             cur_cond = cname
             if cond["content"]:
-                await asyncio.sleep(plan["content_lead_s"])
+                await sleep_collecting(ctx, plan["content_lead_s"])
         restarted = False
         if blk["arm"] != ctx.cur_arm:
             t_restart = tv_arm_apply(ctx, blk["arm"])
             restarted = True
             if t_restart is None:
                 raise RuntimeError("cannot read the TV clock")
-            if not ctx.tv.wait_streaming(t_restart):
+            if not await asyncio.to_thread(ctx.tv.wait_streaming, t_restart):
                 bnotes.append("no_streaming_after_restart")
                 log("WARNING: the satellite did not report streaming within 90 s")
             if L.arm_aec_enabled(plan["arms"][blk["arm"]]["aec"]) and cond["content"]:
-                lock = ctx.tv.wait_lock(t_restart)
+                lock = await asyncio.to_thread(ctx.tv.wait_lock, t_restart)
                 if lock is None:
                     bnotes.append("no_delay_lock")
                     log("WARNING: no delay lock within 60 s of the restart")
                 else:
                     bnotes.append(f"lock_ms={lock}")
+            await maybe_collect_log(ctx, force=True)     # the restart's lines, before they rotate away
         else:
             bnotes.append("no_restart")
         cpu0 = ctx.tv.cpu_sample()
@@ -431,24 +514,21 @@ async def run_ab(ctx):
             ctx.trials_f.flush()
             ctx.trial_recs.append(rec)
             log(f"  {item_id}: detected={'yes' if rec['detections_s'] else 'no'}")
+            await maybe_collect_log(ctx)
         cpu1 = ctx.tv.cpu_sample()
         t_blk1 = time.time()
         wins = [(r["t_play"], r.get("item_end", r["t_play"]) + 3.0) for r in ctx.trial_recs if r["block"] == blk["index"]]
-        fw = 0
+        fw = rl = 0
         if cond["content"]:
-            fw = sum(1 for c in ctx.watch.changes if c[1] == "idle" and c[2] == "listening" and t_blk0 <= c[0] <= t_blk1
-                     and not any(w0 - 0.5 <= c[0] <= w1 for w0, w1 in wins))
+            fw, rl = L.classify_wakes(ctx.watch.changes, wins, t_blk0, t_blk1, plan["timing"]["relisten_gap_s"])
         brec = {"block": blk["index"], "arm": blk["arm"], "condition": cname, "set": blk["set"],
                 "trials": len(blk["items"]), "t_start": round(t_blk0, 3), "t_end": round(t_blk1, 3),
-                "content_s": round(t_blk1 - t_blk0, 1) if cond["content"] else 0, "false_wakes": fw,
+                "content_s": round(t_blk1 - t_blk0, 1) if cond["content"] else 0, "false_wakes": fw, "relistens": rl,
                 "daemon_cpu_pct": Tv.cpu_pct(cpu0, cpu1), "restarted": restarted, "notes": bnotes}
         ctx.block_recs[blk["index"]] = brec
         ctx.blocks_f.write(json.dumps(brec) + "\n")
         ctx.blocks_f.flush()
-        try:
-            collect_log(ctx)        # before the log rotates the block's `aec:` lines away
-        except Exception as e:
-            log(f"could not fetch the TV log after block {blk['index']}: {e}")
+        await maybe_collect_log(ctx, force=True)   # before the log rotates the block's `aec:` lines away
     ctx.content.stop()
 
 
@@ -462,6 +542,7 @@ def collect_log(ctx):
         if not re.search(AEC_LOG_RE, l):
             continue
         l = re.sub(r"config: name=\S+.*", "config: (redacted)", l)
+        l = re.sub(r"ESPHome API on \S+", "ESPHome API on (redacted)", l)
         if l not in have:
             have.add(l)
             ctx.log_lines.append(l)
@@ -492,13 +573,20 @@ def rebuild_csv(plan, run_id, out, entries, skew):
     rows = [L.trial_row(plan, run_id, r, entries, blocks.get(r["block"]), skew) for r in recs]
     L.write_rows(out / "trials.csv", rows)
     import csv
+
+    def blank(v):
+        return "" if v is None else v
     with open(out / "blocks.csv", "w", newline="") as f:
         w = csv.writer(f, lineterminator="\n")
         w.writerow(["run_id", "plan", "block", "arm", "condition", "trials", "content_s", "false_wakes",
-                    "daemon_cpu_pct", "notes"])
+                    "relistens", "false_wakes_log", "daemon_cpu_pct", "notes"])
         for b in blocks.values():
+            fw_log = None
+            if b["content_s"]:
+                wins = [(r["t_play"], r.get("item_end", r["t_play"]) + 3.0) for r in recs if r["block"] == b["block"]]
+                fw_log = L.log_wakes(entries, wins, b["t_start"], b["t_end"], skew)
             w.writerow([run_id, plan["id"], b["block"], b["arm"], b["condition"], b["trials"], b["content_s"],
-                        b["false_wakes"], "" if b["daemon_cpu_pct"] is None else b["daemon_cpu_pct"],
+                        b["false_wakes"], blank(b.get("relistens")), blank(fw_log), blank(b["daemon_cpu_pct"]),
                         ";".join(b["notes"])])
     return rows
 
@@ -718,7 +806,7 @@ async def live(a, plan):
     ctx.content = Content(a.content_sink or "", a.content_manifest, plan["content"]["category"],
                           plan["content"]["repeat"], out / "content-playlog.jsonl")
     ctx.cur_arm, ctx.config_changed, ctx.satellite_stopped, ctx.touched_levels = None, False, False, False
-    ctx.tmp_tv_files, ctx.trial_recs, ctx.block_recs, ctx.seen = [], [], {}, set()
+    ctx.tmp_tv_files, ctx.trial_recs, ctx.block_recs, ctx.seen, ctx.run_owner = [], [], {}, set(), {}
     ctx.tmpdir = tempfile.mkdtemp(prefix="aeclive-", dir=out)
     # --- snapshot the originals before anything changes ---
     orig_cfg = ctx.tv.read_config()

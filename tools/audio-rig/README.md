@@ -296,10 +296,28 @@ key (the `aec:` window lines need `debug`) of `etc/config.toml`; every other byt
 each write). The original is copied to the private output directory (mode 0600) with its md5, and written
 back and md5-checked on exit, Ctrl-C, SIGTERM or error, followed by `ctl.sh restart`. The new config is
 uploaded to a `.new` file, md5-checked and moved into place. Restarts use `ctl.sh restart` only; after a
-restart the runner waits for the `streaming mic audio to HA` log line, for HA's entity to be idle with the
-next wake word run armed, and (arm with AEC and content playing) for the first `aec: echo delay` line.
-Trials are played as in `p2_runner.py` (same arming wait, same detection rule; an HA WebSocket drop is
-retried after a reconnect). The satellite's `aec:` 60 s window covering each trial gives its delay, ERLE
+restart the runner waits for evidence from the **new process**: a live PID in the pid file other than the
+one before the restart, and in the log its start banner (`webos-satellite <version> (<target>) ESPHome API on`,
+logged at or after the restart) followed by its own `streaming mic audio to HA (wake word stage)` line
+(the old process's streaming line, even one from the restart's second, never counts); then for HA's
+entity to be idle with the next wake word run armed, and (arm with AEC and content playing) for the
+new process's first `aec: echo delay` line. Trials are played as in `p2_runner.py` (same detection rule;
+an HA WebSocket drop is retried after a reconnect).
+
+**Only this satellite's pipeline runs.** HA keeps the last 10 debug runs per pipeline, and another
+satellite on the same pipeline (EXP-021: c3-b in a continued-conversation loop) pushes this satellite's
+armed wake word run out of that list. The runner therefore looks only at runs whose `run-start` event
+names the `--entity` as `satellite_id` (fetched once per run and cached), for the arming check, for
+the runs it ignores before a trial and for the trial's STT. When none of the satellite's own runs is left
+in the list, it counts as armed if the entity is idle (the satellite re-arms whenever it is idle).
+
+**TV log collection.** The daemon rotates its log (about 256 KB, under 20 minutes at debug level, more than
+once during a long block in EXP-021), and the runner reads only the current and the rotated file. It
+therefore adds the new `aec:` / `capture:` / streaming / wake / start lines to `tvlog-aec.txt` at least
+every `log_every_s` (plan `[timing]`, default 60 s): while waiting for the satellite to be ready, after
+every trial, during the content lead-in, right after a restart and after every block. Collection runs in a
+thread so HA's state changes keep their receive times. The start banner's address and the `config:` line
+are redacted. The satellite's `aec:` 60 s window covering each trial gives its delay, ERLE
 and reference underruns; the daemon's CPU is sampled from `/proc/<pid>/stat` once per block (all trials of
 a block share it).
 
@@ -327,8 +345,15 @@ then the PC sink up; at the end the PC sinks first, then the TV volume (as EXP-0
 | `daemon_cpu_pct` | the daemon's CPU, share of one core, over the trial's block (blank in EXP-018's data) |
 | `notes` | `key=value;...`: `block=N`, `lock_ms=...`, `no_restart`, `no_delay_lock`, `retried_after_ha_error`, `reconstructed`, `invalid`, ... |
 
-A second file, `blocks.csv`, has one row per block (arm, condition, trials, content seconds, **false wakes**
-while content played outside any trial window, CPU, notes). Rows contain no room speech, no audio, no tokens,
+A second file, `blocks.csv`, has one row per block (arm, condition, trials, content seconds, false wakes,
+CPU, notes). False wakes are counted while content played, outside any trial window, in three columns:
+`false_wakes` (HA entity `idle` to `listening`, without the re-listens), `relistens` (continued conversation:
+the change before was `responding` to `idle` at most `relisten_gap_s` earlier, plan `[timing]`, default 2.5 s;
+EXP-021 saw 0.4 to 0.5 s and once 1.9 s; HA starts these runs at speech-to-text, with no wake word) and
+`false_wakes_log` (the satellite's own `wake word detected by HA` lines in the collected TV log, clock skew
+corrected; blank when the log has no line in that block). EXP-021's runner counted re-listens as false wakes
+(49 and 76, all re-listens); if `false_wakes` and `false_wakes_log` differ, look at the block before
+reporting. Rows contain no room speech, no audio, no tokens,
 no addresses, no timestamps (the writer refuses IPs, MACs, URLs and token-like strings).
 
 **Analysis and pooling.** `aec_live_report.py A-trials.csv B-trials.csv` prints, per cell (condition, TV volume,

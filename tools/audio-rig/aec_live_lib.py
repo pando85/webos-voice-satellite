@@ -22,6 +22,8 @@ import p2_score
 MAX_TV_VOLUME = 20          # the owner's rule for every AEC session
 DAY_START_H, DAY_END_H = 8, 21   # sound only from 08:00 up to (not including) 21:00 local time
 MAX_CLOCK_SKEW_S = 120      # PC against TV clock, for the log alignment
+RELISTEN_GAP_S = 2.5        # responding -> idle -> listening within this: a continued-conversation re-listen
+LOG_EVERY_S = 60.0          # collect the TV log at least this often (it rotated within a block in EXP-021)
 HDMI_RE = re.compile(r"hdmi|displayport|\.dp[-_.]|display[-_]port", re.I)
 
 CSV_COLUMNS = ["run_id", "plan", "arm", "condition", "tv_volume", "talker_level", "item_id", "voice",
@@ -81,7 +83,9 @@ def parse_plan(raw, source="plan"):
     t = raw.get("timing", {})
     plan["timing"] = {"sink_latency_s": float(t.get("sink_latency_s", 0.2)), "settle_s": float(t.get("settle_s", 1.5)),
                       "post_s": float(t.get("post_s", 3.0)), "max_run_s": float(t.get("max_run_s", 40.0)),
-                      "lead_s": float(t.get("lead_s", 1.0))}
+                      "lead_s": float(t.get("lead_s", 1.0)),
+                      "relisten_gap_s": float(t.get("relisten_gap_s", RELISTEN_GAP_S)),
+                      "log_every_s": float(t.get("log_every_s", LOG_EVERY_S))}
     if not re.fullmatch(r"[A-Za-z0-9._-]+", plan["id"]):
         raise PlanError("[plan] id: letters, digits, . _ - only")
     c = raw.get("content", {})
@@ -480,6 +484,9 @@ CAPTURE_WINDOW = re.compile(
     r"out rms (?P<out_rms>-?[0-9.]+) dBFS peak (?P<out_peak>-?[0-9.]+) dBFS, clipped (?P<clipped>\d+), "
     r"xruns (?P<xruns>\d+), chunks sent (?P<sent>\d+) dropped (?P<dropped>\d+)")
 STREAMING = re.compile(_TS + r"\s+INFO\s+streaming mic audio to HA \(wake word stage\)")
+RELISTEN = re.compile(_TS + r"\s+INFO\s+streaming mic audio to HA \(speech-to-text\)")
+WAKE = re.compile(_TS + r"\s+INFO\s+wake word detected by HA")
+START = re.compile(_TS + r"\s+INFO\s+webos-satellite (?P<version>\S+) \(\S+\) ESPHome API on")
 
 
 def parse_ts(s):
@@ -498,7 +505,7 @@ def parse_aec_lines(text):
     Each is a dict with kind in {window, lock, change, on, capture, streaming} and `t` (epoch)."""
     out = []
     for line in text.splitlines():
-        if "aec:" not in line and "capture:" not in line and "streaming mic" not in line:
+        if not any(k in line for k in ("aec:", "capture:", "streaming mic", "wake word detected", "ESPHome API on")):
             continue
         m = AEC_WINDOW.search(line)
         if m:
@@ -534,7 +541,86 @@ def parse_aec_lines(text):
         m = STREAMING.search(line)
         if m:
             out.append({"kind": "streaming", "t": parse_ts(m.group("ts"))})
+            continue
+        m = RELISTEN.search(line)
+        if m:
+            out.append({"kind": "relisten", "t": parse_ts(m.group("ts"))})
+            continue
+        m = WAKE.search(line)
+        if m:
+            out.append({"kind": "wake", "t": parse_ts(m.group("ts"))})
+            continue
+        m = START.search(line)
+        if m:
+            out.append({"kind": "start", "t": parse_ts(m.group("ts")), "version": m.group("version")})
     return out
+
+
+def since_start(entries, t_restart):
+    """The entries after the newest start banner logged at or after `t_restart` (TV clock, whole
+    seconds, read just before `ctl.sh restart`): the new process's lines only. Empty when the new
+    process has not logged its banner yet."""
+    start = None
+    for i, e in enumerate(entries):
+        if e["kind"] == "start" and e["t"] >= t_restart - 1:
+            start = i
+    return [] if start is None else entries[start + 1:]
+
+
+def streaming_after_start(entries, t_restart):
+    """True when the log shows a process started at or after `t_restart` (TV clock, whole seconds,
+    read just before `ctl.sh restart`) that has since reached the wake word stage: a `start` banner
+    with t >= t_restart - 1, followed in file order by a `streaming` line. A streaming line of the old
+    process, even one logged in the same second as the restart, comes before the new banner."""
+    return any(e["kind"] == "streaming" for e in since_start(entries, t_restart))
+
+
+# ---- false wakes ---------------------------------------------------------------------------------
+
+def _outside(t, windows, pre=0.5):
+    return not any(w0 - pre <= t <= w1 for w0, w1 in windows)
+
+
+def classify_wakes(changes, windows, t0, t1, gap_s=RELISTEN_GAP_S):
+    """(wake word wakes, continued-conversation re-listens) among the satellite's `idle` -> `listening`
+    changes in [t0, t1] outside the trial windows. `changes` are (t, old, new) of one entity in order.
+    A change is a re-listen when the change before it was `responding` -> `idle` at most `gap_s` earlier
+    (HA's continued conversation: the satellite listens again after its own spoken reply, no wake word;
+    EXP-021 saw 0.4 to 0.5 s gaps, once 1.9 s)."""
+    wakes = relistens = 0
+    for i, (t, old, new) in enumerate(changes):
+        if old != "idle" or new != "listening" or not (t0 <= t <= t1) or not _outside(t, windows):
+            continue
+        if i > 0 and changes[i - 1][1] == "responding" and changes[i - 1][2] == "idle" and t - changes[i - 1][0] <= gap_s:
+            relistens += 1
+        else:
+            wakes += 1
+    return wakes, relistens
+
+
+def log_wakes(entries, windows, t0, t1, skew_s=0.0):
+    """Wake word detections the satellite logged (`wake word detected by HA`) in [t0, t1] (PC clock)
+    outside the trial windows, or None when the collected log has no line at all in [t0, t1] (no
+    evidence either way). skew_s: TV clock minus PC clock. A re-listen logs `streaming mic audio to HA
+    (speech-to-text)` instead, so it is never counted here."""
+    pc = [(e["kind"], e["t"] - skew_s) for e in entries]
+    if not any(t0 <= t <= t1 for _, t in pc):
+        return None
+    return sum(1 for k, t in pc if k == "wake" and t0 <= t <= t1 and _outside(t, windows))
+
+
+def run_satellite(run):
+    """The satellite entity a pipeline run belongs to (`run-start` data `satellite_id`), or None."""
+    for e in run.get("events", []):
+        if e.get("type") == "run-start":
+            return (e.get("data") or {}).get("satellite_id")
+    return None
+
+
+def run_armed(run):
+    """Whether a pipeline run is a wake word run still waiting for the wake word."""
+    types = [e.get("type") for e in run.get("events", [])]
+    return "wake_word-start" in types and "run-end" not in types and "wake_word-end" not in types
 
 
 def window_for(t, entries, kind="window", span=60.0):
