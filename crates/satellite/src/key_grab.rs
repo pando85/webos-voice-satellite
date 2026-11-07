@@ -57,7 +57,10 @@ pub(crate) const PID_FILE: &str = "remote-proxy.pid";
 pub(crate) const STALL: Duration = Duration::from_millis(2500);
 /// Before `ready`: the helper may wait up to 2 s for keys to be released.
 const START_WAIT: Duration = Duration::from_secs(5);
-/// How long a stop waits for the helper's own clean exit before `SIGKILL`.
+/// After `SIGTERM`, how long the helper gets to release and exit before
+/// `SIGKILL` (review of `3d25abe`).
+const TERM_WAIT: Duration = Duration::from_millis(400);
+/// How long a stop waits for the helper's own clean exit before `SIGTERM`.
 const STOP_WAIT: Duration = Duration::from_secs(1);
 /// Restart backoff.
 const BACKOFF_FIRST: Duration = Duration::from_secs(1);
@@ -293,6 +296,8 @@ pub(crate) struct Handle {
     pub(crate) status: Arc<Mutex<GrabStatus>>,
     /// The running helper's pid (0: none).
     pid: Arc<AtomicU32>,
+    /// For the one-shot release after a `SIGKILL`.
+    plan: Plan,
 }
 
 impl Handle {
@@ -309,34 +314,96 @@ impl Handle {
         log::warn!("remote grab: the supervisor did not stop in time; killing the helper");
         task.abort();
         let pid = self.pid.load(Ordering::SeqCst);
-        if pid != 0 {
-            kill_and_wait(pid).await;
+        if pid != 0 && term_then_kill_pid(pid).await {
+            release_after_kill(&self.plan).await;
         }
     }
 }
 
-/// `SIGKILL` to `pid` (our helper) and a wait until it is gone or a zombie
-/// (its fds, and so the grab, are released then), at most 1 s.
-async fn kill_and_wait(pid: u32) {
+/// True when `pid` is gone or a zombie (its fds, and so the grab, are
+/// released then).
+fn pid_gone(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat")).map_or(true, |s| {
+        s.rsplit(')')
+            .next()
+            .is_some_and(|r| r.trim_start().starts_with('Z'))
+    })
+}
+
+/// `SIGTERM` to `pid` (our helper), up to [`TERM_WAIT`] for it to end, then
+/// `SIGKILL` and up to 1 s more. True when `SIGKILL` was needed.
+async fn term_then_kill_pid(pid: u32) -> bool {
     let Some(p) = i32::try_from(pid)
         .ok()
         .and_then(rustix::process::Pid::from_raw)
     else {
-        return;
+        return false;
     };
+    let _ = rustix::process::kill_process(p, rustix::process::Signal::TERM);
+    let steps = u32::try_from(TERM_WAIT.as_millis() / 50).unwrap_or(8);
+    for _ in 0..steps {
+        if pid_gone(pid) {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    if pid_gone(pid) {
+        return false;
+    }
+    log::warn!("remote grab: helper pid {pid} ignored SIGTERM; SIGKILL");
     let _ = rustix::process::kill_process(p, rustix::process::Signal::KILL);
     for _ in 0..20 {
-        let gone = std::fs::read_to_string(format!("/proc/{pid}/stat")).map_or(true, |s| {
-            s.rsplit(')')
-                .next()
-                .is_some_and(|r| r.trim_start().starts_with('Z'))
-        });
-        if gone {
-            return;
+        if pid_gone(pid) {
+            return true;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     log::error!("remote grab: helper pid {pid} did not end after SIGKILL");
+    true
+}
+
+/// `SIGTERM` to the child, up to [`TERM_WAIT`] for its exit (it releases its
+/// keys and the grab), then `SIGKILL` and a wait. True when `SIGKILL` was
+/// needed (the keys it held down in the target may still be down).
+async fn terminate(child: &mut tokio::process::Child) -> bool {
+    if let Some(p) = child
+        .id()
+        .and_then(|id| i32::try_from(id).ok())
+        .and_then(rustix::process::Pid::from_raw)
+    {
+        let _ = rustix::process::kill_process(p, rustix::process::Signal::TERM);
+        if timeout(TERM_WAIT, child.wait()).await.is_ok() {
+            return false;
+        }
+        log::warn!("remote grab: the helper ignored SIGTERM; SIGKILL");
+    }
+    let _ = child.start_kill();
+    let _ = child.wait().await;
+    true
+}
+
+/// After a `SIGKILL` with no new helper to follow (a new one releases at its
+/// start): `remote-proxy release-target --target T`, one shot, 3 s at most.
+async fn release_after_kill(plan: &Plan) {
+    let mut cmd = Command::new(&plan.helper);
+    cmd.args(["release-target", "--target", &plan.target])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    crate::power::die_with_parent_on(&mut cmd, rustix::process::Signal::TERM);
+    match timeout(Duration::from_secs(3), cmd.output()).await {
+        Ok(Ok(o)) if o.status.success() => log::info!(
+            "remote grab: after the kill: {}",
+            String::from_utf8_lossy(&o.stdout).trim()
+        ),
+        Ok(Ok(o)) => log::warn!(
+            "remote grab: release-target failed: {}",
+            String::from_utf8_lossy(&o.stderr).trim()
+        ),
+        Ok(Err(e)) => log::warn!("remote grab: release-target: {e}"),
+        Err(_) => log::warn!("remote grab: release-target took longer than 3 s"),
+    }
 }
 
 /// Marks the grab failed when the supervisor ends without a stop (a panic).
@@ -354,7 +421,9 @@ impl Drop for Alive {
 
 /// Writes the pid file without following a link: an existing entry (file or
 /// planted link) is removed, then the file is created new, mode 0600.
-fn write_pid_file(path: &Path, pid: u32) {
+/// Its second line is the target's name, for `ctl.sh`'s `release-target`
+/// after it had to `SIGKILL` a left helper.
+fn write_pid_file(path: &Path, pid: u32, target: &str) {
     use std::io::Write as _;
     use std::os::unix::fs::OpenOptionsExt as _;
     let _ = std::fs::remove_file(path);
@@ -363,7 +432,7 @@ fn write_pid_file(path: &Path, pid: u32) {
         .create_new(true)
         .mode(0o600)
         .open(path)
-        .and_then(|mut f| f.write_all(format!("{pid}\n").as_bytes()));
+        .and_then(|mut f| f.write_all(format!("{pid}\n{target}\n").as_bytes()));
     if let Err(e) = r {
         log::warn!(
             "remote grab: cannot write {}: {e} (ctl.sh finds a left helper by its binary instead)",
@@ -387,12 +456,14 @@ pub(crate) fn spawn_with(plan: Plan, tx: mpsc::UnboundedSender<Key>, stall: Dura
     let st = Arc::clone(&status);
     let pid = Arc::new(AtomicU32::new(0));
     let p2 = Arc::clone(&pid);
+    let plan2 = plan.clone();
     let task = tokio::spawn(async move { supervise(plan, tx, stop_rx, st, stall, p2).await });
     Handle {
         stop: stop_tx,
         task,
         status,
         pid,
+        plan: plan2,
     }
 }
 
@@ -413,12 +484,16 @@ async fn supervise(
     let _alive = Alive(Arc::clone(&status));
     let pid_file = plan.run_dir.join(PID_FILE);
     let mut backoff = BACKOFF_FIRST;
+    // The last helper was SIGKILLed: its keys may be down in the target until
+    // a new helper starts (it releases them) or `release-target` runs.
+    let mut pending_release = false;
     loop {
         if *stop.borrow() {
             break;
         }
         let started = tokio::time::Instant::now();
-        let end = run_once(&plan, &tx, &mut stop, &status, &pid_file, stall, &pid).await;
+        let (end, killed) = run_once(&plan, &tx, &mut stop, &status, &pid_file, stall, &pid).await;
+        pending_release = killed;
         let _ = std::fs::remove_file(&pid_file);
         if *stop.borrow() {
             break;
@@ -441,10 +516,14 @@ async fn supervise(
         }
         backoff = (backoff * 2).min(BACKOFF_MAX);
     }
+    if pending_release {
+        release_after_kill(&plan).await;
+    }
     set(&status, |s| s.state = "stopped");
 }
 
-/// One run of the helper; returns why it ended.
+/// One run of the helper; returns why it ended and whether it had to be
+/// `SIGKILL`ed.
 async fn run_once(
     plan: &Plan,
     tx: &mpsc::UnboundedSender<Key>,
@@ -453,7 +532,7 @@ async fn run_once(
     pid_file: &Path,
     stall: Duration,
     pid_slot: &AtomicU32,
-) -> String {
+) -> (String, bool) {
     let mut cmd = Command::new(&plan.helper);
     cmd.args(plan.args(false))
         .stdin(Stdio::piped())
@@ -463,18 +542,24 @@ async fn run_once(
     crate::power::die_with_parent_on(&mut cmd, rustix::process::Signal::TERM);
     let mut child = match cmd.spawn() {
         Ok(c) => c,
-        Err(e) => return format!("cannot start {}: {e}", plan.helper.display()),
+        Err(e) => {
+            return (
+                format!("cannot start {}: {e}", plan.helper.display()),
+                false,
+            );
+        }
     };
     if let Some(pid) = child.id() {
         pid_slot.store(pid, Ordering::SeqCst);
-        write_pid_file(pid_file, pid);
+        write_pid_file(pid_file, pid, &plan.target);
     }
-    let why = serve_child(&mut child, tx, stop, status, stall).await;
+    let r = serve_child(&mut child, tx, stop, status, stall).await;
     pid_slot.store(0, Ordering::SeqCst);
-    why
+    r
 }
 
-/// Reads the running helper's lines until it ends or a stop; returns why.
+/// Reads the running helper's lines until it ends or a stop; returns why,
+/// and whether it had to be `SIGKILL`ed.
 #[allow(clippy::too_many_lines)] // one select loop over the helper's lines
 async fn serve_child(
     child: &mut tokio::process::Child,
@@ -482,7 +567,7 @@ async fn serve_child(
     stop: &mut watch::Receiver<bool>,
     status: &Mutex<GrabStatus>,
     stall: Duration,
-) -> String {
+) -> (String, bool) {
     // The parent link: kept open while the helper should run.
     let stdin = child.stdin.take();
     if let Some(err) = child.stderr.take() {
@@ -497,22 +582,24 @@ async fn serve_child(
         });
     }
     let Some(out) = child.stdout.take() else {
-        let _ = child.start_kill();
-        return "no stdout pipe".to_owned();
+        let killed = terminate(child).await;
+        return ("no stdout pipe".to_owned(), killed);
     };
     let mut lines = BufReader::new(out).lines();
     let mut ready = false;
     let mut held = false;
     let mut end: Option<String> = None;
+    let mut killed = false;
     let why = loop {
         let wait = if ready { stall } else { START_WAIT };
         tokio::select! {
             r = timeout(wait, lines.next_line()) => match r {
                 Err(_) => {
-                    let _ = child.start_kill();
+                    killed = terminate(child).await;
                     break format!(
-                        "no heartbeat for {} ms: killed",
-                        wait.as_millis()
+                        "no heartbeat for {} ms: stopped ({})",
+                        wait.as_millis(),
+                        if killed { "SIGKILL" } else { "SIGTERM" }
                     );
                 }
                 Ok(Ok(Some(l))) => match parse_line(&l) {
@@ -547,7 +634,7 @@ async fn serve_child(
                 },
                 Ok(Ok(None)) => break end.take().unwrap_or_else(|| "its output ended".to_owned()),
                 Ok(Err(e)) => {
-                    let _ = child.start_kill();
+                    killed = terminate(child).await;
                     break format!("reading its output: {e}");
                 }
             },
@@ -555,15 +642,15 @@ async fn serve_child(
                 // A clean stop: end of file on its stdin; it releases held
                 // keys and the grab, then exits.
                 drop(stdin);
+                let mut killed = false;
                 if timeout(STOP_WAIT, child.wait()).await.is_err() {
-                    let _ = child.start_kill();
-                    let _ = child.wait().await;
-                    log::warn!("remote grab: the helper did not stop in {} ms: killed", STOP_WAIT.as_millis());
+                    log::warn!("remote grab: the helper did not stop in {} ms: SIGTERM", STOP_WAIT.as_millis());
+                    killed = terminate(child).await;
                 }
                 if held {
                     let _ = tx.send(Key::Released(None));
                 }
-                return "stopped".to_owned();
+                return ("stopped".to_owned(), killed);
             }
         }
     };
@@ -572,10 +659,10 @@ async fn serve_child(
         let _ = tx.send(Key::Released(None));
     }
     if let Ok(Ok(st)) = code {
-        format!("{why}; {st}")
+        (format!("{why}; {st}"), killed)
     } else {
-        let _ = child.start_kill();
-        why
+        let k = terminate(child).await;
+        (why, killed || k)
     }
 }
 
@@ -817,11 +904,10 @@ mod tests {
         let pidf = d.join("run").join(PID_FILE);
         assert!(!pidf.symlink_metadata().unwrap().file_type().is_symlink());
         assert_eq!(std::fs::read_to_string(&outside).unwrap(), "keep");
-        let pid: u32 = std::fs::read_to_string(&pidf)
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
+        let text = std::fs::read_to_string(&pidf).unwrap();
+        let mut lines = text.lines();
+        let pid: u32 = lines.next().unwrap().parse().unwrap();
+        assert_eq!(lines.next(), Some("T"), "the target's name for ctl.sh");
         handle.stop().await;
         let alive = std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|st| {
             !st.rsplit(')')
@@ -851,6 +937,52 @@ mod tests {
         assert!(describe(&st).starts_with("failed"));
         st.state = "restarting";
         assert!(describe(&st).starts_with("restarting"));
+    }
+
+    /// A helper that ignores its stdin's end; `term` decides what SIGTERM does
+    /// (exit, or nothing); `release-target` writes to the log.
+    fn stubborn(d: &Path, term: &str) -> PathBuf {
+        let log = d.join("log");
+        script(
+            d,
+            &format!(
+                "L='{log}'\nif [ \"$1\" = release-target ]; then echo \"release $3\" >> \"$L\"; exit 0; fi\n\
+                 trap '{term}' TERM\necho 'ready event2 event4'\nwhile :; do echo 'hb 0 0 0'; sleep 0.05; done",
+                log = log.display()
+            ),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_stop_sends_sigterm_before_sigkill_and_releases_the_target_only_after_a_kill() {
+        // SIGTERM honoured: no SIGKILL, no release-target.
+        let d = tmp("termok");
+        let h = stubborn(
+            &d,
+            &format!("echo term >> '{}'; exit 0", d.join("log").display()),
+        );
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let handle = spawn(plan_for(&d, h), tx);
+        assert_eq!(next(&mut rx, 3000).await, Some(Key::Found));
+        let t0 = std::time::Instant::now();
+        handle.stop().await;
+        assert!(t0.elapsed() < STOP_WAIT + TERM_WAIT + Duration::from_millis(500));
+        assert_eq!(std::fs::read_to_string(d.join("log")).unwrap(), "term\n");
+        let _ = std::fs::remove_dir_all(&d);
+
+        // SIGTERM ignored: SIGKILL after it, then one release-target.
+        let d = tmp("termignored");
+        let h = stubborn(&d, &format!("echo term >> '{}'", d.join("log").display()));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let handle = spawn(plan_for(&d, h), tx);
+        assert_eq!(next(&mut rx, 3000).await, Some(Key::Found));
+        handle.stop().await;
+        assert_eq!(
+            std::fs::read_to_string(d.join("log")).unwrap(),
+            "term\nrelease T\n",
+            "TERM first, then (after the kill) one release of the target"
+        );
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[tokio::test]

@@ -201,6 +201,8 @@ Built for 0.6.0 (planned), host-tested only. With `mic_button = "ptt"` and `[rem
 
 **Review of `b33ed38` (fixed):** a key left down in the target after a `SIGKILL` (released at the next start), PDEATHSIG `SIGTERM`, the 2.5 s heartbeat limit, `grab_target` within the firmware gate only, 428 only, the stop order (grab and helper exit before LG's key comes back, also after the persistence recheck), `SYN_DROPPED` reporting a caught key's release, no helper path override and a pid file that never follows a link, a second key check after the grab, refusal when a slot is skipped or the key device is not a source, the live wording ("no toast" only while grabbing), the scan for a left helper, and the OR of all sources' key states on a resync.
 
+**Re-review of `3d25abe` (fixed):** events queued before the grab are dropped after it (host test: pointer frames sent while the helper waits for a held key never reach the target; the test fails without the drain); the target's held keys are released at every start before any refusal; every stop is `SIGTERM` first (0.4 s) and `SIGKILL` only then, in the daemon (stop, heartbeat, `Handle::stop`) and in `lib.sh`; after a `SIGKILL` with no new helper to follow, `remote-proxy release-target --target T` runs (Rust test of the order TERM → KILL → one release; `run.sh` tests of both cases; host tests of the new mode).
+
 **Not covered here:** the TV itself (the owner's acceptance test in ADR 0016), and a screen-off condition (the ADR has none: the grab runs whenever the feature runs).
 
 ## 11. Review of `785d25c` and what changed

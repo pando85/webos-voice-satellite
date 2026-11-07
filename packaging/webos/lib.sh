@@ -531,20 +531,40 @@ lg_restore_after_stop_script() {
 
 # The input grab helper (ADR 0016, `remote-proxy serve`) dies with the daemon
 # (PR_SET_PDEATHSIG, end of file on its stdin pipe); this is the dead-man's
-# last layer for one left anyway: SIGKILL by its pid file, only when that pid
-# runs our helper binary. The kernel releases its grab of the remote.
-# Without a usable pid file (lost, unwritable), every process named
-# remote-proxy whose executable is our helper (also after an update replaced
-# the file: "<path> (deleted)") is killed.
+# last layer for one left anyway, found by its pid file or, without one, by
+# name and executable (also "<path> (deleted)" after an update replaced it).
+# SIGTERM first (it releases the keys it holds down in the target and exits),
+# SIGKILL only when it is still there about 0.4 s later; after a SIGKILL a
+# one-shot `remote-proxy release-target` releases what it may have left down
+# (the target's name is the pid file's second line). The kernel releases its
+# grab of the remote in either case.
 is_grab_helper() { # PID
     ge=$(readlink "/proc/$1/exe" 2>/dev/null) || return 1
     [ "$ge" = "$GRAB_BIN" ] || [ "$ge" = "$GRAB_BIN (deleted)" ]
 }
+end_grab_helper() { # PID
+    kill -TERM "$1" 2>/dev/null || return 0
+    eg=0
+    while [ "$eg" -lt 4 ] && is_grab_helper "$1"; do
+        sleep 0.1 2>/dev/null || sleep 1
+        eg=$((eg + 1))
+    done
+    if ! is_grab_helper "$1"; then
+        note "remote grab helper pid $1 ended on SIGTERM"
+        return 0
+    fi
+    note "remote grab helper pid $1 ignored SIGTERM; sending SIGKILL"
+    kill -KILL "$1" 2>/dev/null || true
+    GRAB_KILLED=1
+}
 stop_grab_helper() {
+    GRAB_KILLED=
+    gt=$(sed -n '2p' "$GRAB_PID" 2>/dev/null | tr -cd 'A-Za-z0-9 +[]_.-')
+    [ -n "$gt" ] || gt='LGE M-RCU - Builtin [2]'
     gp=$(read_pid "$GRAB_PID")
     if [ -n "$gp" ] && is_grab_helper "$gp"; then
         note "stopping the remote grab helper pid $gp"
-        kill -KILL "$gp" 2>/dev/null || true
+        end_grab_helper "$gp"
     fi
     rm -f "$GRAB_PID"
     for gd in /proc/[0-9]*; do
@@ -552,9 +572,18 @@ stop_grab_helper() {
         gp=${gd#/proc/}
         if is_grab_helper "$gp"; then
             note "stopping a remote grab helper left without its pid file: pid $gp"
-            kill -KILL "$gp" 2>/dev/null || true
+            end_grab_helper "$gp"
         fi
     done
+    [ -n "$GRAB_KILLED" ] || return 0
+    # Only an installed helper that passes the trust check is run (as root).
+    if [ -f "$GRAB_BIN" ] && trust_check f "$GRAB_BIN" >/dev/null 2>&1; then
+        note "releasing the keys the killed helper may have left down in \"$gt\""
+        "$GRAB_BIN" release-target --target "$gt" >&2 || note "release-target failed"
+    else
+        note "the killed helper's keys could not be released (no trusted $GRAB_BIN); a TV restart releases them"
+    fi
+    return 0
 }
 
 stop_daemon() {

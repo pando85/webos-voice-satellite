@@ -88,6 +88,21 @@ def key_down(fd, code):
     return bool(buf[code // 8] & (1 << (code % 8)))
 
 
+def drain_all(fd, wait=0.3):
+    """Every non-SYN event as (type, code, value)."""
+    out = []
+    end = time.time() + wait
+    while time.time() < end:
+        r, _, _ = select.select([fd], [], [], 0.05)
+        if r:
+            data = os.read(fd, EVENT.size * 64)
+            for i in range(0, len(data), EVENT.size):
+                _, _, t, c, v = EVENT.unpack(data[i : i + EVENT.size])
+                if t != EV_SYN:
+                    out.append((t, c, v))
+    return out
+
+
 def drain_abs(fd, wait=0.3):
     out = []
     end = time.time() + wait
@@ -394,23 +409,69 @@ def main():
         check((B2, 0) in drain(src_r), "grab released after the parent's death")
 
         # 4g2. serve SIGKILLed while a key is held: the key stays down in the target
-        #      (nothing could release it); the next serve releases it at start
-        p = Proc(binary, ["serve", "--source-prefix", "rp-test-src", "--target", "rp-test-tgt"])
-        p.wait_line("ready ")
-        drain(tgt_r, 0.1)
-        emit(src, B3, 1)
-        check(drain(tgt_r) == [(B3, 1)], "serve forwards a press")
-        p.p.kill()
-        p.finish(3, close_stdin=False)
-        check(key_down(tgt_r, B3), "after SIGKILL the key is still down in the target")
-        emit(src, B3, 0)
-        drain(src_r, 0.1)
+        #      (nothing could release it). A serve that then refuses to start (a
+        #      candidate slot of other capabilities) still releases it first.
+        def leave_key_down():
+            p = Proc(binary, ["serve", "--source-prefix", "rp-test-src", "--target", "rp-test-tgt"])
+            p.wait_line("ready ")
+            drain(tgt_r, 0.1)
+            emit(src, B3, 1)
+            got = drain(tgt_r)
+            p.p.kill()
+            p.finish(3, close_stdin=False)
+            emit(src, B3, 0)
+            drain(src_r, 0.1)
+            return got == [(B3, 1)] and key_down(tgt_r, B3)
+        check(leave_key_down(), "after SIGKILL the key is still down in the target")
+        rc, out = Proc(binary, ["serve", "--source-prefix", "rp-test-", "--target", "rp-test-tgt"]).finish(close_stdin=False)
+        rel = drain(tgt_r)
+        check(rc == 2 and "differ from the target" in out and (B3, 0) in rel and not key_down(tgt_r, B3),
+              f"a serve that refuses to start still releases the key left down in the target ({rel})")
+        # release-target: the one-shot release after a SIGKILL (ADR 0016 dead-man)
+        check(leave_key_down(), "the key is left down again")
+        rc, out = Proc(binary, ["release-target", "--target", "rp-test-tgt"]).finish()
+        rel = drain(tgt_r)
+        check(rc == 0 and "released 1 key" in out and (B3, 0) in rel and not key_down(tgt_r, B3),
+              f"release-target releases the key left down ({out.strip()})")
+        rc, out = Proc(binary, ["release-target", "--target", "rp-test-tgt"]).finish()
+        check(rc == 0 and "released 0 key" in out and drain(tgt_r, 0.1) == [], "release-target with nothing down writes nothing")
+        rc, out = Proc(binary, ["release-target", "--target", "rp-no-such"]).finish()
+        check(rc == 0 and "nothing to release" in out, "release-target without the device: nothing to do")
+        rc, out = Proc(binary, ["release-target"]).finish()
+        check(rc == 2, "release-target without --target is refused")
+        check(leave_key_down(), "the key is left down once more")
         p = Proc(binary, ["serve", "--source-prefix", "rp-test-src", "--target", "rp-test-tgt"])
         check(p.wait_line("ready "), "a new serve starts")
         rel = drain(tgt_r)
         check((B3, 0) in rel and not key_down(tgt_r, B3) and "released 1 key" in "\n".join(p.all),
               f"the new serve released the key left down in the target ({rel})")
         p.finish()
+        drain(tgt_r, 0.1)
+
+        # 4g3. events queued before the grab (while serve waits for a held key
+        #      to be released) are dropped, never re-sent into the target. Keys
+        #      are flushed by the kernel's EVIOCGKEY already; pointer (ABS) and
+        #      wheel events are not, and would be replayed without the drain.
+        emit(src, B2, 1)
+        drain(src_r, 0.1)
+        drain(tgt_r, 0.1)
+        p = Proc(binary, ["serve", "--source-prefix", "rp-test-src", "--target", "rp-test-tgt"])
+        time.sleep(0.6)  # serve has opened the source and waits for B2 to go up
+        emit(src, B1, 1)
+        emit(src, B1, 0)
+        for x in (301, 302, 303):
+            os.write(src, EVENT.pack(0, 0, EV_ABS, 0, x) + EVENT.pack(0, 0, EV_SYN, 0, 0))
+        time.sleep(0.05)
+        emit(src, B2, 0)
+        check(p.wait_line("ready ", 4), "serve grabs once the held key is up")
+        time.sleep(0.3)
+        got = drain_all(tgt_r)
+        check(got == [], f"no event from before the grab reaches the target: {got}")
+        emit(src, B1, 1)
+        emit(src, B1, 0)
+        check(drain(tgt_r) == [(B1, 1), (B1, 0)], "events after the grab are forwarded")
+        p.finish()
+        drain(src_r, 0.1)
         drain(tgt_r, 0.1)
 
         # 4h. serve: a source device disappears -> exit 5, held key released

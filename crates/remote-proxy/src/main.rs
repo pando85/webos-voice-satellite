@@ -53,6 +53,7 @@ const TARGET: &str = env!("REMOTE_PROXY_TARGET");
 
 const USAGE: &str = "usage:
   remote-proxy serve       --target NAME [--source-prefix PREFIX] [--catch CODE]... [--check]
+  remote-proxy release-target --target NAME
   remote-proxy --version
   remote-proxy dry-run     --source NAME [--secs N]
   remote-proxy inject-test --target NAME [--secs N]
@@ -946,6 +947,7 @@ fn run() -> Result<i32, String> {
             return Ok(0);
         }
         Some("serve") => return serve::serve(&argv[1..]),
+        Some("release-target") => return serve::release_target(&argv[1..]),
         _ => {}
     }
     let a = parse_args(&argv)?;

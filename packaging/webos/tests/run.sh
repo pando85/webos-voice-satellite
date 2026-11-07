@@ -216,6 +216,22 @@ sh "$P/bin/stop.sh" >/dev/null 2>&1 || true
 check "stop.sh finds a grab helper without a pid file by name and executable (also a replaced binary), and leaves other processes alone" '! kill -0 "$GP" 2>/dev/null && kill -0 "$OTHER" 2>/dev/null'
 kill "$OTHER" 2>/dev/null || true
 wait "$GP" 2>/dev/null || true
+# SIGTERM first: a helper that ends on it is not SIGKILLed and nothing else
+# runs; one that ignores it is SIGKILLed after about 0.4 s and release-target
+# is run on the target named in the pid file.
+"$P/bin/remote-proxy" 300 &
+GP=$!
+printf '%s\nLGE M-RCU - Builtin [2]\n' "$GP" >"$P/run/remote-proxy.pid"
+out=$(sh "$P/bin/stop.sh" 2>&1) || true
+check "a left helper that ends on SIGTERM: no SIGKILL, no release-target" '! kill -0 "$GP" 2>/dev/null && echo "$out" | grep -q "ended on SIGTERM" && ! echo "$out" | grep -q -e SIGKILL -e release'
+wait "$GP" 2>/dev/null || true
+sh -c "trap '' TERM; exec \"$P/bin/remote-proxy\" 300" &
+GP=$!
+sleep 0.2
+printf '%s\nLGE M-RCU - Builtin [2]\n' "$GP" >"$P/run/remote-proxy.pid"
+out=$(sh "$P/bin/stop.sh" 2>&1) || true
+check "a left helper that ignores SIGTERM: SIGKILL after it, then release-target on the target from the pid file" '! kill -0 "$GP" 2>/dev/null && echo "$out" | grep -q "ignored SIGTERM; sending SIGKILL" && echo "$out" | grep -q "releasing the keys the killed helper may have left down in \"LGE M-RCU - Builtin \[2\]\""'
+wait "$GP" 2>/dev/null || true
 # ctl.sh restore-lg-voice (the daemon is not running) ends a left helper first.
 "$P/bin/remote-proxy" 300 &
 GP=$!

@@ -186,6 +186,16 @@ fn say(line: &str) -> Result<(), String> {
 #[allow(clippy::too_many_lines)]
 pub(crate) fn serve(argv: &[String]) -> Result<i32, String> {
     let a = parse(argv)?;
+    // Keys an earlier helper left down in the target (a SIGKILL gives it no
+    // chance to release them) are released first, before any check that may
+    // refuse the start; a missing target is skipped here (discovery says so).
+    if !a.check {
+        if let Some(n) = release_target_keys(&a.target)? {
+            if n > 0 {
+                eprintln!("serve: released {n} key(s) left down in the target");
+            }
+        }
+    }
     let (tgt, tf, _tc, mut sources) = discover(&a)?;
     if a.check {
         println!("ok {} {}", names(&sources), tgt.event);
@@ -198,21 +208,6 @@ pub(crate) fn serve(argv: &[String]) -> Result<i32, String> {
     });
     let mut dm = DeadMan::start_with(None)?;
 
-    // Keys an earlier helper left down in the target (a SIGKILL gives it no
-    // chance to release them) are released first.
-    let held = sys::key_state(&tf).map_err(|e| format!("EVIOCGKEY on target: {e}"))?;
-    let rel = release_all(&held);
-    if !rel.is_empty() {
-        let mut w: &File = &tf;
-        w.write(&event::encode(&rel))
-            .map_err(|e| format!("target write: {e}"))?;
-        eprintln!(
-            "serve: released {} key(s) left down in {}",
-            rel.len() - 1,
-            tgt.event
-        );
-    }
-
     // Grab each source only with no key down on it, so the compositor never
     // keeps a key it saw go down; a key that went down between the check and
     // the grab is caught by a second check after it (then ungrab and wait).
@@ -222,6 +217,10 @@ pub(crate) fn serve(argv: &[String]) -> Result<i32, String> {
             let st = sys::key_state(&s.file).map_err(|e| format!("EVIOCGKEY: {e}"))?;
             if st.iter().all(|&b| b == 0) {
                 sys::grab(&s.file, true).map_err(|e| format!("EVIOCGRAB {}: {e}", s.node.event))?;
+                // Events queued for us since the device was opened (before
+                // the grab) already reached the compositor: drop them, so no
+                // key acts twice.
+                discard_queued(&s.file)?;
                 let after = sys::key_state(&s.file).map_err(|e| format!("EVIOCGKEY: {e}"))?;
                 if after.iter().all(|&b| b == 0) {
                     break;
@@ -365,6 +364,53 @@ fn write_frame(tf: &File, frame: &[Event], keys: &KeyBits) -> Result<(), String>
         Ok(n) => Err(format!("short write to target: {n} of {}", bytes.len())),
         Err(e) => Err(format!("target write: {e}")),
     }
+}
+
+/// Reads `f` (non-blocking) until nothing is queued; the events are dropped.
+fn discard_queued(f: &File) -> Result<(), String> {
+    let mut evs = Vec::new();
+    for _ in 0..10_000 {
+        evs.clear();
+        read_events(f, &mut evs)?;
+        if evs.is_empty() {
+            return Ok(());
+        }
+    }
+    Err("a source kept delivering events while its queue was emptied".to_owned())
+}
+
+/// Releases every key that is down on the device named `target` (found by
+/// name; `Ok(None)` when there is no such device). Used at every serve start
+/// and by `release-target` after a helper was killed.
+pub(crate) fn release_target_keys(target: &str) -> Result<Option<usize>, String> {
+    let root = PathBuf::from(caps::SYS_INPUT);
+    let Ok(node) = caps::find(&root, target) else {
+        return Ok(None);
+    };
+    let tf = open_write(&node.dev)?;
+    let held = sys::key_state(&tf).map_err(|e| format!("EVIOCGKEY on {}: {e}", node.event))?;
+    let rel = release_all(&held);
+    if rel.is_empty() {
+        return Ok(Some(0));
+    }
+    let mut w: &File = &tf;
+    w.write(&event::encode(&rel))
+        .map_err(|e| format!("write {}: {e}", node.event))?;
+    Ok(Some(rel.len() - 1))
+}
+
+/// `remote-proxy release-target --target NAME`: one shot, after a helper was
+/// killed with `SIGKILL` (ADR 0016 dead-man): releases the keys it left down.
+pub(crate) fn release_target(argv: &[String]) -> Result<i32, String> {
+    let target = match argv {
+        [flag, name] if flag == "--target" && !name.is_empty() => name,
+        _ => return Err("usage: remote-proxy release-target --target NAME".to_owned()),
+    };
+    match release_target_keys(target)? {
+        Some(n) => println!("released {n} key(s) on {target:?}"),
+        None => println!("no input device named {target:?}; nothing to release"),
+    }
+    Ok(0)
 }
 
 /// A frame releasing every key set in `state` (`EVIOCGKEY` bytes), with
