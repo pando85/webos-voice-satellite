@@ -3,6 +3,8 @@
 - **Date:** 2026-11-07. **Status:** a hand-over list for the next session. It records what is open, who has to act, what must be true first and which document to follow. It decides nothing new and does not repeat the documents it links to.
 - **Written without TV access:** nothing here was run. The 0.6.0 release records (install results on c3-a and c3-b, compatibility rows, the P4 logs) come from the release commit and are not copied here. Read them there.
 - **Related:** [roadmap](roadmap.md), [backlog](backlog.md), [mid-term plan](mid-term-plan.md), [ADR 0016](../decisions/0016-remote-key-grab.md), [design: the input grab](../design/remote-mic-button.md#12-the-input-grab-adr-0016), [install permissions](../security/install-permissions.md), [HA-side audio processing](../research/ha-side-audio-processing.md).
+- **Current state (2026-11-07):** 0.6.0 is installed on c3-a and c3-b (commits `a5e3259` and `1a4b5c9`), with the mic button **off** on both. The mic-key grab has therefore not run yet. The acceptance test on c3-a (section 1) is the next step.
+- **`key_grab` reads null in `ctl.sh status --json` while the mic button is off.** That is by design: the grab plan, and its `off: <why>` reason, is evaluated only with the mic button on. Do not read the null as a failure.
 
 Device rules from [AGENTS.md](../../AGENTS.md) still apply to every item: each run on a TV needs the owner's authorization, raw probe output and recordings are never committed, and the TV access policy is "install only" unless the owner says otherwise for a named experiment.
 
@@ -12,12 +14,13 @@ Device rules from [AGENTS.md](../../AGENTS.md) still apply to every item: each r
 | --- | --- | --- | --- | --- |
 | 1 | 0.6.0 acceptance test of the mic-key grab on c3-a | owner, at the TV | 0.6.0 installed on c3-a, about 20 minutes, someone free to use the remote | [section 1](#1-060-owner-acceptance-test-on-c3-a), [ADR 0016](../decisions/0016-remote-key-grab.md#implementation-plan-if-accepted) |
 | 2 | Grab on c3-b (firmware `03.30.73`) | owner runs, agent prepares the record | c3-b unmuted in HA for the run; EXP-026 Part B2 and B3 on c3-b | [section 2](#2-c3-b-is-not-on-the-grab-allow-list) |
-| 3 | Does the TV's app installer reset the app directory to 0777? | agent, at the next app update | an app update the owner approves | [section 3](#3-security-follow-up-the-installer-and-the-app-directory-mode) |
+| 3 | Security hypothesis: does an app update reset the app directory to 0777? (not confirmed at 0.6.0) | agent, at the next app update | an app update the owner approves | [section 3](#3-security-follow-up-the-installer-and-the-app-directory-mode) |
 | 4 | ADR 0015 (silent key filter) | nobody now | only if the grab cannot work on some firmware | [section 4](#4-adr-0015-deferred-fallback) |
 | 5 | Remote-proxy features | owner decides, later | 0.6.0 accepted on the TV and soaked | [section 5](#5-future-remote-proxy-features) |
 | 6 | Mid-term plan (diagnostics, front-end evaluation) | agent and owner | owner decisions in the plan's section 5 | [section 6](#6-mid-term-plan) |
 | 7 | HA audio processing: next candidates | agent (PC and HA, owner approves HA changes) | the offline replay result is in | [section 7](#7-ha-audio-processing) |
 | 8 | Custom wake word | private model repository | | [section 8](#8-wake-word) |
+| 9 | Daemon CPU in Active Standby (about 17 to 18 % of one core on c3-a, against about 6 % in Active) | agent, read-only | the owner's go for each read-only TV check; before 0.7 | [section 9](#9-open-daemon-cpu-in-active-standby) |
 
 ## 1. 0.6.0 owner acceptance test on c3-a
 
@@ -47,8 +50,9 @@ Pass: every step passes. Record the result as a short entry in the c3-a P4 log a
 
 ## 3. Security follow-up: the installer and the app directory mode
 
-- **Open question:** at the 0.5.1 install, app directories were 0777 right after the app installer ran and 0755 after our fix. c3-b's directory was 0755 on 2026-11-03 and 0777 later, which suggests the installer resets it ([install permissions, section 8, result 2](../security/install-permissions.md#8-what-needs-a-tv-check)). That is a likely explanation, not proof.
-- **To confirm:** at the next app update the owner approves, run `stat -c '%a %U %n'` on the app directory and `payload/` right after the installer finishes and before opening the app or running `ctl.sh install`. Expected: 0777 again, from 0755. Either way the fix at every install and start stays.
+- **Hypothesis not confirmed:** at the 0.5.1 install the app directories were 0777 right after the app installer ran, and c3-b's directory was 0755 on 2026-11-03 and 0777 later. That suggested the installer resets the mode on an update. At the 0.6.0 install the app directory and `payload/` stayed **0755 right after the TV's installer ran** on both TVs, so "app updates reset the dir to 0777" is not confirmed ([install permissions, section 8, result 2](../security/install-permissions.md#8-what-needs-a-tv-check)). The cause of c3-b's earlier 0777 is unknown.
+- **The fix stays:** `ctl.sh install` and `start.sh` remove group and other write at every install and start, whatever the installer does.
+- **Light follow-up:** re-check the mode after the next app update the owner approves. Run `stat -c '%a %U %n'` on the app directory and `payload/` right after the installer finishes, before opening the app or running `ctl.sh install`, and record the result in the P4 log.
 - **Who:** an agent, with the owner's go for the update. Read-only after the install.
 
 ## 4. ADR 0015: deferred fallback
@@ -85,3 +89,9 @@ Facts and numbers: [HA-side audio processing, section 10](../research/ha-side-au
 ## 8. Wake word
 
 Custom wake word follow-up tracked in the private model repo.
+
+## 9. Open: daemon CPU in Active Standby
+
+- **Observation:** on c3-a the daemon uses about 17 to 18 % of one core in `Active Standby` (18.05 % on 0.5.1, 16.85 % on 0.6.0, same state), against about 6 % when the TV is `Active`. The cause is unknown. The figures and the context are in the c3-a P4 record ([0.6.0 install, note](../discovery/c3-a/P4-permanent-install.md#update-to-060-2026-11-07-remote-key-grab-off)). It is not a change of 0.6.0.
+- **To do:** investigate before 0.7, read-only. Compare the daemon's CPU and its ticks in `Active` and `Active Standby` with the same configuration, and check what the capture and watchdog threads do in that state. Record counts and timings only. No config change and no TV write.
+- **Who and rules:** an agent. Each read-only TV check needs the owner's go (device rules above).
