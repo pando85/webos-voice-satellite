@@ -190,7 +190,7 @@ Items not in the ranked list stay in the backlog without a priority or a phase: 
 
 ## 16. On-screen assistant overlay
 
-- **Status:** **built on the host, not released** (owner request 2026-11-07: "go with the full version"). Design: [assistant overlay](../design/assistant-overlay.md); decision: [ADR 0014](../decisions/0014-assistant-overlay.md) (proposed); evidence: [EXP-024](../experiments/EXP-024-assistant-overlay-window.md) (c3-a: `overlay` window, own package, launch and relaunch, cost, no parameters in logs).
-- **Scope:** a small transparent panel over whatever plays that shows listening, what was heard, thinking, the answer and errors for every voice run (wake word, mic button, follow-ups), Spanish first, hidden a few seconds after the run; `[overlay] enabled` on by default, in the TV app's Sound screen and as the HA switch "On-screen assistant".
+- **Status:** **built on the host, not released, off by default until the owner's check** (owner request 2026-11-07: "go with the full version"). Design: [assistant overlay](../design/assistant-overlay.md); decision: [ADR 0014](../decisions/0014-assistant-overlay.md) (accepted); evidence: [EXP-024](../experiments/EXP-024-assistant-overlay-window.md) (c3-a: `overlay` window, own package, launch and relaunch, cost, no parameters in logs).
+- **Scope:** a small transparent panel over whatever plays that shows listening, what was heard, thinking, the answer and errors for every voice run (wake word, mic button, follow-ups), Spanish first, hidden a few seconds after the run; `[overlay] enabled`, off by default for the first release, in the TV app's Sound screen and as the HA switch "On-screen assistant".
 - **Next:** release and deploy (`ctl.sh install` installs the overlay app), then the owner's visual and remote check ([design, section 10](../design/assistant-overlay.md#10-the-owners-visual-check)); c3-b; whether remote keys reach the overlay while it shows.
 

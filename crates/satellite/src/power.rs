@@ -509,9 +509,21 @@ pub(crate) async fn call_pty(
     payload: &str,
     max: usize,
 ) -> Result<String, String> {
+    call_pty_wait(luna, uri, payload, max, 3000).await
+}
+
+/// [`call_pty`] with `luna-send`'s reply wait (`-w`) in milliseconds.
+pub(crate) async fn call_pty_wait(
+    luna: &Path,
+    uri: &str,
+    payload: &str,
+    max: usize,
+    wait_ms: u32,
+) -> Result<String, String> {
     let (master, slave) = open_pty().map_err(|e| format!("cannot open a terminal: {e}"))?;
     let mut cmd = Command::new(luna);
-    cmd.args(["-n", "1", "-w", "3000", uri, payload])
+    let wait = wait_ms.to_string();
+    cmd.args(["-n", "1", "-w", wait.as_str(), uri, payload])
         .stdin(Stdio::from(
             slave.try_clone().map_err(|e| format!("terminal: {e}"))?,
         ))

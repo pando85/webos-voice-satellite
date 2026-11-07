@@ -47,6 +47,9 @@ cat >"$T/luna-send-pub" <<FAKEPUB
 uri=\$4
 params=\$5
 echo "\$uri \$params" >>"$T/appinstall.calls"
+# The wait asked for, and whether the daemon ran at the time of the call.
+echo "\$2" >>"$T/appinstall.wait"
+if [ -f "$S/run/webos-satellite.pid" ] && kill -0 "\$(cat "$S/run/webos-satellite.pid")" 2>/dev/null; then echo up; else echo down; fi >>"$T/appinstall.daemon"
 case \$uri in
 */dev/install)
     ipk=\$(echo "\$params" | sed -n 's/.*"ipkUrl":"\\([^"]*\\)".*/\\1/p')
@@ -227,8 +230,14 @@ mac1=$(grep '^mac_seed' "$S/etc/config.toml")
 check "install: the overlay app is installed through appinstalld (its own package, overlay window), status says so" '[ "$(installs)" = 1 ] && python3 -c "
 import json, sys
 a = json.load(open(sys.argv[1]))
-sys.exit(0 if a[\"id\"] == sys.argv[2] and a[\"defaultWindowType\"] == \"overlay\" and a[\"transparent\"] is True else 1)" "$OV/appinfo.json" "$ID.overlay" && [ -f "$OV/overlay.js" ] && json "s[\"overlay_app\"] is True and s[\"overlay_enabled\"] is True" && grep -q "overlay app $ID.overlay installed" "$T/out"'
-check "install: the overlay ipk was a copy (the payload keeps its own, no copy left in TMPDIR)" '[ -f "$APP/payload/overlay.ipk" ] && ! ls "${TMPDIR:-/tmp}"/webos-satellite-overlay.*.ipk >/dev/null 2>&1'
+sys.exit(0 if a[\"id\"] == sys.argv[2] and a[\"defaultWindowType\"] == \"overlay\" and a[\"transparent\"] is True else 1)" "$OV/appinfo.json" "$ID.overlay" && [ -f "$OV/overlay.js" ] && json "s[\"overlay_app\"] is True and s[\"overlay_enabled\"] is False" && grep -q "overlay app $ID.overlay installed" "$T/out"'
+ovurl=$(sed -n 's/.*"ipkUrl":"\([^"]*\)".*/\1/p' "$T/appinstall.calls" | tail -n 1)
+check "install: appinstalld got a copy in a fresh /tmp/webos-satellite-overlay.* directory (never TMPDIR), removed afterwards; the payload keeps its own" '[ -f "$APP/payload/overlay.ipk" ] && case $ovurl in /tmp/webos-satellite-overlay.*/overlay.ipk) true ;; *) false ;; esac && [ ! -e "$(dirname "$ovurl")" ]'
+check "install: the appinstalld wait is 20 s, not 60 s" '[ "$(tail -n 1 "$T/appinstall.wait")" = 20000 ]'
+rm -rf "$OV"
+out=$(TMPDIR=$T/elsewhere $CTL install 2>&1) || true
+ovurl2=$(sed -n 's/.*"ipkUrl":"\([^"]*\)".*/\1/p' "$T/appinstall.calls" | tail -n 1)
+check "install with TMPDIR set: the package copy still goes to /tmp/webos-satellite-overlay.*" 'case $ovurl2 in /tmp/webos-satellite-overlay.*/overlay.ipk) true ;; *) false ;; esac'
 
 # A host-runnable config (file mic, null sink, plaintext on 127.0.0.1) and a
 # key file, as an owner would set them with --config and --psk-file.
@@ -367,12 +376,12 @@ check "update: restarted with the new build (new pid, one daemon, one supervisor
 check "update: installed binary is the new one" 'cmp -s "$S/bin/webos-satellite" "$T/a64-two" && [ "$(cat "$S/VERSION")" = 0.0.2 ] && ! json "s[\"update_pending\"]"'
 check "update: config and key unchanged" '[ "$(sha256sum <"$S/etc/config.toml")" = "$cfg_sum" ] && [ "$(sha256sum <"$S/etc/noise_psk")" = "$psk_sum" ]'
 check "update: boot hook refreshed and still on" 'grep -q "^PREFIX=$S\$" "$H"'
-check "update: the changed overlay app is installed again" '[ "$(installs)" = 2 ] && grep -q "\"version\": \"0.0.2\"" "$OV/appinfo.json"'
+check "update: the changed overlay app is installed again, after the daemon is running again" '[ "$(installs)" = 3 ] && [ "$(tail -n 1 "$T/appinstall.daemon")" = up ] && grep -q "\"version\": \"0.0.2\"" "$OV/appinfo.json"'
 out=$($CTL install 2>&1)
-check "a second install of the same payload does nothing (no restart, no overlay install)" 'echo "$out" | grep -q "already up to date" && [ "$(running_pid)" = "$pid_v2" ] && [ "$(installs)" = 2 ]'
+check "a second install of the same payload does nothing (no restart, no overlay install)" 'echo "$out" | grep -q "already up to date" && [ "$(running_pid)" = "$pid_v2" ] && [ "$(installs)" = 3 ]'
 rm -rf "$OV"
 out=$($CTL install 2>&1)
-check "an overlay app removed by hand comes back at the next install, without a restart" '[ "$(installs)" = 3 ] && [ -f "$OV/appinfo.json" ] && [ "$(running_pid)" = "$pid_v2" ]'
+check "an overlay app removed by hand comes back at the next install, without a restart" '[ "$(installs)" = 4 ] && [ -f "$OV/appinfo.json" ] && [ "$(running_pid)" = "$pid_v2" ]'
 rm -rf "$OV"
 out=$(WEBOS_SAT_LUNA_SEND_PUB=$T/no-such-tool $CTL install 2>&1) && rc=0 || rc=$?
 check "no luna-send-pub: install still succeeds, the overlay app is reported missing" '[ "$rc" -eq 0 ] && echo "$out" | grep -q "overlay app: not installed (no $T/no-such-tool)" && json "s[\"overlay_app\"] is False"'

@@ -455,16 +455,17 @@ done
 cq config remote-ptt on >/dev/null 2>&1 && rc=0 || rc=$?
 check "config remote-ptt: not a setting, exit 2" '[ "$rc" -eq 2 ]'
 
-# The on-screen assistant: [overlay] enabled, on unless it says false.
-check "status: the overlay is on by default (no [overlay] table)" 'cq status --json | grep -q "\"overlay_enabled\":true,\"overlay_app\":false," && cq status 2>/dev/null | grep -q "on-screen assistant: on" && qsum | grep -q " overlay=\[on app="'
+# The on-screen assistant: [overlay] enabled, off unless it says true (until
+# the owner's check on the TV, ADR 0014).
+check "status: the overlay is off by default (no [overlay] table), not available without its app" 'cq status --json | grep -q "\"overlay_enabled\":false,\"overlay_app\":false,\"overlay_available\":false," && cq status 2>/dev/null | grep -q "on-screen assistant: off (config; ctl.sh config overlay on|off), unavailable: its app is not installed" && qsum | grep -q " overlay=\[off\]"'
 cp "$QC" "$T/before-ov.toml"
-out=$(cqc config overlay off 2>/dev/null) && rc=0 || rc=$?
-check "overlay off: applied, [overlay] appended with enabled = false, nothing else changed" '[ "$rc" -eq 0 ] && echo "$out" | grep -q "\"setting\":\"overlay\",\"requested\":\"off\",\"before\":\"on\",\"after\":\"off\",\"result\":\"applied\"" && tail -n 2 "$QC" | tr "\n" "|" | grep -q "^\[overlay\]|enabled = false|\$" && [ "$(diff "$T/before-ov.toml" "$QC" | grep -c "^[<>]")" -eq 3 ]'
-check "overlay off: the daemon reads it, status says so, history line" 'qsum | grep -q " overlay=\[off\]" && cq status --json | grep -q "\"overlay_enabled\":false," && grep -q " overlay result from=on to=off read=off outcome=applied source=ctl\$" "$Q/etc/tv-settings.log"'
-out=$(cqc config overlay off 2>/dev/null) && rc=0 || rc=$?
-check "overlay off again: already" '[ "$rc" -eq 0 ] && echo "$out" | grep -q "\"result\":\"already\""'
 out=$(cqc config overlay on 2>/dev/null) && rc=0 || rc=$?
-check "overlay on: the same line now says true" '[ "$rc" -eq 0 ] && echo "$out" | grep -q "\"before\":\"off\",\"after\":\"on\",\"result\":\"applied\"" && sed -n "/^\[overlay\]\$/{n;p;}" "$QC" | grep -qx "enabled = true" && qsum | grep -q " overlay=\[on app="'
+check "overlay on: applied, [overlay] appended with enabled = true, nothing else changed" '[ "$rc" -eq 0 ] && echo "$out" | grep -q "\"setting\":\"overlay\",\"requested\":\"on\",\"before\":\"off\",\"after\":\"on\",\"result\":\"applied\"" && tail -n 2 "$QC" | tr "\n" "|" | grep -q "^\[overlay\]|enabled = true|\$" && [ "$(diff "$T/before-ov.toml" "$QC" | grep -c "^[<>]")" -eq 3 ]'
+check "overlay on: the daemon reads it, status says so, history line" 'qsum | grep -q " overlay=\[on app=auto\]" && cq status --json | grep -q "\"overlay_enabled\":true," && grep -q " overlay result from=off to=on read=on outcome=applied source=ctl\$" "$Q/etc/tv-settings.log"'
+out=$(cqc config overlay on 2>/dev/null) && rc=0 || rc=$?
+check "overlay on again: already" '[ "$rc" -eq 0 ] && echo "$out" | grep -q "\"result\":\"already\""'
+out=$(cqc config overlay off 2>/dev/null) && rc=0 || rc=$?
+check "overlay off: the same line now says false" '[ "$rc" -eq 0 ] && echo "$out" | grep -q "\"before\":\"on\",\"after\":\"off\",\"result\":\"applied\"" && sed -n "/^\[overlay\]\$/{n;p;}" "$QC" | grep -qx "enabled = false" && qsum | grep -q " overlay=\[off\]"'
 for bad in yes true ""; do
     cq config overlay "$bad" >/dev/null 2>&1 && rc=0 || rc=$?
     check "config overlay '$bad': usage, exit 2" '[ "$rc" -eq 2 ]'

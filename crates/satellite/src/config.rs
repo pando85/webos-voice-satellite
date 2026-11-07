@@ -1178,45 +1178,38 @@ impl RemoteSection {
 /// (docs/design/assistant-overlay.md, ADR 0014). Read at start only;
 /// `ctl.sh config overlay on|off` and HA's switch change `enabled` and
 /// restart.
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct OverlaySection {
-    /// Show listening, thinking and the answer over the app in front (on by
-    /// default). Needs `luna-send` (as the power watch does).
+    /// Show listening, thinking and the answer over the app in front. **Off
+    /// by default** until the owner's on-TV check (whether remote keys reach
+    /// the overlay is not verified, EXP-024). Needs the power watch.
     pub(crate) enabled: bool,
-    /// The overlay app's id (shipped in the same package as the TV app).
-    pub(crate) app_id: String,
+    /// The overlay app's id. Unset (the default): the main app's directory
+    /// name plus `.overlay`, as `ctl.sh install` names the app it installs.
+    pub(crate) app_id: Option<String>,
 }
 
-/// The overlay app's id in the package built by `build_ipk.py`.
-pub(crate) const OVERLAY_APP_ID: &str = "io.github.pando85.voicesatellite.overlay";
-
-impl Default for OverlaySection {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            app_id: OVERLAY_APP_ID.to_owned(),
-        }
-    }
+/// LG's app id rules (ares-cli's check, `build_ipk.py` `ID_RE`), LG's own
+/// prefixes refused. The id goes into a luna payload, so nothing else is
+/// accepted.
+pub(crate) fn valid_app_id(id: &str) -> bool {
+    (2..=128).contains(&id.len())
+        && id
+            .bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        && id.bytes().all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'+' | b'-')
+        })
+        && !["com.palm", "com.webos", "com.lge"]
+            .iter()
+            .any(|p| id.starts_with(p))
 }
 
 impl OverlaySection {
     fn validate(&self) -> Result<(), ConfigError> {
-        // LG's app id rules (ares-cli's check, build_ipk.py ID_RE); the id
-        // goes into a luna payload, so nothing else is accepted.
-        let id = &self.app_id;
-        let ok = (2..=128).contains(&id.len())
-            && id
-                .bytes()
-                .next()
-                .is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
-            && id.bytes().all(|b| {
-                b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'+' | b'-')
-            })
-            && !["com.palm", "com.webos", "com.lge"]
-                .iter()
-                .any(|p| id.starts_with(p));
-        if !ok {
+        if self.app_id.as_deref().is_some_and(|id| !valid_app_id(id)) {
             return Err(err(
                 "overlay.app_id must be an app id of lowercase letters, digits, '.', '+' and '-', not an LG one",
             ));
@@ -1228,7 +1221,7 @@ impl OverlaySection {
     /// `overlay=[on` and `overlay=[off`).
     fn summary(&self) -> String {
         if self.enabled {
-            format!("on app={}", self.app_id)
+            format!("on app={}", self.app_id.as_deref().unwrap_or("auto"))
         } else {
             "off".to_owned()
         }
@@ -3091,31 +3084,31 @@ level = "debug"
         let base = Path::new("/cfg");
         let s = Settings::from_toml("[device]\nallow_plaintext = true\n", base).unwrap();
         s.validate().unwrap();
-        assert!(s.overlay.enabled);
-        assert_eq!(s.overlay.app_id, OVERLAY_APP_ID);
-        assert!(
-            s.summary()
-                .ends_with(" overlay=[on app=io.github.pando85.voicesatellite.overlay]"),
-            "{}",
-            s.summary()
-        );
-        let off = Settings::from_toml(
-            "[device]\nallow_plaintext = true\n[overlay]\nenabled = false\n",
+        // Off by default until the owner's on-TV check (ADR 0014).
+        assert!(!s.overlay.enabled);
+        assert_eq!(s.overlay.app_id, None);
+        assert!(s.summary().ends_with(" overlay=[off]"), "{}", s.summary());
+        let on = Settings::from_toml(
+            "[device]\nallow_plaintext = true\n[overlay]\nenabled = true\n",
             base,
         )
         .unwrap();
-        off.validate().unwrap();
+        on.validate().unwrap();
         assert!(
-            off.summary().ends_with(" overlay=[off]"),
+            on.summary().ends_with(" overlay=[on app=auto]"),
             "{}",
-            off.summary()
+            on.summary()
         );
         let ok = Settings::from_toml(
-            "[device]\nallow_plaintext = true\n[overlay]\napp_id = \"org.example.ov-1+x\"\n",
+            "[device]\nallow_plaintext = true\n[overlay]\nenabled = true\napp_id = \"org.example.ov-1+x\"\n",
             base,
         )
         .unwrap();
         ok.validate().unwrap();
+        assert!(
+            ok.summary()
+                .ends_with(" overlay=[on app=org.example.ov-1+x]")
+        );
         for bad in [
             "\"\"",
             "\"x\"",

@@ -422,7 +422,7 @@
     { id: 'mic', label: 'Remote mic button \u2192 Home Assistant', key: 'mic_button', action: 'mic-button',
       sub: 'Replaces LG\'s voice assistant on the mic button while on. LG\'s toast "not supported" may appear.' },
     { id: 'overlay', label: 'On-screen assistant', key: 'overlay_enabled', action: 'overlay',
-      sub: 'Shows listening, what you said and the answer in a small panel over the picture. No sound.' }
+      sub: 'Shows listening, what you said and the answer in a small panel over the picture. No sound. Off by default for now.' }
   ];
 
   function soundIndex(id) { return { music: 1, mic: 2, overlay: 3 }[id] || 0; }
@@ -493,8 +493,15 @@
           warn: 'The mic button could not be taken from LG\'s assistant, so LG keeps it: ' + why + '. Press OK twice to try again.' });
       } else {
         var c = soundConfirm(d.id, !v);
-        out.push({ word: v ? 'On' : 'Off', cls: '', checked: v ? 'true' : 'false', can: true,
-          cmd: 'config ' + d.action + (v ? ' off' : ' on'), confirm: c + CONFIRM_TAIL, warn: c });
+        var row = { word: v ? 'On' : 'Off', cls: '', checked: v ? 'true' : 'false', can: true,
+          cmd: 'config ' + d.action + (v ? ' off' : ' on'), confirm: c + CONFIRM_TAIL, warn: c };
+        if (d.id === 'overlay' && st.overlay_available === false) {
+          // The setting still changes; the panel cannot show until fixed.
+          row.word += ' (unavailable)';
+          row.cls = 'warn';
+          row.warn = 'The on-screen assistant cannot show: its app is not installed or luna-send is missing. Open the app again after an update, or run ctl.sh install. ' + c;
+        }
+        out.push(row);
       }
     }
     return out;

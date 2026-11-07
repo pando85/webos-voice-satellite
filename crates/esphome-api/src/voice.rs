@@ -544,7 +544,8 @@ impl Voice {
                 let code = get("code").unwrap_or_default();
                 let message = get("message").unwrap_or_default();
                 log::info!("voice: HA error {code}");
-                log::debug!("voice: HA error message: {message:?}");
+                // The message may quote what was said: its length only.
+                log::debug!("voice: HA error message: {} chars", message.chars().count());
                 self.stop_streaming(false);
                 self.run.error = Some(code.clone());
                 self.app(AppEvent::Error { code, message });

@@ -27,7 +27,7 @@ function check(name, f) {
   c.check(name, ok, why);
 }
 
-const fr = (o) => Object.assign({ overlay: 1, seq: 1, stage: 'listening', heard: '', answer: '', error: null }, o);
+const fr = (o) => Object.assign({ overlay: 1, inst: 1762000000000, seq: 1, stage: 'listening', heard: '', answer: '', error: null }, o);
 
 // ---- Part 1: the model ----------------------------------------------------
 check('parse: a frame object and its JSON text', () => {
@@ -42,7 +42,7 @@ check('parse: an error frame needs a known error word', () =>
 check('parse: anything else is refused', () => [
   null, undefined, '', '{', '[]', 'x', 42, {}, fr({ overlay: 2 }), fr({ overlay: '1' }), fr({ seq: -1 }), fr({ seq: 1.5 }),
   fr({ seq: '1' }), fr({ seq: 4294967296 }), fr({ stage: 'speaking' }), fr({ heard: 3 }), fr({ answer: null }),
-  fr({ heard: 'x'.repeat(401) }), 'y'.repeat(5000),
+  fr({ heard: 'x'.repeat(401) }), 'y'.repeat(5000), fr({ inst: undefined }), fr({ inst: -1 }), fr({ inst: 1.5 }), fr({ inst: '7' }),
 ].every((p) => M.parse(p) === null));
 check('parse: the texts may hold quotes, accents and up to 400 characters', () => {
   const f = M.parse(fr({ stage: 'answer', answer: 'Sí, "vale" ñ ' + 'x'.repeat(380) }));
@@ -53,6 +53,16 @@ check('newer: same run, later run, older run, across the wrap', () => {
   const ok = (s, cur) => M.newer(M.parse(fr({ seq: s })), cur);
   return ok(5, null) && ok(5, a) && ok(6, a) && !ok(4, a)
     && ok(0, M.parse(fr({ seq: 4294967295 }))) && !ok(4294967295, M.parse(fr({ seq: 0 })));
+});
+check('newer: a frame of another daemon start is a new run, whatever its seq (a restart counts from 1 again)', () => {
+  const cur = M.parse(fr({ seq: 9, stage: 'answer' }));
+  return M.newer(M.parse(fr({ inst: 1762000999999, seq: 1, stage: 'hide' })), cur)
+    && M.newer(M.parse(fr({ inst: 5, seq: 1 })), cur) && !M.newer(M.parse(fr({ seq: 8 })), cur);
+});
+check('same: only an identical frame of the same start', () => {
+  const a = M.parse(fr({ stage: 'thinking', heard: 'x' }));
+  return M.same(M.parse(fr({ stage: 'thinking', heard: 'x' })), a) && !M.same(M.parse(fr({ stage: 'thinking', heard: 'y' })), a)
+    && !M.same(M.parse(fr({ stage: 'thinking', heard: 'x', inst: 2 })), a) && !M.same(a, null);
 });
 check('langOf: English only for an English TV', () =>
   M.langOf('en-US') === 'en' && M.langOf('en') === 'en' && M.langOf('EN_gb') === 'en'
@@ -216,6 +226,19 @@ check('page: hide closes at once; a frame of an older run and an invalid one are
   p.advance(400);
   return kept && p.closed() === 1;
 });
+check('page: a frame sent again does not restart the hold time', () => {
+  const p = page({ params: JSON.stringify(fr({ stage: 'answer', answer: 'larga' })) });
+  p.advance(170000);
+  p.relaunch(fr({ stage: 'answer', answer: 'larga' }));
+  p.advance(10000 + 400);
+  return p.closed() === 1;
+});
+check('page: after a daemon restart the new start\'s hide closes the stale panel at once', () => {
+  const p = page({ params: JSON.stringify(fr({ seq: 12, stage: 'answer', answer: 'vieja' })) });
+  p.relaunch(fr({ inst: 1762000555555, seq: 1, stage: 'hide' }));
+  p.advance(400);
+  return p.closed() === 1;
+});
 check('page: without a valid frame at launch the window closes', () => {
   const p = page({ params: 'not json' });
   p.advance(400);
@@ -247,10 +270,32 @@ check('ES5 only (no arrows, let, const, classes, templates, spread)', () =>
   !/=>|\blet\s|\bconst\s|\bclass\s|`|\.\.\./.test(code));
 check('no sound, network, storage or log in the page', () =>
   !/\bAudio\b|<audio|<video|XMLHttpRequest|fetch\(|WebSocket|EventSource|localStorage|sessionStorage|indexedDB|console\.|PalmServiceBridge/.test(code + fs.readFileSync(path.join(DIR, 'index.html'), 'utf8')));
-check('index.html loads the model before the page script, and no other script', () => {
+check('index.html loads the model before the page script, and no other script file', () => {
   const html = fs.readFileSync(path.join(DIR, 'index.html'), 'utf8');
   const scripts = [...html.matchAll(/<script src="([^"]+)"/g)].map((m) => m[1]);
   return JSON.stringify(scripts) === '["model.js","overlay.js"]' && /<html lang="es">/.test(html);
+});
+const inline = (fs.readFileSync(path.join(DIR, 'index.html'), 'utf8').match(/<script>([\s\S]*?)<\/script>/) || [])[1] || '';
+function runInline(ready) {
+  let closed = 0;
+  const timers = [];
+  const win = { close() { closed++; } };
+  const ctx = { window: win, setTimeout(f, ms) { timers.push({ f, ms }); return timers.length; } };
+  vm.createContext(ctx);
+  vm.runInContext(inline, ctx);
+  if (ready) { win.overlayReady = true; }
+  timers.forEach((t) => t.f());
+  return { closed, ms: timers.map((t) => t.ms) };
+}
+check('index.html fallback: the window closes after 4 s when the scripts never started, not when they did', () => {
+  const failed = runInline(false);
+  const fine = runInline(true);
+  return failed.closed === 1 && JSON.stringify(failed.ms) === '[4000]' && fine.closed === 0
+    && !/=>|\blet\s|\bconst\s|`/.test(inline);
+});
+check('the page clears the fallback once it runs', () => {
+  const src = fs.readFileSync(path.join(DIR, 'overlay.js'), 'utf8');
+  return /window\.overlayReady = true;/.test(src) && /clearTimeout\(window\.overlayFallback\)/.test(src);
 });
 check('the stylesheet keeps the page transparent and has no CSS animation (60 fps cost a third of a core, EXP-024)', () => {
   const css = fs.readFileSync(path.join(DIR, 'overlay.css'), 'utf8').replace(/\/\*[\s\S]*?\*\//g, '');

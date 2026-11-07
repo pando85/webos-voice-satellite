@@ -321,6 +321,9 @@ pub(crate) struct ConfigSwitches {
     mic_button_active: bool,
     /// `[overlay] enabled` in the config this process started with.
     overlay: bool,
+    /// The overlay can show (luna-send and the overlay app are there);
+    /// without, HA's switch has no state (shown as unknown).
+    overlay_available: bool,
     in_flight: Arc<AtomicBool>,
     slow_after: Duration,
 }
@@ -351,6 +354,7 @@ impl ConfigSwitches {
             mic_button: settings.remote.ptt(),
             mic_button_active: false,
             overlay: settings.overlay.enabled,
+            overlay_available: true,
             in_flight: Arc::new(AtomicBool::new(false)),
             slow_after: SLOW_AFTER,
         })
@@ -380,10 +384,17 @@ impl ConfigSwitches {
             music,
             mic_button: false,
             mic_button_active: false,
-            overlay: true,
+            overlay: false,
+            overlay_available: true,
             in_flight: Arc::new(AtomicBool::new(false)),
             slow_after: SLOW_AFTER,
         }
+    }
+
+    /// Whether the overlay can show at all; call before the first states go
+    /// out.
+    pub(crate) fn set_overlay_available(&mut self, available: bool) {
+        self.overlay_available = available;
     }
 
     /// The mic button as it runs: `active` only when the feature started
@@ -437,7 +448,8 @@ impl ConfigSwitches {
         ALL.into_iter()
             .map(|s| AppCommand::SetSwitch {
                 object_id: s.object_id().to_owned(),
-                state: Some(self.current(s)),
+                // An overlay that cannot show reports no state (unknown).
+                state: (s != Setting::Overlay || self.overlay_available).then(|| self.current(s)),
             })
             .collect()
     }
@@ -782,9 +794,19 @@ mod tests {
                 },
                 AppCommand::SetSwitch {
                     object_id: OVERLAY_ID.into(),
-                    state: Some(true)
+                    state: Some(false)
                 },
             ]
+        );
+        // Without luna-send or the overlay app: no state (unknown in HA).
+        let mut c = switches(true, false);
+        c.set_overlay_available(false);
+        assert_eq!(
+            c.initial_commands()[3],
+            AppCommand::SetSwitch {
+                object_id: OVERLAY_ID.into(),
+                state: None
+            }
         );
     }
 

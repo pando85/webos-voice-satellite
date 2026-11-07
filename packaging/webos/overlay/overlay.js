@@ -129,6 +129,7 @@
     var f = M.parse(raw);
     if (!f) { probe('ignored', how); return; }
     if (!M.newer(f, cur)) { probe('stale', how); return; }
+    if (M.same(f, cur)) { probe('same', how); return; }
     cur = f;
     probe('frame', { how: how, seq: f.seq, stage: f.stage });
     draw(f);
@@ -161,4 +162,7 @@
 
   apply(launchParams(), 'launch');
   if (!cur) { close(); }
+  // index.html's fallback closes the window if this never runs.
+  window.overlayReady = true;
+  if (window.overlayFallback) { clearTimeout(window.overlayFallback); }
 }());

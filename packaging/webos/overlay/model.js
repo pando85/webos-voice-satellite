@@ -5,9 +5,11 @@
  *
  * The daemon sends one frame per change as the overlay app's launch
  * parameters (crates/satellite/src/overlay.rs, Frame::params_json):
- *   {"overlay":1,"seq":N,"stage":"listening|thinking|answer|error|done|hide",
+ *   {"overlay":1,"inst":I,"seq":N,"stage":"listening|thinking|answer|error|done|hide",
  *    "heard":"...","answer":"...","error":"no_speech|disconnected|failed"|null}
- * parse() checks one strictly (anything else is ignored), view() turns it
+ * `inst` is fixed per daemon start (a restarted daemon counts `seq` from 1
+ * again). parse() checks a frame strictly (anything else is ignored),
+ * newer() orders them, same() spots a frame sent again, view() turns one
  * into what the page draws and how long it stays.
  *
  * Texts: Spanish first (the household language); English only when the TV's
@@ -71,23 +73,33 @@
     }
     if (!p || typeof p !== 'object' || p.overlay !== 1) { return null; }
     if (typeof p.seq !== 'number' || p.seq % 1 !== 0 || p.seq < 0 || p.seq > 4294967295) { return null; }
+    if (typeof p.inst !== 'number' || p.inst % 1 !== 0 || p.inst < 0 || p.inst > 9007199254740991) { return null; }
     if (STAGES.indexOf(p.stage) < 0 || !isText(p.heard) || !isText(p.answer)) { return null; }
     var error = null;
     if (p.stage === 'error') {
       if (ERRORS.indexOf(p.error) < 0) { return null; }
       error = p.error;
     }
-    return { seq: p.seq, stage: p.stage, heard: p.heard, answer: p.answer, error: error };
+    return { inst: p.inst, seq: p.seq, stage: p.stage, heard: p.heard, answer: p.answer, error: error };
   }
 
-  // Whether frame `f` replaces the one shown (`cur`, null when none): a newer
-  // run, or the same run (the daemon sends a run's frames in order). A frame
-  // of an older run, delivered late, is dropped. The sequence wraps at 2^32.
+  // Whether frame `f` replaces the one shown (`cur`, null when none): a frame
+  // of another daemon start (a restart counts from 1 again), a newer run, or
+  // the same run (the daemon sends a run's frames in order). A frame of an
+  // older run of the same start, delivered late, is dropped. The sequence
+  // wraps at 2^32.
   function newer(f, cur) {
-    if (!cur) { return true; }
+    if (!cur || f.inst !== cur.inst) { return true; }
     if (f.seq === cur.seq) { return true; }
     var d = (f.seq - cur.seq + 4294967296) % 4294967296;
     return d > 0 && d < 2147483648;
+  }
+
+  // The same frame again (the daemon's re-send after a cold start): nothing
+  // to draw, and the hold time must not start over.
+  function same(f, cur) {
+    return !!cur && f.inst === cur.inst && f.seq === cur.seq && f.stage === cur.stage
+      && f.heard === cur.heard && f.answer === cur.answer && f.error === cur.error;
   }
 
   // What the page draws for frame f:
@@ -133,7 +145,7 @@
   }
 
   return {
-    parse: parse, newer: newer, view: view, langOf: langOf,
+    parse: parse, newer: newer, same: same, view: view, langOf: langOf,
     TEXT: TEXT, HOLD_MS: HOLD_MS, DONE_EMPTY_MS: DONE_EMPTY_MS, STAGES: STAGES, ERRORS: ERRORS
   };
 }));

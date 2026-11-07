@@ -4,6 +4,11 @@
 <meta charset="utf-8">
 <title>Voice Satellite overlay</title>
 <link rel="stylesheet" href="overlay.css">
+<script>
+// If model.js or overlay.js fail to load or start, close the window anyway
+// (a transparent window must never stay over the picture).
+window.overlayFallback = setTimeout(function () { if (!window.overlayReady) { window.close(); } }, 4000);
+</script>
 </head>
 <body>
 <div id="stage" class="stage">

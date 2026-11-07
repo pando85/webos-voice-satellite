@@ -273,7 +273,7 @@ const STATUS = { uid: 0, installed: true, installed_version: '0.4.0', package_ve
   pid: 42, supervised: true, autostart: true, disabled: false, crashloop: false, mic_off: false, firmware: 'firmware 03.30.74',
   firmware_ok: true, key: 'paired', name: 'webos-satellite-test', port: '6053', prefix: '/var/lib/webos-satellite',
   machine: 'aarch64', build: '', log: [], remote_off: 'normal', aec_enabled: true, music_enabled: false,
-  mic_button: 'off', mic_button_active: false, mic_button_error: null, lg_voice_key: 'lg', overlay_enabled: true, overlay_app: true };
+  mic_button: 'off', mic_button_active: false, mic_button_error: null, lg_voice_key: 'lg', overlay_enabled: true, overlay_app: true, overlay_available: true };
 // What the fake ctl.sh answers: `tv` is the tv-settings reply, `setReply(cmd)` the reply of a set command.
 const fake = { tv: state({}), setReply: null, tvFails: false };
 const T = load({
@@ -552,6 +552,9 @@ const nextTick = () => T.timers.filter((t) => t.live && t.interval && t.ms === 1
   check('on-screen assistant from an older status without the field: Not known, not pressable',
     SR({ aec_enabled: true, music_enabled: false, mic_button: 'off', mic_button_active: false })[3].word === 'Not known'
     && !SR({ aec_enabled: true, music_enabled: false, mic_button: 'off', mic_button_active: false })[3].can);
+  const ovNa = SR({ aec_enabled: true, music_enabled: false, mic_button: 'off', mic_button_active: false, overlay_enabled: false, overlay_available: false })[3];
+  check('on-screen assistant without its app or luna-send: Off (unavailable), a warning, still changeable',
+    ovNa.word === 'Off (unavailable)' && ovNa.cls === 'warn' && ovNa.can && ovNa.cmd === 'config overlay on' && /cannot show: its app is not installed or luna-send is missing/.test(ovNa.warn));
   check('sound result: the on-screen assistant', VP.soundResult('overlay', { schema: 1, setting: 'overlay', requested: 'off', before: 'on', after: 'off', result: 'applied', daemon: 'restarted', error: '' })[0]
     === 'On-screen assistant is now Off. The voice service restarted.' && VP.soundIndex('overlay') === 3 && VP.soundIndex('aec') === 0);
   check('sound rows: the mic button row is Off and turns on (config mic-button on, two presses)',

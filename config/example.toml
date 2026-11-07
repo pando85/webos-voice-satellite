@@ -437,14 +437,18 @@ gain_db = 0.0
 # ADR 0014): a small transparent panel at the bottom of the screen that shows
 # "listening", what speech-to-text heard, "thinking" and the reply text over
 # whatever is on screen, and hides itself a few seconds after the run. It is
-# a second app of the package (a "topui" window that never takes the remote
-# from the app in front and plays no sound), started with luna-send, so it
-# needs luna-send (as the power watch does) and is only shown while the TV is
-# on (power state Active). The texts are shown only, never logged.
-# On by default. The TV app's Sound screen, the HA switch "On-screen
-# assistant" (overlay_enabled) and `ctl.sh config overlay on|off` change this
-# key and restart.
-enabled = true
-# The overlay app's id (the package's overlay app; change only with a
-# package built with another app id).
-app_id = "io.github.pando85.voicesatellite.overlay"
+# a second app (a webOS "overlay" window, no sound) that `ctl.sh install`
+# installs next to the TV app and the satellite starts with luna-send, so it
+# needs the power watch, and it is shown only while the TV shows a picture
+# (power state Active, no power-off in progress). The texts are shown only,
+# never logged.
+# OFF by default until the owner's check on the TV: whether the remote's keys
+# still reach the app in front while the panel shows is not verified yet
+# (EXP-024). The TV app's Sound screen, the HA switch "On-screen assistant"
+# (overlay_enabled) and `ctl.sh config overlay on|off` change this key and
+# restart.
+enabled = false
+# The overlay app's id. Unset (default): the TV app's directory name plus
+# ".overlay", the app `ctl.sh install` installs. Set it only for a package
+# built another way.
+# app_id = "io.github.pando85.voicesatellite.overlay"

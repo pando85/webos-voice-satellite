@@ -24,7 +24,7 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::signal::unix::{SignalKind, signal};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::time::{Instant, MissedTickBehavior};
 use webos_esphome_api::{
     AppCommand, AppEvent, MusicCommand, PairingEvent, PipelineMode, Server, TimerEvent, TimerTable,
@@ -587,6 +587,9 @@ struct Daemon {
     /// that starts its app (`None` without `luna-send` or when it is off).
     overlay: Overlay,
     overlay_tx: Option<overlay::Sender>,
+    /// Open while the TV shows a picture ([`overlay::screen_on`]); closed
+    /// until the first power update.
+    screen_tx: watch::Sender<bool>,
 }
 
 impl Daemon {
@@ -1026,21 +1029,22 @@ impl Daemon {
     }
 
     /// Follows whether speech-to-text audio streams (see `stt_streaming`).
-    /// Hands a changed overlay frame to its app, while the TV shows a
-    /// picture (power state `Active`, or not known): the overlay never
-    /// starts an app on a dark screen or in standby.
+    /// Hands a changed overlay frame to its sender, which launches it only
+    /// while the screen gate is open at the moment of the call
+    /// ([`overlay::screen_on`]).
     fn publish_overlay(&mut self) {
         let Some(frame) = self.overlay.take() else {
             return;
         };
-        let state = self.last_power.as_ref().and_then(|p| p.state.as_deref());
-        match (&self.overlay_tx, state) {
-            (Some(tx), None | Some("Active")) => tx.send(frame),
-            (Some(_), Some(other)) => {
-                log::debug!("overlay: not shown while the TV is in {other}");
-            }
-            (None, _) => {}
+        if let Some(tx) = &self.overlay_tx {
+            tx.send(frame);
         }
+    }
+
+    /// The screen gate follows the last power update.
+    fn update_screen_gate(&self) {
+        self.screen_tx
+            .send_replace(overlay::screen_on(self.last_power.as_ref()));
     }
 
     fn track_stt(&mut self, ev: &AppEvent) {
@@ -1186,6 +1190,7 @@ impl Daemon {
             .as_mut()
             .map(|tv| tv.on_power(&shown.state_key(), !shown.processing_key().is_empty()));
         self.last_power = Some(shown);
+        self.update_screen_gate();
         self.run_action(action);
         if let Some(out) = tv_out {
             self.apply_tv(out).await;
@@ -1492,7 +1497,6 @@ impl Daemon {
             }
             AppEvent::Transcript(text) => {
                 log::info!("speech-to-text done ({} chars)", text.chars().count());
-                log::debug!("transcript: {text:?}");
                 self.runs.stt(now);
             }
             AppEvent::IntentEnd {
@@ -1503,7 +1507,6 @@ impl Daemon {
                     "intent done (reply {} chars, continue_conversation={continue_conversation})",
                     speech.chars().count()
                 );
-                log::debug!("reply text: {speech:?}");
                 self.runs.intent(now, !speech.is_empty());
             }
             AppEvent::TtsStreamStart {
@@ -1541,7 +1544,6 @@ impl Daemon {
                     redact_url(&url),
                     text.chars().count()
                 );
-                log::debug!("announcement text: {text:?}");
                 let stopped = self.player.play_url(url, preannounce_url, Kind::Announce);
                 self.report_stopped(stopped).await;
             }
@@ -1569,7 +1571,10 @@ impl Daemon {
             }
             AppEvent::Error { code, message } => {
                 log::warn!("HA pipeline error {code}");
-                log::debug!("HA pipeline error message: {message:?}");
+                log::debug!(
+                    "HA pipeline error message ({} chars, not logged)",
+                    message.chars().count()
+                );
                 self.runs.error(now, &code);
             }
             AppEvent::Pairing(ev) => self.on_pairing(ev).await,
@@ -1743,23 +1748,53 @@ fn status_version(v: &Verdict) -> &str {
     }
 }
 
-/// Starts the overlay's sender with `[overlay] enabled` where `luna-send`
-/// is found (`power.luna_send`, like the power watch; never on a PC).
-fn start_overlay(settings: &Settings) -> Option<overlay::Sender> {
-    let o = &settings.overlay;
-    if !o.enabled {
-        log::info!("overlay: off (overlay.enabled = false)");
-        return None;
+/// The overlay as this start can run it: its app id and whether it can
+/// show at all (`[overlay] enabled` aside): the power watch's `luna-send`
+/// is there and the overlay app is installed.
+pub(crate) struct OverlayPlan {
+    pub(crate) app_id: Option<String>,
+    pub(crate) available: bool,
+}
+
+impl OverlayPlan {
+    pub(crate) fn new(settings: &Settings, luna: Option<&PathBuf>) -> Self {
+        let prefix = settings.install_prefix.as_deref();
+        let app_id = overlay::app_id(settings.overlay.app_id.as_deref(), prefix);
+        let present = app_id
+            .as_deref()
+            .is_some_and(|id| overlay::app_present(prefix, id));
+        Self {
+            available: luna.is_some() && present,
+            app_id,
+        }
     }
-    let Some(luna) = power::find_binary(&settings.power.luna_send) else {
-        log::info!(
-            "overlay: {} not found; no on-screen assistant (normal off the TV)",
-            settings.power.luna_send.display()
-        );
-        return None;
-    };
-    log::info!("overlay: on (app {})", o.app_id);
-    Some(overlay::Sender::spawn(luna, o.app_id.clone()))
+
+    /// Starts the sender with `[overlay] enabled` when the overlay can show.
+    fn start(
+        &self,
+        settings: &Settings,
+        luna: Option<&PathBuf>,
+        screen: watch::Receiver<bool>,
+    ) -> Option<overlay::Sender> {
+        if !settings.overlay.enabled {
+            log::info!("overlay: off (overlay.enabled = false)");
+            return None;
+        }
+        let (Some(luna), Some(app_id)) = (luna, self.app_id.as_ref()) else {
+            log::info!(
+                "overlay: unavailable: needs the power watch's luna-send and the app directory (normal off the TV)"
+            );
+            return None;
+        };
+        if !self.available {
+            log::warn!(
+                "overlay: unavailable: the overlay app {app_id} is not installed (ctl.sh install)"
+            );
+            return None;
+        }
+        log::info!("overlay: on (app {app_id})");
+        Some(overlay::Sender::spawn(luna.clone(), app_id.clone(), screen))
+    }
 }
 
 /// Object id of the diagnostic text sensor "LG voice key".
@@ -1989,6 +2024,10 @@ pub(crate) async fn run(mut settings: Settings, triggers: TestTriggers) -> Resul
     if let Some(cs) = config_switches.as_mut() {
         cs.set_mic_button_active(remote_setup.started.is_some());
     }
+    let overlay_plan = OverlayPlan::new(&settings, luna.as_ref());
+    if let Some(cs) = config_switches.as_mut() {
+        cs.set_overlay_available(overlay_plan.available);
+    }
     let lg_sensor = power::find_binary(&settings.power.luna_send)
         .is_some()
         .then(|| remote_setup.sensor_text());
@@ -2164,7 +2203,11 @@ pub(crate) async fn run(mut settings: Settings, triggers: TestTriggers) -> Resul
     };
     let mut player = Player::new(settings.sink.clone(), volume_gain.clone(), done_tx);
     player.set_fetch_loopback(triggers.fetch_loopback);
-    let overlay_tx = start_overlay(&settings);
+    let (screen_tx, screen_rx) = watch::channel(false);
+    let overlay_tx = overlay_plan.start(&settings, luna.as_ref(), screen_rx);
+    let overlay_inst = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(0));
     let mut d = Daemon {
         cmd_tx,
         shared: Arc::clone(&shared),
@@ -2220,8 +2263,9 @@ pub(crate) async fn run(mut settings: Settings, triggers: TestTriggers) -> Resul
         stt_streaming: false,
         lg_takeover,
         mic_status: Some(mic_status),
-        overlay: Overlay::new(overlay_tx.is_some(), Instant::now()),
+        overlay: Overlay::new(overlay_tx.is_some(), overlay_inst, Instant::now()),
         overlay_tx,
+        screen_tx,
     };
     d.publish_voice_status();
     d.publish_timers().await;
@@ -2691,8 +2735,9 @@ mod tests {
             stt_streaming: false,
             lg_takeover: None,
             mic_status: None,
-            overlay: Overlay::new(true, Instant::now()),
+            overlay: Overlay::new(true, 7, Instant::now()),
             overlay_tx: None,
+            screen_tx: watch::channel(false).0,
         };
         (d, cmd_rx)
     }
@@ -3790,9 +3835,12 @@ esac"#,
 
     /// The overlay end to end in the daemon: the frames of a wake word run
     /// reach `luna-send` as SAM launches of the overlay app, with the texts
-    /// in the parameters, in order; nothing is started while the TV is dark.
+    /// in the parameters, in order, only while the screen gate is open:
+    /// nothing before the power state is known, nothing once a power-off is
+    /// in progress ("apaga la tele": the answer and the re-send land during
+    /// the power-off), and no re-send through a closed gate.
     #[tokio::test]
-    async fn overlay_frames_reach_the_app_through_luna_send() {
+    async fn overlay_frames_reach_the_app_only_while_the_screen_is_on() {
         let dir = test_dir("overlay");
         let (mut d, _rx) = test_daemon(&dir, RemoteOff::Normal, false);
         let fake = dir.join("luna-send");
@@ -3800,11 +3848,18 @@ esac"#,
         crate::testutil::write_script(
             &fake,
             &format!(
-                "printf '%s %s\\n' \"$5\" \"$6\" >> '{}'\necho '{{\"returnValue\":true}}'",
+                "printf '%s %s %s %s\\n' \"$3\" \"$4\" \"$5\" \"$6\" >> '{}'\necho '{{\"returnValue\":true}}'",
                 out.display()
             ),
         );
-        d.overlay_tx = Some(overlay::Sender::spawn(fake, "io.example.overlay".into()));
+        let (screen_tx, screen_rx) = watch::channel(false);
+        d.screen_tx = screen_tx;
+        d.overlay_tx = Some(overlay::Sender::spawn(
+            fake,
+            "io.example.overlay".into(),
+            screen_rx,
+        ));
+        let read = || std::fs::read_to_string(&out).unwrap_or_default();
         let lines = |n: usize| {
             let out = out.clone();
             async move {
@@ -3818,7 +3873,20 @@ esac"#,
                 std::fs::read_to_string(&out).unwrap_or_default()
             }
         };
-        // The idle wake word stage shows nothing.
+        let power = |state: &str, processing: Option<&str>| PowerUpdate {
+            state: Some(state.into()),
+            processing: processing.map(Into::into),
+            reason: None,
+            on_off: None,
+        };
+        // The power state is not known yet: the gate is closed.
+        d.on_event(AppEvent::WakeWordDetected).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(read(), "", "launched before the power state was known");
+        d.on_event(AppEvent::RunEnd).await;
+        // The TV shows a picture: run 2 is shown.
+        d.last_power = Some(power("Active", None));
+        d.update_screen_gate();
         d.on_event(AppEvent::StartStreaming {
             wake_word: true,
             conversation_id: None,
@@ -3828,46 +3896,43 @@ esac"#,
         d.on_event(AppEvent::WakeWordDetected).await;
         let t = lines(1).await;
         assert!(
-            t.starts_with(r#"luna://com.webos.applicationManager/launch {"id":"io.example.overlay","params":{"overlay":1,"seq":1,"stage":"listening","heard":"","answer":"","error":null}}"#),
+            t.starts_with(r#"-w 1500 luna://com.webos.applicationManager/launch {"id":"io.example.overlay","params":{"overlay":1,"inst":7,"seq":2,"stage":"listening","heard":"","answer":"","error":null}}"#),
             "{t}"
         );
-        d.on_event(AppEvent::Transcript("qué hora es".into())).await;
+        d.on_event(AppEvent::Transcript("apaga la tele".into()))
+            .await;
         let t = lines(2).await;
         assert!(
             t.lines()
                 .nth(1)
                 .unwrap()
-                .contains(r#""stage":"thinking","heard":"qué hora es""#),
+                .contains(r#""seq":2,"stage":"thinking","heard":"apaga la tele""#),
             "{t}"
         );
+        // HA turns the TV off: the state still says Active, with the
+        // power-off in progress. The reply and the end of the run must not
+        // launch the app, and neither may the re-send of the run's start.
+        d.last_power = Some(power("Active", Some("Request Power Off")));
+        d.update_screen_gate();
+        // The run's re-send (2.5 s after its first frame) finds the gate closed.
+        tokio::time::sleep(overlay::COLD_SETTLE + Duration::from_millis(400)).await;
+        assert_eq!(read().lines().count(), 2, "{}", read());
         d.on_event(AppEvent::IntentEnd {
-            speech: "Son las \"diez\".".into(),
+            speech: "Apagando.".into(),
             continue_conversation: false,
         })
         .await;
         d.on_event(AppEvent::RunEnd).await;
-        let t = lines(3).await;
-        assert!(
-            t.lines()
-                .nth(2)
-                .unwrap()
-                .contains(r#""stage":"done","heard":"qué hora es","answer":"Son las \"diez\".""#),
-            "{t}"
-        );
-        // A dark screen: the next run is not shown.
-        d.last_power = Some(PowerUpdate {
-            state: Some("Screen Off".into()),
-            processing: None,
-            reason: None,
-            on_off: None,
-        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let t = read();
+        assert_eq!(t.lines().count(), 2, "{t}");
+        assert!(!t.contains("Apagando"), "{t}");
+        // The screen is off; the next run is not shown either.
+        d.last_power = Some(power("Screen Off", None));
+        d.update_screen_gate();
         d.on_event(AppEvent::WakeWordDetected).await;
-        // The resend after a cold start (COLD_SETTLE) repeats the done frame
-        // of run 1 at most; nothing of run 2 is sent.
-        tokio::time::sleep(overlay::COLD_SETTLE + Duration::from_millis(300)).await;
-        let t = std::fs::read_to_string(&out).unwrap();
-        assert!(!t.contains(r#""seq":2"#), "{t}");
-        assert!(t.lines().count() <= 4, "{t}");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(read().lines().count(), 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
