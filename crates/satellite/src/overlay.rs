@@ -499,40 +499,79 @@ fn resendable(stage: Stage) -> bool {
     matches!(stage, Stage::Listening | Stage::Thinking | Stage::Answer)
 }
 
+/// When to send what (pure, so the ordering rules are unit tests): a frame
+/// not handled yet is always sent, also when the re-send timer woke the
+/// loop at the same moment (a final done, error or hide frame must never be
+/// taken for a re-send and skipped: the panel would stay up); the timer
+/// alone sends the newest frame again only while its run is open.
+#[derive(Debug, Default)]
+pub(crate) struct Pace {
+    last_seq: Option<u32>,
+    resend_at: Option<Instant>,
+}
+
+impl Pace {
+    /// When the re-send is due.
+    pub(crate) fn resend_at(&self) -> Option<Instant> {
+        self.resend_at
+    }
+
+    /// After a wake-up: `fresh` the newest frame was not handled yet,
+    /// `timer` the re-send time was reached. `Some(again)`: send `frame`
+    /// (`again`: as a re-send); `None`: nothing to send.
+    pub(crate) fn decide(
+        &mut self,
+        now: Instant,
+        frame: &Frame,
+        fresh: bool,
+        timer: bool,
+    ) -> Option<bool> {
+        if fresh {
+            if self.last_seq != Some(frame.seq) {
+                self.last_seq = Some(frame.seq);
+                self.resend_at = Some(now + COLD_SETTLE);
+            }
+            if !resendable(frame.stage) {
+                self.resend_at = None;
+            }
+            return Some(false);
+        }
+        if timer {
+            self.resend_at = None;
+            return resendable(frame.stage).then_some(true);
+        }
+        None
+    }
+}
+
 async fn send_loop(
     luna: PathBuf,
     app_id: String,
     mut rx: watch::Receiver<Option<Frame>>,
     screen: watch::Receiver<bool>,
 ) {
-    let mut last_seq: Option<u32> = None;
-    let mut resend_at: Option<Instant> = None;
+    let mut pace = Pace::default();
     let mut failures = 0_u32;
     loop {
-        let resend = tokio::select! {
+        // Frames first: when both are ready, the new frame wins.
+        let timer = tokio::select! {
+            biased;
             changed = rx.changed() => {
                 if changed.is_err() {
                     return;
                 }
                 false
             }
-            () = crate::daemon::sleep_opt(resend_at) => true,
+            () = crate::daemon::sleep_opt(pace.resend_at()) => true,
         };
+        // A frame that arrived while the timer fired is new, not a re-send.
+        let fresh = !timer || rx.has_changed().unwrap_or(false);
         let Some(frame) = rx.borrow_and_update().clone() else {
             continue;
         };
-        if resend {
-            resend_at = None;
-            if !resendable(frame.stage) {
-                continue;
-            }
-        } else if last_seq != Some(frame.seq) {
-            last_seq = Some(frame.seq);
-            resend_at = Some(Instant::now() + COLD_SETTLE);
-        }
-        if !resendable(frame.stage) {
-            resend_at = None;
-        }
+        let Some(resend) = pace.decide(Instant::now(), &frame, fresh, timer) else {
+            continue;
+        };
         // The gate is read right before the call: a frame that waited behind
         // a slow call, and the re-send, see the power state of now.
         if !*screen.borrow() {
@@ -583,6 +622,80 @@ async fn send_loop(
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+
+    fn frame(seq: u32, stage: Stage) -> Frame {
+        Frame {
+            inst: 1,
+            seq,
+            stage,
+            heard: String::new(),
+            answer: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_final_frame_that_meets_the_resend_timer_is_sent_not_skipped() {
+        let t0 = Instant::now();
+        let mut p = Pace::default();
+        assert_eq!(
+            p.decide(t0, &frame(1, Stage::Listening), true, false),
+            Some(false)
+        );
+        assert_eq!(p.resend_at(), Some(t0 + COLD_SETTLE));
+        // The timer fires and a Done frame is waiting: it is sent as new.
+        let t1 = t0 + COLD_SETTLE;
+        assert_eq!(
+            p.decide(t1, &frame(1, Stage::Done), true, true),
+            Some(false)
+        );
+        assert_eq!(
+            p.resend_at(),
+            None,
+            "nothing to re-send after the run closed"
+        );
+        // The same for an error and a hide.
+        let mut p = Pace::default();
+        p.decide(t0, &frame(2, Stage::Thinking), true, false);
+        assert_eq!(
+            p.decide(t1, &frame(2, Stage::Hide), true, true),
+            Some(false)
+        );
+        let mut p = Pace::default();
+        p.decide(t0, &frame(3, Stage::Listening), true, false);
+        assert_eq!(
+            p.decide(
+                t1,
+                &frame(3, Stage::Error(ErrorKind::Disconnected)),
+                true,
+                true
+            ),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn the_timer_alone_resends_an_open_run_once_and_never_a_closed_one() {
+        let t0 = Instant::now();
+        let mut p = Pace::default();
+        p.decide(t0, &frame(1, Stage::Thinking), true, false);
+        let t1 = t0 + COLD_SETTLE;
+        assert_eq!(
+            p.decide(t1, &frame(1, Stage::Thinking), false, true),
+            Some(true)
+        );
+        assert_eq!(p.resend_at(), None);
+        assert_eq!(p.decide(t1, &frame(1, Stage::Thinking), false, false), None);
+        // A later frame of the same run does not re-arm the timer.
+        assert_eq!(
+            p.decide(t1, &frame(1, Stage::Answer), true, false),
+            Some(false)
+        );
+        assert_eq!(p.resend_at(), None);
+        // A closed run is not re-sent by the timer.
+        let mut p = Pace::default();
+        p.decide(t0, &frame(4, Stage::Listening), true, false);
+        assert_eq!(p.decide(t1, &frame(4, Stage::Done), false, true), None);
+    }
 
     fn start(wake_word: bool) -> AppEvent {
         AppEvent::StartStreaming {

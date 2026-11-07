@@ -246,6 +246,7 @@ overlay_sync() {
 }
 
 overlay_app_present() { [ -n "$APPDIR" ] && [ -f "$(overlay_dir)/appinfo.json" ]; }
+
 # The overlay can show: its app is installed and luna-send is there (the
 # daemon also needs its power watch).
 overlay_can_show() { overlay_app_present && command -v "$LUNA" >/dev/null 2>&1; }
@@ -264,6 +265,23 @@ overlay_remove() {
         note "overlay app: not removed ($why); remove $(overlay_id) with the Homebrew Channel"
     fi
     rm -rf "$wd"
+}
+
+# overlay_sync, then a restart of a running daemon that started before the
+# overlay app existed (the first install: overlay_sync runs after the
+# restart, so the voice service is not kept down by appinstalld, but the
+# daemon decides at its start whether it can show the overlay). Only with
+# [overlay] enabled = true; otherwise nothing would change.
+overlay_sync_then_restart() {
+    had=0
+    ! overlay_app_present || had=1
+    overlay_sync
+    if [ "$had" -eq 0 ] && overlay_app_present && [ "$(overlay_enabled_json)" = true ] && running; then
+        note "the overlay app is new: restarting the satellite so it shows the on-screen assistant"
+        stop_daemon 10
+        lg_restore_after_stop
+        sh "$P/bin/start.sh" --supervise
+    fi
 }
 
 cmd_install() {
@@ -286,7 +304,7 @@ cmd_install() {
     if [ "$force" -eq 0 ] && [ -z "$cfg" ] && [ -z "$psk" ] && installed &&
         cmp -s "$PAYLOAD/SHA256SUMS" "$P/package.sums"; then
         note "already up to date ($(cat "$P/VERSION" 2>/dev/null || echo unknown)); nothing to do (--force reinstalls)"
-        overlay_sync
+        overlay_sync_then_restart
         return 0
     fi
     stop_setup_server
@@ -334,7 +352,7 @@ cmd_install() {
         sh "$P/bin/start.sh" --supervise
     fi
     # After the restart: the voice service is not kept down by appinstalld.
-    overlay_sync
+    overlay_sync_then_restart
 }
 
 cmd_start() {
@@ -542,8 +560,12 @@ overlay_enabled_json() { if [ "$(cfg_section_value overlay enabled)" = true ]; t
 # daemon reports, else the state file: "lg", "ours (configd)" or "unknown"
 # (a state file is left and no daemon confirms it: restore-lg-voice clears it).
 LG_VOICE_STATE=lg_voice_override
+# The daemon process itself is alive (not only its supervisor): what it
+# wrote to voice.json is then current. After a crash the file stays fresh
+# for up to 60 s and must not be believed.
+daemon_alive() { is_ours "$(read_pid "$PIDFILE")"; }
 lg_voice_key_word() {
-    if running && voice_fresh; then
+    if daemon_alive && voice_fresh; then
         lk=$(sed -n 's/.*"lg_voice_key"[[:space:]]*:[[:space:]]*"\([a-z ()]*\)".*/\1/p' "$RUN_DIR/voice.json" 2>/dev/null | head -n 1)
         case $lk in lg | 'ours (configd)' | unknown) printf '%s' "$lk"; return 0 ;; esac
     fi
@@ -692,7 +714,7 @@ cmd_status() {
     lg_voice_key=$(lg_voice_key_word)
     mic_active=null
     mic_error=
-    if running && voice_fresh; then
+    if daemon_alive && voice_fresh; then
         case $(voice_field mic_button) in
         ptt) mic_active=true ;;
         off | failed) mic_active=false ;;
@@ -1253,8 +1275,15 @@ lg_emit() { # RESULT LG_VOICE_KEY ERROR
 # a stop. python3 (on the TVs) or flock(1) takes it; a lock that cannot be
 # taken in 30 s fails the restore (nothing is changed).
 lg_lock() {
-    mkdir -p "$P/run" 2>/dev/null || return 1
-    exec 9>>"$P/run/lg_voice.lock" || return 1
+    LG_LOCK_ERR=
+    lf=$P/run/lg_voice.lock
+    mkdir -p "$P/run" 2>/dev/null || { LG_LOCK_ERR="cannot make $P/run"; return 1; }
+    # A failed `exec` redirection ends a POSIX shell: open it in a subshell first.
+    if ! (: >>"$lf") 2>/dev/null; then
+        LG_LOCK_ERR="cannot open the lock $lf"
+        return 1
+    fi
+    exec 9>>"$lf"
     if command -v python3 >/dev/null 2>&1; then
         python3 -c 'import fcntl, sys, time
 end = time.time() + 30
@@ -1266,11 +1295,26 @@ while True:
         if time.time() > end:
             sys.exit(1)
         time.sleep(0.1)' && return 0
+        exec 9>&-
+        LG_LOCK_ERR="the lock run/lg_voice.lock is held by an acquire or another restore (30 s)"
         return 1
     fi
     if command -v flock >/dev/null 2>&1; then
-        flock -x 9 && return 0
+        # -n in a loop: busybox flock has no -w.
+        i=0
+        while [ "$i" -lt 30 ]; do
+            if flock -n -x 9 2>/dev/null; then
+                return 0
+            fi
+            sleep 1
+            i=$((i + 1))
+        done
+        exec 9>&-
+        LG_LOCK_ERR="the lock run/lg_voice.lock is held by an acquire or another restore (30 s)"
+        return 1
     fi
+    exec 9>&-
+    LG_LOCK_ERR="neither python3 nor flock is available to take the lock run/lg_voice.lock"
     return 1
 }
 
@@ -1298,13 +1342,20 @@ lg_restore() {
         return 1
     fi
     if ! lg_lock; then
-        lg_emit failed unknown "the lock run/lg_voice.lock is held by an acquire or another restore"
+        lg_emit failed unknown "$LG_LOCK_ERR"
         return 1
     fi
     if [ ! -f "$sf" ]; then
         lg_unlock
         lg_emit nothing lg ""
         return 0
+    fi
+    # Again under the lock: a daemon that started while this waited holds
+    # the key now (its acquire ran first); its state file is not ours to undo.
+    if is_ours "$(read_pid "$PIDFILE")"; then
+        lg_unlock
+        lg_emit refused "$(lg_voice_key_word)" "the satellite started meanwhile and holds the key: turn the mic button off (ctl.sh config mic-button off) or stop it first"
+        return 1
     fi
     tok=$(cat "$sf" 2>/dev/null)
     seterr=
@@ -1526,7 +1577,7 @@ cmd_config_set() { # aec|music|mic-button on|off, already validated
     # running daemon that reports it not running (the takeover failed) makes
     # "on" a retry (the same config, a restart), and "off" still writes off.
     eff=$before
-    if [ "$st" = mic-button ] && running && voice_fresh; then
+    if [ "$st" = mic-button ] && daemon_alive && voice_fresh; then
         case $(voice_field mic_button) in
         ptt) eff=on ;;
         off | failed) eff=off ;;

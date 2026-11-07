@@ -432,13 +432,15 @@
   function soundValue(st, d) {
     if (d.id !== 'mic') { return typeof st[d.key] === 'boolean' ? st[d.key] : undefined; }
     if (typeof st.mic_button !== 'string') { return undefined; }
-    // On only when the running satellite says it holds the button.
-    return st.mic_button === 'ptt' && st.mic_button_active === true;
+    // On only when the running satellite says it holds the button (and the
+    // daemon process is up: a crashed daemon's last report is not believed).
+    return st.mic_button === 'ptt' && st.mic_button_active === true && st.running !== false;
   }
 
   // Configured but no word from a running satellite yet: null or missing.
   function micPending(st) {
-    return !!st && st.mic_button === 'ptt' && st.mic_button_active !== true && st.mic_button_active !== false;
+    return !!st && st.mic_button === 'ptt' && st.mic_button_active !== false
+      && (st.mic_button_active !== true || st.running === false);
   }
 
   // Configured but not running: the takeover of LG's voice key failed.

@@ -270,6 +270,25 @@ stop_setup_server() {
 # Every kill tolerates a process that is already gone: the supervisor
 # forwards its TERM to the daemon, which can exit before our own TERM, and
 # callers run with `set -e` (found on c3-b, EXP-009).
+# Gives LG's voice key back after a stop (ADR 0013) when the daemon left its
+# state file: through the installed ctl.sh restore-lg-voice (the one
+# implementation, with its lock and checks). For the scripts that stop the
+# daemon without ctl.sh (stop.sh, uninstall.sh). $1: "removing" when the
+# install goes away afterwards (then only a TV restart can help).
+lg_restore_after_stop_script() {
+    [ -f "$PREFIX/run/lg_voice_override" ] || return 0
+    here_ctl=$(dirname "$BIN")/ctl.sh
+    if [ -f "$here_ctl" ] && WEBOS_SAT_PREFIX=$PREFIX sh "$here_ctl" restore-lg-voice >&2; then
+        return 0
+    fi
+    if [ "${1:-}" = removing ]; then
+        note "LG's voice key could NOT be given back: reboot the TV to give the mic button back to LG"
+    else
+        note "LG's voice key could NOT be given back: run ctl.sh restore-lg-voice or reboot the TV"
+    fi
+    return 0
+}
+
 stop_daemon() {
     wait_s=${1:-10}
     stop_setup_server
@@ -297,8 +316,15 @@ stop_daemon() {
     else
         note "daemon not running"
     fi
+    # The supervisor may be giving LG's voice key back (ctl.sh
+    # restore-lg-voice after the daemon's exit, ADR 0013): it may take its
+    # lock (up to 30 s) and two luna calls, so it gets 45 s then, 5 s
+    # otherwise, before the kill.
+    sup_wait=5
+    [ ! -f "$PREFIX/run/lg_voice_override" ] || sup_wait=${WEBOS_SAT_RESTORE_WAIT:-45}
+    case $sup_wait in '' | *[!0-9]*) sup_wait=45 ;; esac
     i=0
-    while supervisor_alive && [ "$i" -lt 5 ]; do
+    while supervisor_alive && [ "$i" -lt "$sup_wait" ]; do
         sleep 1
         i=$((i + 1))
     done

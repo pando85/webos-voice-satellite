@@ -569,6 +569,10 @@ const nextTick = () => T.timers.filter((t) => t.live && t.interval && t.ms === 1
   const micStopped = SR({ running: false, aec_enabled: true, music_enabled: false, mic_button: 'ptt', mic_button_active: null })[2];
   check('mic button configured, satellite not running: Not running (never On), can be turned off', micStopped.word === 'Not running'
     && micStopped.checked === 'false' && micStopped.cmd === 'config mic-button off' && /LG\'s assistant has the mic button/.test(micStopped.warn));
+  const micCrash = SR({ running: false, aec_enabled: true, music_enabled: false, mic_button: 'ptt', mic_button_active: true, lg_voice_key: 'ours (configd)' })[2];
+  check('mic button after a daemon crash (an old report says active, the daemon is not running): Not running, never On',
+    micCrash.word === 'Not running' && micCrash.checked === 'false'
+    && VP.soundSummary({ running: false, aec_enabled: true, music_enabled: false, mic_button: 'ptt', mic_button_active: true }) === 'Echo cancellation on, music off');
   const micWait = SR({ running: true, aec_enabled: true, music_enabled: false, mic_button: 'ptt', mic_button_active: null })[2];
   check('mic button configured, no answer yet from the running satellite: Checking..., not pressable', micWait.word === 'Checking...' && !micWait.can && micWait.checked === 'false');
   const micOld = SR({ running: true, aec_enabled: true, music_enabled: false, mic_button: 'ptt' })[2];

@@ -150,13 +150,39 @@ echo "configd 1 hang" >"$P/run/lg_voice_override"
 kill -KILL "$ph"
 wait_for 5 'pgrep -f "$T/hang/luna-send-hang" >/dev/null' || true
 check "the supervisor's restore is running (configd hangs)" 'pgrep -f "$T/hang/luna-send-hang" >/dev/null'
-sh "$P/bin/stop.sh" >/dev/null 2>&1 || true
+# The wait for a restoring supervisor (45 s on the TV) cut short, to
+# exercise the kill.
+WEBOS_SAT_RESTORE_WAIT=2 sh "$P/bin/stop.sh" >/dev/null 2>&1 || true
 wait_for 3 '! pgrep -f "$P/bin/ctl.sh restore-lg-voice" >/dev/null' || true
 check "stop kills the supervisor's process group: no ctl.sh restore is left to remove a state file later, and it was not removed" '! pgrep -f "$P/bin/ctl.sh restore-lg-voice" >/dev/null && ! supervisor_alive && [ "$(cat "$P/run/lg_voice_override")" = "configd 1 hang" ]'
 # The luna-send it had started is bounded by its own timeout (6 s): it
 # removes no file; at most its call reaches configd late.
 wait_for 15 '! pgrep -f "$T/hang/luna-send-hang" >/dev/null' || true
 check "the luna call it left ends by its own timeout" '! pgrep -f "$T/hang/luna-send-hang" >/dev/null'
+
+# A slow restore in the supervisor (about 6 s, longer than the plain 5 s a
+# stop gives the supervisor) is allowed to finish: the stop waits up to 45 s
+# while the state file exists.
+cat >"$T/luna-send-slow" <<'FAKE'
+#!/bin/sh
+sleep 3
+case $5 in
+*/setConfigs) case $6 in *null*) rm -f "$KA_DIR/kav" ;; esac; printf '{"returnValue": true}\n' ;;
+*/getConfigs) printf '{"configs":{"com.webos.keyaction.voice":{"action":"%s"}},"returnValue":true}\n' "$(cat "$KA_DIR/kav" 2>/dev/null || echo launch)" ;;
+esac
+FAKE
+chmod 755 "$T/luna-send-slow"
+KA_DIR=$T WEBOS_SAT_LUNA_SEND=$T/luna-send-slow WEBOS_SAT_ALLOW_NONROOT=1 sh "$P/bin/start.sh" --supervise >/dev/null
+echo ignore >"$T/kav"
+echo "configd 1 slow" >"$P/run/lg_voice_override"
+KA_DIR=$T WEBOS_SAT_LUNA_SEND=$T/luna-send-slow WEBOS_SAT_ALLOW_NONROOT=1 sh "$P/bin/stop.sh" >/dev/null 2>&1 || true
+check "stop gives a slow restore in the supervisor time to finish (no kill at 5 s): LG's key back, state file gone" '[ ! -e "$P/run/lg_voice_override" ] && [ ! -e "$T/kav" ] && ! supervisor_alive'
+# stop.sh with no supervisor and a state file left (an unsupervised crash):
+# stop.sh itself gives the key back.
+echo ignore >"$T/kav"
+echo "configd 1 left" >"$P/run/lg_voice_override"
+KA_DIR=$T WEBOS_SAT_LUNA_SEND=$T/luna-send WEBOS_SAT_ALLOW_NONROOT=1 sh "$P/bin/stop.sh" >/dev/null 2>&1 || true
+check "stop.sh gives a leftover state file's key back itself" '[ ! -e "$P/run/lg_voice_override" ] && [ ! -e "$T/kav" ]'
 rm -f "$P/run/lg_voice_override"
 
 for what in loop capture; do
@@ -203,8 +229,13 @@ sh "$P/bin/autostart.sh" --delay 0
 pid3=$(read_pid "$PIDFILE")
 check "autostart: starts the supervised daemon when all checks pass" 'is_ours "$pid3" && supervisor_alive'
 
-sh "$P/bin/uninstall.sh" >/dev/null
+# A state file left while the daemon runs (as after an earlier crash with a
+# failed restore): uninstall gives LG's key back before it removes the prefix.
+echo ignore >"$T/kav"
+echo "configd 1 uninstall" >"$P/run/lg_voice_override"
+KA_DIR=$T WEBOS_SAT_LUNA_SEND=$T/luna-send WEBOS_SAT_ALLOW_NONROOT=1 sh "$P/bin/uninstall.sh" >/dev/null 2>"$T/uninstall.err"
 check "uninstall: stops everything and removes the prefix" '[ ! -e "$P" ] && ! is_ours "$pid3"'
+check "uninstall: LG's voice key given back before the state file went with the prefix" '[ ! -e "$T/kav" ]'
 
 t0=$(date +%s)
 out=$(sh "$PKG/init.d/webos-satellite" 2>&1) && rc=0 || rc=$?

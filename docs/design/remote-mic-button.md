@@ -198,3 +198,19 @@ Owner priority added at the same time: off is inert (no reader), and `ctl.sh` re
 ### Review of `506cbe7` (LG hand-over)
 
 Fixed before the release: success of a restore requires `launch` (it accepted anything but `ignore`); the restore is serialised with the daemon through a `flock`ed lock file, the state file carries a token, and a stop kills the supervisor's process group (an orphaned restore could remove a newer acquire's state file); the state file and lock live under the install, not `[report] dir`; the app shows On only with `mic_button_active` true; the persistence check also compares `configd_db.json` (size, modification time) and runs again 5 s after the takeover and at the release; the takeover runs after every fallible start-up step; uninstall and purge failures say "reboot the TV"; a leftover state file without `luna-send` reports `unknown`; `mic_button_error` is written without quotes so `ctl.sh` reads it whole.
+
+### Re-review of `456e9ec` (before 0.5.0)
+
+- `stop.sh` and `uninstall.sh` now give LG's key back after their stop (through the installed `ctl.sh restore-lg-voice`; an uninstall failure says "reboot the TV"), and a stop waits up to 45 s (not 5 s) for a supervisor that is restoring before the process-group kill (`WEBOS_SAT_RESTORE_WAIT`, tests only).
+- A restore checks again, under the lock, that no daemon runs: a daemon that started while the restore waited keeps its key and state file.
+- The takeover (lock wait up to 30 s plus luna calls) and a stop of the mic button at runtime keep the watchdog's loop heartbeat going, so a slow configd at boot cannot trip `limits.loop_stall_s`.
+- `ctl.sh status` (and `config mic-button`) believe `voice.json` only while the daemon process itself is alive, not its supervisor: after a crash the mic button is not reported On; the TV app also shows On only with the daemon running.
+- `lg_lock`: the lock file is opened in a subshell first (a failed `exec` redirection would end the shell), `flock(1)` is used with a 30 s `-n` loop (busybox has no `-w`), and a TV with neither `python3` nor `flock` gets that reason.
+
+### Open question: a persistent write despite `"volatile": true` (hypothesis, not seen)
+
+The persistence check (section 7) exists for the case that this firmware's configd stores the override in a persistent database although `"volatile": true` was sent (upstream source: volatile values stay in memory; the shipped binary has the same symbols; **not observed on a TV**). If the check ever fires, the satellite removes its in-memory value with `null` (volatile) and stops the feature, but a `null` sent with `"volatile": true` **cannot be expected to remove a value from a persistent database**. The satellite then must not try more: any non-volatile `setConfigs` is outside [ADR 0013](../decisions/0013-remote-mic-button-coexistence.md) and is never sent.
+
+What the owner should do then (hypothesis until evidence exists): leave the feature off, note the log line (`configd's persistent database ... changed`), and check whether LG's assistant still opens from the mic button after a TV restart. If it does, the change was not about this key (configd writes the file for other reasons) and nothing else is needed. If it does not, LG's key stays at `ignore` across reboots, and undoing it needs a separate, owner-approved experiment and an ADR amendment (for example a non-volatile `null` for this one key, which upstream says removes it from the factory database: EXP-023's C1 rollback note).
+
+Evidence needed before anything is run: on the TV, read-only, the metadata (size, time) of `/var/preferences/configd_db.json` and `configd_factory_db.json` before and after one enable session (EXP-023 C1 step 3), and whether `getConfigs` of `com.webos.keyaction.voice` reads `launch` after a TV restart. No write is part of that check.

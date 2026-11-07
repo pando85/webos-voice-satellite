@@ -382,6 +382,20 @@ check "a second install of the same payload does nothing (no restart, no overlay
 rm -rf "$OV"
 out=$($CTL install 2>&1)
 check "an overlay app removed by hand comes back at the next install, without a restart" '[ "$(installs)" = 4 ] && [ -f "$OV/appinfo.json" ] && [ "$(running_pid)" = "$pid_v2" ]'
+# With the overlay enabled, a daemon that started without the overlay app
+# (the first install: the app is installed after the restart) is restarted
+# once, so it decides again whether it can show the overlay.
+cp "$S/etc/config.toml" "$T/cfg-before-overlay"
+printf '\n[overlay]\nenabled = true\n' >>"$S/etc/config.toml"
+$CTL restart >/dev/null 2>&1
+pid_ov=$(running_pid)
+rm -rf "$OV"
+out=$($CTL install 2>&1)
+check "overlay enabled and its app new: installed, then the daemon is restarted once to use it" '[ "$(installs)" = 5 ] && [ -f "$OV/appinfo.json" ] && echo "$out" | grep -q "the overlay app is new: restarting" && [ -n "$(running_pid)" ] && [ "$(running_pid)" != "$pid_ov" ] && [ "$(daemons)" = 1 ]'
+out=$($CTL install 2>&1)
+check "overlay enabled, app already there: no restart" '! echo "$out" | grep -q "the overlay app is new" && [ "$(installs)" = 5 ]'
+cp "$T/cfg-before-overlay" "$S/etc/config.toml"
+$CTL restart >/dev/null 2>&1
 rm -rf "$OV"
 out=$(WEBOS_SAT_LUNA_SEND_PUB=$T/no-such-tool $CTL install 2>&1) && rc=0 || rc=$?
 check "no luna-send-pub: install still succeeds, the overlay app is reported missing" '[ "$rc" -eq 0 ] && echo "$out" | grep -q "overlay app: not installed (no $T/no-such-tool)" && json "s[\"overlay_app\"] is False"'

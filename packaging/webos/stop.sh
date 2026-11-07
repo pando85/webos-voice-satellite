@@ -18,4 +18,5 @@ done
 resolve_prefix "$0" "$prefix_arg"
 require_installed
 stop_daemon 10
+lg_restore_after_stop_script
 note "stopped"

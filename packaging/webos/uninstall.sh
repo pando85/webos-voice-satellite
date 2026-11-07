@@ -20,6 +20,7 @@ done
 resolve_prefix "$0" "$prefix_arg"
 require_installed
 stop_daemon 10
+lg_restore_after_stop_script removing
 # This script lives inside the prefix; the shell keeps its open file, so it
 # can remove its own directory.
 cd /

@@ -684,43 +684,59 @@ out=$(cqc config music on 2>/dev/null) && rc=0 || rc=$?
 check "busy file but nothing running: applied, daemon not running" '[ "$rc" -eq 0 ] && echo "$out" | grep -q "\"result\":\"applied\",\"daemon\":\"not running\"" && qsum | grep -q " music=\[on "'
 rm -f "$Q/run/voice.json" "$stamp"
 
-# The mic button is on only while it runs (LG's key taken over, ADR 0013):
-# with mic_button = "ptt" in the config but a daemon that reports it failed,
-# "on" is a retry (the same config and a restart) and "off" writes off.
+cp "$T/base.toml" "$QC"
+cp "$HOST_BIN" "$Q/bin/webos-satellite"
+
+# The mic button is on only while it runs (LG's key taken over, ADR 0013),
+# and only a live daemon process says so: a second host daemon with its own
+# report directory stands in for the running one (its pid in run/), and
+# run/voice.json is written by hand.
+fport=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')
+mkdir -p "$T/fakerun"
+sed -e "s/^port = .*/port = $fport/" "$T/base.toml" >"$T/fake.toml"
+printf '\n[report]\ndir = "%s"\n' "$T/fakerun" >>"$T/fake.toml"
+fakedaemon() {
+    "$Q/bin/webos-satellite" --config "$T/fake.toml" >/dev/null 2>&1 &
+    FD=$!
+    echo "$FD" >"$Q/run/webos-satellite.pid"
+    i=0; while ! is_ours "$FD" && [ "$i" -lt 30 ]; do sleep 0.1; i=$((i + 1)); done
+}
 mic_json() { # MIC_BUTTON LG_VOICE_KEY ERROR(json)
     printf '{"schema":1,"mic":"listening","remote_off":"normal","remote_off_active":true,"power_state":"Active","pairing_until":null,"ha":"connected","ha_since":1762000000,"busy":null,"mic_button":"%s","lg_voice_key":"%s","mic_button_error":%s,"music":{"enabled":true}}\n' "$1" "$2" "$3" >"$Q/run/voice.json"
 }
 cp "$T/base.toml" "$QC"
 printf '\n[remote]\nmic_button = "ptt"\n' >>"$QC"
 cp "$QC" "$T/ptt.toml"
-fakesup
+fakedaemon
 # The daemon writes the reason without double quotes or backslashes.
 mic_json failed lg '"the read-back says '"'"'launch'"'"', not ignore; LG'"'"'s voice key was restored"'
 st=$(cq status --json)
 check "status: configured ptt, not running, the whole reason, LG has the key" 'echo "$st" | grep -q "\"mic_button\":\"ptt\",\"mic_button_active\":false,\"mic_button_error\":\"the read-back says .launch., not ignore; LG.s voice key was restored\",\"lg_voice_key\":\"lg\","'
 check "status text: not running, with the reason" 'cq status 2>/dev/null | grep -q "remote mic button NOT running: the read-back says" && cq status 2>/dev/null | grep -q "LG voice key: lg"'
-out=$(cqc config mic-button on 2>/dev/null) && rc=0 || rc=$?
-check "mic-button on with ptt configured but failed: a retry, not already (before off; restart, rolled back by the stand-in)" '! echo "$out" | grep -q "\"result\":\"already\"" && echo "$out" | grep -q "\"requested\":\"on\",\"before\":\"off\"" && cmp -s "$QC" "$T/ptt.toml"'
-cq stop >/dev/null 2>&1
-rm -f "$Q/crashloop"
-kill "$FAKEPID" 2>/dev/null || true
-fakesup
-mic_json failed lg null
-out=$(cqc config mic-button off 2>/dev/null) && rc=0 || rc=$?
-check "mic-button off with ptt configured but failed: writes off (not already)" '! echo "$out" | grep -q "\"result\":\"already\"" && echo "$out" | grep -q "\"requested\":\"off\",\"before\":\"off\""'
-cq stop >/dev/null 2>&1
-rm -f "$Q/crashloop"
-kill "$FAKEPID" 2>/dev/null || true
-cp "$T/ptt.toml" "$QC"
-fakesup
 mic_json ptt 'ours (configd)' null
 out=$(cqc config mic-button on 2>/dev/null) && rc=0 || rc=$?
 check "mic-button on while it runs: already" '[ "$rc" -eq 0 ] && echo "$out" | grep -q "\"result\":\"already\""'
 check "status: running, ours" 'cq status --json | grep -q "\"mic_button_active\":true,\"mic_button_error\":null,\"lg_voice_key\":\"ours (configd)\","'
-kill "$FAKEPID" 2>/dev/null || true
-rm -f "$Q/run/supervise.pid" "$Q/run/voice.json" "$stamp"
+# The daemon dies (a crash); run/voice.json still says ptt and ours for up
+# to 60 s: the status must not believe it.
+kill -KILL "$FD" 2>/dev/null || true
+wait "$FD" 2>/dev/null || true
+check "a dead daemon with a fresh voice.json that says ptt: not active (null), the key from the state file (lg), never On" 'cq status --json | grep -q "\"mic_button\":\"ptt\",\"mic_button_active\":null,\"mic_button_error\":null,\"lg_voice_key\":\"lg\","'
+# Configured ptt, the takeover failed: "on" is a retry (a restart), "off"
+# writes off.
+fakedaemon
+mic_json failed lg null
+out=$(cqc config mic-button on 2>/dev/null) && rc=0 || rc=$?
+check "mic-button on with ptt configured but failed: a retry (not already; before off; the daemon restarted)" '! echo "$out" | grep -q "\"result\":\"already\"" && echo "$out" | grep -q "\"requested\":\"on\",\"before\":\"off\"" && cmp -s "$QC" "$T/ptt.toml"'
+cq stop >/dev/null 2>&1
+fakedaemon
+mic_json failed lg null
+out=$(cqc config mic-button off 2>/dev/null) && rc=0 || rc=$?
+check "mic-button off with ptt configured but failed: writes off (not already)" '! echo "$out" | grep -q "\"result\":\"already\"" && echo "$out" | grep -q "\"requested\":\"off\",\"before\":\"off\"" && grep -qx "mic_button = \"off\"" "$QC"'
+cq stop >/dev/null 2>&1
+kill "$FD" 2>/dev/null || true
+rm -f "$Q/run/voice.json" "$Q/run/webos-satellite.pid" "$stamp"
 cp "$T/base.toml" "$QC"
-cp "$HOST_BIN" "$Q/bin/webos-satellite"
 
 # --- restore-lg-voice (ADR 0013): repeatable, only from the state file, only
 # volatile writes and the one config name; refused while the daemon runs;
@@ -771,6 +787,33 @@ out=$(cq restore-lg-voice 2>/dev/null) && rc=0 || rc=$?
 t1=$(date +%s)
 wait "$lockpid" 2>/dev/null || true
 check "restore waits for the lock an acquire holds (flock on run/lg_voice.lock), then runs" '[ "$rc" -eq 0 ] && [ $((t1 - t0)) -ge 1 ] && echo "$out" | grep -q "\"restore\":\"done\"" && [ ! -e "$sf" ] && [ ! -e "$F/kav" ]'
+# lg_lock: no python3 and no flock: a clear failure; a lock file that cannot
+# be opened: a failure, not an exit of the shell; flock(1) alone works.
+mkdir -p "$T/nopy"
+for d in /usr/local/bin /usr/bin /bin; do
+    for f in "$d"/*; do
+        n=$(basename "$f")
+        case $n in python3* | flock) continue ;; esac
+        [ -e "$T/nopy/$n" ] || ln -s "$f" "$T/nopy/$n" 2>/dev/null || true
+    done
+done
+echo "configd 1" >"$sf"
+echo ignore >"$F/kav"
+out=$(PATH=$T/nopy cq restore-lg-voice 2>/dev/null) && rc=0 || rc=$?
+check "restore without python3 and flock: failed with that reason, nothing changed" '[ "$rc" -eq 1 ] && echo "$out" | grep -q "neither python3 nor flock is available" && [ -e "$sf" ] && [ -e "$F/kav" ]'
+if command -v flock >/dev/null 2>&1; then
+    ln -s "$(command -v flock)" "$T/nopy/flock"
+    out=$(PATH=$T/nopy cq restore-lg-voice 2>/dev/null) && rc=0 || rc=$?
+    check "restore with flock(1) only: done" '[ "$rc" -eq 0 ] && echo "$out" | grep -q "\"restore\":\"done\"" && [ ! -e "$sf" ] && [ ! -e "$F/kav" ]'
+    rm -f "$T/nopy/flock"
+fi
+echo "configd 1" >"$sf"
+echo ignore >"$F/kav"
+rm -f "$Q/run/lg_voice.lock"
+mkdir "$Q/run/lg_voice.lock"
+out=$(cq restore-lg-voice 2>/dev/null) && rc=0 || rc=$?
+check "a lock file that cannot be opened: failed with the reason (the shell does not just exit), nothing changed" '[ "$rc" -eq 1 ] && echo "$out" | grep -q "cannot open the lock" && [ -e "$sf" ] && [ -e "$F/kav" ]'
+rmdir "$Q/run/lg_voice.lock"
 echo "configd 1" >"$sf"
 echo ignore >"$F/kav"
 out=$(WEBOS_SAT_PREFIX=$Q WEBOS_SAT_ALLOW_NONROOT=1 WEBOS_SAT_LUNA_SEND=$T/no-luna-send sh "$PKG/ctl.sh" restore-lg-voice 2>/dev/null) && rc=0 || rc=$?
@@ -780,8 +823,30 @@ cq start >/dev/null 2>&1
 check "daemon started for the restore checks" 'is_ours "$(qpid)"'
 out=$(cq restore-lg-voice 2>/dev/null) && rc=0 || rc=$?
 check "restore-lg-voice while the daemon runs: refused, nothing called" '[ "$rc" -eq 1 ] && echo "$out" | grep -q "\"restore\":\"refused\"" && [ -e "$sf" ] && [ -e "$F/kav" ]'
+cq stop >/dev/null 2>&1
+# The race: a restore that waits for the lock while a daemon starts. After
+# the lock it checks again and refuses (the daemon holds the key).
 echo "configd 1" >"$sf"
 echo ignore >"$F/kav"
+rm -f "$T/locked2"
+python3 -c 'import fcntl, os, sys, time
+fd = os.open(sys.argv[1], os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+fcntl.flock(fd, fcntl.LOCK_EX)
+open(sys.argv[2], "w").close()
+time.sleep(4)' "$Q/run/lg_voice.lock" "$T/locked2" &
+lockpid=$!
+i=0; while [ ! -e "$T/locked2" ] && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+cq restore-lg-voice >"$T/race.out" 2>/dev/null &
+rpid=$!
+sleep 0.5
+cq start >/dev/null 2>&1
+wait "$rpid" 2>/dev/null || true
+wait "$lockpid" 2>/dev/null || true
+check "a daemon that starts while a restore waits for the lock: the restore refuses after the lock, state file and key left" 'grep -q "\"restore\":\"refused\".*started meanwhile" "$T/race.out" && [ -e "$sf" ] && [ -e "$F/kav" ] && is_ours "$(qpid)"'
+cq stop >/dev/null 2>&1
+echo "configd 1" >"$sf"
+echo ignore >"$F/kav"
+cq start >/dev/null 2>&1
 cq stop >/dev/null 2>&1
 check "ctl.sh stop gives LG's key back (state file removed, value back)" '! is_ours "$(qpid)" && [ ! -e "$sf" ] && [ ! -e "$F/kav" ]'
 check "no setConfigs without volatile and no category read in all of the above" '[ ! -e "$F/kaviolation" ]'

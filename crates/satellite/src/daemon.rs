@@ -592,6 +592,8 @@ struct Daemon {
     screen_tx: watch::Sender<bool>,
     /// HA's "LG voice key" sensor is listed.
     lg_sensor_listed: bool,
+    /// The watchdog's heartbeats (kept going during a long takeover step).
+    beats: Arc<Beats>,
     /// When the persistent databases are looked at again after the takeover.
     lg_recheck_at: Option<Instant>,
 }
@@ -1085,6 +1087,7 @@ impl Daemon {
     /// reader and the machine stop, HA's switch goes off and the reports
     /// say why.
     async fn stop_mic_button(&mut self, why: String) {
+        let _beat = Heartbeat::start(&self.beats);
         let mut key = KeyOwner::Lg;
         if let Some(mut t) = self.lg_takeover.take() {
             if let Err(e) = t.release().await {
@@ -1917,6 +1920,32 @@ pub(crate) fn lg_state_dir(settings: &Settings) -> PathBuf {
         .map_or_else(|| settings.report.dir_or_default(), |p| p.join("run"))
 }
 
+/// Keeps the watchdog's event-loop heartbeat going while a long awaited step
+/// runs on the loop: the takeover of LG's voice key may wait up to 30 s for
+/// its lock and then for several luna calls, against `limits.loop_stall_s`
+/// (30 s by default). The runtime keeps running other tasks while it waits,
+/// so the ticker is real progress; a truly stuck loop stops it too (it runs
+/// on the same thread). Stops when dropped.
+pub(crate) struct Heartbeat(tokio::task::JoinHandle<()>);
+
+impl Heartbeat {
+    pub(crate) fn start(beats: &Arc<Beats>) -> Self {
+        let b = Arc::clone(beats);
+        Self(tokio::spawn(async move {
+            loop {
+                b.event_loop.fetch_add(1, Ordering::Relaxed);
+                tokio::time::sleep(KILL_SWITCH_POLL).await;
+            }
+        }))
+    }
+}
+
+impl Drop for Heartbeat {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// How long after the takeover the persistent databases are looked at again.
 const LG_RECHECK_AFTER: Duration = Duration::from_secs(5);
 
@@ -2229,7 +2258,10 @@ pub(crate) async fn run(mut settings: Settings, triggers: TestTriggers) -> Resul
     // LG's voice key taken over (ADR 0013); HA's switch shows what runs.
     // After every step that can fail, so no early return leaves the key
     // taken over (the supervisor would give it back, but not at once).
-    let remote_setup = setup_remote(&settings, crate::evdev::InputPaths::default()).await;
+    let remote_setup = {
+        let _beat = Heartbeat::start(&beats);
+        setup_remote(&settings, crate::evdev::InputPaths::default()).await
+    };
     if let Some(cs) = config_switches.as_mut() {
         cs.set_mic_button_active(remote_setup.started.is_some());
     }
@@ -2361,6 +2393,7 @@ pub(crate) async fn run(mut settings: Settings, triggers: TestTriggers) -> Resul
         overlay_tx,
         screen_tx,
         lg_sensor_listed,
+        beats: Arc::clone(&beats),
     };
     d.publish_voice_status();
     d.publish_timers().await;
@@ -2839,6 +2872,7 @@ mod tests {
             screen_tx: watch::channel(false).0,
             lg_sensor_listed: false,
             lg_recheck_at: None,
+            beats: Arc::new(Beats::default()),
         };
         (d, cmd_rx)
     }
@@ -3691,6 +3725,25 @@ esac"#,
         assert!(!dir.join("val").exists());
         assert!(!dir.join("run").join(lg_voice::STATE_FILE).exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_heartbeat_keeps_the_loop_watchdog_fed_during_a_long_takeover() {
+        let beats = Arc::new(Beats::default());
+        let hb = Heartbeat::start(&beats);
+        // A takeover that waits (a held lock, a slow configd) on the loop.
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        let n = beats.event_loop.load(Ordering::Relaxed);
+        assert!(n >= 2, "{n} beats in 700 ms");
+        drop(hb);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let m = beats.event_loop.load(Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert_eq!(
+            beats.event_loop.load(Ordering::Relaxed),
+            m,
+            "stops when dropped"
+        );
     }
 
     #[test]
