@@ -6,10 +6,14 @@
  * (window.voicePower), shared with the phone setup page.
  *
  * Talks to the satellite through the Homebrew Channel's root `exec` method
- * (luna://org.webosbrew.hbchannel.service/exec), running the package's own
- * payload/ctl.sh with a fixed argument list: no text typed or received is
- * ever put into a command, except the 8-hex-digit id of a phone request,
- * checked by a regular expression (docs/design/phone-setup.md, ADR 0009).
+ * (luna://org.webosbrew.hbchannel.service/exec), running ctl.sh with a fixed
+ * argument list: no text typed or received is ever put into a command,
+ * except the 8-hex-digit id of a phone request, checked by a regular
+ * expression (docs/design/phone-setup.md, ADR 0009). Once the satellite is
+ * installed, the installed copy (/var/lib/webos-satellite/bin/ctl.sh, root's
+ * alone) runs every command, updates included; the package's own
+ * payload/ctl.sh only for the first install: this app's directory is
+ * writable by other users on some TVs (docs/security/install-permissions.md).
  *
  * Screens (design "Calm dark", 2026-11-05): Home, Voice and power, Sound
  * (echo cancellation and music), Home Assistant (with the phone setup QR),
@@ -60,6 +64,13 @@
 
   var appDir = decodeURIComponent(window.location.pathname.replace(/\/[^\/]*$/, ''));
   var ctlPath = appDir + '/payload/ctl.sh';
+  // The installed ctl.sh, used when it and the app-dir record exist (ctl.sh
+  // STATE_PREFIX_DEFAULT); a static shell text, chosen on the TV.
+  var STATE = '/var/lib/webos-satellite';
+  function ctlCommand(args) {
+    return 'c=' + STATE + '/bin/ctl.sh; [ -f "$c" ] && [ -f ' + STATE + "/app-dir ] || c='" + ctlPath +
+      "'; sh \"$c\" " + args + ' 2>&1';
+  }
   var bridges = [];
   var busy = false;            // an action from run() is in flight
   var autoUpdateTried = false;
@@ -113,7 +124,7 @@
       done({ ok: false, out: '', err: 'refused: ' + args });
       return;
     }
-    luna(HBC_EXEC, { command: "sh '" + ctlPath + "' " + args + ' 2>&1' }, function (res) {
+    luna(HBC_EXEC, { command: ctlCommand(args) }, function (res) {
       var out = res.stdoutString || '';
       var ok = res.returnValue !== false && !res.errorCode && !res.errorText;
       done({ ok: ok, out: out, err: res.errorText || '' });

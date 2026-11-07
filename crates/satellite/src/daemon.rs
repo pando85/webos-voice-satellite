@@ -3526,6 +3526,8 @@ esac
             "#!/bin/sh\necho \"$@\" > \"$WEBOS_SAT_PREFIX/marker\"\n",
         )
         .unwrap();
+        // The lib.sh it would source: checked before ctl.sh runs.
+        std::fs::write(dir.join("bin").join("lib.sh"), "").unwrap();
         d.config_switches = Some(ConfigSwitches::fixture(true, false, &dir, &dir.join("run")));
         let _ = drain(&mut rx);
         d.on_event(flip).await;

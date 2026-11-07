@@ -26,4 +26,6 @@ The optional `[pairing]` mode lets Home Assistant (2026.9 or newer) set the Nois
 
 The webOS app package ([packaging design](docs/design/packaging.md)) adds no listening socket beyond the satellite's API port. Its status app runs the package's own `ctl.sh` as root through the Homebrew Channel's `exec`, with a fixed list of arguments and never with typed or received text. The daemon runs as root from `/var/lib/webos-satellite`, where the config, the key (mode 0600) and the logs stay until "Remove service and all data" (`ctl.sh purge`); removing only the app keeps them. Start at boot is off until the user turns it on.
 
+The app's own directory is laid out by the TV's installer and can be writable by other users (mode 0777 on one tested TV), so root never runs a file from it that is not owned by root, and once the satellite is installed the app runs the installed `ctl.sh` instead of its own. Everything root runs from the install directory is checked first (owned by root, not writable by group or others; `run/` private); see [file permissions of what runs as root](docs/security/install-permissions.md).
+
 For security issues, contact maintainers privately instead of disclosing exploitable device details in a public issue. A dedicated reporting channel will be specified before production releases.

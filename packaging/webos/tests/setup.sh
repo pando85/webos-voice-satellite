@@ -5,6 +5,8 @@
 # fields of `ctl.sh status --json`. The fake is a shell script that writes a
 # synthetic state.json (a made-up path with a recognisable marker in place of
 # the token), consumes answer.json, and is controlled by files in a directory.
+# Also: the kill switch, the install lock and the session directory in /tmp
+# are never written through a link or into a directory ctl.sh did not make.
 # No real server, no network, no TV output; everything stays in a temporary
 # directory.
 #
@@ -442,6 +444,39 @@ rm -f "$P/run/webos-satellite.pid"
 out=$(ctl status --json)
 check "daemon stopped: unknown" 'jq "$out" "s[\"ha\"][\"state\"]==\"unknown\""'
 check "no address, version or name in the ha object" 'jq "$out" "set(s[\"ha\"])=={\"state\",\"since_s\"}"'
+
+echo "== links and other users' directories in /tmp (docs/security/install-permissions.md) =="
+# The kill switch: never created through a link planted at its name.
+echo keep >"$T/victim"
+ln -s "$T/victim" "$T/kill"
+ctl mic off >/dev/null 2>&1
+check "mic off: a link planted at the kill switch's name is replaced by a file; its target is untouched" '[ -f "$T/kill" ] && [ ! -L "$T/kill" ] && [ "$(cat "$T/victim")" = keep ]'
+ctl mic on >/dev/null 2>&1
+# The install lock: a link at its name (to a directory with a live pid) is
+# not a lock of ours: removed at once, its target untouched.
+mkdir "$T/elsewhere"
+echo $$ >"$T/elsewhere/pid"
+ln -s "$T/elsewhere" "$T/lock"
+out=$(ctl set reply-volume 31 2>&1) && rc=0 || rc=$?
+check "lock: a link at the lock's name is removed at once and the command runs; the target is untouched" '[ "$rc" -eq 0 ] && [ ! -e "$T/lock" ] && [ "$(cat "$T/elsewhere/pid")" = $$ ] && echo "$out" | grep -q "not a lock of ours"'
+# Another user's session directory in /tmp (WEBOS_SAT_TEST_TRUST_UID makes
+# the test's own uid "another user"), with a live process that looks like
+# the server and a link at the heartbeat's name: status writes nothing into
+# it, stop removes it without signalling the process.
+ctl setup stop >/dev/null 2>&1
+rm -rf "$D"
+mkdir -m 700 "$D"
+printf '{"schema":1,"state":"waiting"}\n' >"$D/state.json"
+sh -c 'sleep 30; :' webos-satellite-setup &
+LOOK=$!
+echo "$LOOK" >"$D/setup.pid"
+echo keep >"$T/victim2"
+ln -s "$T/victim2" "$D/heartbeat"
+out=$(WEBOS_SAT_TEST_TRUST_UID=99999 ctl setup status --json) && rc=0 || rc=$?
+check "setup status: another user's session directory is neither trusted nor written: state none, the link's target untouched" '[ "$rc" -eq 0 ] && jq "$out" "s[\"state\"]==\"none\"" && [ "$(cat "$T/victim2")" = keep ] && [ "$(cat "$D/state.json")" = "{\"schema\":1,\"state\":\"waiting\"}" ]'
+WEBOS_SAT_TEST_TRUST_UID=99999 ctl setup stop >/dev/null 2>&1
+check "setup stop: the foreign directory is removed, the link's target untouched, the look-alike process not signalled" '[ ! -e "$D" ] && [ "$(cat "$T/victim2")" = keep ] && kill -0 "$LOOK"'
+kill "$LOOK" 2>/dev/null || true
 
 echo
 if [ "$fails" -eq 0 ]; then

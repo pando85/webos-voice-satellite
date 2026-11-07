@@ -562,16 +562,28 @@ for junk in garbage "" "12 34" "-5" "007" "99999999999999999999"; do
     out=$(cq config aec $want 2>/dev/null) && rc=0 || rc=$?
     check "a garbled stamp ('$junk') blocks nothing" '[ "$rc" -eq 0 ] && echo "$out" | grep -q "\"result\":\"applied\""'
 done
-# The cooldown file cannot be written (run is a file): failed, nothing changed.
+# run is a file, not a directory: the install is not trusted
+# (docs/security/install-permissions.md), refused before anything runs.
 mv "$Q/run" "$Q/run.keep"
 : >"$Q/run"
 cp "$QC" "$T/nostamp.toml"
 want=on
 sed -n "/^\[aec\]\$/{n;p;}" "$QC" | grep -qx "enabled = false" || want=off
 out=$(cq config aec $want 2>/dev/null) && rc=0 || rc=$?
-check "no cooldown file possible: failed, cannot write the cooldown file, config untouched, no temporary file" '[ "$rc" -eq 1 ] && echo "$out" | grep -q "\"result\":\"failed\",\"daemon\":\"none\",\"error\":\"cannot write the cooldown file\"" && cmp -s "$QC" "$T/nostamp.toml" && [ "$(leftovers)" = 0 ]'
+check "run/ is a file: refused (the install is not trusted), config untouched, no temporary file" '[ "$rc" -eq 1 ] && echo "$out" | grep -q "\"result\":\"refused\",\"daemon\":\"none\",\"error\":\"the install is not trusted: .*/run is not a directory" && cmp -s "$QC" "$T/nostamp.toml" && [ "$(leftovers)" = 0 ]'
 rm -f "$Q/run"
 mv "$Q/run.keep" "$Q/run"
+# The cooldown file cannot be written (a stand-in date gives no time for
+# the stamp): failed, nothing changed.
+mkdir -p "$T/fakedate"
+cat >"$T/fakedate/date" <<'FAKEDATE'
+#!/bin/sh
+[ "$*" != +%s ] || { echo never; exit 0; }
+exec /bin/date "$@"
+FAKEDATE
+chmod 755 "$T/fakedate/date"
+out=$(PATH="$T/fakedate:$PATH" cq config aec $want 2>/dev/null) && rc=0 || rc=$?
+check "no cooldown file possible: failed, cannot write the cooldown file, config untouched, no temporary file" '[ "$rc" -eq 1 ] && echo "$out" | grep -q "\"result\":\"failed\",\"daemon\":\"none\",\"error\":\"cannot write the cooldown file\"" && cmp -s "$QC" "$T/nostamp.toml" && [ "$(leftovers)" = 0 ]'
 rm -f "$stamp"
 # The final rename over the config fails (a stand-in mv): failed, nothing
 # changed, and the stamp written just before it is removed again, so the

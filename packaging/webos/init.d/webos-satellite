@@ -15,11 +15,35 @@
 # Does nothing when the install is missing, DIR/disable exists, or the app
 # recorded in DIR/app-dir has been removed (an app removed through the
 # Homebrew Channel or the launcher runs no uninstall script).
+#
+# Runs nothing either unless the install directory, its bin/, autostart.sh
+# and lib.sh are root's (the hook's own user) and not writable by group or
+# others (docs/security/install-permissions.md); autostart.sh checks the
+# rest before it runs anything.
 PREFIX=@PREFIX@
+
+safe=0
+me=$(id -u 2>/dev/null) || me=0
+if st=$(stat -c '%u %A' "$PREFIX" "$PREFIX/bin" "$PREFIX/bin/autostart.sh" "$PREFIX/bin/lib.sh" 2>/dev/null); then
+    safe=1
+    set -f
+    # shellcheck disable=SC2086 # uid and mode words
+    set -- $st
+    set +f
+    [ $# -eq 8 ] || safe=0
+    while [ $# -ge 2 ]; do
+        { [ "$1" = 0 ] || [ "$1" = "$me" ]; } || safe=0
+        case $2 in
+        [d-]????[!w]??[!w]*) ;;
+        *) safe=0 ;;
+        esac
+        shift 2
+    done
+fi
 
 app=
 [ ! -f "$PREFIX/app-dir" ] || read -r app <"$PREFIX/app-dir" || true
-if [ -f "$PREFIX/.webos-satellite-install" ] && [ -f "$PREFIX/bin/autostart.sh" ] &&
+if [ "$safe" = 1 ] && [ -f "$PREFIX/.webos-satellite-install" ] && [ -f "$PREFIX/bin/autostart.sh" ] &&
     [ ! -e "$PREFIX/disable" ] && { [ -z "$app" ] || [ -f "$app/appinfo.json" ]; }; then
     if command -v setsid >/dev/null 2>&1; then
         setsid sh "$PREFIX/bin/autostart.sh" </dev/null >/dev/null 2>&1 &

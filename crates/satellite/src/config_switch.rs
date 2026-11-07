@@ -32,6 +32,11 @@
 //! process inherited, in particular not `WEBOS_SAT_LOCK_HELD`, reaches it, so
 //! it takes the install lock like any other caller.
 //!
+//! Before it runs `ctl.sh` (as root), the script, the `lib.sh` it sources
+//! and their `bin/` directory must be root's (this process's user) and not
+//! writable by group or others ([`script_untrusted`],
+//! docs/security/install-permissions.md); otherwise the request fails.
+//!
 //! A refused or failed request (ours, or reported by `ctl.sh`: cooldown,
 //! busy) is answered with the stored state again
 //! (`AppCommand::ResendSwitch`); whether HA's UI then reverts is not verified.
@@ -520,6 +525,37 @@ fn ctl_command(c: &ConfigSwitches, setting: Setting, on: bool) -> Command {
     cmd
 }
 
+/// Why `path` must not be run by this process, or `None`: it must exist, not
+/// be a symbolic link, be a regular file (`dir`: a directory), be owned by
+/// root or by this process's user, and not be writable by group or others.
+/// The same rule as `trust_check` in `packaging/webos/lib.sh`.
+pub(crate) fn script_untrusted(path: &Path, dir: bool) -> Option<String> {
+    use std::os::unix::fs::MetadataExt as _;
+    let md = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) => return Some(format!("{}: {e}", path.display())),
+    };
+    let ft = md.file_type();
+    if ft.is_symlink() || (dir && !ft.is_dir()) || (!dir && !ft.is_file()) {
+        return Some(format!(
+            "{} is a symbolic link or of the wrong type",
+            path.display()
+        ));
+    }
+    let me = rustix::process::geteuid().as_raw();
+    if md.uid() != 0 && md.uid() != me {
+        return Some(format!(
+            "{} is owned by uid {}, not root",
+            path.display(),
+            md.uid()
+        ));
+    }
+    if md.mode() & 0o022 != 0 {
+        return Some(format!("{} is writable by group or others", path.display()));
+    }
+    None
+}
+
 /// Starts `ctl.sh config ...`. A task reaps it and, if this process is still
 /// alive afterwards (the change did not restart it), logs what `ctl.sh`
 /// reported and asks the server to send the stored state again. The change
@@ -532,6 +568,15 @@ fn spawn_ctl(
 ) -> std::io::Result<()> {
     // The JSON line goes to a file, not a pipe: the restart ends this process
     // and a closed pipe would kill the script at its last line.
+    let bin = c.ctl.parent().unwrap_or_else(|| Path::new("/"));
+    let checks = [
+        (bin.to_path_buf(), true),
+        (c.ctl.clone(), false),
+        (bin.join("lib.sh"), false),
+    ];
+    if let Some(why) = checks.iter().find_map(|(p, d)| script_untrusted(p, *d)) {
+        return Err(std::io::Error::other(format!("not run: {why}")));
+    }
     let out_path = c.state_dir.join(OUT_FILE);
     let out = open_out(&out_path);
     let mut cmd = ctl_command(c, setting, on);
@@ -880,12 +925,52 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// An install directory with a `bin/ctl.sh` of the given text.
+    /// An install directory with a `bin/ctl.sh` of the given text (and the
+    /// `bin/lib.sh` it would source).
     fn install(name: &str, script: &str) -> PathBuf {
         let d = tmp(name);
         std::fs::create_dir_all(d.join("bin")).unwrap();
         std::fs::write(d.join("bin").join("ctl.sh"), script).unwrap();
+        std::fs::write(d.join("bin").join("lib.sh"), "").unwrap();
         d
+    }
+
+    #[tokio::test]
+    async fn a_ctl_sh_others_can_write_is_not_run() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let d = install("untrusted", "#!/bin/sh\n: > \"$WEBOS_SAT_PREFIX/ran\"\n");
+        let bin = d.join("bin");
+        let ctl = bin.join("ctl.sh");
+        std::fs::set_permissions(&ctl, std::fs::Permissions::from_mode(0o646)).unwrap();
+        let (tx, _rx) = mpsc::channel(4);
+        let mut c = ConfigSwitches::fixture(true, false, &d, &d.join("run"));
+        assert_eq!(
+            c.on_request(Setting::Music, true, None, &tx),
+            Some(AppCommand::ResendSwitch {
+                object_id: MUSIC_ID.into()
+            })
+        );
+        assert!(!c.in_flight.load(Ordering::Relaxed));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!d.join("ran").exists());
+        assert!(
+            script_untrusted(&ctl, false)
+                .unwrap()
+                .contains("writable by group or others")
+        );
+        // A group-writable bin/ and a lib.sh that is a link are refused too.
+        std::fs::set_permissions(&ctl, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(script_untrusted(&ctl, false), None);
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o775)).unwrap();
+        assert!(script_untrusted(&bin, true).is_some());
+        std::fs::remove_file(bin.join("lib.sh")).unwrap();
+        std::os::unix::fs::symlink("/etc/hostname", bin.join("lib.sh")).unwrap();
+        assert!(
+            script_untrusted(&bin.join("lib.sh"), false)
+                .unwrap()
+                .contains("symbolic link")
+        );
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     async fn resend_arrives(rx: &mut mpsc::Receiver<AppCommand>, id: &str) {

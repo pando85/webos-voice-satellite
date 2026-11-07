@@ -108,6 +108,24 @@ fi
 umask 077
 mkdir -p "$PREFIX/bin" "$PREFIX/etc" "$PREFIX/run" "$PREFIX/log" "$PREFIX/out"
 chmod 700 "$PREFIX" "$PREFIX/bin" "$PREFIX/etc" "$PREFIX/run" "$PREFIX/log" "$PREFIX/out"
+# Root will run what lands here: the directories (and those above) must be
+# root's and closed to other users (docs/security/install-permissions.md). A
+# kept config must be root's; group/other write on it is removed.
+pp=$(cd "$PREFIX" && pwd -P) || die "cannot enter $PREFIX"
+set --
+a=$pp
+while a=${a%/*} && [ -n "$a" ]; do
+    set -- "$@" a "$a"
+done
+set -- "$@" a / d "$pp"
+for d in bin etc run log out; do
+    set -- "$@" d "$PREFIX/$d"
+done
+if [ -z "$config" ] && [ -f "$CFG" ]; then
+    set -- "$@" p "$CFG"
+fi
+trust_check "$@" || die "refusing to install into $PREFIX: $TRUST_WHY"
+[ -z "$TRUST_FIXED" ] || note "removed group/other write from:$TRUST_FIXED"
 
 # Binary: copy the candidate next to its final name, check that it runs,
 # then rename it over the installed one.

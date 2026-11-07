@@ -7,7 +7,12 @@
 #   --supervise   run the daemon under supervise.sh (restart with backoff,
 #                 crash-loop guard); refuses while DIR/crashloop exists
 #
-# Refuses to start while DIR/disable exists.
+# Refuses to start while DIR/disable exists, and when a file it would run
+# (DIR/bin), the config or a directory of the install is not root's or is
+# writable by group or others; DIR/run is made 0700 (and logged) if it is not
+# (docs/security/install-permissions.md). The app's own files (DIR/app-dir)
+# get group/other write removed at every start: the TV's installer lays them
+# out again on each app update.
 #
 # Environment: WEBOS_SAT_LOG_MAX (bytes, default 262144) is the log size at
 # which the log is moved to webos-satellite.log.1 (one generation is kept).
@@ -24,7 +29,7 @@ while [ $# -gt 0 ]; do
     case $1 in
     --prefix) [ $# -ge 2 ] || die "--prefix needs a value"; prefix_arg=$2; shift 2 ;;
     --supervise) supervise=1; shift ;;
-    -h | --help) sed -n '2,17p' "$0"; exit 0 ;;
+    -h | --help) sed -n '2,20p' "$0"; exit 0 ;;
     --) shift; break ;;
     *) die "unknown argument: $1 (see --help)" ;;
     esac
@@ -32,7 +37,17 @@ done
 close_inherited_fds "$0"
 resolve_prefix "$0" "$prefix_arg"
 require_installed
+require_trusted_install
 [ -x "$BIN" ] || die "binary missing: $BIN"
+app=
+[ ! -f "$PREFIX/app-dir" ] || read -r app <"$PREFIX/app-dir" || true
+if [ -n "$app" ] && [ -d "$app/payload" ]; then
+    if payload_trust_check "$app" "$app/payload"; then
+        [ -z "$TRUST_FIXED" ] || note "removed group/other write from the app's files:$TRUST_FIXED"
+    else
+        note "WARNING: the app's files are not trusted ($TRUST_WHY): an update from them will be refused"
+    fi
+fi
 [ -f "$CFG" ] || die "config missing: $CFG"
 
 pid=$(read_pid "$PIDFILE")

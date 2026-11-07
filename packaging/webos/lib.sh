@@ -41,6 +41,207 @@ check_prefix() {
     echo "$p"
 }
 
+# --- Trust of what root runs (docs/security/install-permissions.md) --------
+# Root runs scripts and binaries from the install directory (PREFIX/bin) and,
+# to install or update, from the app's payload, which the TV's installer
+# manages (its directories are world-writable on c3-a, EXP-025). Before root
+# runs or reads such a file, it must be a regular file (not a symbolic link)
+# owned by a trusted user and not writable by group or others. A process
+# that is not root can rename or replace entries of a world-writable
+# directory, but cannot make a file owned by root, so the owner is the test
+# that matters.
+#
+# Trusted owners: root, and the caller's own uid when the caller is not root
+# (host tests, a non-root layout). In host tests WEBOS_SAT_TEST_TRUST_UID
+# replaces the caller's uid (a file of "another user"); root ignores it.
+TRUST_ME=
+trust_uid_ok() { # UID
+    [ "$1" != 0 ] || return 0
+    if [ -z "$TRUST_ME" ]; then
+        TRUST_ME=$(id -u)
+        [ "$TRUST_ME" = 0 ] || TRUST_ME=${WEBOS_SAT_TEST_TRUST_UID:-$TRUST_ME}
+    fi
+    [ "$1" = "$TRUST_ME" ]
+}
+
+# trust_check KIND PATH [KIND PATH]...: one `stat` for all paths. KIND:
+#   f  a file root runs, sources or reads as code or config: refused when it
+#      is not a regular file, not owned by a trusted user, or writable by
+#      group or others (its content may have changed: reinstall)
+#   p  a file of the app package (installer-managed): refused when it is not
+#      a regular file or not owned by a trusted user; group/other write is
+#      removed and reported (the installer may create it so)
+#   d  a directory of ours: refused when not a real directory or not owned by
+#      a trusted user; group/other write is removed and reported
+#   r  the run directory: as d, and forced to exactly 0700; when it had to be
+#      fixed, entries that are symbolic links or not owned by a trusted user
+#      are deleted (they may have been planted) and reported
+#   a  a directory above ours: refused when not a real directory, not owned
+#      by root or a trusted user, or writable by group or others without the
+#      sticky bit. Never changed (not ours)
+# Status 0 when nothing is refused; otherwise 1 with TRUST_WHY. TRUST_FIXED
+# lists what was changed (also on success).
+TRUST_WHY=
+TRUST_FIXED=
+trust_check() {
+    TRUST_WHY=
+    TRUST_FIXED=
+    tc_items=
+    tc_paths=
+    tc_n=0
+    while [ $# -ge 2 ]; do
+        case $2 in
+        /*) ;;
+        *) TRUST_WHY="not an absolute path: $2"; return 1 ;;
+        esac
+        case $2 in
+        *[!A-Za-z0-9._/+-]*) TRUST_WHY="unsupported characters in $2"; return 1 ;;
+        esac
+        if [ ! -e "$2" ] && [ ! -L "$2" ]; then
+            TRUST_WHY="$2 is missing"
+            return 1
+        fi
+        tc_items="$tc_items $1$2"
+        tc_paths="$tc_paths $2"
+        tc_n=$((tc_n + 1))
+        shift 2
+    done
+    [ "$tc_n" -gt 0 ] || return 0
+    # One "uid mode" pair per path, in order; stat does not follow a link.
+    # shellcheck disable=SC2086 # checked above: no spaces or glob characters
+    tc_out=$(stat -c '%u %A' $tc_paths 2>/dev/null) || {
+        TRUST_WHY="cannot read the owner and mode of:$tc_paths"
+        return 1
+    }
+    set -f
+    # shellcheck disable=SC2086
+    set -- $tc_out
+    set +f
+    [ $# -eq $((tc_n * 2)) ] || { TRUST_WHY="unexpected stat output for:$tc_paths"; return 1; }
+    for tc_it in $tc_items; do
+        tc_k=${tc_it%%/*}
+        tc_p=/${tc_it#*/}
+        tc_u=$1
+        tc_m=$2
+        shift 2
+        case $tc_u in
+        '' | *[!0-9]*) TRUST_WHY="cannot read the owner of $tc_p"; return 1 ;;
+        esac
+        case $tc_k$tc_m in
+        [fp]-*) ;;
+        [fp]*) TRUST_WHY="$tc_p is not a regular file (or is a symbolic link)"; return 1 ;;
+        [dra]d*) ;;
+        *) TRUST_WHY="$tc_p is not a directory (or is a symbolic link)"; return 1 ;;
+        esac
+        trust_uid_ok "$tc_u" || { TRUST_WHY="$tc_p is owned by uid $tc_u, not root"; return 1; }
+        tc_w=0
+        case $tc_m in ?????w* | ????????w*) tc_w=1 ;; esac
+        case $tc_k in
+        f)
+            [ "$tc_w" -eq 0 ] || { TRUST_WHY="$tc_p is writable by group or others"; return 1; }
+            ;;
+        a)
+            if [ "$tc_w" -eq 1 ]; then
+                case $tc_m in
+                ?????????[tT]*) ;;
+                *) TRUST_WHY="$tc_p (a parent directory) is writable by other users"; return 1 ;;
+                esac
+            fi
+            ;;
+        p | d)
+            if [ "$tc_w" -eq 1 ]; then
+                chmod go-w "$tc_p" || { TRUST_WHY="cannot remove group/other write from $tc_p"; return 1; }
+                TRUST_FIXED="$TRUST_FIXED $tc_p (was $tc_m)"
+            fi
+            ;;
+        r)
+            if [ "$tc_m" != drwx------ ]; then
+                chmod 700 "$tc_p" || { TRUST_WHY="cannot set $tc_p to 0700"; return 1; }
+                TRUST_FIXED="$TRUST_FIXED $tc_p (was $tc_m)"
+                run_dir_clean "$tc_p" || return 1
+            fi
+            ;;
+        esac
+    done
+    return 0
+}
+
+# Deletes the entries of directory $1 that are symbolic links or not owned
+# by a trusted user (anything planted while it was open to others).
+run_dir_clean() {
+    for rc_f in "$1"/* "$1"/.[!.]*; do
+        [ -e "$rc_f" ] || [ -L "$rc_f" ] || continue
+        rc_u=$(stat -c %u "$rc_f" 2>/dev/null) || rc_u=
+        if [ -L "$rc_f" ] || ! trust_uid_ok "${rc_u:-x}"; then
+            rm -rf "$rc_f" || { TRUST_WHY="cannot delete $rc_f"; return 1; }
+            TRUST_FIXED="$TRUST_FIXED deleted $rc_f"
+        fi
+    done
+    return 0
+}
+
+# Checks the install under PREFIX (set_paths first) before root runs
+# anything from it: the directories above PREFIX (a), PREFIX itself, bin/,
+# etc/ and log/ (d), every file in bin/ and etc/config.toml (f), the app-dir
+# record and the install marker (p), and run/ (r; made 0700 when missing).
+install_trust_check() {
+    TRUST_WHY=
+    TRUST_FIXED=
+    it_pp=$(cd "$PREFIX" 2>/dev/null && pwd -P) || { TRUST_WHY="cannot enter $PREFIX"; return 1; }
+    for it_d in "$PREFIX/run" "$PREFIX/log"; do
+        [ -e "$it_d" ] || [ -L "$it_d" ] || mkdir -m 700 "$it_d" || { TRUST_WHY="cannot make $it_d"; return 1; }
+    done
+    set --
+    it_a=$it_pp
+    while it_a=${it_a%/*} && [ -n "$it_a" ]; do
+        set -- "$@" a "$it_a"
+    done
+    set -- "$@" a / d "$it_pp" d "$PREFIX/bin" d "$PREFIX/etc" d "$PREFIX/log" r "$PREFIX/run"
+    for it_f in "$PREFIX"/bin/*; do
+        [ -e "$it_f" ] || [ -L "$it_f" ] || continue
+        set -- "$@" f "$it_f"
+    done
+    [ ! -e "$CFG" ] && [ ! -L "$CFG" ] || set -- "$@" f "$CFG"
+    # Records, not code (an older ctl.sh wrote app-dir with the caller's umask).
+    for it_f in "$PREFIX/app-dir" "$PREFIX/$MARKER"; do
+        [ ! -e "$it_f" ] && [ ! -L "$it_f" ] || set -- "$@" p "$it_f"
+    done
+    trust_check "$@"
+}
+
+# The install is trusted (install_trust_check), or the script stops with the
+# reason. What had to be fixed is noted.
+require_trusted_install() {
+    if ! install_trust_check; then
+        [ -z "$TRUST_FIXED" ] || note "fixed:$TRUST_FIXED" >&2
+        die "refusing to run from $PREFIX: $TRUST_WHY (see docs/security/install-permissions.md: check the TV, then reinstall with ctl.sh install --force, or purge)"
+    fi
+    [ -z "$TRUST_FIXED" ] || note "fixed the permissions of:$TRUST_FIXED" >&2
+}
+
+# Checks the app's files before root runs or copies anything from them: the
+# app directory $1 (may be empty: a bare payload tree) and the payload
+# directory $2, and every file directly in them. The directories above the
+# app directory belong to the TV and are not checked (world-writable on
+# c3-a, EXP-025). Group/other write on the app's own files and directories is
+# removed (the installer lays them out); a file not owned by root is refused.
+payload_trust_check() { # APPDIR PAYLOAD
+    pt_app=$1
+    pt_pl=$2
+    set --
+    for pt_d in "$pt_app" "$pt_pl"; do
+        [ -n "$pt_d" ] || continue
+        set -- "$@" d "$pt_d"
+        for pt_f in "$pt_d"/*; do
+            [ -e "$pt_f" ] || [ -L "$pt_f" ] || continue
+            # Subdirectories (the payload) are not run; a link is refused.
+            [ ! -d "$pt_f" ] || [ -L "$pt_f" ] || continue
+            set -- "$@" p "$pt_f"
+        done
+    done
+    trust_check "$@"
+}
+
 # True if the prefix is on a non-persistent location.
 is_volatile_prefix() {
     case $1 in
@@ -99,7 +300,15 @@ lock_take() {
     LOCKDIR=${WEBOS_SAT_LOCK:-$LOCK_DEFAULT}
     [ "${WEBOS_SAT_LOCK_HELD:-}" != "$LOCKDIR" ] || return 0
     waited=0
-    while ! mkdir "$LOCKDIR" 2>/dev/null; do
+    while ! mkdir -m 700 "$LOCKDIR" 2>/dev/null; do
+        # The default lock is in /tmp: a directory (or link) there that a
+        # user other than root made is not ours to honour or to write into.
+        lk_u=$(stat -c %u "$LOCKDIR" 2>/dev/null) || lk_u=
+        if [ -L "$LOCKDIR" ] || { [ -n "$lk_u" ] && ! trust_uid_ok "$lk_u"; }; then
+            note "removing $LOCKDIR: a link or another user's directory, not a lock of ours" >&2
+            rm -rf "$LOCKDIR"
+            continue
+        fi
         holder=$(read_pid "$LOCKDIR/pid")
         if [ -n "$holder" ] && ! kill -0 "$holder" 2>/dev/null; then
             rm -rf "$LOCKDIR"
@@ -217,9 +426,36 @@ supervisor_alive() {
     tr '\0' ' ' <"/proc/$sp/cmdline" 2>/dev/null | grep -q "supervise.sh"
 }
 
+# True if the setup session directory is ours to read and write: a real
+# directory owned by a trusted user (ctl.sh setup start makes it, mode
+# 0700). It is in /tmp: another user's directory or a link there is never
+# read or written (a planted link would make root truncate its target).
+# Shell built-ins first (the app polls `setup status` once a second); stat
+# only when the built-in test says no or lacks -O. Remembered for the rest
+# of this script.
+SETUP_DIR_OK=
+setup_dir_ok() {
+    if [ -z "$SETUP_DIR_OK" ]; then
+        SETUP_DIR_OK=no
+        if [ -d "$SETUP_DIR" ] && [ ! -L "$SETUP_DIR" ]; then
+            # -O (owned by the effective user): BusyBox ash and dash have
+            # it; a shell without it fails the test and takes the stat path.
+            # shellcheck disable=SC3067
+            if [ -z "${WEBOS_SAT_TEST_TRUST_UID:-}" ] && [ -O "$SETUP_DIR" ] 2>/dev/null; then
+                SETUP_DIR_OK=yes
+            else
+                sd=$(stat -c %u "$SETUP_DIR" 2>/dev/null) || sd=
+                [ -z "$sd" ] || ! trust_uid_ok "$sd" || SETUP_DIR_OK=yes
+            fi
+        fi
+    fi
+    [ "$SETUP_DIR_OK" = yes ]
+}
+
 # True if the phone setup server is running: the pid in setup.pid is alive
 # and its command line names the server binary.
 setup_alive() {
+    setup_dir_ok || return 1
     # Shell built-ins only (the app polls this once a second through exec):
     # read the pid, then the command line. A shell drops the NUL bytes
     # between the arguments, which leaves the names in one string.
@@ -245,7 +481,7 @@ stop_setup_server() {
         # The server polls this file every 100 ms and ends the session
         # (state ended, reason done); it has no signal handler, so TERM
         # after 2 s ends it at once.
-        : >"$SETUP_DIR/stop" 2>/dev/null || true
+        ! setup_dir_ok || : >"$SETUP_DIR/stop" 2>/dev/null || true
         i=0
         while setup_alive && [ "$i" -lt 10 ]; do
             sleep 0.2 2>/dev/null || sleep 1
@@ -262,6 +498,7 @@ stop_setup_server() {
     case $SETUP_DIR in
     /?*) rm -rf "$SETUP_DIR" 2>/dev/null || true ;;
     esac
+    SETUP_DIR_OK=
     return 0
 }
 

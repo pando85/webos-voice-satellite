@@ -19,7 +19,7 @@
 // usage: node packaging/webos/tests/app_matrix.js
 'use strict';
 const path = require('path');
-const { load, checker } = require('./app_fake.js');
+const { load, checker, CTL_PREFIX } = require('./app_fake.js');
 
 const VP = require(path.join(__dirname, '..', 'app', 'voicepower.js'));
 const { check, done } = checker();
@@ -289,7 +289,7 @@ const T = load({
 const { byId, doc, settle, advance, execs, key, click, calls } = T;
 const indexHtml = require('fs').readFileSync(require('path').join(__dirname, '..', 'app', 'index.html'), 'utf8');
 check('index.html row sub-lines are the voicepower.js ones', VP.ROWS.every((r) => indexHtml.indexOf('<span class="vr-sub">' + r.sub + '</span>') > 0));
-const CTL_ALLOWED = /^sh '\/media\/developer\/apps\/usr\/palm\/applications\/io\.github\.pando85\.voicesatellite\/payload\/ctl\.sh' (status --json|tv-settings --json|setup status --json|set always-ready (on|off)|set hi-lg (on|off)|set remote-off (normal|keep)|config (aec|music|mic-button|overlay) (on|off)) 2>&1$/;
+const CTL_ALLOWED = new RegExp('^' + CTL_PREFIX.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '(status --json|tv-settings --json|setup status --json|set always-ready (on|off)|set hi-lg (on|off)|set remote-off (normal|keep)|config (aec|music|mic-button|overlay) (on|off)) 2>&1$');
 const press = async (id) => { click(id); await settle(); };
 const word = (r) => byId[`v-${r}-state`].textContent;
 const sets = () => execs().filter((c) => c !== 'tv-settings --json' && c !== 'status --json');

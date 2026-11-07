@@ -84,6 +84,9 @@
 # anything else is logged as ctl).
 # Exit status: 0 done, 1 failed (message on stderr), 2 usage.
 set -eu
+# Files and directories this script makes are root's alone unless it says
+# otherwise (the boot hook, the overlay's working copy).
+umask 077
 here=$(cd "$(dirname "$0")" && pwd)
 # shellcheck source=lib.sh
 . "$here/lib.sh"
@@ -280,8 +283,24 @@ overlay_sync_then_restart() {
         note "the overlay app is new: restarting the satellite so it shows the on-screen assistant"
         stop_daemon 10
         lg_restore_after_stop
-        sh "$P/bin/start.sh" --supervise
+        start_supervised
     fi
+}
+
+# Starts the supervised daemon from the install, after checking the files
+# root is about to run (docs/security/install-permissions.md).
+start_supervised() {
+    require_trusted_install
+    sh "$P/bin/start.sh" --supervise
+}
+
+# The app's files may be run or copied only when they pass
+# payload_trust_check (lib.sh); what had to be fixed is noted.
+require_trusted_payload() {
+    if ! payload_trust_check "$APPDIR" "$PAYLOAD"; then
+        die "refusing to use the package files in $PAYLOAD: $TRUST_WHY (reinstall the app; see docs/security/install-permissions.md)"
+    fi
+    [ -z "$TRUST_FIXED" ] || note "removed group/other write from the app's files:$TRUST_FIXED" >&2
 }
 
 cmd_install() {
@@ -301,6 +320,7 @@ cmd_install() {
     need_root
     [ -n "$PAYLOAD" ] || die "no package payload found (run the ctl.sh inside the app's payload directory)"
     locked
+    require_trusted_payload
     if [ "$force" -eq 0 ] && [ -z "$cfg" ] && [ -z "$psk" ] && installed &&
         cmp -s "$PAYLOAD/SHA256SUMS" "$P/package.sums"; then
         note "already up to date ($(cat "$P/VERSION" 2>/dev/null || echo unknown)); nothing to do (--force reinstalls)"
@@ -334,7 +354,7 @@ cmd_install() {
     if [ "$rc" -ne 0 ]; then
         if [ "$was_running" -eq 1 ] && installed; then
             note "install failed; starting the previous install again"
-            sh "$P/bin/start.sh" --supervise || true
+            (start_supervised) || true
         fi
         die "install failed (status $rc)"
     fi
@@ -349,7 +369,7 @@ cmd_install() {
     fi
     note "installed $(cat "$P/VERSION" 2>/dev/null || echo "(no version)") under $P"
     if [ "$was_running" -eq 1 ]; then
-        sh "$P/bin/start.sh" --supervise
+        start_supervised
     fi
     # After the restart: the voice service is not kept down by appinstalld.
     overlay_sync_then_restart
@@ -359,7 +379,7 @@ cmd_start() {
     need_root
     installed || die "not installed (ctl.sh install)"
     locked
-    sh "$P/bin/start.sh" --supervise
+    start_supervised
 }
 
 cmd_stop() {
@@ -392,7 +412,15 @@ cmd_autostart() {
 cmd_mic() {
     [ $# -eq 1 ] || usage
     case $1 in
-    off) : >"$KILL_SWITCH_DEFAULT" && note "microphone off (kill switch $KILL_SWITCH_DEFAULT)" ;;
+    off)
+        # In /tmp: never through a link someone planted there (noclobber
+        # creates with O_EXCL; an existing regular file is already "off").
+        [ ! -L "$KILL_SWITCH_DEFAULT" ] || rm -f "$KILL_SWITCH_DEFAULT"
+        (set -C && : >"$KILL_SWITCH_DEFAULT") 2>/dev/null ||
+            { [ -f "$KILL_SWITCH_DEFAULT" ] && [ ! -L "$KILL_SWITCH_DEFAULT" ]; } ||
+            die "cannot create the kill switch $KILL_SWITCH_DEFAULT"
+        note "microphone off (kill switch $KILL_SWITCH_DEFAULT)"
+        ;;
     on) rm -f "$KILL_SWITCH_DEFAULT" && note "kill switch removed" ;;
     *) usage ;;
     esac
@@ -445,6 +473,7 @@ cmd_report() {
         esac
         return 0
     fi
+    require_trusted_install
     case $mode in
     short) exec "$BIN" --config "$CFG" --report ;;
     *) exec "$BIN" --config "$CFG" --report "--$mode" ;;
@@ -671,7 +700,14 @@ cmd_status() {
     fw=
     fw_ok=false
     fw_verified=false
-    if [ "$is_inst" = true ]; then
+    problem=
+    if [ "$is_inst" = true ] && ! install_trust_check; then
+        problem=$TRUST_WHY
+    fi
+    if [ "$is_inst" = true ] && [ -n "$problem" ]; then
+        # Nothing from the install is run (docs/security/install-permissions.md).
+        fw="not checked: the install is not trusted"
+    elif [ "$is_inst" = true ]; then
         build=$("$BIN" --version 2>/dev/null || true)
         rc=0
         fw=$("$BIN" --config "$CFG" --check-firmware 2>&1) || rc=$?
@@ -725,6 +761,7 @@ cmd_status() {
     if [ "$json" -eq 0 ]; then
         note "package: ${pkg_version:-none} ($PAYLOAD)"
         note "installed: $is_inst ${inst_version:+$inst_version }in $P${build:+ ($build)}"
+        [ -z "$problem" ] || note "NOT TRUSTED, nothing is run from it: $problem (docs/security/install-permissions.md)"
         [ "$update" = false ] || note "an update is pending: run ctl.sh install (or open the app)"
         if [ -n "$pid" ]; then note "running: pid $pid"; else note "running: no"; fi
         if [ -e "$HOOK" ]; then note "start at boot: on ($HOOK)"; else note "start at boot: off"; fi
@@ -769,6 +806,7 @@ cmd_status() {
     printf '{"package_version":%s,' "$(json_str "$pkg_version")"
     printf '"installed":%s,"installed_version":%s,' "$is_inst" "$(json_str "$inst_version")"
     printf '"build":%s,"update_pending":%s,' "$(json_str "$build")" "$update"
+    printf '"install_problem":%s,' "$( [ -n "$problem" ] && json_str "$problem" || printf null)"
     printf '"uid":%s,"machine":%s,' "$(id -u)" "$(json_str "$(uname -m)")"
     printf '"running":%s,"pid":%s,' "$(json_bool test -n "$pid")" "${pid:-null}"
     printf '"supervised":%s,' "$(json_bool supervisor_alive)"
@@ -1278,6 +1316,8 @@ lg_lock() {
     LG_LOCK_ERR=
     lf=$P/run/lg_voice.lock
     mkdir -p "$P/run" 2>/dev/null || { LG_LOCK_ERR="cannot make $P/run"; return 1; }
+    # Root opens the lock for writing: run/ must be private (0700) first.
+    trust_check r "$P/run" || { LG_LOCK_ERR="$TRUST_WHY"; return 1; }
     # A failed `exec` redirection ends a POSIX shell: open it in a subshell first.
     if ! (: >>"$lf") 2>/dev/null; then
         LG_LOCK_ERR="cannot open the lock $lf"
@@ -1484,7 +1524,7 @@ $2 = $3" "$CFG" >"$4"
 cfg_restart() {
     (stop_daemon 10) >&2 || return 1
     lg_restore_after_stop
-    sh "$P/bin/start.sh" --supervise >&2 || return 1
+    (start_supervised) >&2 || return 1
 }
 
 # The one JSON line (schema 1) and a note on stderr. REASON is cooldown or
@@ -1567,6 +1607,10 @@ cmd_config_set() { # aec|music|mic-button on|off, already validated
     installed || die "not installed (ctl.sh install)"
     locked
     [ -f "$CFG" ] || { cfg_emit "$st" "$want" "" "" refused "no config file" none; return; }
+    if ! install_trust_check; then
+        cfg_emit "$st" "$want" "" "" refused "the install is not trusted: $TRUST_WHY" none
+        return
+    fi
     if ! sum=$(cfg_check "$CFG"); then
         cfg_emit "$st" "$want" "" "" refused "the config does not pass the check now: $sum" none
         return
@@ -1763,6 +1807,12 @@ setup_print_state() {
         setup_json none ""
         return 0
     fi
+    # Not ours (another user's directory or a link in /tmp): never read or
+    # written; the next setup start replaces it.
+    if ! setup_dir_ok; then
+        setup_json none ""
+        return 0
+    fi
     st=
     if [ -f "$SETUP_DIR/state.json" ]; then IFS= read -r st <"$SETUP_DIR/state.json" || true; fi
     # The server's own end marker: the compact JSON it writes ("state" of
@@ -1789,6 +1839,11 @@ cmd_setup_start() {
     installed || die "not installed (ctl.sh install)"
     [ -x "$SETUP_BIN" ] || die "the setup server is missing: $SETUP_BIN (reinstall the package)"
     locked
+    require_trusted_install
+    case $SETUP_BIN in
+    "$P"/bin/*) ;;
+    *) trust_check f "$SETUP_BIN" || die "refusing to run $SETUP_BIN: $TRUST_WHY" ;;
+    esac
     if setup_alive; then
         case $(setup_state_word) in
         waiting) # the app was reopened: hand out the same session again
@@ -1803,6 +1858,7 @@ cmd_setup_start() {
     rm -rf "${SETUP_DIR:?}"
     (umask 077 && mkdir -p "$(dirname "$SETUP_DIR")" && mkdir -m 700 "$SETUP_DIR" && : >"$SETUP_DIR/heartbeat") ||
         die "cannot create $SETUP_DIR"
+    SETUP_DIR_OK=
     mkdir -p "$P/log"
     if [ -f "$SETUP_LOG" ] && [ "$(wc -c <"$SETUP_LOG" 2>/dev/null || echo 0)" -gt 65536 ]; then
         (umask 077 && : >"$SETUP_LOG")
@@ -1916,7 +1972,7 @@ restart)
     locked
     stop_daemon 10
     lg_restore_after_stop
-    sh "$P/bin/start.sh" --supervise
+    start_supervised
     ;;
 autostart) cmd_autostart "$@" ;;
 mic) cmd_mic "$@" ;;

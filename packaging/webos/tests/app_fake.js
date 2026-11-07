@@ -11,7 +11,9 @@ const vm = require('vm');
 
 const APP = path.join(__dirname, '..', 'app');
 const APP_PATH = '/media/developer/apps/usr/palm/applications/io.github.pando85.voicesatellite/index.html';
-const CTL_PREFIX = "sh '/media/developer/apps/usr/palm/applications/io.github.pando85.voicesatellite/payload/ctl.sh' ";
+// The installed ctl.sh when there is one, else the app's own (app.js ctlCommand).
+const CTL_PREFIX = 'c=/var/lib/webos-satellite/bin/ctl.sh; [ -f "$c" ] && [ -f /var/lib/webos-satellite/app-dir ] || ' +
+  "c='/media/developer/apps/usr/palm/applications/io.github.pando85.voicesatellite/payload/ctl.sh'; sh \"$c\" ";
 
 // [left, top, width, height] at 1920x1080, from style.css.
 const LAYOUT = {

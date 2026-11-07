@@ -1,6 +1,8 @@
 #!/bin/sh
 # Host test of the ops scripts: install, start --supervise, restart after a
 # crash, crash-loop guard, autostart gating (disable marker, firmware guard),
+# the permission checks before root runs anything (a world-writable binary,
+# another user's files, run/ not 0700, the supervisor and the boot hook),
 # stop and uninstall, and install.sh's choice between the armv7 and aarch64
 # builds (stand-in binaries, `uname -m` replaced by WEBOS_SAT_UNAME_M). Runs the host build of webos-satellite with a file mic,
 # the null sink and plaintext on 127.0.0.1. Touches nothing outside a
@@ -224,6 +226,40 @@ pidw=$(read_pid "$PIDFILE")
 check "autostart: warn policy and an unverified firmware: logged, started anyway" 'grep -q "starting anyway (firmware_policy warn)" "$P/log/autostart.log" && is_ours "$pidw" && supervisor_alive'
 sh "$P/bin/stop.sh" >/dev/null
 cp "$T/sat.toml" "$P/etc/config.toml"
+
+# Permissions of what root runs (docs/security/install-permissions.md).
+chmod o+w "$P/bin/webos-satellite"
+out=$(sh "$P/bin/start.sh" --supervise 2>&1) && rc=0 || rc=$?
+check "permissions: a world-writable binary: start.sh refuses, names it, starts nothing" '[ "$rc" -ne 0 ] && echo "$out" | grep -q "bin/webos-satellite is writable by group or others" && ! supervisor_alive && [ -z "$(read_pid "$PIDFILE")" ]'
+sh "$P/bin/autostart.sh" --delay 0
+check "permissions: a world-writable binary: autostart logs it and starts nothing" 'grep -q "the install is not trusted: .*writable by group or others; not starting" "$P/log/autostart.log" && ! supervisor_alive'
+out=$(WEBOS_SAT_PREFIX=$P WEBOS_SAT_ALLOW_NONROOT=1 WEBOS_SAT_LOCK=$T/lock sh "$P/bin/ctl.sh" start 2>&1) && rc=0 || rc=$?
+check "permissions: a world-writable binary: ctl.sh start refuses before it runs start.sh" '[ "$rc" -ne 0 ] && echo "$out" | grep -q "refusing to run from" && ! supervisor_alive'
+chmod o-w "$P/bin/webos-satellite"
+chmod g+w "$P/etc/config.toml"
+out=$(sh "$P/bin/start.sh" --supervise 2>&1) && rc=0 || rc=$?
+check "permissions: a group-writable config: start.sh refuses" '[ "$rc" -ne 0 ] && echo "$out" | grep -q "config.toml is writable by group or others" && ! supervisor_alive'
+chmod g-w "$P/etc/config.toml"
+# Another user's files (the test's own uid stands in for "not root").
+out=$(WEBOS_SAT_TEST_TRUST_UID=99999 sh "$P/bin/start.sh" --supervise 2>&1) && rc=0 || rc=$?
+check "permissions: files of another user: start.sh refuses, names the owner" '[ "$rc" -ne 0 ] && echo "$out" | grep -q "is owned by uid $(id -u), not root" && ! supervisor_alive'
+# run/ not 0700, with a link planted in it: made 0700, the link deleted, logged.
+chmod 755 "$P/run"
+ln -s "$T/victim" "$P/run/voice.json"
+out=$(sh "$P/bin/start.sh" --supervise 2>&1) && rc=0 || rc=$?
+check "permissions: run/ 0755 with a planted link: start fixes it to 0700, deletes the link, says so, starts" '[ "$rc" -eq 0 ] && [ "$(stat -c %a "$P/run")" = 700 ] && [ ! -L "$P/run/voice.json" ] && [ ! -e "$T/victim" ] && echo "$out" | grep -q "fixed the permissions of:.*run (was drwxr-xr-x)" && echo "$out" | grep -q "deleted $P/run/voice.json" && supervisor_alive'
+# The supervisor checks again before every restart.
+pids=$(read_pid "$PIDFILE")
+chmod o+w "$P/bin/webos-satellite"
+kill -KILL "$pids"
+check "permissions: the supervisor refuses a restart once the binary is world-writable, and ends" 'wait_for 8 "! supervisor_alive" && grep -q "SUPER the install is not trusted, nothing is run from it: .*writable by group or others" "$LOG" && grep -q "SUPER NOT STARTING the daemon" "$LOG" && [ -z "$(read_pid "$PIDFILE")" ]'
+# The boot hook runs nothing from an install it cannot trust.
+sed "s|@PREFIX@|$P|" "$PKG/init.d/webos-satellite" >"$T/hook"
+chmod o-w "$P/bin/webos-satellite"
+chmod o+w "$P/bin/autostart.sh"
+out=$(sh "$T/hook" 2>&1) && rc=0 || rc=$?
+check "permissions: boot hook: exit 0, no output, autostart.sh not launched when it is world-writable" '[ "$rc" -eq 0 ] && [ -z "$out" ] && ! wait_for 1 "pgrep -f \"$P/bin/autostart.sh\" >/dev/null"'
+chmod o-w "$P/bin/autostart.sh"
 
 sh "$P/bin/autostart.sh" --delay 0
 pid3=$(read_pid "$PIDFILE")

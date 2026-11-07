@@ -3,10 +3,11 @@
 # of webos-satellite standing in for both TV builds, checks their structure
 # and reproducibility, unpacks them the way the TV's installer lays them out
 # (usr/palm/applications/<id>/), and drives the package's ctl.sh through
-# first install, start, boot hook, update (by ctl.sh and at boot), app
-# removal, uninstall and purge. Everything stays in a temporary directory
-# (install directory, init.d, lock, kill switch); the daemon listens on
-# 127.0.0.1 with a file microphone and the null sink.
+# first install, the permission checks of the app's files, start, boot hook,
+# update (by ctl.sh and at boot), app removal, uninstall and purge.
+# Everything stays in a temporary directory (install directory, init.d,
+# lock, kill switch); the daemon listens on 127.0.0.1 with a file microphone
+# and the null sink.
 #
 # usage: packaging/webos/tests/ipk.sh [BINARY]   (default: builds it)
 # The checks are strings run with eval, so single quotes are intended.
@@ -269,6 +270,24 @@ $CTL install --config "$T/sat.toml" --psk-file "$T/psk" >/dev/null
 check "install --config/--psk-file: replaced config, key mode 0600" 'grep -q "pkg-test" "$S/etc/config.toml" && cmp -s "$T/psk" "$S/etc/noise_psk" && [ "$(stat -c %a "$S/etc/noise_psk")" = 600 ]'
 cfg_sum=$(sha256sum <"$S/etc/config.toml")
 psk_sum=$(sha256sum <"$S/etc/noise_psk")
+
+echo "== permissions of the app's files (docs/security/install-permissions.md) =="
+# The TV's installer may leave the app directory world-writable (0777 on
+# c3-a, EXP-025): install removes group/other write from the app's own
+# files and directories and says so; another user's file there is refused
+# before anything runs from the package.
+chmod 777 "$APP"
+chmod o+w "$APP/payload/install.sh"
+out=$($CTL install --force 2>&1) && rc=0 || rc=$?
+check "install: an app directory 0777 and a world-writable payload script are fixed (0755) and named; the install goes on" '[ "$rc" -eq 0 ] && [ "$(stat -c %a "$APP")" = 755 ] && [ "$(stat -c %a "$APP/payload/install.sh")" = 755 ] && echo "$out" | grep -q "removed group/other write from the app.s files:.*$APP (was drwxrwxrwx)"'
+cfg_sum2=$(sha256sum <"$S/etc/config.toml")
+out=$(WEBOS_SAT_TEST_TRUST_UID=99999 $CTL install --force 2>&1) && rc=0 || rc=$?
+check "install: app files of another user are refused before anything runs from them; the install is unchanged" '[ "$rc" -ne 0 ] && echo "$out" | grep -q "refusing to use the package files in .* is owned by uid $(id -u), not root" && [ "$(sha256sum <"$S/etc/config.toml")" = "$cfg_sum2" ] && [ "$(cat "$S/VERSION")" = 0.0.1 ]'
+# The installer lays the app out again on every update: start fixes it again.
+chmod 777 "$APP"
+out=$($CTL start 2>&1) && rc=0 || rc=$?
+check "start: an app directory 0777 is made 0755 again at every start, and said so" '[ "$rc" -eq 0 ] && [ "$(stat -c %a "$APP")" = 755 ] && echo "$out" | grep -q "removed group/other write from the app.s files"'
+$CTL stop >/dev/null 2>&1
 
 echo "== start, status, boot hook =="
 # As the Homebrew Channel's exec runs it: output read through a pipe until

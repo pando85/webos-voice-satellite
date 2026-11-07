@@ -16,6 +16,9 @@
 # - After every daemon exit (before a restart, and before supervision ends):
 #   if run/lg_voice_override exists, LG's voice key is given back with
 #   `ctl.sh restore-lg-voice` (ADR 0013); the next daemon takes it again.
+# - Before every daemon start and every `ctl.sh restore-lg-voice`: the install
+#   must pass install_trust_check (lib.sh, docs/security/install-permissions.md);
+#   when it does not, supervision ends with the reason in the log.
 set -u
 here=$(cd "$(dirname "$0")" && pwd)
 # shellcheck source=lib.sh
@@ -25,7 +28,7 @@ prefix_arg=
 while [ $# -gt 0 ]; do
     case $1 in
     --prefix) [ $# -ge 2 ] || die "--prefix needs a value"; prefix_arg=$2; shift 2 ;;
-    -h | --help) sed -n '2,20p' "$0"; exit 0 ;;
+    -h | --help) sed -n '2,21p' "$0"; exit 0 ;;
     --) shift; break ;;
     *) die "unknown argument: $1 (see --help)" ;;
     esac
@@ -52,12 +55,28 @@ slog() {
 lg_restore() {
     [ -f "$PREFIX/run/lg_voice_override" ] || return 0
     slog "the daemon left LG's voice key taken over: giving it back (ctl.sh restore-lg-voice)"
+    if ! trusted; then
+        slog "LG's voice key could NOT be given back (the install is not trusted): reboot the TV"
+        return 0
+    fi
     if [ -f "$here/ctl.sh" ] &&
         WEBOS_SAT_PREFIX=$PREFIX sh "$here/ctl.sh" restore-lg-voice >>"$LOG" 2>&1; then
         slog "LG's voice key given back"
     else
         slog "LG's voice key could NOT be given back: run ctl.sh restore-lg-voice or reboot the TV"
     fi
+}
+
+# The install may be run from (lib.sh install_trust_check); logs what was
+# fixed or why not.
+trusted() {
+    if install_trust_check; then
+        [ -z "$TRUST_FIXED" ] || slog "fixed the permissions of:$TRUST_FIXED"
+        return 0
+    fi
+    [ -z "$TRUST_FIXED" ] || slog "fixed the permissions of:$TRUST_FIXED"
+    slog "the install is not trusted, nothing is run from it: $TRUST_WHY (docs/security/install-permissions.md: check the TV, then reinstall with ctl.sh install --force)"
+    return 1
 }
 
 stopping=0
@@ -81,6 +100,10 @@ crashes=
 while [ "$stopping" -eq 0 ]; do
     if [ -e "$DISABLE" ]; then
         slog "$DISABLE present: not starting"
+        break
+    fi
+    if ! trusted; then
+        slog "NOT STARTING the daemon; supervision ends"
         break
     fi
     "$BIN" --config "$CFG" "$@" </dev/null >>"$LOG" 2>&1 &

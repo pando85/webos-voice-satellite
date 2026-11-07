@@ -23,8 +23,12 @@
 #                                             owner decision 2026-11-04)
 #
 # Pending update: when the app's payload (DIR/app-dir/payload) differs from
-# the installed one (SHA256SUMS against DIR/package.sums), its ctl.sh install
-# runs first (it keeps config and key). A failed update keeps the old install.
+# the installed one (SHA256SUMS against DIR/package.sums), it is applied
+# first (it keeps config and key). A failed update keeps the old install.
+# The installed DIR/bin/ctl.sh applies it, which refuses app files that are
+# not root's (lib.sh payload_trust_check; the installed version then starts),
+# and nothing starts when the install itself is not trusted
+# (install_trust_check): docs/security/install-permissions.md.
 set -u
 here=$(cd "$(dirname "$0")" && pwd)
 # shellcheck source=lib.sh
@@ -36,7 +40,7 @@ while [ $# -gt 0 ]; do
     case $1 in
     --prefix) [ $# -ge 2 ] || die "--prefix needs a value"; prefix_arg=$2; shift 2 ;;
     --delay) [ $# -ge 2 ] || die "--delay needs a value"; delay=$2; shift 2 ;;
-    -h | --help) sed -n '2,29p' "$0"; exit 0 ;;
+    -h | --help) sed -n '2,31p' "$0"; exit 0 ;;
     *) die "unknown argument: $1 (see --help)" ;;
     esac
 done
@@ -75,12 +79,21 @@ trap 'lock_release; exit 1' INT TERM HUP
 if [ -n "$app" ] && [ -f "$app/payload/ctl.sh" ] && [ -f "$app/payload/SHA256SUMS" ] &&
     ! cmp -s "$app/payload/SHA256SUMS" "$PREFIX/package.sums"; then
     alog "package update pending ($(cat "$PREFIX/VERSION" 2>/dev/null || echo unknown) -> $(cat "$app/payload/VERSION" 2>/dev/null || echo unknown)); applying"
-    if sh "$app/payload/ctl.sh" install >>"$PREFIX/log/autostart.log" 2>&1; then
+    # The installed ctl.sh drives it (never the app's own copy, which is in
+    # a directory others may write): it checks the app's files first.
+    if [ -f "$here/ctl.sh" ] && trust_check f "$here/ctl.sh" &&
+        WEBOS_SAT_PREFIX=$PREFIX sh "$here/ctl.sh" install >>"$PREFIX/log/autostart.log" 2>&1; then
         alog "update applied"
     else
         alog "update failed (status $?); starting the installed version"
     fi
 fi
+if ! install_trust_check; then
+    [ -z "$TRUST_FIXED" ] || alog "fixed the permissions of:$TRUST_FIXED"
+    alog "the install is not trusted: $TRUST_WHY; not starting (docs/security/install-permissions.md)"
+    exit 0
+fi
+[ -z "$TRUST_FIXED" ] || alog "fixed the permissions of:$TRUST_FIXED"
 if command -v timeout >/dev/null 2>&1; then
     fw=$(timeout 10 "$BIN" --config "$CFG" --check-firmware 2>&1)
 else
