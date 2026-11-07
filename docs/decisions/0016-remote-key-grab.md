@@ -1,6 +1,6 @@
 # ADR 0016: Take the Magic Remote's mic key with an evdev grab and re-send the rest into a sibling device
 
-- **Status:** **Proposed (draft, 2026-11-07). NOT accepted.** No owner decision. Nothing here is built; the evidence comes from the test tool `remote-proxy` in [EXP-026](../experiments/EXP-026-mic-key-grab-reinject.md), whose kill test (B3) is still to run. Nothing here may run on a TV on the strength of this draft.
+- **Status:** **Accepted (2026-11-07, owner approval)** after [EXP-026](../experiments/EXP-026-mic-key-grab-reinject.md) Part B passed on c3-a (B2 grab test and B3 kill test, owner-run). Implementation: 0.6.0 (planned), off by default. History: proposed earlier the same day.
 - **Scope:** how the satellite keeps LG's assistant and LG's toast away from the mic button while its mic button feature runs ([ADR 0013](0013-remote-mic-button-coexistence.md)). It adds a mechanism; it does not change what the feature does for the user.
 - **Would relax, if accepted:** the AGENTS.md device-safety rules, which today allow only ADR 0013's volatile configd override; this ADR adds an exclusive grab of one LG input device and writes into another (proposed text at the end).
 - **Related:** research [mic-button key interception](../research/mic-button-key-interception.md) (candidate C1a, community tools) and [remote mic button](../research/remote-mic-button.md) section 10 (the toast), [EXP-026](../experiments/EXP-026-mic-key-grab-reinject.md), [EXP-023](../experiments/EXP-023-remote-mic-button-handover.md), draft [ADR 0015](0015-silent-mic-key-filter.md), [ADR 0006](0006-soft-firmware-policy-and-compatibility-reports.md) (per-firmware allow list), [design](../design/remote-mic-button.md).
@@ -17,7 +17,7 @@
 - **Prior art (observed-on-other-device, project claims):** LG Input Mapper (C5, webOS 10.3) and magic_mapper (C9 webOS 4 to C6H webOS 11.1) use the same grab-and-resend into `[2]` (magic_mapper uses `[1]` from webOS 10, where resending through `[2]` made Back exit apps). A webOS 11.2 report says the AI/mic button no longer reaches evdev there (research section 6).
 - **Owner direction:** "I'm open to explore any hacking option that could be extended to any other WebOS version"; the owner ran Part B and reported "the test was perfect".
 
-## Decision (proposed)
+## Decision
 
 1. **Mechanism ("grab"):** while the mic button feature runs, the satellite holds an exclusive grab of the remote's active input device(s) and re-sends every event except `EV_KEY` 428 (press, release, repeat) unchanged, frame by frame, into one idle sibling device. 428 goes to the satellite's push-to-talk machine instead. Nothing else is remapped, dropped, added or delayed.
 2. **Choosing devices, never by `eventN`:**
