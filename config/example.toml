@@ -398,3 +398,33 @@ pause_timeout_s = 600
 # always stops the music, and play_media is refused there; the satellite
 # never wakes the TV for music.
 disconnect_stop_s = 60
+
+[remote]
+# The Magic Remote's mic button (design: docs/design/remote-mic-button.md;
+# how it coexists with LG's assistant is ADR 0013, PROPOSED and not built).
+# "off" (default): the key is only observed (a passive read of its input
+# device, never grabbed; no run, no stream, nothing of LG's changed).
+# "ptt": hold the button to talk to Home Assistant: the press starts a run
+# at speech-to-text (no wake word), the release ends its audio. LG's own
+# assistant still opens on each press until the ADR 0013 hand-over exists.
+# The TV app's Sound screen does not show it yet; the HA switch "Remote mic
+# button" (remote_mic_button) and `ctl.sh config mic-button on|off` change
+# this key and restart.
+mic_button = "off"
+# The key's input device, by its exact name (never an eventN index), and the
+# EV_KEY code (428 on LG C3, webOS 8.3, EXP-022).
+device_name = "LGE M-RCU - Builtin [0]"
+key_code = 428
+# The run's audio from the remote's own microphone (LG's voiceinput stream,
+# 16 kHz mono, opened at the press and closed at the release, the cap or the
+# run's end); the TV microphone takes over when it fails. false: always the
+# TV microphone.
+remote_mic = true
+# The audio ends this long after the press even if the button is held (1-60).
+max_hold_s = 15
+# A release before this many ms is a tap: the run goes on with the TV
+# microphone and Home Assistant's end-of-speech detection ends it (0: no taps,
+# every release ends the audio; at most 2000).
+tap_ms = 300
+# Fixed gain on the remote microphone in dB (-20 to 30); no echo canceller.
+gain_db = 0.0

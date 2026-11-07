@@ -236,7 +236,7 @@ fn open_pty() -> std::io::Result<(std::fs::File, std::os::fd::OwnedFd)> {
 
 /// Starts `luna-send -i <uri> <payload>` on a pty; lines arrive on the
 /// receiver, which closes when the child's terminal is gone.
-fn start_child(
+pub(crate) fn start_child(
     luna: &Path,
     uri: &str,
     payload: &str,

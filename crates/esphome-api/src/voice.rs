@@ -622,6 +622,18 @@ impl Voice {
         }
     }
 
+    /// `AppCommand::EndAudio`: the application ends the audio of the run
+    /// that is streaming (a hold-to-talk button was released). HA gets
+    /// `AudioEnd` and finalizes speech-to-text; the run itself goes on.
+    pub(crate) fn on_end_audio(&mut self) {
+        if self.is_streaming() {
+            log::debug!("voice: the application ended the audio");
+            self.stop_streaming(true);
+        } else {
+            log::debug!("voice: end of audio ignored; nothing is streaming");
+        }
+    }
+
     pub(crate) fn on_stop_pipeline(&mut self) {
         self.armed = false;
         self.abort_run();
@@ -1123,6 +1135,51 @@ mod tests {
         v.take();
         assert_eq!(v.next_deadline(), None);
         assert!(!v.is_streaming());
+    }
+
+    #[test]
+    fn end_audio_ends_a_push_to_talk_stream_gracefully_and_the_run_goes_on() {
+        let t0 = Instant::now();
+        let mut v = Voice::new(false);
+        v.on_subscribe(t0, true);
+        v.on_start_pipeline(t0, PipelineMode::PushToTalk);
+        v.take();
+        // Before HA answered nothing streams: ignored.
+        v.on_end_audio();
+        assert!(v.take().is_empty());
+        v.on_response(t0, 0, false);
+        v.take();
+        assert!(v.is_streaming());
+        v.on_end_audio();
+        assert_eq!(
+            v.take(),
+            [Out::Ha(ToHa::AudioEnd), Out::App(AppEvent::StopStreaming)]
+        );
+        assert!(!v.is_streaming());
+        // A second one (and HA's own VAD end afterwards) changes nothing.
+        v.on_end_audio();
+        ev(&mut v, t0, Ev::VoiceAssistantSttVadEnd, &[]);
+        assert!(v.take().is_empty());
+        // The run is not aborted: the transcript and the run end follow.
+        ev(&mut v, t0, Ev::VoiceAssistantSttEnd, &[("text", "hi")]);
+        assert_eq!(v.take(), [Out::App(AppEvent::Transcript("hi".into()))]);
+        ev(&mut v, t0, Ev::VoiceAssistantRunEnd, &[]);
+        assert_eq!(v.take(), [Out::App(AppEvent::RunEnd)]);
+    }
+
+    #[test]
+    fn end_audio_keeps_the_wake_word_armed() {
+        let t0 = Instant::now();
+        let mut v = armed_and_streaming(t0);
+        v.on_end_audio();
+        assert_eq!(
+            v.take(),
+            [Out::Ha(ToHa::AudioEnd), Out::App(AppEvent::StopStreaming)]
+        );
+        ev(&mut v, t0, Ev::VoiceAssistantRunEnd, &[]);
+        v.take();
+        // No progress, no error: a soft end, re-armed after the base delay.
+        assert_eq!(v.next_deadline(), Some(t0 + BACKOFF_BASE));
     }
 
     #[test]

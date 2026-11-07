@@ -1,7 +1,9 @@
-//! HA's two config switches, `aec_enabled` and `music_enabled`
-//! ([ADR 0012](../../../docs/decisions/0012-config-switches-in-ha.md)).
+//! HA's config switches, `aec_enabled`, `music_enabled`
+//! ([ADR 0012](../../../docs/decisions/0012-config-switches-in-ha.md)) and
+//! `remote_mic_button` (the Magic Remote's mic button, `[remote] mic_button`
+//! "ptt" or "off", added the same way: docs/design/remote-mic-button.md).
 //!
-//! Flipping one in Home Assistant runs `ctl.sh config aec|music on|off`
+//! Flipping one in Home Assistant runs `ctl.sh config aec|music|mic-button on|off`
 //! detached: that command rewrites the one config key, checks the config,
 //! restarts this daemon (which ends this process) and puts the previous
 //! config back if the new one does not start. The daemon never edits the
@@ -14,7 +16,7 @@
 //! ([`Setting::from_object_id`], [`ctl_args`], [`decide`]) tested without a
 //! process:
 //!
-//! - only the two fixed object ids map to a setting, and the arguments of
+//! - only the fixed object ids map to a setting, and the arguments of
 //!   `ctl.sh` come from a fixed table, never from received text;
 //! - a request for the state already in force does nothing (an optimization,
 //!   not a separate rule: `ctl.sh` answers `already` for it too);
@@ -53,6 +55,8 @@ use crate::voice_status::Busy;
 pub(crate) const AEC_ID: &str = "aec_enabled";
 /// Object id of the music switch.
 pub(crate) const MUSIC_ID: &str = "music_enabled";
+/// Object id of the remote mic button switch (on: `mic_button = "ptt"`).
+pub(crate) const MIC_BUTTON_ID: &str = "remote_mic_button";
 /// After this long a still running `ctl.sh` is logged (a stop, a start and a
 /// rollback with another start take about 40 s in the worst case). It is not
 /// killed (it may be between two config files) and stays in flight until it
@@ -78,14 +82,20 @@ pub(crate) enum Setting {
     Aec,
     /// `[music] enabled`.
     Music,
+    /// `[remote] mic_button` (on: `"ptt"`, off: `"off"`).
+    MicButton,
 }
 
+/// Every setting, in the order of the entities.
+const ALL: [Setting; 3] = [Setting::Aec, Setting::Music, Setting::MicButton];
+
 impl Setting {
-    /// The setting of an object id, for exactly the two known ids.
+    /// The setting of an object id, for exactly the known ids.
     pub(crate) fn from_object_id(id: &str) -> Option<Self> {
         match id {
             AEC_ID => Some(Self::Aec),
             MUSIC_ID => Some(Self::Music),
+            MIC_BUTTON_ID => Some(Self::MicButton),
             _ => None,
         }
     }
@@ -94,6 +104,7 @@ impl Setting {
         match self {
             Self::Aec => AEC_ID,
             Self::Music => MUSIC_ID,
+            Self::MicButton => MIC_BUTTON_ID,
         }
     }
 
@@ -102,6 +113,7 @@ impl Setting {
         match self {
             Self::Aec => "aec",
             Self::Music => "music",
+            Self::MicButton => "mic-button",
         }
     }
 }
@@ -111,7 +123,7 @@ pub(crate) fn ctl_args(setting: Setting, on: bool) -> [&'static str; 3] {
     ["config", setting.word(), if on { "on" } else { "off" }]
 }
 
-/// The two switch entities (entity category `config`).
+/// The switch entities (entity category `config`).
 pub(crate) fn entities() -> Vec<SwitchEntity> {
     let sw = |id: &str, name: &str, icon: &str| SwitchEntity {
         object_id: id.to_owned(),
@@ -123,6 +135,7 @@ pub(crate) fn entities() -> Vec<SwitchEntity> {
     vec![
         sw(AEC_ID, "Echo cancellation", "mdi:waveform"),
         sw(MUSIC_ID, "Music playback", "mdi:music"),
+        sw(MIC_BUTTON_ID, "Remote mic button", "mdi:remote"),
     ]
 }
 
@@ -271,7 +284,7 @@ async fn log_last_change(path: &Path, every: Duration, tries: u32) -> Option<Out
     None
 }
 
-/// The two switches' state in this process and the guard state.
+/// The switches' state in this process and the guard state.
 #[derive(Debug)]
 pub(crate) struct ConfigSwitches {
     /// The install directory (`WEBOS_SAT_PREFIX` of `ctl.sh`).
@@ -282,6 +295,7 @@ pub(crate) struct ConfigSwitches {
     state_dir: PathBuf,
     aec: bool,
     music: bool,
+    mic_button: bool,
     in_flight: Arc<AtomicBool>,
     slow_after: Duration,
 }
@@ -297,7 +311,7 @@ impl ConfigSwitches {
         let ctl = prefix.join("bin").join("ctl.sh");
         if !ctl.is_file() {
             log::info!(
-                "config switches: {} not found; the aec_enabled and music_enabled switches are not offered",
+                "config switches: {} not found; the aec_enabled, music_enabled and remote_mic_button switches are not offered",
                 ctl.display()
             );
             return None;
@@ -309,6 +323,7 @@ impl ConfigSwitches {
             state_dir,
             aec: settings.aec.enabled,
             music: settings.music.enabled,
+            mic_button: settings.remote.ptt(),
             in_flight: Arc::new(AtomicBool::new(false)),
             slow_after: SLOW_AFTER,
         })
@@ -336,6 +351,7 @@ impl ConfigSwitches {
             state_dir: state_dir.to_path_buf(),
             aec,
             music,
+            mic_button: false,
             in_flight: Arc::new(AtomicBool::new(false)),
             slow_after: SLOW_AFTER,
         }
@@ -363,13 +379,13 @@ impl ConfigSwitches {
         match setting {
             Setting::Aec => self.aec,
             Setting::Music => self.music,
+            Setting::MicButton => self.mic_button,
         }
     }
 
     /// The states from the config this process started with.
     pub(crate) fn initial_commands(&self) -> Vec<AppCommand> {
-        [Setting::Aec, Setting::Music]
-            .into_iter()
+        ALL.into_iter()
             .map(|s| AppCommand::SetSwitch {
                 object_id: s.object_id().to_owned(),
                 state: Some(self.current(s)),
@@ -526,11 +542,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_the_two_object_ids_map_to_a_setting() {
+    fn only_the_known_object_ids_map_to_a_setting() {
         assert_eq!(Setting::from_object_id("aec_enabled"), Some(Setting::Aec));
         assert_eq!(
             Setting::from_object_id("music_enabled"),
             Some(Setting::Music)
+        );
+        assert_eq!(
+            Setting::from_object_id("remote_mic_button"),
+            Some(Setting::MicButton)
         );
         for id in [
             "",
@@ -541,6 +561,8 @@ mod tests {
             "tv_screen",
             "aec_enabled; reboot",
             "../aec_enabled",
+            "remote_ptt_enabled",
+            "mic-button",
         ] {
             assert_eq!(Setting::from_object_id(id), None, "{id:?}");
         }
@@ -552,8 +574,16 @@ mod tests {
         assert_eq!(ctl_args(Setting::Aec, false), ["config", "aec", "off"]);
         assert_eq!(ctl_args(Setting::Music, true), ["config", "music", "on"]);
         assert_eq!(ctl_args(Setting::Music, false), ["config", "music", "off"]);
+        assert_eq!(
+            ctl_args(Setting::MicButton, true),
+            ["config", "mic-button", "on"]
+        );
+        assert_eq!(
+            ctl_args(Setting::MicButton, false),
+            ["config", "mic-button", "off"]
+        );
         // The object ids map back to their own words.
-        for s in [Setting::Aec, Setting::Music] {
+        for s in ALL {
             assert_eq!(Setting::from_object_id(s.object_id()), Some(s));
         }
     }
@@ -569,10 +599,11 @@ mod tests {
     }
 
     #[test]
-    fn entities_are_config_switches_with_the_two_ids() {
+    fn entities_are_config_switches_with_the_known_ids() {
         let e = entities();
         let ids: Vec<_> = e.iter().map(|s| s.object_id.as_str()).collect();
-        assert_eq!(ids, [AEC_ID, MUSIC_ID]);
+        assert_eq!(ids, [AEC_ID, MUSIC_ID, MIC_BUTTON_ID]);
+        assert_eq!(e[2].name, "Remote mic button");
         assert!(e.iter().all(|s| s.entity_category == EntityCategory::Config
             && !s.name.is_empty()
             && s.icon.starts_with("mdi:")));
@@ -681,6 +712,10 @@ mod tests {
                     object_id: MUSIC_ID.into(),
                     state: Some(false)
                 },
+                AppCommand::SetSwitch {
+                    object_id: MIC_BUTTON_ID.into(),
+                    state: Some(false)
+                },
             ]
         );
     }
@@ -698,8 +733,10 @@ mod tests {
         s.report.dir = Some(dir.join("run"));
         s.aec.enabled = false;
         s.music.enabled = true;
+        s.remote.mic_button = crate::config::MicButton::Ptt;
         let c = ConfigSwitches::new(&s).unwrap();
         assert!(!c.current(Setting::Aec) && c.current(Setting::Music));
+        assert!(c.current(Setting::MicButton));
         assert_eq!(c.prefix, dir);
         assert_eq!(c.ctl, dir.join("bin").join("ctl.sh"));
         let _ = std::fs::remove_dir_all(&dir);

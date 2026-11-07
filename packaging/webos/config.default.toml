@@ -84,3 +84,12 @@ open_on_start = true
 # config/example.toml ([music]). Restart after a change; the app's Sound
 # screen and `ctl.sh config music on|off` change this key and restart.
 enabled = false
+
+[remote]
+# The Magic Remote's mic button. "off": the key is only observed (passive
+# read, no grab). "ptt": hold it to talk to Home Assistant (LG's assistant
+# still opens too: ADR 0013 is proposed, not built). Every key:
+# config/example.toml ([remote]). Restart after a change; the HA switch
+# "Remote mic button" and `ctl.sh config mic-button on|off` change this key
+# and restart.
+mic_button = "off"

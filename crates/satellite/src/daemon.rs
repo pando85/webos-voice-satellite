@@ -43,6 +43,8 @@ use crate::firmware::{self, Model, Verdict};
 use crate::music::{End, Music};
 use crate::player::{Done, Kind, Player, redact_url};
 use crate::power::{self, PowerUpdate};
+use crate::remote_mic::StreamEvent;
+use crate::remote_ptt::{self, Act, Button};
 use crate::selfcheck::Note;
 use crate::tv_control::{self, Tv, TvMsg};
 use crate::voice_status::{Busy, Ha, Mic, VoiceFile, VoiceStatus};
@@ -566,6 +568,8 @@ struct Daemon {
     /// HA's `aec_enabled` and `music_enabled` switches (ADR 0012), when
     /// `ctl.sh` is found.
     config_switches: Option<ConfigSwitches>,
+    /// The Magic Remote's mic button (`[remote]`), when its reader runs.
+    remote: Option<Button>,
 }
 
 impl Daemon {
@@ -833,6 +837,15 @@ impl Daemon {
     /// Polls the kill-switch file.
     async fn poll_kill_switch(&mut self) {
         let on = self.kill_switch.exists();
+        if self.gate.mic_off() || on {
+            // The remote's microphone obeys the same gates.
+            let acts = self
+                .remote
+                .as_mut()
+                .map(|b| b.halt("the microphone is off"))
+                .unwrap_or_default();
+            self.run_remote_acts(acts).await;
+        }
         if on == self.gate.kill {
             return;
         }
@@ -933,6 +946,82 @@ impl Daemon {
             mode: PipelineMode::PushToTalk,
         })
         .await;
+    }
+
+    /// What the mic button's machine needs to know at a press.
+    fn remote_ctx(&self) -> remote_ptt::Context {
+        remote_ptt::Context {
+            connected: self.connected,
+            mic_off: self.gate.mic_off(),
+            mic_open: self.shared.open.load(Ordering::Relaxed),
+            announcing: self.player.is_active()
+                && self.player.current_kind() == Some(Kind::Announce),
+            run_streaming: self.in_run && self.shared.streaming.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Carries out the mic button's actions, in order.
+    async fn run_remote_acts(&mut self, acts: Vec<Act>) {
+        for a in acts {
+            match a {
+                Act::StartRun => {
+                    self.send(AppCommand::StartPipeline {
+                        mode: PipelineMode::PushToTalk,
+                    })
+                    .await;
+                }
+                Act::EndAudio => self.send(AppCommand::EndAudio).await,
+                Act::Audio(chunk) => {
+                    self.send(AppCommand::Audio(chunk)).await;
+                    self.shared.chunks_sent.fetch_add(1, Ordering::Relaxed);
+                }
+                Act::RemoteFeeds(on) => self.shared.remote_feeds.store(on, Ordering::Relaxed),
+                // Run by the button itself.
+                Act::OpenStream | Act::CloseStream => {}
+            }
+        }
+    }
+
+    async fn on_remote_key(&mut self, key: crate::evdev::Key) {
+        let ctx = self.remote_ctx();
+        let acts = match self.remote.as_mut() {
+            Some(b) => b.on_key(key, Instant::now(), ctx),
+            None => return,
+        };
+        self.run_remote_acts(acts).await;
+    }
+
+    async fn on_remote_stream(&mut self, generation: u64, ev: StreamEvent) {
+        let acts = match self.remote.as_mut() {
+            Some(b) => b.on_stream(generation, ev, Instant::now()),
+            None => return,
+        };
+        self.run_remote_acts(acts).await;
+    }
+
+    async fn remote_tick(&mut self) {
+        let acts = match self.remote.as_mut() {
+            Some(b) => b.on_tick(Instant::now()),
+            None => return,
+        };
+        self.run_remote_acts(acts).await;
+    }
+
+    /// The mic button follows the voice layer's events.
+    async fn remote_on_event(&mut self, ev: &AppEvent) {
+        let Some(b) = self.remote.as_mut() else {
+            return;
+        };
+        let acts = match ev {
+            AppEvent::StartStreaming {
+                wake_word: false, ..
+            } => b.on_run_started(),
+            AppEvent::StopStreaming | AppEvent::RunEnd => b.on_audio_over(),
+            AppEvent::HaDisconnected => b.halt("Home Assistant disconnected"),
+            AppEvent::MuteChanged(true) => b.halt("the microphone was muted"),
+            _ => return,
+        };
+        self.run_remote_acts(acts).await;
     }
 
     async fn send_finished(&self, kind: Kind, success: bool) {
@@ -1294,6 +1383,7 @@ impl Daemon {
             self.on_timer(&ev).await;
             return;
         }
+        self.remote_on_event(&ev).await;
         // A command for a TV control entity.
         let tv_out = self.tv.as_mut().and_then(|tv| tv.on_event(&ev));
         if let Some(out) = tv_out {
@@ -1597,6 +1687,34 @@ fn status_version(v: &Verdict) -> &str {
     }
 }
 
+/// Starts the mic button's reader (and, with `mic_button = "ptt"`, its
+/// machine and the remote microphone). `None` when the thread cannot start.
+fn start_remote(settings: &Settings) -> Option<remote_ptt::Started> {
+    let r = &settings.remote;
+    let luna = (r.ptt() && r.remote_mic)
+        .then(|| power::find_binary(&settings.power.luna_send))
+        .flatten();
+    if r.ptt() && r.remote_mic && luna.is_none() {
+        log::info!(
+            "remote mic: {} not found; button runs use the TV microphone (normal off the TV)",
+            settings.power.luna_send.display()
+        );
+    }
+    match Button::start(
+        r,
+        luna,
+        settings.dsp.hpf_hz,
+        crate::evdev::InputPaths::default(),
+        Box::new(remote_ptt::LeaveToLg),
+    ) {
+        Ok(st) => Some(st),
+        Err(e) => {
+            log::warn!("remote mic button: cannot start the reader thread: {e}");
+            None
+        }
+    }
+}
+
 /// Runs the daemon until SIGTERM/SIGINT.
 #[allow(clippy::too_many_lines)] // linear setup, loop and shutdown
 pub(crate) async fn run(mut settings: Settings, triggers: TestTriggers) -> Result<(), String> {
@@ -1832,6 +1950,12 @@ pub(crate) async fn run(mut settings: Settings, triggers: TestTriggers) -> Resul
         Some((m, rx)) => (Some(m), Some(rx)),
         None => (None, None),
     };
+    // The Magic Remote's mic button: the passive reader always runs (it
+    // only observes with mic_button = "off"); hold-to-talk with "ptt".
+    let (remote, mut remote_keys, mut remote_stream) = match start_remote(&settings) {
+        Some(st) => (Some(st.button), Some(st.keys), Some(st.stream)),
+        None => (None, None, None),
+    };
     let mut player = Player::new(settings.sink.clone(), volume_gain.clone(), done_tx);
     player.set_fetch_loopback(triggers.fetch_loopback);
     let mut d = Daemon {
@@ -1885,6 +2009,7 @@ pub(crate) async fn run(mut settings: Settings, triggers: TestTriggers) -> Resul
         voice_file: VoiceFile::new(&settings.report.dir_or_default()),
         music,
         config_switches,
+        remote,
     };
     d.publish_voice_status();
     d.publish_timers().await;
@@ -1954,6 +2079,9 @@ pub(crate) async fn run(mut settings: Settings, triggers: TestTriggers) -> Resul
             Some(u) = power_rx.recv() => d.on_power(u).await,
             Some(m) = recv_opt(tv_rx.as_mut()) => d.on_tv_msg(m).await,
             Some(n) = notes_rx.recv() => d.on_note(n).await,
+            Some(k) = recv_opt(remote_keys.as_mut()) => d.on_remote_key(k).await,
+            Some((g, ev)) = recv_opt(remote_stream.as_mut()) => d.on_remote_stream(g, ev).await,
+            () = sleep_opt(d.remote.as_ref().and_then(Button::deadline)) => d.remote_tick().await,
             () = tick_opt(tv_tick.as_mut()) => d.poll_tv().await,
             _ = sigterm.recv() => {
                 log::info!("SIGTERM: shutting down");
@@ -2010,6 +2138,10 @@ pub(crate) async fn run(mut settings: Settings, triggers: TestTriggers) -> Resul
         tv.shutdown().await;
     }
     d.set_streaming(false);
+    if let Some(mut b) = d.remote.take() {
+        let acts = b.shutdown().await;
+        d.run_remote_acts(acts).await;
+    }
     if let Some(m) = d.music.take() {
         m.shutdown().await;
     }
@@ -2333,6 +2465,7 @@ mod tests {
             voice_file: VoiceFile::new(&dir.join("run")),
             music: None,
             config_switches: None,
+            remote: None,
         };
         (d, cmd_rx)
     }

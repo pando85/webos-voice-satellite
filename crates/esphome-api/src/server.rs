@@ -1299,6 +1299,7 @@ impl Ctx {
             }
             AppCommand::StartPipeline { mode } => self.voice.on_start_pipeline(now, mode),
             AppCommand::StopPipeline => self.voice.on_stop_pipeline(),
+            AppCommand::EndAudio => self.voice.on_end_audio(),
             AppCommand::PlaybackFinished { success } => {
                 self.voice.on_playback_finished(now, success);
             }

@@ -52,6 +52,9 @@ pub(crate) struct Settings {
     pub(crate) report: ReportSection,
     /// Music on the satellite's media player (off by default; ADR 0010).
     pub(crate) music: MusicSection,
+    /// The Magic Remote's mic button (`mic_button`, off by default;
+    /// docs/design/remote-mic-button.md, ADR 0013 proposed).
+    pub(crate) remote: RemoteSection,
     /// The install directory (the parent of `etc/`), when the config sits in
     /// an `etc/` directory (like the default `report.dir`). Not a config key.
     /// HA's two config switches (ADR 0012) run `bin/ctl.sh` of it with
@@ -1056,6 +1059,119 @@ impl MusicSection {
     }
 }
 
+/// What the Magic Remote's mic button does for the satellite.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum MicButton {
+    /// Nothing: the key is only observed (passive read, no grab, no run, no
+    /// stream, nothing of LG's changed).
+    #[default]
+    Off,
+    /// Hold to talk to Home Assistant.
+    Ptt,
+}
+
+/// `[remote]`: the Magic Remote's mic button (docs/design/remote-mic-
+/// button.md; the coexistence with LG's assistant is ADR 0013, proposed).
+/// Read at start only; `ctl.sh config mic-button on|off` and HA's switch
+/// change `mic_button` and restart.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct RemoteSection {
+    /// `"off"` (default) or `"ptt"` (hold to talk).
+    pub(crate) mic_button: MicButton,
+    /// The input device, by its exact name (`/sys/class/input/eventN/device/
+    /// name`); never by index, which changes with the remote's connection.
+    pub(crate) device_name: String,
+    /// The button's `EV_KEY` code (428 on c3-a and c3-b, EXP-022).
+    pub(crate) key_code: u16,
+    /// Take the run's audio from the remote's own microphone (LG
+    /// `voiceinput` stream) while the button is held; the TV microphone is
+    /// the fallback. False: always the TV microphone.
+    pub(crate) remote_mic: bool,
+    /// Longest hold, in seconds: the audio ends there even if the button is
+    /// still held.
+    pub(crate) max_hold_s: u32,
+    /// A release before this many ms is a tap (tap-to-talk on the TV
+    /// microphone, ended by Home Assistant's end-of-speech detection). 0: no
+    /// taps, every release ends the audio.
+    pub(crate) tap_ms: u32,
+    /// Fixed gain on the remote microphone, in dB (the TV mic's `dsp.gain_db`
+    /// is for a far-field mic and not used here).
+    pub(crate) gain_db: f32,
+}
+
+/// Name of the Magic Remote's key device on c3-a and c3-b (EXP-022).
+pub(crate) const REMOTE_DEVICE: &str = "LGE M-RCU - Builtin [0]";
+/// `KEY_VOICE` in LG's naming (Linux: `KEY_VOICEMAIL`), EXP-022.
+pub(crate) const REMOTE_MIC_KEY: u16 = 428;
+
+impl Default for RemoteSection {
+    fn default() -> Self {
+        Self {
+            mic_button: MicButton::Off,
+            device_name: REMOTE_DEVICE.to_owned(),
+            key_code: REMOTE_MIC_KEY,
+            remote_mic: true,
+            max_hold_s: 15,
+            tap_ms: 300,
+            gain_db: 0.0,
+        }
+    }
+}
+
+impl RemoteSection {
+    /// Hold-to-talk is on.
+    pub(crate) fn ptt(&self) -> bool {
+        self.mic_button == MicButton::Ptt
+    }
+
+    fn validate(&self) -> Result<(), ConfigError> {
+        if self.device_name.trim().is_empty() || self.device_name.len() > 128 {
+            return Err(err("remote.device_name must be 1 to 128 characters"));
+        }
+        if self.device_name.chars().any(char::is_control) {
+            return Err(err("remote.device_name must not hold control characters"));
+        }
+        // KEY_MAX is 0x2ff.
+        if !(1..=0x2ff).contains(&self.key_code) {
+            return Err(err("remote.key_code must be between 1 and 767"));
+        }
+        if !(1..=60).contains(&self.max_hold_s) {
+            return Err(err("remote.max_hold_s must be between 1 and 60"));
+        }
+        if self.tap_ms > 2000 || u64::from(self.tap_ms) >= u64::from(self.max_hold_s) * 1000 {
+            return Err(err(
+                "remote.tap_ms must be between 0 and 2000 and below max_hold_s",
+            ));
+        }
+        if !self.gain_db.is_finite() || !(-20.0..=30.0).contains(&self.gain_db) {
+            return Err(err("remote.gain_db must be between -20 and 30"));
+        }
+        Ok(())
+    }
+
+    /// The `[remote]` part of the summary line (`ctl.sh config` reads
+    /// `remote=[mic_button=off` and `remote=[mic_button=ptt`).
+    fn summary(&self) -> String {
+        if !self.ptt() {
+            return format!(
+                "mic_button=off device={:?} key={}",
+                self.device_name, self.key_code
+            );
+        }
+        format!(
+            "mic_button=ptt device={:?} key={} mic={} max_hold_s={} tap_ms={} gain_db={}",
+            self.device_name,
+            self.key_code,
+            if self.remote_mic { "remote" } else { "tv" },
+            self.max_hold_s,
+            self.tap_ms,
+            self.gain_db
+        )
+    }
+}
+
 /// ` aec3={name=value,...}` for the summary line (empty without overrides).
 fn aec3_summary(t: &std::collections::BTreeMap<String, f32>) -> String {
     if t.is_empty() {
@@ -1268,6 +1384,7 @@ impl Settings {
         }
         self.validate_aec()?;
         self.music.validate()?;
+        self.remote.validate()?;
         self.esphome_config()?
             .validate()
             .map_err(|e| err(format!("device: {e}")))?;
@@ -1736,7 +1853,7 @@ impl Settings {
             "off".to_owned()
         };
         format!(
-            "name={} port={} voice_features={} mode={:?} encryption={encryption} mic=[{mic}] dsp=[{:?} gain_db={} hpf_hz={}] aec=[{aec}] sink=[{sink}] safety=[kill_switch={} mute_file={} firmware={fw}] limits=[nice={} nofile={} rss_mb={} capture_stall_s={} loop_stall_s={}] power=[watch={} remote_off={:?}(default) max_per_hour={} cooldown_s={}] tv_control=[{tv}] music=[{music}]",
+            "name={} port={} voice_features={} mode={:?} encryption={encryption} mic=[{mic}] dsp=[{:?} gain_db={} hpf_hz={}] aec=[{aec}] sink=[{sink}] safety=[kill_switch={} mute_file={} firmware={fw}] limits=[nice={} nofile={} rss_mb={} capture_stall_s={} loop_stall_s={}] power=[watch={} remote_off={:?}(default) max_per_hour={} cooldown_s={}] tv_control=[{tv}] music=[{music}] remote=[{remote}]",
             self.device.name,
             self.device.port,
             self.voice_features(),
@@ -1757,6 +1874,7 @@ impl Settings {
             self.power.cooldown_s,
             tv = self.tv_control_summary(),
             music = self.music.summary(),
+            remote = self.remote.summary(),
         )
     }
 
@@ -2901,6 +3019,65 @@ level = "debug"
             Command::SelfTest
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remote_section_defaults_summary_and_validation() {
+        let base = Path::new("/cfg");
+        let s = Settings::from_toml("[device]\nallow_plaintext = true\n", base).unwrap();
+        s.validate().unwrap();
+        assert_eq!(s.remote, RemoteSection::default());
+        assert!(!s.remote.ptt());
+        assert!(
+            s.summary()
+                .ends_with("remote=[mic_button=off device=\"LGE M-RCU - Builtin [0]\" key=428]"),
+            "{}",
+            s.summary()
+        );
+
+        let s = Settings::from_toml(
+            "[device]\nallow_plaintext = true\n[remote]\nmic_button = \"ptt\"\n",
+            base,
+        )
+        .unwrap();
+        s.validate().unwrap();
+        assert!(s.remote.ptt());
+        assert!(
+            s.summary().contains(
+                "remote=[mic_button=ptt device=\"LGE M-RCU - Builtin [0]\" key=428 mic=remote max_hold_s=15 tap_ms=300 gain_db=0]"
+            ),
+            "{}",
+            s.summary()
+        );
+        let s = Settings::from_toml(
+            "[device]\nallow_plaintext = true\n[remote]\nmic_button = \"ptt\"\nremote_mic = false\ndevice_name = \"Other\"\nkey_code = 582\nmax_hold_s = 30\ntap_ms = 0\ngain_db = 6\n",
+            base,
+        )
+        .unwrap();
+        s.validate().unwrap();
+        assert!(s.summary().contains(
+            "remote=[mic_button=ptt device=\"Other\" key=582 mic=tv max_hold_s=30 tap_ms=0 gain_db=6]"
+        ));
+
+        for bad in [
+            "mic_button = \"on\"",
+            "mic_button = true",
+            "device_name = \"\"",
+            "device_name = \"a\\nb\"",
+            "key_code = 0",
+            "key_code = 768",
+            "max_hold_s = 0",
+            "max_hold_s = 61",
+            "tap_ms = 2001",
+            "max_hold_s = 1\ntap_ms = 1000",
+            "gain_db = 31",
+            "gain_db = -21",
+            "unknown = 1",
+        ] {
+            let text = format!("[device]\nallow_plaintext = true\n[remote]\n{bad}\n");
+            let r = Settings::from_toml(&text, base).and_then(|s| s.validate());
+            assert!(r.is_err(), "{bad:?} was accepted");
+        }
     }
 
     #[test]

@@ -80,6 +80,11 @@ const STATS_EVERY: Duration = Duration::from_secs(60);
 pub(crate) struct Shared {
     /// Forward audio to HA.
     pub(crate) streaming: AtomicBool,
+    /// The Magic Remote's microphone feeds the run (`[remote] mic_button`):
+    /// the daemon sends its chunks, so this thread holds the TV
+    /// microphone's back while streaming. Cleared when the remote stream
+    /// ends, so the TV microphone takes over again (also mid-run).
+    pub(crate) remote_feeds: AtomicBool,
     /// Stop the thread.
     pub(crate) stop: AtomicBool,
     /// The source is open and delivering audio.
@@ -906,6 +911,7 @@ fn pump(
     let mut mono = Vec::with_capacity(READ_FRAMES);
     let mut chunker = Chunker::default();
     let mut was_streaming = false;
+    let mut was_forward = false;
     // File pacing clock: restarted whenever reading resumes.
     let mut pace_start = Instant::now();
     let mut paced_frames = 0_u64;
@@ -930,6 +936,13 @@ fn pump(
             was_streaming = streaming;
             pace_start = Instant::now();
             paced_frames = 0;
+        }
+        // The remote's microphone may feed the run instead (the daemon sends
+        // its audio); a switch in either direction starts a fresh chunk.
+        let forward = streaming && !shared.remote_feeds.load(Ordering::Relaxed);
+        if forward != was_forward {
+            chunker.clear();
+            was_forward = forward;
         }
         if is_file && (eof || (cfg.pause_when_idle && !streaming)) {
             if glue.as_mut().is_some_and(|g| g.on_tick(shared)) {
@@ -967,7 +980,7 @@ fn pump(
         feed.feed(src.as_mut(), &mut frontend, cfg.frontend, rate);
         frontend.process(&buf[..n * ch], src.channels(), &mut mono);
         log_aec_event(&mut frontend);
-        if streaming {
+        if forward {
             for chunk in chunker.push(&mono) {
                 match tx.try_send(AppCommand::Audio(chunk)) {
                     Ok(()) => {
@@ -1078,6 +1091,42 @@ mod tests {
         // 8000 frames - 4000 skipped = 4000 samples = 7 whole chunks.
         assert_eq!(samples, 7 * CHUNK_SAMPLES);
         assert_eq!(shared.chunks_sent.load(Ordering::Relaxed), 7);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_tv_microphone_is_held_back_while_the_remote_feeds_the_run() {
+        let dir = std::env::temp_dir().join(format!("webos-sat-cap-rf-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mic.raw");
+        write_raw(&path, 16_000, 1000);
+        let mut s = Settings::default();
+        s.mic.source = MicSource::File;
+        s.mic.path = Some(path);
+        s.mic.realtime = true;
+        s.mic.looping = true;
+        let cfg = CaptureSettings::from_settings(&s);
+        let shared = Arc::new(Shared::default());
+        let (tx, mut rx) = mpsc::channel(1024);
+        shared.remote_feeds.store(true, Ordering::Relaxed);
+        shared.streaming.store(true, Ordering::Relaxed);
+        let h = spawn(cfg, Arc::clone(&shared), tx, None).unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        let audio = |rx: &mut mpsc::Receiver<AppCommand>| {
+            let mut n = 0;
+            while let Ok(cmd) = rx.try_recv() {
+                n += usize::from(matches!(cmd, AppCommand::Audio(_)));
+            }
+            n
+        };
+        assert_eq!(audio(&mut rx), 0, "TV audio while the remote feeds");
+        // The remote stream ended: the TV microphone takes over at once.
+        shared.remote_feeds.store(false, Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(300));
+        let n = audio(&mut rx);
+        shared.stop.store(true, Ordering::Relaxed);
+        h.join().unwrap();
+        assert!(n >= 4, "{n} chunks after the switch back");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

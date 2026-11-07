@@ -374,6 +374,14 @@ pub enum AppCommand {
     },
     /// Disarm the wake word and abort the current run.
     StopPipeline,
+    /// End the audio of the run that is streaming now, gracefully: HA is sent
+    /// `VoiceAssistantAudio{end: true}` (speech-to-text finalizes what it
+    /// has, the run goes on to the intent and the reply) and the application
+    /// gets [`AppEvent::StopStreaming`]. For hold-to-talk: the button was
+    /// released. Ignored (debug log) when no audio is streaming; the run is
+    /// never aborted by it and the wake word stays armed. Send it after the
+    /// run's last [`AppCommand::Audio`] chunk, on the same channel.
+    EndAudio,
     /// Playback of the TTS response ([`AppEvent::TtsUrl`] or the streamed
     /// [`AppEvent::TtsStreamStart`]..[`AppEvent::TtsStreamEnd`]) finished.
     PlaybackFinished {
@@ -634,6 +642,7 @@ impl fmt::Debug for AppCommand {
                 f.debug_struct("StartPipeline").field("mode", mode).finish()
             }
             Self::StopPipeline => f.write_str("StopPipeline"),
+            Self::EndAudio => f.write_str("EndAudio"),
             Self::PlaybackFinished { success } => f
                 .debug_struct("PlaybackFinished")
                 .field("success", success)

@@ -43,9 +43,9 @@
 #                     reply-volume (N = 0 to 100) are the satellite's own
 #                     settings, written to etc/ and picked up by the running
 #                     daemon within a second. The daemon never does this
-#   config aec on|off | music on|off
-#                     the config keys [aec] enabled (echo cancellation) and
-#                     [music] enabled, read by the daemon at start only:
+#   config aec on|off | music on|off | mic-button on|off
+#                     [aec] and [music] enabled, [remote] mic_button (on:
+#                     "ptt", off: "off"); the daemon reads them at start:
 #                     rewrites only that line of etc/config.toml (checked with
 #                     --check-config first, never installed when the check
 #                     fails) and restarts a running daemon, which ends a
@@ -405,6 +405,9 @@ s/^[[:space:]]*$2[[:space:]]*=[[:space:]]*\"\\{0,1\\}\\([^\"#[:space:]]*\\).*/\\
 # (default off, ADR 0010). The daemon reads both at start only.
 aec_enabled_json() { if [ "$(cfg_section_value aec enabled)" = false ]; then printf false; else printf true; fi; }
 music_enabled_json() { if [ "$(cfg_section_value music enabled)" = true ]; then printf true; else printf false; fi; }
+# [remote] mic_button (the Magic Remote's mic button, ADR 0013 proposed): off
+# unless it says ptt.
+mic_button_word() { if [ "$(cfg_section_value remote mic_button)" = ptt ]; then printf ptt; else printf off; fi; }
 
 # The reply volume file: sink.volume_file of the config, relative to etc/
 # (the daemon's default is etc/reply_volume).
@@ -536,6 +539,7 @@ cmd_status() {
     port=$(cfg_value port)
     aec_on=$(aec_enabled_json)
     music_on=$(music_enabled_json)
+    mic_button=$(mic_button_word)
     if [ "$json" -eq 0 ]; then
         note "package: ${pkg_version:-none} ($PAYLOAD)"
         note "installed: $is_inst ${inst_version:+$inst_version }in $P${build:+ ($build)}"
@@ -565,7 +569,7 @@ cmd_status() {
         fi
         note "reply volume: $vol_text, remote power-off: ${remote_off:-normal}"
         on_off() { if [ "$1" = true ]; then echo on; else echo off; fi; }
-        note "echo cancellation: $(on_off "$aec_on"), music: $(on_off "$music_on") (config; ctl.sh config aec|music on|off)"
+        note "echo cancellation: $(on_off "$aec_on"), music: $(on_off "$music_on"), remote mic button: $mic_button (config; ctl.sh config aec|music|mic-button on|off)"
         return 0
     fi
     printf '{"package_version":%s,' "$(json_str "$pkg_version")"
@@ -583,6 +587,7 @@ cmd_status() {
     printf '"remote_off":%s,"reply_volume":%s,' "$(json_str "${remote_off:-normal}")" "$(json_str "$reply_volume")"
     printf '"reply_volume_default":%s,' "$(json_str "$reply_volume_default")"
     printf '"aec_enabled":%s,"music_enabled":%s,' "$aec_on" "$music_on"
+    printf '"mic_button":%s,' "$(json_str "$mic_button")"
     printf '"pairing_window_s":%s,' "$(json_str "$(cfg_value window_s | sed 's/[^0-9]//g')")"
     printf '"pairing":%s,"ha":%s,' "$(pairing_json)" "$(ha_json)"
     printf '"prefix":%s,"log":[' "$(json_str "$P")"
@@ -1046,8 +1051,10 @@ volume_emit() { # REQUESTED BEFORE AFTER RESULT ERROR DAEMON
         "$(json_str "$1")" "$(json_str "$2")" "$(json_str "$3")" "$(json_str "$4")" "$(json_str "$6")" "$(json_str "$5")"
 }
 
-# --- config aec|music: one config key and a restart (ADR 0011, ADR 0010) ---
-# [aec] enabled and [music] enabled are read by the daemon at start only, so
+# --- config aec|music|mic-button: one config key and a restart (ADR 0011,
+# ADR 0010, docs/design/remote-mic-button.md) ---
+# [aec] enabled, [music] enabled and [remote] mic_button are read by the
+# daemon at start only, so
 # a change rewrites etc/config.toml and restarts a running daemon. The new
 # config is built in a temporary file next to it (only the one key's line
 # changes, or one line or table is added; comments, other keys and other
@@ -1070,34 +1077,48 @@ cfg_check() {
     return 1
 }
 
-# on or off for setting $1 (aec | music) in summary line $2, "" when the
-# line does not say. "aec=[off (file mic without ...)]" is enabled.
+# on or off for setting $1 (aec | music | mic-button) in summary line $2, ""
+# when the line does not say. "aec=[off (file mic without ...)]" is enabled.
 cfg_state() {
     case "$1 $2" in
     "aec "*" aec=[off]"*) echo off ;;
     "aec "*" aec=["*) echo on ;;
     "music "*" music=[off]"*) echo off ;;
     "music "*" music=[on"*) echo on ;;
+    "mic-button "*" remote=[mic_button=off"*) echo off ;;
+    "mic-button "*" remote=[mic_button=ptt"*) echo on ;;
     *) echo "" ;;
     esac
 }
 
-# Writes $CFG with `enabled = $2` in table [$1] to file $3: the key's line is
+# The table, key and TOML value that put setting $1 (aec | music |
+# mic-button) to $2 (on | off): "TABLE KEY VALUE". The values are fixed
+# literals without spaces (a quoted mic_button word is one token).
+cfg_target() {
+    case "$1 $2" in
+    "mic-button on") echo 'remote mic_button "ptt"' ;;
+    "mic-button off") echo 'remote mic_button "off"' ;;
+    *" on") echo "$1 enabled true" ;;
+    *) echo "$1 enabled false" ;;
+    esac
+}
+
+# Writes $CFG with `$2 = $3` in table [$1] to file $4: the key's line is
 # changed in place (indent and trailing comment kept), or the line is added
 # right under the table's header, or the table is appended at the end.
-cfg_write_enabled() { # TABLE true|false OUT
+cfg_write_key() { # TABLE KEY VALUE OUT
     hre=$(cfg_header_re "$1")
-    if [ -n "$(cfg_section_value "$1" enabled)" ]; then
-        sed "/$hre/,/^[[:space:]]*\\[/s/^\\([[:space:]]*\\)enabled[[:space:]]*=[[:space:]]*[^#[:space:]]*/\\1enabled = $2/" "$CFG" >"$3"
+    if [ -n "$(cfg_section_value "$1" "$2")" ]; then
+        sed "/$hre/,/^[[:space:]]*\\[/s/^\\([[:space:]]*\\)$2[[:space:]]*=[[:space:]]*[^#[:space:]]*/\\1$2 = $3/" "$CFG" >"$4"
     elif grep -q "$hre" "$CFG"; then
         sed "/$hre/a\\
-enabled = $2" "$CFG" >"$3"
+$2 = $3" "$CFG" >"$4"
     else
         {
             cat "$CFG"
             [ -z "$(tail -c 1 "$CFG")" ] || echo
-            printf '\n[%s]\nenabled = %s\n' "$1" "$2"
-        } >"$3"
+            printf '\n[%s]\n%s = %s\n' "$1" "$2" "$3"
+        } >"$4"
     fi
 }
 
@@ -1179,9 +1200,12 @@ ha) CFG_SOURCE=ha ;;
 *) CFG_SOURCE=ctl ;;
 esac
 
-cmd_config_set() { # aec|music on|off, already validated
+cmd_config_set() { # aec|music|mic-button on|off, already validated
     st=$1
     want=$2
+    # shellcheck disable=SC2046 # three fixed words
+    set -- $(cfg_target "$st" "$want")
+    tb=$1 key=$2 v=$3
     installed || die "not installed (ctl.sh install)"
     locked
     [ -f "$CFG" ] || { cfg_emit "$st" "$want" "" "" refused "no config file" none; return; }
@@ -1202,17 +1226,15 @@ cmd_config_set() { # aec|music on|off, already validated
         cfg_emit "$st" "$want" "$before" "$before" refused "the last change was $ago s ago; try again in $left s" none cooldown "$left"
         return
     fi
-    v=false
-    [ "$want" != on ] || v=true
     new=$CFG.new.$$
     prev=$CFG.prev.$$
     err=
-    if ! (umask 077 && cfg_write_enabled "$st" "$v" "$new"); then
+    if ! (umask 077 && cfg_write_key "$tb" "$key" "$v" "$new"); then
         err="cannot write the config"
     elif ! sum=$(cfg_check "$new"); then
         err="the changed config did not pass the check, nothing changed: $sum"
     elif [ "$(cfg_state "$st" "$sum")" != "$want" ]; then
-        err="the config could not be changed automatically, nothing changed: set [$st] enabled = $v by hand"
+        err="the config could not be changed automatically, nothing changed: set [$tb] $key = $v by hand"
     elif ! chmod 600 "$new" || ! cp -p "$CFG" "$prev"; then
         err="cannot keep a copy of the config"
     fi
@@ -1296,13 +1318,13 @@ cmd_set() {
     esac
 }
 
-# config aec|music on|off. Not part of `set` on purpose: it restarts the
+# config aec|music|mic-button on|off. Not part of `set` on purpose: it restarts the
 # daemon, which ends a phone setup session, and nothing the setup server may
 # run reaches that (review C7, tests/no_self_stop.py).
 cmd_config() {
     [ $# -eq 2 ] || usage
     case "$1 $2" in
-    "aec on" | "aec off" | "music on" | "music off") ;;
+    "aec on" | "aec off" | "music on" | "music off" | "mic-button on" | "mic-button off") ;;
     *) usage ;;
     esac
     need_root

@@ -395,6 +395,7 @@ out=$(cq status --json)
 check "status --json: aec_enabled true (no key), music_enabled false" 'echo "$out" | grep -q "\"aec_enabled\":true,\"music_enabled\":false,"'
 check "status: the pairing key word reads [pairing] enabled, not another table's enabled" 'echo "$out" | grep -q "\"key\":\"none\""'
 check "status text: echo cancellation and music" 'cq status 2>/dev/null | grep -q "echo cancellation: on, music: off"'
+check "status: the mic button is off by default" 'echo "$out" | grep -q "\"mic_button\":\"off\"," && cq status 2>/dev/null | grep -q "remote mic button: off"'
 
 out=$(cqc config aec off 2>"$T/err") && rc=0 || rc=$?
 check "aec off (daemon stopped): applied, exit 0, JSON line" '[ "$rc" -eq 0 ] && [ "$out" = "{\"schema\":1,\"setting\":\"aec\",\"requested\":\"off\",\"before\":\"on\",\"after\":\"off\",\"result\":\"applied\",\"daemon\":\"not running\",\"error\":\"\",\"reason\":\"\",\"retry_in_s\":null}" ]'
@@ -414,6 +415,22 @@ check "music on: applied, value changed in place, its comment kept, nothing else
 check "music on: the daemon reads it with the tuned duck_db, status says so" 'qsum | grep -q " music=\[on .*duck_db=-12" && cq status --json | grep -q "\"music_enabled\":true,"'
 out=$(cqc config music off 2>/dev/null) && rc=0 || rc=$?
 check "music off: applied; the [music] table is byte for byte the original again" '[ "$rc" -eq 0 ] && echo "$out" | grep -q "\"after\":\"off\",\"result\":\"applied\"" && sed "/^\[aec\]\$/{n;d;}" "$QC" | cmp -s - "$T/base.toml" && qsum | grep -q " music=\[off\]"'
+
+# The mic button: [remote] mic_button, a quoted word, not an `enabled` key.
+cp "$QC" "$T/before-mic.toml"
+out=$(cqc config mic-button on 2>/dev/null) && rc=0 || rc=$?
+check "mic-button on: applied, [remote] appended with mic_button = \"ptt\", nothing else changed" '[ "$rc" -eq 0 ] && echo "$out" | grep -q "\"setting\":\"mic-button\",\"requested\":\"on\",\"before\":\"off\",\"after\":\"on\",\"result\":\"applied\"" && tail -n 2 "$QC" | tr "\n" "|" | grep -q "^\[remote\]|mic_button = \"ptt\"|\$" && [ "$(diff "$T/before-mic.toml" "$QC" | grep -c "^[<>]")" -eq 3 ]'
+check "mic-button on: the daemon reads it, status says ptt" 'qsum | grep -q " remote=\[mic_button=ptt " && cq status --json | grep -q "\"mic_button\":\"ptt\"," && grep -q " mic-button result from=off to=on read=on outcome=applied source=ctl\$" "$Q/etc/tv-settings.log"'
+out=$(cqc config mic-button on 2>/dev/null) && rc=0 || rc=$?
+check "mic-button on again: already" '[ "$rc" -eq 0 ] && echo "$out" | grep -q "\"result\":\"already\""'
+out=$(cqc config mic-button off 2>/dev/null) && rc=0 || rc=$?
+check "mic-button off: the quoted value is replaced in place" '[ "$rc" -eq 0 ] && echo "$out" | grep -q "\"after\":\"off\",\"result\":\"applied\"" && grep -qx "mic_button = \"off\"" "$QC" && ! grep -q ptt "$QC" && qsum | grep -q " remote=\[mic_button=off "'
+for bad in ptt yes ""; do
+    cq config mic-button "$bad" >/dev/null 2>&1 && rc=0 || rc=$?
+    check "config mic-button '$bad': usage, exit 2" '[ "$rc" -eq 2 ]'
+done
+cq config remote-ptt on >/dev/null 2>&1 && rc=0 || rc=$?
+check "config remote-ptt: not a setting, exit 2" '[ "$rc" -eq 2 ]'
 
 # Tables that are not there: appended at the end (also after a last line without a newline).
 grep -v "^\[music\]\$\|^# music comment\$\|^enabled = false  # keep this comment\$\|^duck_db = -12.0\$" "$T/base.toml" |
