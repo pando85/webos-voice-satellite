@@ -127,3 +127,11 @@ Rollback: `ctl.sh stop`; `ctl.sh autostart off`; `ctl.sh purge` and `make tv-rem
 - **After the start:** `microphone muted (remembered ...)`, `capture: microphone off (muted)`, `remote mic button: off`, `overlay: off`, HA connected at 21:40:43.2Z (3.0 s), **no WARN or ERROR line**; threads as before; the satellite does not hold the microphone (HA's mute); 27 ticks in 20 s (1.35 %), RSS 2.0 MB; no `run/lg_voice_override`. `status --json`: 0.5.1, AEC on, music on, `mic_button` off, `lg_voice_key` `lg`, overlay off, app present, available.
 - **Rollback:** the 0.5.0 ipk (`cff2b2b0...`) with `ctl.sh install`.
 
+## Update to 0.6.0 (2026-11-07)
+
+- **Approval and scope:** as on [c3-a](../c3-a/P4-permanent-install.md#update-to-060-2026-11-07-remote-key-grab-off); the same ipk (sha256 `1cf220c3...`), installed after c3-a showed no regression. HA's mute left as it is; mic button and overlay off as before. Firmware `03.30.73` is not on the grab's verified list (`03.30.74` only), so even with the mic button on the grab would stay off here until an allow-list entry is added ([next steps](../../project/next-steps.md)).
+- **Before (22:46Z):** 0.5.1 (pid 19515), AEC on, music on, mic button off, overlay off (available), `lg_voice_key` `lg`, HA connected, power state `Active`; microphone **muted by HA** (`pcm0c`/`pcm3c` closed, `mic` `muted`); 6 ticks in 20 s (0.3 %), RSS 1.4 MB; app directory 0755; no `remote-proxy` process.
+- **Install:** `scp`, `tv/appinstall.sh install` (app directory and `payload/` **0755 right after it**), the installed 0.5.1 `bin/ctl.sh install`: installed 0.6.0, `remote grab helper: the aarch64 build`, config kept, started pid 30677 at 22:48:49.5Z, overlay app reinstalled.
+- **After the start (read-only):** `bin/remote-proxy` and `bin/webos-satellite` 0700 root; no `NOT TRUSTED` line; no `remote-proxy` process or pid file, no `run/lg_voice_override`; log `microphone muted (remembered ...)`, `remote mic button: off`, `overlay: off`, HA connected at 22:48:53.1Z (3.5 s), **no WARN or ERROR line**; the satellite does not hold the microphone (HA's mute); 5 ticks in 20 s (0.25 %), RSS 1.9 MB. `status --json`: 0.6.0, AEC on, music on, `mic_button` off, `lg_voice_key` `lg`, `key_grab` null, overlay off, available.
+- **Rollback:** the 0.5.1 ipk (`4a1a13a9...`) with `ctl.sh install`.
+
