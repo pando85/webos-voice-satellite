@@ -1,12 +1,12 @@
 # EXP-022 — Magic Remote mic button: passive key observation and the remote's voice stream
 
-**Status:** Part A RUN on c3-b only (2026-11-07, read-only; results below). Part A on c3-a and **Part B (`startStreaming`) NOT run and not authorized**
+**Status:** Part A RUN on c3-b (2026-11-07, read-only). Part B (`startStreaming`) RUN on c3-a (2026-11-07, second attempt; the first attempt saw no mic press and is recorded below as inconclusive). Part A proper on c3-a: only its key capture was repeated inside Part B. Results below
 **Date:** written 2026-11-07
 **Device alias / model / firmware / webOS / architecture:** c3-a first (LG C3 42 inch, firmware `03.30.74`, webOS TV 8.3.0, aarch64 kernel, 32-bit ARM userland); c3-b (`OLED55C36LC`, `03.30.73`) optional and only Part A. The Magic Remote model is recorded during the run
 **Power and playback state:** `Active`, no playback started by the agent, LG hands-free ("Hi LG") **off** (unchanged), installed satellite running unchanged
 **Related research / requirements / issue:** [remote mic button research](../research/remote-mic-button.md), [D3 step 5a](../discovery/c3-a/D3-mic-identification.md#2-step-5a-magic-remote-mic-button-2026-11-01), [D2 service surface](../discovery/c3-a/D2-audio-stack.md#lg-audio-and-voice-service-surface-luna-service2), [D5 passive input trace](../discovery/c3-b/D5-results.md), [EXP-011](EXP-011-lg-settings-toggle.md) (`voiceinput` private calls over `ssh -tt`); requirement F7 (truthful listening indicator)
 **Risk:** Part A **read-only** (passive reads of event nodes, named files, process fd lists, one read-only luna getter). Part B is a **short consented voice stream**: one luna subscription to LG's `voiceinput`; audio is counted in memory and never stored
-**Approval needed / obtained:** Part A on c3-b: **obtained** from the owner on 2026-11-07 ("We can test it at c3-b now"), read-only, owner at the TV. Part A on c3-a: not obtained. Part B (a session plus consent for one spoken neutral phrase that LG's assistant may also send to LG): not obtained, not run
+**Approval needed / obtained:** Part A on c3-b: **obtained** from the owner on 2026-11-07 ("We can test it at c3-b now"), read-only, owner at the TV. Part A on c3-a: not obtained. Part B on c3-a: **obtained** from the owner on 2026-11-07 ("we can do it now at c3-a"), with the owner speaking "uno dos tres" while holding the button (consent for LG's assistant to hear it too). Part B on c3-b: not run
 
 ## Question and falsifiable hypothesis
 
@@ -198,6 +198,47 @@ So four mic presses reached the log and `event2` (one more than the plan, and sp
 
 **What the filtered log does not show.** No `voiceinput` line mentions starting a capture, a stream or a socket during the presses (the only `Capture`, `TaskManager` and `CaptureHidRaw` lines are the remote's disconnect at 14:08:45Z and its reconnect at about 14:09:40Z). That fits "no speech, no stream", but the filter would not catch every line, so it is not proof that no audio was captured. No transcript or speech text appeared in the 202 kept lines.
 
+## Part B on c3-a: the remote's voice stream (2026-11-07)
+
+Target: c3-a (LG C3 42 inch, firmware `03.30.74`, webOS TV 8.3.0, remote `LGE MR23`, satellite 0.4.5 holding `pcm0c`, LG hands-free off). Raw files (key events, stream counters, filtered log) are in the gitignored `devices/private/c3-a/EXP-022/`. **No audio was stored, copied or transmitted:** the counter ran on the TV (a python script piped over ssh stdin, so no file was written on the TV), keeping only byte counts and levels in memory. No `EVIOCGRAB`, no hidraw read, no LG process touched (only my own `luna-send` children were stopped). The owner's phrase was "uno dos tres".
+
+**Attempt 1 (readers 14:50:49.6Z to 14:52:54.9Z): inconclusive.** The only key event was code 1199 (press, release) at 14:50:51.7Z; no 428, no Up, no hidraw node before, during or after, 0 filtered log lines, 0 `startStreaming` attempts. The remote had not connected to this TV in that window. This says nothing about the feature.
+
+**Attempt 2 (readers 14:54:33.0Z to 14:59:38.8Z, owner told at 14:54:38.0Z).** The stream script keys on the 428 press, then calls `luna://com.webos.service.voiceinput/startStreaming` every 0.3 to 0.4 s while the button is down (cap 14 per hold, 42 in all; **4 used**). `hidraw0` was absent in the 14:54:33Z and 14:59:39Z snapshots and in a check at 15:00:14Z, and **present in a read-only check at 14:55:51Z** (it exists only while the remote is connected; LG's `voiceinput` and `lginput2` held it on c3-b).
+
+Key events (`event2`, `LGE M-RCU - Builtin [0]`, UTC): Up 103 at 14:54:50.220; mic holds **428** 14:54:53.440 to 14:54:56.600 (3.16 s), 14:55:02.162 to 14:55:05.361 (3.20 s), 14:55:10.021 to 14:55:13.841 (3.82 s); then volume up (115, with auto-repeat 14:55:36 to 14:55:41, owner raising the volume) and a lone 1199 at 14:58:36.7. Code 1199 also appeared 31 ms and 51 ms after our two successful subscriptions (14:54:53.500 and 14:55:04.269) and alone twice, so it is not tied to our call; its meaning is still unknown. `NL_BUTTON_CLICK … KEY_VOICE` (`LGE MR23`) was logged for each of the three holds (and `KEY_UP`, `KEY_VOLUMEUP`).
+
+Every `startStreaming` response (socket path unredacted: it holds no identifier):
+
+| Time | Hold, attempt | Parameters | Response |
+| --- | --- | --- | --- |
+| 14:54:53.469 (29 ms after the press) | 1, n=1 | `{"deviceType":"remote","subscribe":true}` | `{"subscribed":true,"returnValue":true,"socketPath":"/tmp/voiceinput_remote1.soc"}` |
+| 14:55:03.570 | 2, n=1 | same | `{"errorCode":"2003","errorText":"audio data is already capturing","returnValue":false,"subscribed":true}` |
+| 14:55:03.892 | 2, n=2 | `{"id":"remote1","deviceType":"remote","subscribe":true}` | `{"returnValue":false}` |
+| 14:55:04.218 | 2, n=3 | `{"deviceType":"remote","keyType":"thinQtv","subscribe":true}` | `{"subscribed":true,"returnValue":true,"socketPath":"/tmp/voiceinput_remote1.soc"}` |
+
+The `10000` refusal seen on webOS 25 was never returned: the call was only made while the button was already down (29 ms and later), and the first one succeeded. Hold 3 had no call of its own (the script was still counting the hold-2 stream); the hold-2 stream covered it.
+
+Stream counts (the socket is a Unix stream socket; the numbers are for the format assumed to be 16 kHz mono S16LE):
+
+| Stream | Connected | Ended | Bytes | Rate | Whole-stream level (assumed S16LE) |
+| --- | --- | --- | --- | --- | --- |
+| 1 (hold 1) | 14:54:53.472 | 14:55:03.481, **my 10 s cap** | 316 160 | 31 587 B/s | rms -34.0 dBFS, peak -4.9 dBFS |
+| 2 (holds 2 and 3) | 14:55:04.222 | 14:55:14.223, **my 10 s cap** | 315 840 | 31 581 B/s | rms -32.7 dBFS, peak -12.5 dBFS |
+
+The rate is 98.7 % of 32 000 B/s (16 kHz x 2 bytes), so the format guess fits. The per-0.5 s levels (about 16 400 bytes each) follow what the owner did:
+- **Stream 1:** rms -49.7 dBFS in the first 0.5 s, then -32 to -27 dBFS at 1.0 to 3.1 s (the first "uno dos tres", while the button was held until 3.16 s), a floor of about -51.5 dBFS (peak about -39.5) from 4.2 s to 8.3 s, and speech again at 8.8 to 9.9 s (-45 to -30 dBFS; this is the second hold, which began at 14:55:02.2Z, 8.7 s after the stream started). Speech over the floor: about 24 dB.
+- **Stream 2:** speech at 0 to 1.0 s (hold 2 was still held), a floor of about -51 dBFS from 2.1 s to 5.7 s, a short bump at 6.2 s, and speech at 7.3 to 9.3 s (-33 to -24 dBFS, which is hold 3 at 14:55:10.0 to 14:55:13.8Z).
+
+**What happened on release:** nothing. The stream was **not** closed by the button release: it kept delivering 32 kB/s of live remote-microphone audio for at least 6.9 s after the release (stream 1) and 8.9 s (stream 2) until my cap, and it carried the next hold's speech. The remote's microphone therefore stays live for as long as the subscription is open; a satellite run must end it itself (a close, or a timer).
+
+**LG's UI (owner observation, reported by the coordinator; time not recorded):** after the three holds LG's assistant said "El procesamiento de audio es inestable, inténtelo de nuevo" ("audio processing is unstable, try again"). On c3-b in Part A (no subscription by us, no speech), the owner saw only "the assistant appeared, said nothing, disappeared", with no such message. **The filtered log shows nothing on c3-a for the voice UI:** unlike c3-b, where each tap wrote `voiceconductor` lines and a `com.webos.app.voice` launch, here the filter (`voiceinput`, `voiceconductor`, `KEY_VOICE`, `hidraw` and others) kept only the five `lginput2` button lines (753 bytes). Why is unknown (a different log setting, or LG's voice flow did not start); so LG's UI opening is known only from the owner's report.
+
+**Does the message line up with our subscription? Possibly, not shown.**
+- For: error 2003 "audio data is already capturing" at 14:55:03.570 means a capture was active 86 ms after I stopped my stream 1 and 1.4 s after press 2. That is either `voiceinput` still tearing down my stream, or LG's own hold-triggered capture holding the single remote stream. Either fits a contention story, and LG's own session would then get an unstable stream. Our subscriptions overlapped LG's three holds almost completely (14:54:53.5 to 14:55:14.2Z).
+- Against or unknown: the error cleared within 0.65 s, and our third attempt then succeeded, so two consumers were not permanently exclusive; no LG log lines to timestamp the message; no control hold on c3-a without our subscription; c3-a and c3-b differ in unit and in the spoken phrase (c3-b had none).
+- **Test that would settle it:** on c3-a, the owner holds the mic button and says the same phrase **without** our stream script running. If LG shows the message anyway, it is LG's own reaction; if not, our subscription is the cause.
+
 ## Conclusion and confidence
 
 Hypotheses, against the evidence (c3-b, `03.30.73`, one session, four presses; confidence high for A1 and A4, medium for A2, A3 and the voice UI facts):
@@ -213,7 +254,18 @@ Hypotheses, against the evidence (c3-b, `03.30.73`, one session, four presses; c
 
 Consequences for the design (inferences, not tested): a passive trigger on `event2` code 428 (value 1 then 0), or a filtered `NL_BUTTON_CLICK … KEY_VOICE` log line, is a working read-only signal on this unit. **LG's voice UI opens at the same time**, so a satellite run started from the button would have LG's assistant on screen too, until a coexistence decision (research note 1.3) says otherwise. The remote's hidraw node comes and goes with the Bluetooth connection (it vanished 15 s after the last press), while the uinput nodes stay.
 
-**Residual unknowns:** a held press (hold-to-talk); the code 1199 sent with Up; the Magic Remote node on **c3-a** (not run there); `startStreaming` behaviour (Part B); whether `voiceinput` captured audio during the presses; why `getDevices` is empty; why the voice UI closed at 14:09:01Z.
+**Residual unknowns (Part A, c3-b):** a held press (hold-to-talk); the code 1199 sent with Up; the Magic Remote node on **c3-a** (not run there); `startStreaming` behaviour (Part B); whether `voiceinput` captured audio during the presses; why `getDevices` is empty; why the voice UI closed at 14:09:01Z.
+
+**Part B conclusion (c3-a, `03.30.74`, one session of 3 holds, 2 successful subscriptions; confidence medium-high for the stream, low for the cause of LG's message):**
+
+| Hypothesis | Verdict |
+| --- | --- |
+| H-B1: with the button held, `startStreaming` replies with a `socketPath` and the socket delivers about 32 kB/s (16 kHz mono S16LE) whose level rises while the owner speaks | **Confirmed** (both successes: 31.6 kB/s, speech 24 dB above a -51.5 dBFS floor). **The call worked with `{"deviceType":"remote","subscribe":true}`, no `keyType` and no `id`**, 29 ms after the press. The `10000` refusal before the hold was not seen (not tested before the press) |
+| "The stream ends at the release" | **Falsified:** it stays open and live until the subscription ends (at least 6.9 s after release) |
+| `keyType thinQtv` is needed | **Not needed**; it was accepted too (attempt 2.3, after a 2003 refusal), but the plain call also worked |
+| No contention with LG's own voice flow | **Not shown:** error 2003 "audio data is already capturing" once, and the owner saw LG's "audio processing is unstable" message. See the section above; a control hold is needed |
+
+Next steps (not authorized): a control hold without our stream; the remote's stream while the satellite runs a real push-to-talk run; closing the subscription at release or after a timer.
 
 ## Rollback and cleanup
 
@@ -225,4 +277,4 @@ Consequences for the design (inferences, not tested): a passive trigger on `even
 
 - Fill in the results here and in [c3-a](../compatibility/c3-a.md) (one row per capability), and update the labels in the [research note](../research/remote-mic-button.md).
 - A coexistence ADR (LG's assistant and ours on the same key) before any grab, hook or change to an LG process.
-- c3-a Part A, to compare firmware `03.30.74` (c3-b is done, see above). A held-press trace (hold-to-talk) on either TV.
+- c3-a Part A inventory is covered (same nodes and schema as c3-b); a control hold without our stream (see Part B); Part B on c3-b to compare `03.30.73`; a coexistence ADR before any use of the remote's stream next to LG's assistant.
