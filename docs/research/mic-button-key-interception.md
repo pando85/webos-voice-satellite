@@ -1,0 +1,240 @@
+# Mic-button key interception: ways to get the press with no LG toast and no LG assistant
+
+- **Date:** 2026-11-07. **Scope:** desk research on the PC only. **Nothing was run on a TV for this note.** Sources: the repository's own findings; a static reading (strings and Thumb disassembly) of the `lginput2` binary copied read-only from c3-a (`03.30.74`) for [EXP-023](../experiments/EXP-023-remote-mic-button-handover.md) (gitignored `devices/private/c3-a/EXP-023/bin/`, nothing committed); the key-filter files and the loader copied by [EXP-025](../experiments/EXP-025-mic-button-toast.md) Part A; the Linux kernel's input and uinput source; webOS OSE source; and community projects for rooted LG TVs (section 6).
+- **Owner request (2026-11-07):** "Are there other alternatives? I'm open to explore any hacking option that could be extended to any other WebOS version." The goal is a mic-button press that reaches the satellite with **no LG toast and no LG assistant**, weighted heavily towards **portability**: other webOS versions (about 4 to 24/25), other LG models, and other remotes (Magic Remote generations, older IR and Bluetooth remotes). The owner lifted the earlier "no `EVIOCGRAB`" restriction **for research**. Every on-TV step still needs the owner's authorization per run, and anything shipped needs an ADR.
+- **Not in this note:** the key-filter-list candidate is researched in [research section 10.7](remote-mic-button.md#107-part-a-on-c3-a-the-key-filter-list-is-a-candidate-2026-11-07), [EXP-025](../experiments/EXP-025-mic-button-toast.md) and the draft [ADR 0015](../decisions/0015-silent-mic-key-filter.md). It is ranked here (candidate C3a) but not re-analysed.
+- **Related:** [remote mic button research](remote-mic-button.md) (sections 1, 9 and 10), [ADR 0013](../decisions/0013-remote-mic-button-coexistence.md), [design](../design/remote-mic-button.md), [EXP-022](../experiments/EXP-022-remote-mic-button-observe.md), [EXP-023](../experiments/EXP-023-remote-mic-button-handover.md).
+
+Labels follow [AGENTS.md](../../AGENTS.md): **documented** (vendor or upstream documentation or source, including the Linux kernel), **observed-on-other-device** (a report from another TV, named with its model and webOS version where known), **hypothesis**, **verified-on-target** (seen on c3-a or c3-b, with a link). "**static (c3-a)**" means read in a file or binary shipped on c3-a: it says what the code does, not that the runtime behaves so.
+
+## Summary
+
+| Rank | Candidate | One line | Portability | Risk |
+| --- | --- | --- | --- | --- |
+| **1** | **C1a: grab `[0]`, re-emit everything except 428 into a sibling (`[2]`, or `[1]` on webOS 10 and later)** | Linux input layer only: the compositor never sees the key, so no toast and no `setInputEvent`; no new device; no LG configuration or voice service touched | **Best:** the same grab-and-resend technique is reported working from webOS 4 (C9) to webOS 11 (C6H) by magic_mapper, and on webOS 10.3 by LG Input Mapper; `lginput2`'s layout matches on c3-a (static) | Remote lockout if the proxy hangs (watchdog required); sibling quirks (Back on `[2]` on webOS 10) |
+| 2 | C3a: our own silent handler in the key-filter list (draft ADR 0015) | Volatile configd override of `com.webos.surfacemanager.keyFilters` | **Medium:** three community projects use the same list on webOS 5.6, 7.6 and 25; absent on webOS 3.4; file paths and handler API vary | Our JavaScript inside LG's compositor; every apply rebuilds the whole chain (and pops up Quick Settings, reported on webOS 25); all remotes affected by a broken chain |
+| 3 | C5: keep `launch`, pause `voiceconductor` | No toast (the filter takes the `launch` branch), LG's assistant frozen | Medium (`voiceconductor` seen on 8.3, 11 and 25) | Wide blast radius; queued `setInputEvent` delivered at SIGCONT |
+| 4 | C1b: grab `[0]`, re-emit into our own uinput clone | C1a for layouts without a usable sibling | **Doubtful:** LG Input Mapper reports that `surface-manager` ignores input devices created after it starts; LG's TV compositor takes input from LG's closed input manager, not Qt's evdev hot-plug | As C1a, and probably a dead remote: only as a guarded fallback |
+| 5 | C3b: bind-mount a patched `appLaunch.js` | Same effect as C3a, with a firmware-specific patch and a `surface-manager` restart | Poor (patch per file hash; done on webOS 4.10, dropped on webOS 9) | Compositor restart (black screen risk, notification burst) |
+| 6 | C6: hook `lginput2` (`LD_PRELOAD`, a patched binary, or `ezinject`) | Drop 428 before it is written to uinput | Poor: LG Input Hook broke on webOS 24/25 and later broke `tvservice` on webOS 4 | Restarting and hooking LG's input service: all remotes |
+| 7 | C4: toast-level tricks (catalogue patch, closing the toast window) | Hide or break the toast after the filter decided | Poor (per language, per firmware) | Not narrow (7 toasts share the string); the toast still flashes |
+| — | C2: grab without a proxy | Only if 428 had a node of its own | — | **Rejected on C3:** `[0]` carries the pointer and every key (verified-on-target) |
+| — | C7 kernel input filter module, C8 ls-hub ACL, `EVIOCSKEYCODE`, app-scoped bypass | See section 5 | — | Rejected or low value |
+
+**Recommendation:** C1a, with ADR 0013's configd override kept as a safety net (if the proxy dies, a press shows today's toast instead of LG's assistant). It is the only candidate that works below every LG-specific layer, and the same technique is already reported working by other projects from webOS 4 to webOS 11, so it is also the one with the most evidence of portability. C1b (a uinput clone) is kept only as a guarded fallback because of the report that the compositor ignores new devices. Its single serious risk, a dead Magic Remote while the proxy hangs, is bounded by the kernel (the grab dies with the process) and by a watchdog. First step: the read-only Part A of section 8 (about 15 minutes, no key press, no write).
+
+## 1. What a candidate has to beat
+
+| Fact | Label | Source |
+| --- | --- | --- |
+| The mic button is `EV_KEY` 428 (press 1, release 0) on `LGE M-RCU - Builtin [0]`, which also carries the pointer (`EV_ABS` 0 and 1) and the navigation, Up and Back keys | verified-on-target (c3-b `03.30.73` and c3-a `03.30.74`) | [EXP-022](../experiments/EXP-022-remote-mic-button-observe.md) A and B |
+| `[0]` to `[2]` (and `LGE TONE+ - Builtin [3]`) are uinput devices of `lginput2` (5 `/dev/uinput` fds); `surface-manager` holds every event node | verified-on-target (c3-b) | EXP-022 A |
+| LG's assistant is started by the compositor's key filter (`appLaunch.js handleHotkeys` → `voiceconductor/setInputEvent`, caller `com.webos.starfish.keyfilters` in the log); any `com.webos.keyaction.voice` action other than `launch` shows the toast instead | static (c3-a) + verified-on-target (log, c3-b) | [research 9.1](remote-mic-button.md#91-how-a-mic-press-reaches-lgs-assistant-on-webos-83), [10.1](remote-mic-button.md#101-which-component-shows-the-toast-question-1) |
+| The toast (Spanish "Esta función no es compatible.") opens 12 to 58 ms after each press and stays 5 s | verified-on-target (c3-a, filtered log) | [research 10.7](remote-mic-button.md#107-part-a-on-c3-a-the-key-filter-list-is-a-candidate-2026-11-07) |
+| The remote's audio comes from `voiceinput` reading `hidraw0` directly; our own `startStreaming {"deviceType":"remote"}` works while LG's flow does **not** run (0.5.0 with the override: the key filter sends no `setInputEvent`, and the remote's stream still feeds our runs) | verified-on-target (c3-a, EXP-022 B; owner-reported for 0.5.0) | [EXP-023 observations](../experiments/EXP-023-remote-mic-button-handover.md#observations-and-redacted-evidence-links) |
+
+**Consequence (inference, strong on webOS 8.3):** on this firmware, LG's assistant has **one** trigger, the key filter, and the key filter only sees the key through the evdev node. Anything that keeps `EV_KEY` 428 away from the compositor therefore removes both the toast and LG's assistant **without** any configd override, and the audio route is the same as with 0.5.0 today (the key filter does not start LG's flow in either case). On other firmware this must be checked: on webOS 25 CleanYourTV pauses `voiceconductor` **in addition to** its `lginput2` hook, which may mean a second trigger path there (research 1.3; hypothesis).
+
+## 2. New static facts: how `lginput2` builds the remote's input devices (c3-a)
+
+Read from the `lginput2` copied for EXP-023 (32-bit ARM, stripped, exported symbols), `llvm-objdump` Thumb disassembly of `lginput_uinput_init`, `lginput_uinput_create`, `lginput_uinput_setup_general`, `lginput_uinput_setup_sensor` and `lginput_uinput_destroy`. **static (c3-a)** for every row.
+
+| Finding | Evidence | Why it matters |
+| --- | --- | --- |
+| `lginput_uinput_init` creates **three** devices `LGE M-RCU - Builtin [%d]` (index 0, 1, 2) in one loop with the **same** key table and count, then `LGE TONE+ - Builtin [3]`, then calls `xpa_im_registerEvdev` | loop `cmp r4, #3`, format strings, call order | `[0]`, `[1]` and `[2]` should have identical capabilities, so `[2]` can take anything `[0]` emits (C1a). The registration call hints that LG's input manager is **told** about its devices, which fits the report that a new device of ours is ignored (C1b, section 6) |
+| Each device: `open("/dev/uinput", O_WRONLY or O_NONBLOCK)`, legacy `struct uinput_user_dev` (1116 bytes) written, then `UI_DEV_CREATE`. Name up to 80 bytes; `id.bustype` 3 (USB), `id.version` 4, vendor and product 0; `absmax[ABS_X]`, `absmax[ABS_Y]` = the panel's graphic resolution (`xpa_boardInfo_getGraphicResolution`), `absmin` 0 | struct offsets 0x50, 0x56, 92, 348 | A clone (C1b) can copy all of it with `EVIOCGID` and `EVIOCGABS`. No `UI_SET_PHYS` call, so `phys` and `uniq` are empty (no identifier to copy) |
+| `setup_general` sets `EV_KEY`, `EV_REL`, `EV_ABS`; `REL_WHEEL`; `ABS_X`, `ABS_Y`; `BTN_LEFT`, `BTN_RIGHT`, `BTN_MIDDLE`; then every code of the key table (`UI_SET_KEYBIT` in a loop) and a second fixed table starting at code 1194 | `ioctl` numbers `0x40045564` to `0x40045567` with their arguments | The proxy must forward keys, the wheel and the absolute pointer. The fixed table explains the unexplained code **1199** seen on `event2` in EXP-022 B (an LG-private key code, inference) |
+| **No `EV_REP`, no `EV_MSC`** is set | absence of `UI_SET_EVBIT 20` and `4` | Repeats (value 2, seen for volume in EXP-022 B) come from `lginput2` itself. A clone must **not** set `EV_REP`, or the kernel would add its own repeats |
+| `setup_sensor` sets LG-private `ABS` axes 0x21 to 0x27, 0x29, 0x3a, 0x3b (range ±50000); it is not called from `lginput_uinput_create` | call graph | Motion-sensor data may sit on another path; Part A reads the real bitmaps instead of trusting this |
+| `lginput_uinput_destroy` is a stub that returns 1 | disassembly | The devices live as long as `lginput2`; EXP-022 saw them survive a Bluetooth disconnect. Only an `lginput2` restart removes and re-creates them |
+| Key maps are compiled in (`_mrcu_init_keymap`, `_sp16_init_keymap`); `lginput2` reads no key-map file | strings (only `/mnt/lg/cmn_data/mrcu/*` pairing data and configd) | No file to bind-mount to remap 428 (rules out a "remap in `lginput2`" variant) |
+| `lginput2` handles the remote's voice packets itself (`interpret_ble_voice_packet`, `LGINPUT_COMMAND_VOICE_START/STOP`) | strings | Starting the remote's audio does not depend on the compositor seeing 428 (consistent with 0.5.0, inference) |
+
+## 3. Candidate C1: `EVIOCGRAB` plus re-emit (the proxy)
+
+### 3.1 Mechanism
+
+1. Find the remote's key device **by capability**: an event node whose `KEY` bitmap contains 428 and whose name starts with `LGE M-RCU` (on other firmware: any node with 428 in its bitmap; TONE+ earbuds use another LG code, `KEY_TONE_VOICE`).
+2. Wait until no key is down on it (`EVIOCGKEY` all zero), then `ioctl(fd, EVIOCGRAB, 1)`. From then on the kernel delivers its events **only** to our fd; `surface-manager`'s open fd receives nothing ([kernel `evdev.c`](https://github.com/torvalds/linux/blob/v5.4/drivers/input/evdev.c) `evdev_grab`, `evdev_pass_values`; documented).
+3. Read each frame (events up to `SYN_REPORT`). Drop `EV_KEY` 428 (press, release, repeat) and hand it to the satellite's button machine; write every other event, frame by frame, to the target:
+   - **C1a, sibling target:** `write()` of `struct input_event` records to `/dev/input/eventN` of `LGE M-RCU - Builtin [2]` (or `[1]`), which the compositor already reads. The kernel turns each record into `input_inject_event()` on that device and delivers it to every reader ([kernel `evdev_write`, `input_inject_event`](https://github.com/torvalds/linux/blob/v5.4/drivers/input/input.c); documented). Events whose type or code the target does not declare are dropped by the input core (`is_event_supported`), hence the capability check. LG Input Mapper and magic_mapper re-emit this way (observed-on-other-device, section 6); magic_mapper uses `[1]` on webOS 10 and later because resending through `[2]` made Back exit the whole app there, so the compositor does treat the siblings differently on some versions.
+   - **C1b, own clone:** create a uinput device copying `[0]`'s name, id, event bits, key bits, `REL` bits and `ABS` ranges (`UI_DEV_SETUP`, `UI_ABS_SETUP`, `UI_SET_*BIT`; kernel 5.4 has them), without `EV_REP`, and write to it.
+   - Injecting into `[0]` itself does **not** work: while a client holds the grab, injected events also go only to the grabbing client (`input_inject_event` accepts them only through the grabbed handle, and `evdev_pass_values` passes them to the grab owner; documented).
+4. Release: `EVIOCGRAB 0` or closing the fd. The kernel also releases the grab when the process dies (the fd closes); a uinput clone disappears with its fd (documented). It does **not** synthesize key releases: the proxy forwards any release still pending before it lets go, and grabs only when no key is down.
+
+### 3.2 Checks asked by the owner
+
+| Question | Answer | Label |
+| --- | --- | --- |
+| Is `[0]` a uinput device of `lginput2` (so grabbing it is clean)? | Yes: `lginput2` creates it through `/dev/uinput` (section 2) and holds 5 uinput fds; the Bluetooth HID device is separate (`hidraw0`, held by `voiceinput` and `lginput2`). Grabbing `[0]` touches neither the HID link nor `voiceinput` | static (c3-a) + verified-on-target (fd lists, c3-b, EXP-022 A); Part A A2 confirms `/devices/virtual/input` on c3-a |
+| Does the compositor hot-plug a new uinput device? | **Probably not.** LG Input Mapper's README: "surface-manager does not pick up input devices created after it starts, so a fresh uinput clone would go unread" (observed-on-other-device, webOS 10.3, project claim). The public LG TV compositor backend (`eglfs_starfish.env` in OSE `luna-surfacemanager` `b2fef6f`) sets `QT_QPA_EGLFS_DISABLE_INPUT=1` and takes input from LG's closed input manager (`QStarfishInputManager`, `libim`), not from Qt's udev hot-plug (documented, OSE; the TV build may differ). `lginput2`'s `xpa_im_registerEvdev` call after creating its devices fits this (static, c3-a). Some LG devices do come and go (TONE+, `LGE Network Input`), so the input manager has some runtime path; whether a third party can use it is unknown. C1a avoids the question | documented (OSE) + observed-on-other-device + static (c3-a); Part A A5 to A8, Part B B4 |
+| Names, phys, uniq, udev properties? | `lginput2` sets only the name and the id (USB, version 4, vendor and product 0); phys and uniq are empty. A clone can copy them exactly. udev properties (`ID_INPUT_KEY`, `ID_INPUT_MOUSE`) come from udev's own rules on the capabilities, not from the creator; whether udev runs and tags them is Part A A4 | static (c3-a); hypothesis for udev |
+| Failsafe | Kernel: grab released and clone destroyed when the fd closes, including on a crash or SIGKILL (documented). A **hang** with the fd open leaves the Magic Remote dead (the IR remote and the LG ThinQ app are separate devices and keep working, hypothesis for the ThinQ path). Hence: a separate small proxy process, a watchdog (section 3.4), and a grab only while the feature is on | documented + design |
+| Pointer latency, gestures, wheel | One `read()` and one `write()` per frame in a dedicated thread: microseconds against a remote report period of milliseconds (hypothesis; Part B measures it from the kernel timestamps of the source and target events). Gestures and the wheel are plain `ABS`/`REL`/`KEY` events here (section 2), so they pass unchanged if the target declares them | static + hypothesis |
+| BLE reconnect | The uinput nodes survive a Bluetooth disconnect (EXP-022: `hidraw0` vanished, the uinput nodes stayed), and `lginput_uinput_destroy` is a stub, so a reconnect does not disturb the grab. An `lginput2` restart does: the read returns `ENODEV`, the proxy drops its clone or target and rediscovers (the existing reader already rediscovers with backoff) | verified-on-target (EXP-022) + static (c3-a) |
+| Does `voiceinput` or the remote's mic depend on LG seeing 428? | No, on webOS 8.3: the voice packets are parsed by `lginput2` and `voiceinput` from `hidraw0`; the key filter is the only path from 428 to LG's flow; and with 0.5.0 the key filter already stops at the toast, yet our `startStreaming` gets the remote's audio | static (c3-a) + verified-on-target (owner-reported, 0.5.0) |
+
+### 3.3 Portability
+
+- **Kernel interfaces:** `EVIOCGRAB`, evdev write and uinput are old, stable Linux ABI (documented); c3-a runs 5.4.96. `UI_DEV_SETUP` and `UI_ABS_SETUP` need kernel 4.5 or later; on an older kernel the clone (C1b) uses the legacy `struct uinput_user_dev` write, exactly as `lginput2` does (section 2). Kernel versions of older webOS TVs are not recorded here (hypothesis: 3.x to 4.x).
+- **Device layout:** `LGE M-RCU - Builtin [0..2]` is seen on webOS 8.3 (c3-a and c3-b, verified-on-target) and on webOS 10.3 / webOS 25 with MR23 and MR25 remotes (LG Input Mapper, CleanYourTV; observed-on-other-device). `/proc/bus/input/devices` dumps posted in magic_mapper issue 12 (a G3 on webOS 8.2, and a "webOS 23" TV on software 13.30.56) show `Builtin [0]` to `[3]` all with `EV=f`, `REL=100`, `ABS=3` and identical key bitmaps (observed-on-other-device), as section 2 predicts for c3-a. magic_mapper's grab-and-resend is reported on a C9 (webOS 4, firmware 05.30.25, "fully tested"), a C2 (webOS 7), a C4 and a C5 (webOS 10) and a C6H (webOS 11.1) (project claims). The CleanYourTV report that no button reached its `lginput2` hook on webOS 5.6 concerns the hook, not the evdev node. The proxy still discovers by name prefix and capability, never by index, and picks the sibling per version (`[2]` before webOS 10, `[1]` from webOS 10, as magic_mapper does).
+- **Counter-report (webOS 11.2):** glasshouse (C5, webOS 11.2, project claim) says its readers on `/dev/input/event*` saw no AI-button presses and that the button goes to `voiceconductor` whatever `com.webos.keyaction.voice` holds; magic_mapper reports working on a C6H with webOS 11.1. On the newest firmware the voice key may not reach evdev at all (hypothesis to check per firmware with a passive reader, as EXP-022 did).
+- **Remotes:** any remote whose voice key arrives on an evdev node: every Magic Remote generation that `lginput2` serves (MR23, MR25 observed), TONE+ earbuds (`[3]`, another code). IR-only remotes mostly have no mic button; Bluetooth remotes that `lginput2` does not parse would appear as their own HID input device, which the same proxy can grab (hypothesis).
+- **Whether removing the key also stops LG's assistant** depends on the firmware's trigger paths (section 1). Each firmware needs one press under the proxy with a log check for `setInputEvent` (Part B), recorded in its compatibility file (ADR 0006 allow list).
+
+### 3.4 Risks, failure modes and rollback
+
+| Failure | Effect | Mitigation and rollback |
+| --- | --- | --- |
+| Proxy crashes or is killed | Grab released at once; with C1b the clone vanishes; the remote works through `[0]` again. A mic press then reaches the key filter: with ADR 0013's override still set, the toast; without it, LG's assistant | Keep ADR 0013's override as the safety net in the first version; the supervisor restarts the proxy |
+| Proxy **hangs** (deadlock, stopped, blocked write) | Magic Remote dead (pointer and keys) until the fd closes | (1) A separate process with one job, no async runtime, no allocation in the loop; (2) `alarm()` re-armed on every loop turn (`poll` timeout 500 ms), so a stalled loop is killed by `SIGALRM`'s default action without any handler; (3) a heartbeat checked by the supervisor, which SIGKILLs after 2 s; (4) the target fd opened `O_NONBLOCK`, so a write cannot block; (5) the IR remote and SSH as the human fallback; a TV restart clears everything |
+| Key stuck | A key down at grab or release never gets its release in the compositor | Grab only with `EVIOCGKEY` all zero; on release, forward pending releases first; on `SYN_DROPPED`, resync with `EVIOCGKEY` and send releases for keys now up |
+| Capability mismatch (C1a) | Events the sibling does not declare are silently dropped (for example a sensor axis) | Part A compares the bitmaps; the proxy refuses C1a unless the target's bitmaps contain `[0]`'s, and then uses C1b or does not run |
+| The cursor wakes on re-emitted keys | magic_mapper's known issue: "Some buttons automatically activate the mouse" (observed-on-other-device) | Part B B2 watches for it; we forward the original events unchanged (magic_mapper resends remapped keys), so it may not apply |
+| Second remote paired into `[2]` (C1a) | Two writers on one device; frames could interleave | Prefer the silent sibling, write whole frames in one `write()`, and fall back to C1b; a household with two Magic Remotes is a Part B question |
+| Compositor treats the target differently (C1b: name or registration) | Pointer or keys ignored, or the cursor behaves as for another remote type | Part B B3 checks it before C1b is used; clone the name exactly |
+| `lginput2` restart | `ENODEV` on the grabbed node | Release, drop the clone, rediscover with backoff (the reader's existing logic) |
+| Persistence | None: a grab and a clone exist only while our fd is open; a TV restart clears both | Nothing to undo on disk |
+
+### 3.5 Effort in the Rust daemon
+
+- **New:** a `remote-proxy` binary (or a mode of the satellite binary started as its own process) of roughly 600 to 900 lines with tests: discovery by bitmap (sysfs `capabilities/*`), the ioctls (`EVIOCGRAB`, `EVIOCGKEY`, `EVIOCGBIT`, `EVIOCGABS`, `EVIOCGID`, `EVIOCGNAME`; uinput `UI_SET_*BIT`, `UI_DEV_SETUP`, `UI_ABS_SETUP`, `UI_DEV_CREATE`, `UI_DEV_DESTROY`) through `rustix` (already a dependency; the capture crate uses raw ioctls the same way), the frame forwarder, the watchdog, and a pipe or Unix socket that passes 428 events (with their kernel times) to the daemon.
+- **Reused:** `crates/satellite/src/evdev.rs` (name lookup, 16- and 24-byte record layouts, `SYN_DROPPED` handling, rediscovery), the supervisor and state-file pattern of `lg_voice.rs`, the `[remote]` configuration and HA switch. The button machine (`remote_ptt.rs`) does not change: it receives the same press and release events from the proxy instead of a passive reader.
+- **Estimate:** 4 to 6 days including host tests (a fake input device pair via a PC's `/dev/uinput` where available, otherwise fake fds), plus the Part A and Part B sessions.
+
+## 4. Candidates C3 to C6 (LG software layers)
+
+### C3a: a silent handler of ours in the key-filter list
+
+Analysed in [research 10.7](remote-mic-button.md#107-part-a-on-c3-a-the-key-filter-list-is-a-candidate-2026-11-07) and draft [ADR 0015](../decisions/0015-silent-mic-key-filter.md). For this note's ranking:
+
+- **Mechanism:** a volatile configd override of `com.webos.surfacemanager.keyFilters` with one entry of ours before `handleHotkeys`; the loader includes any absolute path (`StarfishKeyFilterShell.js` `load()` = `Qt.include("file://" + file)`; verified-on-target file, EXP-025 A3).
+- **Portability: medium.** The same configd list is used by three community projects: `RYUJIN-ISO/lg-tv-home` (`5759796`, G4, webOS 25: `setConfigs` of `com.webos.surfacemanager.keyFilters` with a filter of its own that returns `KeyPolicy.Accepted`, `Key_webOS_Voice` remappable), `rudra-avatar/Hearth` (`895c583`, webOS 7.6; its script notes that webOS 3.4 has no `keyFilters` list) and `rorygallagher2024/glasshouse` (`2af052d`, CX on webOS 5.6: a filter file with a syntax error costs only its own entry) (observed-on-other-device, code read by our research agent). The file locations (`/usr/lib/qml/KeyFilters/` versus `/usr/lib/qt5/qml/KeyFilters/`), the handler names and the voice branch itself vary per firmware; on webOS 11.2 glasshouse reports the voice key handled in a compiled `libappLaunch.so` instead.
+- **Reported side effects:** RYUJIN-ISO notes that every change of the list re-runs `appLaunch.js` `init()`, which pops up Quick Settings (webOS 25); the projects disagree on whether a `setConfigs` value survives a reboot (glasshouse says it does; RYUJIN-ISO and Hearth say runtime only). Our own reading of configd (`volatile` = in memory only) and the volatile flag settle this for us, but it shows why the read-back of ADR 0013 matters.
+- **Risk:** our code runs in `surface-manager` as root; each apply and restore rebuilds every key filter; a broken chain affects **every** remote (IR, Magic Remote, ThinQ app), unlike C1, which affects only the grabbed device.
+- **Effort:** small (the configd machinery of `lg_voice.rs` exists). That is its main appeal on c3-a.
+
+### C3b: bind-mount a patched `appLaunch.js`
+
+- **Mechanism:** copy `/usr/lib/qt5/qml/KeyFilters/appLaunch.js`, change only the voice branch (for example: no `createToast` when the action is a new value such as `"satellite"`, so LG's own `ignore` keeps its meaning), `mount --bind` the copy over the original (non-persistent; webosbrew startup scripts use bind mounts the same way, section 6), and set ADR 0013's override to the new value. The patched file is read only when a filter object is created: through a change of `com.webos.surfacemanager.keyFilters` (the C3a mechanism again; `Qt.include` reads the file each time, hypothesis) or a `surface-manager` restart.
+- **Evidence:** static (c3-a) for the branch (`appLaunch.js` lines 1856 to 1868) and the loader. Observed-on-other-device: `IrvingGuerra/lglow` (`a8c5ec7`, webOS 4.10.2) bind-mounts over `/usr/lib/qt5/qml/KeyFilters/appLaunch.js`, waits until Home, an HDMI input or Live TV is in front, runs `initctl restart surface-manager`, and warns of a 2 s flicker and to reboot if the screen stays black; glasshouse (C2, webOS 9) built the same and dropped it because a restart during boot "tears down the UI and fires a burst of system notifications" and a filter that does not parse "takes the compositor down"; `anubhavmalhotra/r2d2-tv` (`9e555bf`) patches the `Key_webOS_Voice` case to return `Accepted`. Homebrew Channel's `services/startup.sh` (`webosbrew/webos-homebrew-channel` `6e928d0`) bind-mounts its own files at boot the same non-persistent way.
+- **Portability: worst of the compositor options:** the patch is bound to one file hash, so every firmware needs its own patch.
+- **Risk:** as C3a, plus a mount in the root mount namespace and either a chain rebuild or a compositor restart (all apps' windows are lost; not tried, hypothesis). Rollback: `umount`, then the same reload; a TV restart.
+- **Verdict:** strictly worse than C3a; recorded so it is not proposed again.
+
+### C4: toast-level tricks
+
+| Trick | Finding | Label | Verdict |
+| --- | --- | --- | --- |
+| Bind-mount a `.qm` catalogue with an empty translation | `lrelease` drops empty translations, and Qt then shows the source text (the English "This function is not supported."); a hand-made catalogue with an empty string would at best give an empty toast box. The toast window still opens either way | documented (Qt `QCoreApplication::translate` falls back to the source text) + hypothesis for a hand-made catalogue | Useless |
+| Translation that breaks the JSON (an unescaped `"`) | The filter builds the `createToast` payload by string concatenation and `lunaCall.send` calls `JSON.parse` first; an exception there leaves `handleHotkeys` without its `return KeyPolicy.Accepted`, so the key may go on to the foreground app | static (c3-a): `appLaunch.js` 1860, `StarfishKeyFilter.qml` `send()` | **Rejected:** the same source string serves 7 toasts in `appLaunch.js` alone (lines 1675, 1696, 1860, 1874, 1927, 2700, 2982), needs one patched catalogue per UI language, and changes how the key is routed |
+| Close the toast window: `luna://com.webos.service.sysuicompmgr/close {"appId":"com.webos.app.toast"}` | Used by `gprot42/webos-launch-home` (`acb577c`, C5, webOS 25) to dismiss toasts (observed-on-other-device, project code). The toast is its own app window (`com.webos.app.toast`, verified-on-target, EXP-025 A7), so this could close it; it would still flash for at least tens of ms and would close **any** toast showing at that moment | observed-on-other-device + hypothesis for c3-a | **Fallback only:** narrow in time if called right after our 428 press; a change to LG's UI at runtime, needs an ADR; not portable before the toast app existed |
+| `closeToast` right after the toast appears | In OSE it only deletes the history item; the TV's notification service has no per-source method (EXP-025 A6). Even if it closed the window, the toast would flash for tens of ms (it appears 12 to 58 ms after the press) | documented (OSE) + verified-on-target (method list) | **Rejected:** flicker at best, and a change to LG's notification service |
+
+### C5: keep `launch`, pause `voiceconductor`
+
+- **Mechanism:** ADR 0013 decision 2(b) with the key left at `launch`: the filter sends `setInputEvent` to a stopped `voiceconductor`, no toast.
+- **Evidence:** observed-on-other-device (CleanYourTV, webOS 25) + static (c3-a, unit file `Restart=on-failure`; [research 9.2](remote-mic-button.md#92-what-each-lead-turned-out-to-be)).
+- **Portability:** medium; `voiceconductor` exists on webOS 8.3 and 25, unknown before.
+- **Risk:** every `voiceconductor` client waits (Hi LG, Alexa and Search keys, apps using `recordVoice`, Settings pages); the queued `setInputEvent` calls are delivered at SIGCONT, which can open LG's assistant late (inference). Recovery: `kill -CONT`, or a TV restart.
+- **Effort:** small. **Needs** an ADR 0013 amendment (not covered by the AGENTS.md exception) and EXP-023 C2.
+
+### C6: `LD_PRELOAD` shim in `lginput2`
+
+- **Mechanism (new):** a runtime systemd drop-in in `/run/systemd/system/<lginput2 unit>.d/` (gone at reboot) with `Environment=LD_PRELOAD=<shim>.so`, `systemctl daemon-reload`, and a restart of `lginput2`. The shim wraps `write()` on uinput fds, drops `EV_KEY` 428 and passes it to the satellite.
+- **Evidence (observed-on-other-device, project code):** `KevinLWorthington/Mahta` (`16a452b`, webOS 24) sets `LD_PRELOAD` for `lginput2` through `/var/systemd/system/env/lginput2.env` (a persistent path) and restarts `lginput2`; `dinohusejnovic/magic-remote-unlock` (`2b7ccd9`, C5, webOS 10.3) bind-mounts a patched copy over `/usr/sbin/lginput2` and restarts it; LG Input Hook (`Simon34545/lginputhook`, `a607900`, with `sundermann/inputhookpp`) injects with `ezinject` into `lginput2`, `micomservice` or `tvservice` and replaces `lginput_uinput_send_button` (or libc `write` on `/dev/uinput`). Its issues 26 and 31 report it broken on webOS 24/25 (fixed in 1.5.0, per the maintainer), and issues 39, 41 and 46 report 1.5.0 breaking `tvservice` on webOS 4 (black screen, kernel panic).
+- **Portability:** poor in practice: the hook projects' own history (above) shows breakage across webOS 4, 24 and 25.
+- **Risk:** high. Restarting `lginput2` drops every remote and `com.webos.service.mrcu` client; a shim bug crashes LG's input service for all remotes. Rollback: remove the drop-in, `daemon-reload`, restart `lginput2`; a TV restart.
+- **Verdict:** not recommended; process hooking of an LG input service is the class ADR 0013 already rejects.
+
+## 5. Other candidates
+
+| Candidate | Finding | Label | Verdict |
+| --- | --- | --- | --- |
+| **C2: grab without a proxy** | Only possible if 428 had an event node of its own. On c3-a and c3-b it shares `[0]` with the pointer and all keys | verified-on-target (EXP-022) | **Rejected on C3;** Part A re-checks the bitmaps per firmware |
+| **C7: kernel input filter module** | An `input_handler` with a `.filter` callback can drop one key for every reader without a proxy (the mechanism the kernel's own SysRq filter uses) | documented (kernel `input.c` `input_to_handler` calls each handler's `filter` first; `drivers/tty/sysrq.c`) | **Rejected:** needs a module built for LG's exact kernel (`/lib/modules/5.4.96-307`, no `/proc/config.gz`), any bug is a kernel oops on a TV that already had one; no portability |
+| **C8: ls-hub ACL** | Removing the key filter's right to call `voiceconductor/setInputEvent` would silence the `launch` branch; but the ACL is per service (`surface-manager` as a whole), so the Alexa and Search keys and other compositor calls would break too, and the permission files are on the read-only rootfs (bind mounts plus a hub rescan) | hypothesis (ACG files read in research 9) | **Rejected:** not narrow, not credible |
+| `EVIOCSKEYCODE` remap | Changes a scancode-to-keycode table; uinput devices have none | documented (kernel) | Not applicable |
+| App-scoped key-filter bypass | `com.webos.surfacemanager.blockKeyFilterNonCardTypeApps`, `registerAllowedKey`, `activateXinput`: only while a given app is in front | verified-on-target (files, EXP-025 A4) | Low value |
+| A different key | The proxy of C1 can take any key; the owner asked for the mic button | — | Kept as a by-product of C1 |
+
+## 6. Community tools
+
+Read 2026-11-07 by a research agent (clones at the commits named; "code" = read in the code, "claim" = the project or a user says so). All **observed-on-other-device**; none of it is on a C3 with webOS 8.3 except where noted.
+
+| Project | Mechanism | webOS versions and models | Relevance |
+| --- | --- | --- | --- |
+| [LG Input Mapper](https://github.com/fivefold3/lginputmapper) (`fca03ae`) | Code: scans `/dev/input/event*`, matches `EVIOCGNAME` against `LGE *`, skips devices whose keys `[2]` cannot carry, `EVIOCGRAB`, and writes `struct input_event` records into the existing `LGE M-RCU - Builtin [2]` node (`open_output`, `out_flush` in `daemon/lginputmapperd.c`); a uinput clone only if `[2]` is missing. Copies ABS, REL and MSC unchanged; flushes on `SYN_REPORT`; does not forward `SYN_DROPPED`. inotify on `/dev/input` for rescans; reopens the output every 2 s after a write error; a Node service restarts it; installed through `/var/lib/webosbrew/init.d`. Long press by timer (the remote sends no repeats) | C5, webOS 10.3 (claim); no issues filed | **The C1a template**; README claim that new uinput devices are ignored |
+| [magic_mapper](https://github.com/andrewfraley/magic_mapper) (`ae309bc`) and [magic-mapper-webos](https://github.com/afonsojramos/magic-mapper-webos) (`8a14cff`) | Same grab-and-resend (Python), into `[2]`, or `[1]` on webOS 10 and later (Back exited apps through `[2]`); gives up after 5 crashes within 30 s; uninstall releases the grab | C9 webOS 4 (firmware 05.30.25), C2 webOS 7, C4 webOS 10.3.1, C5 webOS 10, C6H webOS 11.1 (claims); issue 12 device dumps from webOS 8.2 and "webOS 23"; issue 31: `block_mouse` intermittently froze Kodi (B9, webOS 4.10) | **Portability evidence for C1a** across webOS 4 to 11 |
+| [CleanYourTV](https://github.com/lasharor/cleanyourtv-WebOS) (`dev`, `0945050`) | LG Input Hook for keys; `voiceinput/startStreaming` for audio; opt-in SIGSTOP/SIGCONT of `voiceconductor` (`helper/voice.js` lines 524 to 545). Its docs say the hook may not see the mic button. No toast handling | webOS 25 (OLED65G26LA, 65UR91006LB) | C5 precedent |
+| [LG Input Hook](https://github.com/Simon34545/lginputhook) (`a607900`), [inputhookpp](https://github.com/sundermann/inputhookpp) (`2e808c1`) | `ezinject` into `lginput2` and others; hooks `lginput_uinput_send_button` | Issues: broken on webOS 24/25 until 1.5.0; 1.5.0 broke `tvservice` on webOS 4 | C6; the fragility record |
+| `RYUJIN-ISO/lg-tv-home` (`5759796`), `rudra-avatar/Hearth` (`895c583`), `rorygallagher2024/glasshouse` (`2af052d`) | Own filter in `com.webos.surfacemanager.keyFilters` via `setConfigs` | webOS 25 (G4), 7.6, 5.6 (CX); not on 3.4; glasshouse's webOS 11.2 notes: keyaction values read by a compiled `libappLaunch.so`, `{"action":"ignore","accept":true}` as "nothing", the AI button reaching `voiceconductor` regardless | C3a portability; the `accept: true` note is a lead only (our 8.3 voice branch does not read `accept`, research 10.2) |
+| `IrvingGuerra/lglow` (`a8c5ec7`), `anubhavmalhotra/r2d2-tv` (`9e555bf`) | Bind-mounted patched `appLaunch.js` (+ `surface-manager` restart) | webOS 4.10.2; r2d2-tv unnamed firmware | C3b |
+| `gprot42/webos-launch-home` (`acb577c`) | Detects presses from `NL_BUTTON_CLICK` log lines; closes toasts with `sysuicompmgr/close`; claims `/tmp/voiceinput_disable_set_input_event` stops `setInputEvent` reaching `voiceconductor` | C5, webOS 25 | C4; the flag-file claim contradicts our static reading for 8.3 (far-field trigger only, research 9.2) and is not pursued |
+| `KevinLWorthington/Mahta` (`16a452b`), `dinohusejnovic/magic-remote-unlock` (`2b7ccd9`) | `LD_PRELOAD` into `lginput2`; patched `lginput2` bind-mounted | webOS 24; C5 webOS 10.3 | C6 |
+| [Homebrew Channel](https://github.com/webosbrew/webos-homebrew-channel) `services/startup.sh` (`6e928d0`) | Bind-mounts its own files, then `run-parts /var/lib/webosbrew/init.d`; glasshouse measured the compositor up at 15 s and init.d at 35 s after boot (C2) | all rooted TVs with HBC | Boot timing for any of the above |
+
+**webOS OSE input stack (documented, OSE only):** `webosose/qtbase-plugins-webos` (`b2cf1fe`) discovers input through udev (`ID_INPUT_KEYBOARD`, `ID_INPUT_KEY`) with hot-plug; but the LG TV backend in `luna-surfacemanager` (`eglfs_starfish.env`) disables Qt's evdev input (`QT_QPA_EGLFS_DISABLE_INPUT=1`) and uses LG's closed `QStarfishInputManager` / `libim`. So public source cannot decide whether a new uinput device would be accepted on a TV. OSE `notificationmgr` (`c50c4d7`) rejects a `createToast` with an empty message ("Message can't be empty").
+
+**Searched and not found:** public proof that a commercial `surface-manager` accepts a new uinput device; the source of LG's `libim`; any public report of the voice-key toast; anything for a C3 / webOS 23 bind-mount of `KeyFilters`; any issue in LG Input Mapper. hyperion-webos and PicCap were not examined (video capture, not input). GitHub code search hit its rate limit, so `Key_webOS_Voice` and `com.webos.keyaction` were only searched inside the cloned repositories.
+
+## 7. Ranking and recommendation
+
+Weights: portability first (other webOS versions, models and remotes), then risk to the TV, then effort.
+
+1. **C1a, grab and re-emit into a sibling (`[2]`, or `[1]` from webOS 10).** The only candidate below every LG-specific layer: no configd key, no compositor code, no LG voice service, no toast string. Two independent projects report the same technique on webOS 4, 7, 10 and 11. Its known risk (a hang kills the Magic Remote) is bounded by the kernel and a watchdog, and does not touch the IR remote. Once proven, the satellite could stop changing LG's voice configuration at all (ADR 0013's override stays as a safety net at first).
+2. **C3a, silent key-filter handler (draft ADR 0015).** Cheapest on c3-a, the pointer never passes through us, and three projects use the list on webOS 5.6 to 25. Ranked below C1a because it runs inside LG's compositor, a broken chain affects every remote, each change rebuilds the chain (Quick Settings pop-up reported), and the voice branch moved into compiled code on webOS 11.2.
+3. **C5, `voiceconductor` pause with `launch`.** No toast, but wide side effects and late LG launches.
+4. **C1b, grab and own uinput clone.** Same code path as C1a, but a new device is reported to be ignored by the compositor: a guarded fallback only, tried once in Part B B4.
+5. **C3b, bind-mounted `appLaunch.js`.** As C3a, plus a compositor restart.
+6. **C6, hooking `lginput2`.** The hook projects' history shows breakage across versions; all remotes at risk.
+7. **C4, toast tricks.** Not narrow, per language, still a flash.
+8. Rejected: C2 (on C3), C7, C8.
+
+**Top recommendation:** build C1a behind a new option, off by default (C1b only if Part B B4 shows that the compositor reads a new device), after the read-only Part A and one authorized Part B session. The ADR for it would replace ADR 0013's override as the primary mechanism (and keep it as the safety net), and would add the grab to the AGENTS.md exception list. No ADR is written yet.
+
+**On-TV access needed:** Part A is read-only (sysfs, `/proc`, unit files; no key press). Part B needs the owner at the TV with the Magic Remote and the IR remote, about 15 minutes, and runs one test binary of ours for at most 60 s per step.
+
+## 8. Draft experiment outline for C1 (to become EXP-026; not written as an experiment yet)
+
+**Device:** c3-a (`03.30.74`), `Active`, LG hands-free off. Raw output only in the gitignored `devices/private/c3-a/EXP-026/` (`/proc/bus/input/devices` holds `Uniq` and `Phys`; keep only `N:`, `H:` and `B:` lines in results). **Never:** ASoC `dapm_widget` or debugfs; the configd `voiceframework` category; any configd write; a read of `/dev/hidraw*`; a write to any input node in Part A.
+
+### Part A: read-only (about 15 minutes, no key press, no write)
+
+| Step | Command (bounded with `timeout`) | Answers |
+| --- | --- | --- |
+| A1 | `cat /proc/bus/input/devices` (private); results keep `N:`, `H:`, `B: EV/KEY/REL/ABS/MSC` for every `LGE` node | Does `[2]` (and `[1]`) declare every bit of `[0]`? Is 428 only on `[0]` to `[2]`? Any node with 428 alone (C2)? |
+| A2 | For each `LGE` node: `readlink -f /sys/class/input/eventN/device`; `cat .../device/id/{bustype,vendor,product,version}`, `.../device/properties`, `.../device/capabilities/{ev,key,rel,abs,msc}` | Virtual (uinput) devices, ids to clone, exact bitmaps |
+| A3 | `ls -l /proc/<pid>/fd` of `surface-manager` and `lginput2`, grep `event` and `uinput` | Who reads and writes which node on c3-a (EXP-022 A did c3-b) |
+| A4 | `pidof systemd-udevd udevd`; `cat /run/udev/data/c13:<minor of event2>` | Does udev run and tag the devices (`ID_INPUT_*`)? (C1b) |
+| A5 | `cat /proc/net/netlink`, keep rows with protocol 15 (`NETLINK_KOBJECT_UEVENT`) and map their port ids to process names | Does `surface-manager` listen for device hot-plug? (C1b) |
+| A6 | `grep -a -o -E '[^ /]*(evdev|input)[^ /]*\.so[^ ]*' /proc/<surface-manager pid>/maps \| sort -u`; the names (not values) of `QT_QPA*` variables in its environment | Which input plugin the compositor uses (Qt evdev, libinput, LG's own) |
+| A7 | `systemctl cat` of the `surface-manager` and `lginput2` units (find the unit names with `systemctl list-units \| grep -i -e surface -e lginput -e mrcu`) | Restart policies; any input-related environment |
+| A8 | Filtered log, once: `grep -a -i -e 'registerEvdev' -e 'input device' -e 'M-RCU' /var/log/messages \| cut -c1-200 \| tail -40` | How LG logs device registration (C1b) |
+
+Part A decides: C1a possible (A1 bitmaps), C1b plausible (A4 to A6, A8), C2 rejected or not (A1).
+
+### Part B: short trial (owner at the TV, separately authorized, about 15 minutes)
+
+**Setup:** the satellite runs with the mic button feature **off**, so `com.webos.keyaction.voice` reads `launch` and nothing of ADR 0013 is active. One test binary of ours (`remote-proxy`, built from this repository, copied to `/tmp`), started as `timeout -s KILL 75 /tmp/remote-proxy ...`, with its own hard limit of 60 s (`alarm`) and the `alarm()` watchdog of section 3.4. The IR remote at hand; an SSH shell open with `pidof remote-proxy` ready.
+
+| Step | What | Pass | Rollback if not |
+| --- | --- | --- | --- |
+| B0 | `--dry-run`, 30 s: open `[0]` read-only, no grab, no write; count events by type and code while the owner moves the pointer and presses OK, Back and the mic button once (silent tap) | Counts match the owner's actions; LG's assistant opens on the tap as today | Nothing to undo |
+| B1 | One injected pointer move into `[2]` (C1a target; `[1]` if Part A shows `[2]` differs), no grab | The cursor jumps to the screen centre | Nothing to undo (one event) |
+| B2 | Grab `[0]` and forward to `[2]` for 60 s: owner moves the pointer, clicks, scrolls the wheel, uses Back, Home, volume with a long press (repeats), number or channel keys, then one mic **tap** and one mic **hold** (silent) | Everything works as before (Back closes a menu rather than the app: magic_mapper's webOS 10 quirk; no cursor wake-up on keys); on the mic presses **no toast, no LG assistant**; the proxy logs the 428 presses and the per-frame latency (target time minus source time); the filtered log shows no `setInputEvent` and no `com.webos.app.toast` in the window | Kill the proxy (SSH `kill -9`, or wait for the 60 s and 75 s limits): the kernel releases the grab. If the remote still misbehaves: re-pair or take out the batteries; a TV restart (owner approval) |
+| B3 | Kill test: repeat B2 for 10 s and `kill -9` the proxy mid-use | The pointer and keys work at once; a mic tap opens LG's assistant again (nothing left over) | As B2 |
+| B4 (optional, only if Part A makes C1b relevant) | Create a clone of `[0]` without grabbing, 20 s: does `surface-manager` open the new node (A3 command)? Then destroy it | The compositor opens it within 2 s | The clone disappears with the process |
+
+**Failure interpretation:** LG's assistant still opens in B2 means a second trigger path on this firmware (record it; C1 alone is not enough there). A missing wheel or pointer means a capability mismatch (back to A1/A2). A latency above about 5 ms per frame, or a visibly jerky pointer, is a negative result for C1a on this TV.
+
+**After Part B:** results in the compatibility file and in this note; then an ADR proposal for C1 (primary) with ADR 0013's override as the safety net.
+
+## 9. Open questions
+
+1. Do `[1]` and `[2]` declare exactly `[0]`'s capabilities on c3-a (static says yes)? Part A A1.
+2. Does `surface-manager` accept a new uinput device, and does it need LG's registration (`xpa_im_registerEvdev`)? Part A A4 to A8, Part B B4.
+3. Is the key filter the only trigger of LG's assistant on other firmware (webOS 25: CleanYourTV pauses `voiceconductor` as well)? One press under the proxy per firmware.
+4. What does `surface-manager` do with events from a second Magic Remote slot (cursor wake-up, Back behaviour as on webOS 10 through `[2]`)? Part B B2 observes it.
+5. On webOS 11.2, glasshouse saw no AI-button events on evdev while magic_mapper works on 11.1: does the voice key leave evdev on the newest firmware? A passive reader (as EXP-022) answers it per firmware.
+6. Does `{"action":"ignore","accept":true}` (glasshouse, webOS 11.2) behave differently anywhere? Not on 8.3 (the voice branch does not read `accept`, research 10.2); recorded as a lead only.

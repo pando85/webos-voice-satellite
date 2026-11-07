@@ -13,6 +13,11 @@ Read in dependency order:
 7. [Deployment and compatibility](07-deployment.md)
 8. [Privacy, security, and performance](08-security-quality.md)
 
+Topic notes (features researched after the feasibility phase):
+
+- [Magic Remote mic button](remote-mic-button.md): the press, the remote's microphone, LG's assistant and its toast
+- [Mic-button key interception](mic-button-key-interception.md): portable ways to take the mic key with no LG toast and no LG assistant (evdev grab and re-emit, compositor and service options), ranked
+
 Use the [source ledger](sources.md) to distinguish vendor-documented facts from observations on **other** devices. Never represent the presence of webOS Open Source Edition APIs as a confirmed LG commercial TV interface.
 
 **Status convention:** `DOCUMENTED` (contract only), `OBSERVED_OTHER_MODEL`, `HYPOTHESIS`, `TARGET_VERIFIED`, `REJECTED`, `INCONCLUSIVE`. A `TARGET_VERIFIED` claim must link an experiment and identify firmware/model/state.
