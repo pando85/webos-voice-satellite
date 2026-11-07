@@ -1600,6 +1600,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "webos-remote-proxy"
+version = "0.5.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "webos-satellite"
 version = "0.5.0"
 dependencies = [

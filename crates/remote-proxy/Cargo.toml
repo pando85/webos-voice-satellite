@@ -1,0 +1,32 @@
+[package]
+name = "webos-remote-proxy"
+description = "webos-voice-satellite: EXP-026 Part B test tool (evdev grab of the Magic Remote, re-send to a sibling node without the mic key)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "remote-proxy"
+path = "src/main.rs"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+# Mirrors [workspace.lints] except `unsafe_code`: the evdev, uinput, poll and
+# signal calls need `unsafe`, which is confined to `src/sys.rs` (the only
+# `#[allow(unsafe_code)]`). Keep the rest in sync with the root Cargo.toml.
+[lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"
+unreachable_pub = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "warn"
+expect_used = "warn"
+dbg_macro = "warn"
+doc_markdown = "allow"
+module_name_repetitions = "allow"

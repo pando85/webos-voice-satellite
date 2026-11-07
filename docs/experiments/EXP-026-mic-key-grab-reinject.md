@@ -2,7 +2,7 @@
 
 > **Part B needs the owner's authorization for each run**, given separately from Part A, with the owner at the TV. Part B grabs the Magic Remote's input device: while it runs, the remote works only through our test binary. Nothing in Part B may run on the strength of this document alone. Part A (read-only) ran once on 2026-11-07, owner-authorized for that run only.
 
-**Status:** Part A **run** (2026-11-07, read-only, c3-a); Part B **PLANNED, not authorized, not run**. The test binary of Part B does not exist yet.
+**Status:** Part A **run** (2026-11-07, read-only, c3-a); Part B **PLANNED, not authorized, not run**. The test binary `remote-proxy` is built and host-tested (2026-11-07, PC only; never copied to a TV).
 **Date:** written and Part A run 2026-11-07
 **Device alias / model / firmware / webOS / architecture:** c3-a (LG C3 42 inch, firmware `03.30.74`, webOS TV 8.3.0, `Rockhopper release 8.3.0-1508`, aarch64 kernel `5.4.96-307`, 32-bit ARM userland). c3-b is not part of this experiment.
 **Power and playback state:** Part A: `Active`, uptime about 14 h; LG hands-free off (unchanged); the satellite running with the mic button feature **on** (its passive reader held `event2`), left alone. Part B: `Active`, the satellite's mic button feature **off** (see prerequisites).
@@ -26,7 +26,7 @@ Can the satellite take the mic key (`EV_KEY` 428) away from LG's compositor at t
 - **Access:** SSH as root (address only in the gitignored local config). Every TV command wrapped in `timeout`. Raw output only in the gitignored `devices/private/c3-a/EXP-026/`. `/proc/bus/input/devices` holds `Uniq` and `Phys` lines (identifiers): never copied into a document.
 - **Never (both parts):** ASoC `dapm_widget` or debugfs (they caused a kernel oops on this TV); the configd `voiceframework` category; any configd write; a read of `/dev/hidraw*`; signals to any LG process; a grab or a write to any input node other than the ones named in Part B.
 - **Part B only:**
-  - The test binary `remote-proxy` built from this repository (to be written; static, armv7 musl like the satellite), reviewed and host-tested before the session: an **input-event proxy only**, no network, no luna, no file writes except its log on stdout.
+  - The test binary `remote-proxy` (crate `crates/remote-proxy`, section "The test binary" below): an **input-event proxy only**, no network, no luna, no file writes; its log goes to stdout.
   - The satellite's mic button feature **off** before the session (HA switch "Remote mic button" or the TV app, by the owner), so `com.webos.keyaction.voice` reads `launch` and the satellite holds no reader on `event2`. Check: `ctl.sh status --json` shows `mic_button_active` false and `lg_voice_key` `lg`. The owner turns it back on afterwards if wanted.
   - Copy the binary to `/tmp/exp026/` (Part B's only file write on the TV); remove it at the end.
 
@@ -50,34 +50,82 @@ Two scripts, streamed with `ssh root@<tv> 'sh -s' < script > devices/private/c3-
 
 ### Part B: short guarded trial (needs per-run authorization; not run)
 
-**Time limits and dead-man kill, all four always on:**
+#### The test binary
 
-1. **Hard cap in the binary:** `alarm(N)` once at start (`N` = the step's limit, at most 60 s); `SIGALRM` keeps its default action (the process dies), no handler.
-2. **Loop watchdog in the binary:** the forward loop polls with a 200 ms timeout and stamps a heartbeat each turn; a second thread checks it every 250 ms and calls `_exit(3)` if it is older than 1 s. Any exit closes the fds, so the kernel releases the grab.
-3. **Session dead-man:** the binary exits when its stdin reaches end of file or on `SIGHUP`, so a dropped SSH session ends it. It runs in the foreground of `ssh -tt`.
-4. **Outer kill:** `timeout -s KILL $((N+10))` around the binary on the TV.
+- **Source:** `crates/remote-proxy` (its own crate; `unsafe` only in `src/sys.rs`, the evdev and uinput ioctls, `poll`, `signalfd`, `alarm`, `_exit`). Modes: `dry-run`, `inject-test`, `grab`, `clone-probe` (usage: run it without arguments).
+- **Build (PC):** `cargo zigbuild -j4 --release -p webos-remote-proxy --target armv7-unknown-linux-musleabi`, as the satellite's armv7 build (`.cargo/config.toml` flags). Output `target/armv7-unknown-linux-musleabi/release/remote-proxy`, never committed.
+- **Build checked for the session (2026-11-07, rustc 1.99.1, this commit):** static ELF 32-bit ARM EABI5, stripped, **416236 bytes**, SHA-256 **`a239c8dafcab8c7db484ac2323b0d46950a236ff5d1a50c315947f60029a45e8`**. Rebuilt twice with the same hash. Rebuild and compare before the session; a different hash means a different binary (code or toolchain change): re-run the host tests below first.
+- **What it checks before touching anything:** both nodes found by **exact name** in sysfs (exactly one match each, never an `eventN`); the source has key 428; source and target capabilities identical (`EVIOCGBIT` for the event types, keys, `REL`, `ABS`, `MSC`); `ABS` ranges identical (`EVIOCGABS`: min, max, fuzz, flat, resolution). Any difference: it logs both and exits with code 2 without grabbing. It logs the capability lists and ranges of both nodes.
+- **Exit codes:** 0 normal end (cap, `q`, signal, stdin end of file), 2 refused or a write error, 3 watchdog, 4 panic, 5 source node gone, 137 the outer kill.
 
-Plus the human fallback: a second SSH shell with `kill -9 $(pidof remote-proxy)` typed in advance, and the IR remote (a separate device, `LGE RCU`, not grabbed).
+#### Dead-man: all four layers always on
 
-**Grab hygiene in the binary:** grab only when `EVIOCGKEY` on `[0]` reports no key down (wait at most 2 s, else exit without grabbing); forward whole frames (up to `SYN_REPORT`) in one `write()`; target opened `O_WRONLY | O_NONBLOCK`; on exit, forward a release for any key still down before closing; on `SYN_DROPPED`, resync with `EVIOCGKEY`; refuse to run unless the target's sysfs capabilities contain all of `[0]`'s and both nodes are found **by name** (never by index).
+1. **Hard cap in the binary:** `--secs` (1 to 60; defaults dry-run 30, inject-test 5, grab 60, clone-probe 20) is a deadline the loop honours (the normal release path runs), and `alarm(secs + 2)` is set at start with `SIGALRM` at its default action, so the process dies even if the loop never runs again.
+2. **Loop watchdog in the binary:** the loop polls with a 200 ms timeout and stamps a heartbeat each turn; a watchdog thread checks every 250 ms and, when the heartbeat is older than 1 s, writes releases for every key still down in the target and calls `_exit(3)`. The exit closes the fds: the kernel releases the grab.
+3. **Session dead-man:** the binary exits on SIGHUP, SIGINT or SIGTERM (handled through `signalfd`, so the normal release path runs), on end of file on stdin, and on a line containing `q` (the owner's or operator's "stop" key). It ignores SIGTTIN and SIGTTOU (a background read must never **stop** the process, which would also stop the watchdog), and it **refuses to start** when stdin is a terminal whose foreground group it is not in (for example under coreutils `timeout` without `--foreground`, which would keep a hangup from reaching it). Run it in the foreground of `ssh -tt`.
+4. **Outer kill on the TV:** not `timeout` (see 3); the command line starts a sleeper that `kill -9`s the binary's pid `N + 10` s later if, and only if, that pid is still `remote-proxy`:
+   `P=$$; (sleep <N+10>; [ "$(cat /proc/$P/comm 2>/dev/null)" = remote-proxy ] && kill -9 $P) & exec /tmp/exp026/remote-proxy ...`
+   (`exec` keeps the shell's pid and foreground group; when the session ends, the sleeper gets the hangup too.)
 
-**Logging:** counts per event type and code, the 428 press and release times, and the per-frame delay (time of our write minus the kernel time of the source frame) as min, median and max. No other content.
+Plus the human fallback: a second SSH shell with the kill typed in advance, and the IR remote (a separate device, `LGE RCU`, never grabbed).
+
+**Grab hygiene (in the binary):** grab only when `EVIOCGKEY` on the source reports no key down (waits at most 2 s, else exits without grabbing); forward whole frames (up to `SYN_REPORT`) in one `write()`, every event except `EV_KEY` 428 (press, release and repeat), unchanged; frames that held only the mic key are not sent; target opened `O_WRONLY | O_NONBLOCK`; on `SYN_DROPPED`, discard up to the next report and release the keys that `EVIOCGKEY` shows up; on every exit (cap, `q`, signal, end of file, watchdog, panic), release in the target every key it holds down, then ungrab.
+
+**Logging (stdout only):** the two nodes' capability lists and `ABS` ranges, the dead-man settings, each 428 press and release with its time since start and the hold length, and at the end the counts per event type and code, the reason for the end, and the frame delay (our write time minus the source frame's kernel time) as frame count, median and maximum in microseconds. Nothing else; no file on the TV.
+
+#### Host tests (PC, 2026-11-07)
+
+- `cargo test -p webos-remote-proxy`: **20 passed** (the filter drops only `EV_KEY` 428 and passes 427, 429 and `REL` code 428; frames; `SYN_DROPPED`; held keys released on exit, once; resync; the cap is 1 to 60 s and the `alarm` comes 2 s after it; the watchdog fires on a stall and not while the loop beats; ioctl numbers equal to the kernel headers' values; c3-a's key bitmap (Part A) has 428, 412, 103, 28 and LG's codes 1194 to 1199; name lookup refuses missing and duplicate names; capability and range comparison). `cargo clippy -D warnings` clean for the host and for the armv7 target.
+- `python3 -I crates/remote-proxy/tests/host_uinput.py target/debug/remote-proxy`: end to end against two throwaway uinput devices with the same keys and `ABS_X`/`ABS_Y` (desktop-harmless joystick buttons `BTN_TRIGGER_HAPPY1..3`, and 428). It needs `/dev/uinput` write access, which this PC grants the user through the seat ACL (no root). **23 of 23 passed:** grab starts; the target gets every key and pointer frame except 428; a second reader of the grabbed source sees nothing; stdin end of file, the 2 s cap, SIGTERM, SIGHUP and `q` each end the run, and the keys still down in the target are released; the **watchdog** (a debug-build-only stall hook, `REMOTE_PROXY_TEST_STALL_MS`, compiled out of the release binary) ends a stalled loop in 1.37 s with code 3 and releases the held key; the grab is gone after every exit; `clone-probe` creates a copy and it disappears; `inject-test` writes the centre of the range; refusals for different capabilities, different `ABS` ranges, the same node twice, a cap above 60 s, a missing name, and a key held at the start.
+- Wrappers under a pseudo-terminal: the outer-kill command line above killed the binary after 2 s of a 6 s cap (exit 137); a hangup of the terminal ended it.
+- **Not tested on the host:** the armv7 binary itself end to end (under `qemu-arm` the kernel answers a 64-bit process, so the record size and sysfs widths differ from the TV's 32-bit compat path; the satellite's reader already uses the same 16-byte records on the TV); the panic hook (unit-level only: it calls the same release-and-`_exit` path as the watchdog).
+
+#### Session commands (owner present; Part B authorized for that run)
+
+On the PC, from the repository (raw output only to the gitignored `devices/private/c3-a/EXP-026/`). `<tv>` is the address from the gitignored local config.
 
 ```sh
-# on the PC
-scp remote-proxy root@<tv>:/tmp/exp026/remote-proxy        # the only file written on the TV
-ssh root@<tv> 'ctl.sh status --json'                         # mic_button_active false, lg_voice_key lg (path per install)
-ssh root@<tv> 'timeout 10 luna-send -n 1 -w 5000 -f luna://com.webos.service.config/getConfigs "{\"configNames\":[\"com.webos.keyaction.voice\"]}"'   # expect "launch" (ssh -tt)
-# each step below in the foreground of: ssh -tt root@<tv> 'timeout -s KILL <N+10> /tmp/exp026/remote-proxy <args>'
+# 0. build and verify, then copy (the only file Part B writes on the TV)
+cargo zigbuild -j4 --release -p webos-remote-proxy --target armv7-unknown-linux-musleabi
+sha256sum target/armv7-unknown-linux-musleabi/release/remote-proxy   # must equal the hash above
+ssh root@<tv> 'mkdir -p /tmp/exp026'
+scp target/armv7-unknown-linux-musleabi/release/remote-proxy root@<tv>:/tmp/exp026/remote-proxy
+ssh root@<tv> 'chmod 755 /tmp/exp026/remote-proxy && sha256sum /tmp/exp026/remote-proxy'   # same hash
+
+# 1. baseline (the owner has turned the mic button feature off)
+ssh root@<tv> '<install>/ctl.sh status --json'      # mic_button_active false, lg_voice_key lg
+ssh -tt root@<tv> 'timeout 10 luna-send -n 1 -w 5000 -f luna://com.webos.service.config/getConfigs "{\"configNames\":[\"com.webos.keyaction.voice\"]}"'   # "launch"
+
+# 2. second shell, kept open for the whole session (the human kill)
+ssh root@<tv>                                          # then, only if needed:  kill -9 $(pidof remote-proxy)
 ```
 
-| Step | Args (limit) | Owner does | Pass | If not |
+Every step runs in the foreground of its own `ssh -tt` (the whole remote command in single quotes, so nothing is expanded on the PC), with the outer kill 10 s after the step's cap:
+
+```sh
+# B0  dry run, 30 s (outer kill at 40 s)
+ssh -tt root@<tv> 'P=$$; (sleep 40; [ "$(cat /proc/$P/comm 2>/dev/null)" = remote-proxy ] && kill -9 $P) & exec /tmp/exp026/remote-proxy dry-run --source "LGE M-RCU - Builtin [0]" --secs 30' | tee devices/private/c3-a/EXP-026/b0.txt
+# B1  one pointer move into [2], 5 s (outer kill at 15 s)
+ssh -tt root@<tv> 'P=$$; (sleep 15; [ "$(cat /proc/$P/comm 2>/dev/null)" = remote-proxy ] && kill -9 $P) & exec /tmp/exp026/remote-proxy inject-test --target "LGE M-RCU - Builtin [2]" --secs 5' | tee devices/private/c3-a/EXP-026/b1.txt
+# B2  grab [0], re-send to [2], 60 s (outer kill at 70 s)
+ssh -tt root@<tv> 'P=$$; (sleep 70; [ "$(cat /proc/$P/comm 2>/dev/null)" = remote-proxy ] && kill -9 $P) & exec /tmp/exp026/remote-proxy grab --source "LGE M-RCU - Builtin [0]" --target "LGE M-RCU - Builtin [2]" --secs 60' | tee devices/private/c3-a/EXP-026/b2.txt
+# B3  kill test, 20 s (outer kill at 30 s); in the second shell after about 10 s: kill -9 $(pidof remote-proxy)
+ssh -tt root@<tv> 'P=$$; (sleep 30; [ "$(cat /proc/$P/comm 2>/dev/null)" = remote-proxy ] && kill -9 $P) & exec /tmp/exp026/remote-proxy grab --source "LGE M-RCU - Builtin [0]" --target "LGE M-RCU - Builtin [2]" --secs 20' | tee devices/private/c3-a/EXP-026/b3.txt
+# B4  optional clone probe, 20 s (outer kill at 30 s)
+ssh -tt root@<tv> 'P=$$; (sleep 30; [ "$(cat /proc/$P/comm 2>/dev/null)" = remote-proxy ] && kill -9 $P) & exec /tmp/exp026/remote-proxy clone-probe --source "LGE M-RCU - Builtin [0]" --secs 20' | tee devices/private/c3-a/EXP-026/b4.txt
+```
+
+For `[1]` instead of `[2]` (B1 or B2 fallback), change only the target name.
+
+To stop any step early: type `q` and Enter in its terminal, or close the terminal (hangup), or use the second shell.
+
+| Step | Command | Owner does | Pass | If not |
 | --- | --- | --- | --- | --- |
-| B0 | `--dry-run --source "LGE M-RCU - Builtin [0]"` (30 s): read-only open, no grab, no write | Moves the pointer, presses OK, Back, and one silent mic tap | Counts match; the mic tap opens LG's assistant as usual (no grab yet) | Stop: parsing or discovery is wrong |
-| B1 | `--inject-test --target "LGE M-RCU - Builtin [2]"` (5 s): no grab, writes **one** frame `ABS_X`, `ABS_Y` = screen centre, `SYN_REPORT` | Watches the cursor | The cursor appears or jumps to the centre: the compositor reads injected events from `[2]` | Repeat once with `[1]`; if neither, stop (C1a fails here) |
-| B2 | `--grab --source "...[0]" --target "...[2]"` (60 s) | Pointer, click, wheel scroll, Back to close a menu (not the app), Home, volume held (repeats), a number key, then one silent mic **tap** and one silent mic **hold** (2 s) | Everything as before; **no toast and no LG assistant** on both mic presses; the binary logs both 428 press and release pairs; frame delay median below 2 ms and max below 10 ms; filtered log of the window shows no `setInputEvent` and no `com.webos.app.toast` | Any failure: the cap or a kill ends it; note what failed. Back exiting the app: repeat B2 with `[1]` as the target (magic_mapper's webOS 10 quirk) |
-| B3 | B2's args (20 s), then `kill -9` from the second shell after about 10 s | Uses the pointer and keys after the kill, then one silent mic tap | Remote works at once after the kill; the tap opens LG's assistant (nothing left over) | See rollback |
-| B4 (optional, only if the owner wants C1b checked) | `--clone-test` (20 s): creates a uinput copy of `[0]` (same name, id, bits, ranges), no grab, writes nothing | Nothing | `ls -l /proc/$(pidof surface-manager)/fd` lists the new node within 2 s | The clone disappears with the process; C1b stays rejected |
+| B0 | `dry-run`, 30 s (no grab, no write) | Moves the pointer, presses OK, Back, and one silent mic tap | Capability lines show `[0]` with 428; counts match the actions; one 428 press and release; LG's assistant opens on the tap as usual (no grab yet); read delay logged | Stop: discovery or parsing is wrong |
+| B1 | `inject-test`, 5 s (no grab, one frame) | Watches the screen | The cursor appears or jumps to the centre: the compositor reads injected events from `[2]` | Repeat once with `[1]` as the target; if neither, stop (C1a fails here) |
+| B2 | `grab`, 60 s | Pointer, click, wheel scroll, Back to close a menu (not the app), Home, volume held (repeats), a number key, then one silent mic **tap** and one silent mic **hold** (about 2 s) | Everything as before; **no toast and no LG assistant** on both mic presses; both 428 pairs logged; frame delay median below 2000 us and max below 10000 us; end reason `cap reached` (or `q`); the filtered log of the window shows no `setInputEvent` and no `com.webos.app.toast` | Any failure: `q`, the cap or a kill ends it; note what failed. Back exiting the app: repeat B2 with `[1]` (magic_mapper's webOS 10 quirk) |
+| B3 | `grab`, 20 s, then `kill -9 $(pidof remote-proxy)` in the second shell after about 10 s | Uses the pointer and keys before and after the kill, then one silent mic tap | Exit 137; the remote works at once after the kill; the tap opens LG's assistant (nothing left over) | See rollback |
+| B4 (optional) | `clone-probe`, 20 s (no grab, no events) | Nothing | The log says `opened by surface-manager after <ms> ms` (C1b possible) or `NOT opened` (C1b rejected on this firmware); the clone disappears at the end | The clone disappears with the process |
 
 Filtered log after B2 and B3 (counting lines only, cut, bounded):
 
@@ -135,7 +183,7 @@ Raw output in the gitignored `devices/private/c3-a/EXP-026/a.txt` and `a2.txt`. 
 
 ## Follow-ups / unresolved questions
 
-- Write and host-test `remote-proxy` (research note section 3.5), then ask for Part B.
-- Read the `ABS` ranges of `[0]` and `[2]` with `EVIOCGABS` at the start of Part B (the binary refuses to run if they differ).
+- ~~Write and host-test `remote-proxy`~~ done (2026-11-07, PC only); Part B waits for the owner's authorization.
+- The `ABS` ranges of `[0]` and `[2]` are read with `EVIOCGABS` at the start of every Part B step (the binary refuses to run if they differ).
 - After Part B: an ADR proposal for C1a, with ADR 0013's override kept as the safety net.
 - c3-b and other firmware: repeat Part A before any Part B there.
