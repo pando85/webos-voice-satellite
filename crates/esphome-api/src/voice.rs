@@ -137,6 +137,10 @@ pub(crate) struct Voice {
     conversation: Option<(String, Instant)>,
     /// An abort was sent and the aborted run's `RUN_END` has not arrived.
     stale_run: bool,
+    /// A `StartPipeline(PushToTalk)` waits for its run to stream: the next
+    /// `StartStreaming` carries `push_to_talk: true`, or
+    /// `AppEvent::PushToTalkFailed` says it will not come.
+    pending_ptt: bool,
     out: Vec<Out>,
 }
 
@@ -169,7 +173,16 @@ impl Voice {
             soft_ends: 0,
             conversation: None,
             stale_run: false,
+            pending_ptt: false,
             out: Vec::new(),
+        }
+    }
+
+    /// A pending push-to-talk request will not stream: tell the application.
+    fn drop_ptt(&mut self) {
+        if std::mem::take(&mut self.pending_ptt) {
+            log::info!("voice: the push-to-talk run did not start");
+            self.app(AppEvent::PushToTalkFailed);
         }
     }
 
@@ -240,6 +253,7 @@ impl Voice {
             if self.subscribed && !self.muted {
                 log::debug!("voice: no run while the microphone delivers no audio");
             }
+            self.drop_ptt();
             self.phase = Phase::Idle;
             return;
         }
@@ -249,6 +263,10 @@ impl Voice {
                 wake_word,
             };
             return;
+        }
+        if wake_word {
+            // A wake word session replaces a push-to-talk start.
+            self.drop_ptt();
         }
         let conversation_id = self.conversation_id(now).unwrap_or_default();
         self.ha(ToHa::Start {
@@ -305,6 +323,7 @@ impl Voice {
     }
 
     fn fail(&mut self, now: Instant, config_error: bool) {
+        self.drop_ptt();
         self.failures = self.failures.saturating_add(1);
         let delay = backoff_delay(self.failures, config_error);
         log::info!(
@@ -380,12 +399,14 @@ impl Voice {
             }
         } else {
             self.abort_run();
+            self.drop_ptt();
             self.subscribed = false;
             self.phase = Phase::Idle;
         }
     }
 
     pub(crate) fn on_disconnect(&mut self) {
+        self.drop_ptt();
         self.stop_streaming(false);
         // SPEAKER mode: a reply whose stream already ended is complete on the
         // device and finishes playing; HA needs no report for it. A reply
@@ -426,9 +447,11 @@ impl Voice {
         self.phase = Phase::Running;
         self.run.streaming = true;
         let conversation_id = self.conversation_id(now);
+        let push_to_talk = !self.run.wake_word && std::mem::take(&mut self.pending_ptt);
         self.app(AppEvent::StartStreaming {
             wake_word: self.run.wake_word,
             conversation_id,
+            push_to_talk,
         });
     }
 
@@ -567,6 +590,7 @@ impl Voice {
         start_conversation: bool,
     ) {
         self.abort_run();
+        self.drop_ptt();
         // HA's cancel of the idle run that came with this announcement is
         // not a failure and does not add to any backoff.
         self.soft_ends = 0;
@@ -594,6 +618,9 @@ impl Voice {
     pub(crate) fn on_start_pipeline(&mut self, now: Instant, mode: PipelineMode) {
         if self.muted {
             log::warn!("voice: start ignored while muted");
+            if mode == PipelineMode::PushToTalk {
+                self.app(AppEvent::PushToTalkFailed);
+            }
             return;
         }
         match mode {
@@ -604,19 +631,24 @@ impl Voice {
                 }
             }
             PipelineMode::PushToTalk => {
-                if !self.capture_live {
-                    log::warn!("voice: push-to-talk ignored; the microphone delivers no audio");
+                let refusal = if !self.capture_live {
+                    Some("the microphone delivers no audio")
+                } else if matches!(self.phase, Phase::Announcing { .. }) {
+                    Some("an announcement plays")
+                } else if !self.subscribed {
+                    Some("HA has not subscribed")
+                } else {
+                    None
+                };
+                if let Some(why) = refusal {
+                    log::warn!("voice: push-to-talk ignored; {why}");
+                    self.app(AppEvent::PushToTalkFailed);
                     return;
                 }
-                if matches!(self.phase, Phase::Announcing { .. }) {
-                    log::warn!("voice: push-to-talk ignored during an announcement");
-                    return;
-                }
-                if !self.subscribed {
-                    log::warn!("voice: push-to-talk ignored; HA has not subscribed");
-                    return;
-                }
+                // A newer request replaces one still waiting (silently: the
+                // application asked again).
                 self.abort_run();
+                self.pending_ptt = true;
                 self.start(now, false);
             }
         }
@@ -637,6 +669,7 @@ impl Voice {
     pub(crate) fn on_stop_pipeline(&mut self) {
         self.armed = false;
         self.abort_run();
+        self.drop_ptt();
         if !matches!(self.phase, Phase::Announcing { .. }) {
             self.phase = Phase::Idle;
         }
@@ -676,6 +709,7 @@ impl Voice {
     /// audio stream), a reply that is playing finishes, and nothing re-arms
     /// until listening is possible again. An announcement is not touched.
     fn halt_listening(&mut self) {
+        self.drop_ptt();
         match self.phase {
             Phase::Running
                 if self.run.playback_pending || self.run.tts_stream != TtsStream::None =>
@@ -794,7 +828,8 @@ mod tests {
             v.take(),
             [Out::App(AppEvent::StartStreaming {
                 wake_word: true,
-                conversation_id: None
+                conversation_id: None,
+                push_to_talk: false
             })]
         );
         assert!(v.is_streaming());
@@ -1233,7 +1268,7 @@ mod tests {
             ]
         );
         v.on_start_pipeline(t0, PipelineMode::PushToTalk);
-        assert!(v.take().is_empty());
+        assert_eq!(v.take(), [Out::App(AppEvent::PushToTalkFailed)]);
         // HA ends the aborted run while the mic is muted.
         ev(&mut v, t0, Ev::VoiceAssistantRunEnd, &[]);
         assert!(v.take().is_empty());
@@ -1388,7 +1423,7 @@ mod tests {
         let t0 = Instant::now();
         let mut v = armed_without_capture(t0);
         v.on_start_pipeline(t0, PipelineMode::PushToTalk);
-        assert!(v.take().is_empty());
+        assert_eq!(v.take(), [Out::App(AppEvent::PushToTalkFailed)]);
     }
 
     #[test]
@@ -1539,7 +1574,8 @@ mod tests {
             v.take(),
             [Out::App(AppEvent::StartStreaming {
                 wake_word: true,
-                conversation_id: None
+                conversation_id: None,
+                push_to_talk: false
             })]
         );
     }
@@ -1640,10 +1676,138 @@ mod tests {
             v.take(),
             [Out::App(AppEvent::StartStreaming {
                 wake_word: false,
-                conversation_id: None
+                conversation_id: None,
+                push_to_talk: true
             })]
         );
         assert!(v.is_streaming());
+    }
+
+    fn ptt_failed(out: &[Out]) -> usize {
+        out.iter()
+            .filter(|o| matches!(o, Out::App(AppEvent::PushToTalkFailed)))
+            .count()
+    }
+
+    fn streams(out: &[Out]) -> Vec<(bool, bool)> {
+        out.iter()
+            .filter_map(|o| match o {
+                Out::App(AppEvent::StartStreaming {
+                    wake_word,
+                    push_to_talk,
+                    ..
+                }) => Some((*wake_word, *push_to_talk)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn only_the_push_to_talk_run_is_marked_and_its_follow_up_is_not() {
+        let t0 = Instant::now();
+        let mut v = Voice::new(false);
+        v.on_subscribe(t0, true);
+        v.on_start_pipeline(t0, PipelineMode::PushToTalk);
+        v.on_response(t0, 0, false);
+        assert_eq!(streams(&v.take()), [(false, true)]);
+        ev(&mut v, t0, Ev::VoiceAssistantSttEnd, &[("text", "hi")]);
+        ev(
+            &mut v,
+            t0,
+            Ev::VoiceAssistantIntentEnd,
+            &[("continue_conversation", "1")],
+        );
+        ev(&mut v, t0, Ev::VoiceAssistantRunEnd, &[]);
+        v.take();
+        // The continue_conversation follow-up is HA's run, not the button's.
+        v.on_response(t0, 0, false);
+        let out = v.take();
+        assert_eq!(streams(&out), [(false, false)]);
+        assert_eq!(ptt_failed(&out), 0);
+    }
+
+    #[test]
+    fn a_refused_push_to_talk_is_reported() {
+        let t0 = Instant::now();
+        // Not subscribed.
+        let mut v = Voice::new(false);
+        v.on_start_pipeline(t0, PipelineMode::PushToTalk);
+        assert_eq!(v.take(), [Out::App(AppEvent::PushToTalkFailed)]);
+        // No live capture.
+        v.on_subscribe(t0, true);
+        v.on_capture(t0, false);
+        v.take();
+        v.on_start_pipeline(t0, PipelineMode::PushToTalk);
+        assert_eq!(v.take(), [Out::App(AppEvent::PushToTalkFailed)]);
+        // Muted.
+        v.on_capture(t0, true);
+        v.on_mute(t0, true);
+        v.take();
+        v.on_start_pipeline(t0, PipelineMode::PushToTalk);
+        assert_eq!(v.take(), [Out::App(AppEvent::PushToTalkFailed)]);
+        // During an announcement.
+        v.on_mute(t0, false);
+        v.on_announce("http://a".into(), String::new(), String::new(), false);
+        v.take();
+        v.on_start_pipeline(t0, PipelineMode::PushToTalk);
+        assert_eq!(v.take(), [Out::App(AppEvent::PushToTalkFailed)]);
+    }
+
+    #[test]
+    fn a_failed_or_dropped_push_to_talk_start_is_reported_once() {
+        let t0 = Instant::now();
+        // HA answers with an error.
+        let mut v = Voice::new(false);
+        v.on_subscribe(t0, true);
+        v.on_start_pipeline(t0, PipelineMode::PushToTalk);
+        v.take();
+        v.on_response(t0, 0, true);
+        assert_eq!(ptt_failed(&v.take()), 1);
+        // HA does not answer.
+        v.on_start_pipeline(t0, PipelineMode::PushToTalk);
+        v.take();
+        v.on_tick(t0 + START_TIMEOUT);
+        assert_eq!(ptt_failed(&v.take()), 1);
+        // An announcement takes over while it starts; the start_conversation
+        // run after it is not the button's.
+        v.on_start_pipeline(t0, PipelineMode::PushToTalk);
+        v.take();
+        v.on_announce("http://a".into(), String::new(), String::new(), true);
+        assert_eq!(ptt_failed(&v.take()), 1);
+        ev(&mut v, t0, Ev::VoiceAssistantRunEnd, &[]);
+        v.on_announce_finished(t0, true);
+        v.take();
+        v.on_response(t0, 0, false);
+        let out = v.take();
+        assert_eq!(streams(&out), [(false, false)]);
+        assert_eq!(ptt_failed(&out), 0);
+        // Mute while it waits for the aborted run's end.
+        let mut v = armed_and_streaming(t0);
+        v.on_start_pipeline(t0, PipelineMode::PushToTalk);
+        v.take();
+        v.on_mute(t0, true);
+        assert_eq!(ptt_failed(&v.take()), 1);
+        v.on_mute(t0, false);
+        assert_eq!(ptt_failed(&v.take()), 0, "reported once");
+        // A disconnect.
+        let mut v = Voice::new(false);
+        v.on_subscribe(t0, true);
+        v.on_start_pipeline(t0, PipelineMode::PushToTalk);
+        v.take();
+        v.on_disconnect();
+        assert_eq!(ptt_failed(&v.take()), 1);
+    }
+
+    #[test]
+    fn a_second_push_to_talk_replaces_the_first_silently() {
+        let t0 = Instant::now();
+        let mut v = Voice::new(false);
+        v.on_subscribe(t0, true);
+        v.on_start_pipeline(t0, PipelineMode::PushToTalk);
+        v.take();
+        v.on_start_pipeline(t0, PipelineMode::PushToTalk);
+        let out = v.take();
+        assert_eq!(ptt_failed(&out), 0, "{out:?}");
     }
 
     #[test]

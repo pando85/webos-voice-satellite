@@ -159,6 +159,9 @@ pub(crate) struct RemoteMic {
     tx: mpsc::UnboundedSender<(u64, StreamEvent)>,
     generation: u64,
     session: Option<Session>,
+    /// Tasks of closed sessions that may still be killing and reaping their
+    /// child; awaited by [`RemoteMic::shutdown`].
+    closing: Vec<tokio::task::JoinHandle<()>>,
 }
 
 impl RemoteMic {
@@ -168,6 +171,7 @@ impl RemoteMic {
             tx,
             generation: 0,
             session: None,
+            closing: Vec::new(),
         }
     }
 
@@ -198,24 +202,24 @@ impl RemoteMic {
     }
 
     /// Ends the session: the subscription child is killed and reaped by its
-    /// task, the reader thread stops within [`READ_TIMEOUT`].
+    /// task, the reader thread stops within [`READ_TIMEOUT`]. The task is
+    /// kept until it has finished, for [`RemoteMic::shutdown`].
     pub(crate) fn close(&mut self) {
+        self.closing.retain(|t| !t.is_finished());
         if let Some(s) = self.session.take() {
             s.stop.store(true, Ordering::Relaxed);
             let _ = s.stop_tx.send(true);
+            self.closing.push(s.task);
         }
     }
 
-    /// Closes and waits (bounded) until the child is gone.
+    /// Closes the session and waits (3 s at most in all) until every
+    /// session's child is killed and reaped, also of sessions closed before.
     pub(crate) async fn shutdown(&mut self) {
-        if let Some(s) = self.session.take() {
-            s.stop.store(true, Ordering::Relaxed);
-            let _ = s.stop_tx.send(true);
-            let mut task = s.task;
-            if tokio::time::timeout(Duration::from_secs(3), &mut task)
-                .await
-                .is_err()
-            {
+        self.close();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        for mut task in std::mem::take(&mut self.closing) {
+            if tokio::time::timeout_at(deadline, &mut task).await.is_err() {
                 task.abort();
             }
         }
@@ -632,6 +636,31 @@ exec sleep 30"#,
         assert!(!gone(pid));
         mic.shutdown().await;
         assert!(gone(pid), "the subscription child {pid} is still running");
+        server.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shutdown_after_close_still_waits_for_the_child() {
+        let dir = tmp("closewait");
+        let sock = dir.join("remote1.soc");
+        let listener = UnixListener::bind(&sock).unwrap();
+        let luna = fake(&dir, &sock, 0);
+        let server = std::thread::spawn(move || {
+            let (_c, _) = listener.accept().unwrap();
+            std::thread::sleep(Duration::from_secs(2));
+        });
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut mic = RemoteMic::new(cfg(Some(luna)), tx);
+        mic.open();
+        assert_eq!(next(&mut rx).await, (1, StreamEvent::Opened));
+        let pid = read_pid(&dir.join("pid"));
+        // The machine closes the stream (release, halt), then the daemon
+        // shuts down: the child must be reaped when shutdown returns, with
+        // no polling.
+        mic.close();
+        mic.shutdown().await;
+        assert!(gone(pid), "the subscription child {pid} outlived shutdown");
         server.join().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }

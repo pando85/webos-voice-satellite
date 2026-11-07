@@ -568,8 +568,15 @@ struct Daemon {
     /// HA's `aec_enabled` and `music_enabled` switches (ADR 0012), when
     /// `ctl.sh` is found.
     config_switches: Option<ConfigSwitches>,
-    /// The Magic Remote's mic button (`[remote]`), when its reader runs.
+    /// The Magic Remote's mic button (`[remote] mic_button = "ptt"`).
     remote: Option<Button>,
+    /// Speech-to-text audio streams now: a run without the wake word, or a
+    /// wake word run after the wake word. Set by `StartStreaming` (no wake
+    /// word) and `WakeWordDetected`, cleared by `StopStreaming`, `RunEnd`
+    /// and a disconnect. Unlike `in_run` it cannot stay set when the voice
+    /// layer aborted a run and swallowed HA's `RUN_END`; the mic button
+    /// joins only a run for which it is set.
+    stt_streaming: bool,
 }
 
 impl Daemon {
@@ -956,7 +963,7 @@ impl Daemon {
             mic_open: self.shared.open.load(Ordering::Relaxed),
             announcing: self.player.is_active()
                 && self.player.current_kind() == Some(Kind::Announce),
-            run_streaming: self.in_run && self.shared.streaming.load(Ordering::Relaxed),
+            run_streaming: self.stt_streaming && self.shared.streaming.load(Ordering::Relaxed),
         }
     }
 
@@ -1007,15 +1014,29 @@ impl Daemon {
         self.run_remote_acts(acts).await;
     }
 
+    /// Follows whether speech-to-text audio streams (see `stt_streaming`).
+    fn track_stt(&mut self, ev: &AppEvent) {
+        match ev {
+            AppEvent::StartStreaming { wake_word, .. } => self.stt_streaming = !wake_word,
+            AppEvent::WakeWordDetected => self.stt_streaming = true,
+            AppEvent::StopStreaming | AppEvent::RunEnd | AppEvent::HaDisconnected => {
+                self.stt_streaming = false;
+            }
+            _ => {}
+        }
+    }
+
     /// The mic button follows the voice layer's events.
     async fn remote_on_event(&mut self, ev: &AppEvent) {
         let Some(b) = self.remote.as_mut() else {
             return;
         };
         let acts = match ev {
+            // Only the run its own push-to-talk request started.
             AppEvent::StartStreaming {
-                wake_word: false, ..
+                push_to_talk: true, ..
             } => b.on_run_started(),
+            AppEvent::PushToTalkFailed => b.on_ptt_failed(),
             AppEvent::StopStreaming | AppEvent::RunEnd => b.on_audio_over(),
             AppEvent::HaDisconnected => b.halt("Home Assistant disconnected"),
             AppEvent::MuteChanged(true) => b.halt("the microphone was muted"),
@@ -1383,6 +1404,7 @@ impl Daemon {
             self.on_timer(&ev).await;
             return;
         }
+        self.track_stt(&ev);
         self.remote_on_event(&ev).await;
         // A command for a TV control entity.
         let tv_out = self.tv.as_mut().and_then(|tv| tv.on_event(&ev));
@@ -1687,14 +1709,20 @@ fn status_version(v: &Verdict) -> &str {
     }
 }
 
-/// Starts the mic button's reader (and, with `mic_button = "ptt"`, its
-/// machine and the remote microphone). `None` when the thread cannot start.
+/// Starts the mic button (reader thread, machine, remote microphone) with
+/// `mic_button = "ptt"`. `None` with `"off"` (no thread, no device opened)
+/// or when the thread cannot start.
 fn start_remote(settings: &Settings) -> Option<remote_ptt::Started> {
     let r = &settings.remote;
-    let luna = (r.ptt() && r.remote_mic)
+    if !r.ptt() {
+        log::info!("remote mic button: off (mic_button = \"off\")");
+        return None;
+    }
+    let luna = r
+        .remote_mic
         .then(|| power::find_binary(&settings.power.luna_send))
         .flatten();
-    if r.ptt() && r.remote_mic && luna.is_none() {
+    if r.remote_mic && luna.is_none() {
         log::info!(
             "remote mic: {} not found; button runs use the TV microphone (normal off the TV)",
             settings.power.luna_send.display()
@@ -1950,8 +1978,8 @@ pub(crate) async fn run(mut settings: Settings, triggers: TestTriggers) -> Resul
         Some((m, rx)) => (Some(m), Some(rx)),
         None => (None, None),
     };
-    // The Magic Remote's mic button: the passive reader always runs (it
-    // only observes with mic_button = "off"); hold-to-talk with "ptt".
+    // The Magic Remote's mic button: nothing at all is started unless
+    // mic_button = "ptt" (a change restarts the daemon).
     let (remote, mut remote_keys, mut remote_stream) = match start_remote(&settings) {
         Some(st) => (Some(st.button), Some(st.keys), Some(st.stream)),
         None => (None, None, None),
@@ -2010,6 +2038,7 @@ pub(crate) async fn run(mut settings: Settings, triggers: TestTriggers) -> Resul
         music,
         config_switches,
         remote,
+        stt_streaming: false,
     };
     d.publish_voice_status();
     d.publish_timers().await;
@@ -2466,6 +2495,7 @@ mod tests {
             music: None,
             config_switches: None,
             remote: None,
+            stt_streaming: false,
         };
         (d, cmd_rx)
     }
@@ -3160,6 +3190,45 @@ esac
         d.player.start_stream(16_000, 1);
         assert_eq!(d.busy(), Some(Busy::Voice));
         d.halt_chime();
+    }
+
+    #[tokio::test]
+    async fn the_mic_button_joins_only_while_speech_to_text_streams() {
+        let dir = test_dir("stt-join");
+        let (mut d, _rx) = test_daemon(&dir, RemoteOff::Normal, false);
+        let start = |wake_word: bool| AppEvent::StartStreaming {
+            wake_word,
+            conversation_id: None,
+            push_to_talk: false,
+        };
+        let joinable = |d: &Daemon| d.remote_ctx().run_streaming;
+        // A continued conversation streams: joinable.
+        d.on_event(start(false)).await;
+        assert!(joinable(&d));
+        // The voice layer aborts it (mute, capture loss, an announcement)
+        // and swallows HA's RUN_END: only StopStreaming arrives.
+        d.on_event(AppEvent::StopStreaming).await;
+        assert!(!joinable(&d));
+        // The wake word session that follows is not joinable, although
+        // in_run is still set from the aborted run.
+        d.on_event(start(true)).await;
+        assert!(d.in_run, "the stale flag this test is about");
+        assert!(!joinable(&d));
+        // After the wake word it is speech-to-text: joinable.
+        d.on_event(AppEvent::WakeWordDetected).await;
+        assert!(joinable(&d));
+        d.on_event(AppEvent::RunEnd).await;
+        assert!(!joinable(&d));
+        d.on_event(start(false)).await;
+        d.on_event(AppEvent::HaDisconnected).await;
+        assert!(!joinable(&d));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mic_button_off_starts_nothing() {
+        // Off is inert: no reader thread, no device opened, no machine.
+        assert!(start_remote(&Settings::default()).is_none());
     }
 
     #[tokio::test]

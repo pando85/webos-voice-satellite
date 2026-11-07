@@ -32,5 +32,21 @@ webos-tv-control = { workspace = true }
 [target.'cfg(target_env = "musl")'.dependencies]
 dlmalloc = { version = "0.2", features = ["global"] }
 
-[lints]
-workspace = true
+# Mirrors [workspace.lints] except `unsafe_code`: the `pre_exec` hook that
+# makes a `luna-send` subscription child die with the daemon
+# (PR_SET_PDEATHSIG) needs `unsafe`, confined to `power::start_child` (the
+# only `#[allow(unsafe_code)]`). Keep the rest in sync with the root
+# Cargo.toml.
+[lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"
+unreachable_pub = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "warn"
+expect_used = "warn"
+dbg_macro = "warn"
+doc_markdown = "allow"
+module_name_repetitions = "allow"

@@ -234,8 +234,33 @@ fn open_pty() -> std::io::Result<(std::fs::File, std::os::fd::OwnedFd)> {
     Ok((std::fs::File::from(master), slave))
 }
 
+/// Makes the child get SIGKILL when the thread that spawned it ends
+/// (`PR_SET_PDEATHSIG`): a subscription must not outlive the daemon, also
+/// when it does not get to kill its children (a panic abort, the watchdog's
+/// exit, SIGKILL). A leftover `voiceinput` subscription would hold LG's
+/// remote stream until a reboot. The daemon spawns from its single runtime
+/// thread, which lives as long as the process. If the parent is already
+/// gone when the child starts, the child does not run.
+#[allow(unsafe_code)]
+fn die_with_parent(cmd: &mut Command) {
+    let parent = rustix::process::getpid();
+    // SAFETY: the closure runs in the forked child before exec and only
+    // makes two system calls (prctl and getppid), which are
+    // async-signal-safe; it allocates nothing and takes no lock.
+    unsafe {
+        cmd.pre_exec(move || {
+            rustix::process::set_parent_process_death_signal(Some(rustix::process::Signal::KILL))?;
+            if rustix::process::getppid() != Some(parent) {
+                return Err(std::io::Error::other("the parent is gone"));
+            }
+            Ok(())
+        });
+    }
+}
+
 /// Starts `luna-send -i <uri> <payload>` on a pty; lines arrive on the
-/// receiver, which closes when the child's terminal is gone.
+/// receiver, which closes when the child's terminal is gone. The child dies
+/// with this process ([`die_with_parent`]).
 pub(crate) fn start_child(
     luna: &Path,
     uri: &str,
@@ -250,6 +275,7 @@ pub(crate) fn start_child(
         .stdout(Stdio::from(slave.try_clone()?))
         .stderr(Stdio::from(slave))
         .kill_on_drop(true);
+    die_with_parent(&mut cmd);
     let child = cmd.spawn()?;
     // The Command holds the slave descriptors: drop them, so the master
     // read ends (EIO) when the child is gone.
@@ -660,6 +686,57 @@ printf '{"returnValue":true,"state":"Active Standby","processing":"Request Power
         assert_eq!(got[1].reason.as_deref(), Some("remoteKey"));
         assert_eq!(got[2].state.as_deref(), Some("Active"), "restarted");
         w.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_subscription_child_dies_with_the_thread_that_spawned_it() {
+        let dir = std::env::temp_dir().join(format!("webos-sat-power-pd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let pidfile = dir.join("pid");
+        let luna = fake_luna(
+            &dir,
+            &format!("echo $$ > '{}'\nexec sleep 30", pidfile.display()),
+        );
+        // A thread with its own runtime spawns the child and ends without
+        // killing it (as if the daemon died): kill_on_drop is bypassed.
+        let read_pid = |f: &Path| {
+            std::fs::read_to_string(f)
+                .ok()
+                .and_then(|t| t.trim().parse::<i32>().ok())
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let (l, pf) = (luna.clone(), pidfile.clone());
+        let pid = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let (child, _lines) = start_child(&l, "luna://x/y", "{}").unwrap();
+                std::mem::forget(child);
+            });
+            // Wait until the child runs its script, then end the thread.
+            loop {
+                if let Some(p) = read_pid(&pf) {
+                    break p;
+                }
+                assert!(std::time::Instant::now() < deadline, "no pid");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        })
+        .join()
+        .unwrap();
+        let alive = || {
+            Path::new(&format!("/proc/{pid}")).exists()
+                && !std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                    .unwrap_or_default()
+                    .contains(") Z ")
+        };
+        while alive() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!alive(), "child {pid} outlived the thread that spawned it");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

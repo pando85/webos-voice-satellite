@@ -222,7 +222,18 @@ pub enum AppEvent {
         wake_word: bool,
         /// Conversation id sent with the request, if continuing one.
         conversation_id: Option<String>,
+        /// This is the run of the last
+        /// `StartPipeline { mode: PushToTalk }` (not a wake word run, a
+        /// `continue_conversation` follow-up or a `start_conversation` run).
+        push_to_talk: bool,
     },
+    /// The last `StartPipeline { mode: PushToTalk }` will not stream: it was
+    /// refused (muted, no live capture, an announcement, HA not subscribed)
+    /// or its start failed or was dropped (HA's error answer, no answer, an
+    /// announcement, mute, capture loss, a disconnect, `StopPipeline`).
+    /// Sent once per request that does not reach
+    /// [`AppEvent::StartStreaming`] with `push_to_talk: true`.
+    PushToTalkFailed,
     /// Stop sending audio (end of speech, error, run end, abort, mute).
     StopStreaming,
     /// HA's wake word engine detected the wake word.
@@ -534,6 +545,7 @@ impl fmt::Debug for AppEvent {
             Self::StartStreaming {
                 wake_word,
                 conversation_id,
+                push_to_talk,
             } => f
                 .debug_struct("StartStreaming")
                 .field("wake_word", wake_word)
@@ -541,7 +553,9 @@ impl fmt::Debug for AppEvent {
                     "conversation_id",
                     &conversation_id.as_ref().map(|_| "<set>"),
                 )
+                .field("push_to_talk", push_to_talk)
                 .finish(),
+            Self::PushToTalkFailed => f.write_str("PushToTalkFailed"),
             Self::StopStreaming => f.write_str("StopStreaming"),
             Self::WakeWordDetected => f.write_str("WakeWordDetected"),
             Self::Transcript(t) => write!(f, "Transcript(<{} bytes>)", t.len()),
@@ -738,6 +752,7 @@ mod tests {
             AppEvent::StartStreaming {
                 wake_word: true,
                 conversation_id: Some("SECRET".to_owned()),
+                push_to_talk: false,
             },
             AppEvent::Error {
                 code: "stt-failed".to_owned(),

@@ -12,8 +12,21 @@
 //!   event (other keys, the pointer) is dropped unread beyond its type and
 //!   code; nothing is logged or kept.
 //! - When the device goes away (a read error or the end of the file) a press
-//!   still held is reported released, and the device is looked up again.
-//!   When it is not there, it is looked up again every few seconds.
+//!   still held is reported released, and the device is looked up again,
+//!   with a growing pause (1 s doubling to 30 s) and a log line only at the
+//!   1st, 2nd, 4th, 8th ... loss in a row. When it is not there, it is
+//!   looked up again every few seconds (logged once).
+//! - The kernel's own event time is reported with each press and release
+//!   (the hold length is measured from it, not from when the thread read
+//!   the event).
+//! - `SYN_DROPPED` (the kernel's buffer overflowed): the events up to the
+//!   next `SYN_REPORT` are discarded and a held key is reported released
+//!   ("lost"), so the state is never stuck down; the next press starts
+//!   anew. A press while the key is already down (a release that was
+//!   missed) is reported as a lost release followed by the press. The
+//!   uinput node survives a Bluetooth disconnect of the remote (EXP-022), so
+//!   a release that never comes is not detected here: the hold's cap ends
+//!   it.
 //!
 //! Records follow the kernel's layout for this process: a `struct timeval`
 //! of two `long`s, then `u16` type, `u16` code and `i32` value (16 bytes for
@@ -30,16 +43,26 @@ use tokio::sync::mpsc;
 
 /// Size of one `struct input_event` for this process.
 pub(crate) const EVENT_SIZE: usize = 2 * std::mem::size_of::<usize>() + 8;
+/// `EV_SYN`, with its codes `SYN_REPORT` and `SYN_DROPPED`.
+const EV_SYN: u16 = 0;
+const SYN_REPORT: u16 = 0;
+const SYN_DROPPED: u16 = 3;
 /// `EV_KEY`.
 const EV_KEY: u16 = 1;
+/// Longest pause between two attempts after the device went away.
+const LOSS_PAUSE_MAX: Duration = Duration::from_secs(30);
 
 /// What the reader reports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Key {
     /// The device was found by name and opened (again).
     Found,
-    Pressed,
-    Released,
+    /// The key went down, at this kernel event time.
+    Pressed(Duration),
+    /// The key went up at this kernel event time, or `None`: the release
+    /// was lost (the device went away, the kernel dropped events, or a
+    /// press came without a release).
+    Released(Option<Duration>),
 }
 
 /// Where input devices are listed and opened (fixed on the TV, a temporary
@@ -99,15 +122,33 @@ pub(crate) fn find_device(paths: &InputPaths, name: &str) -> Option<PathBuf> {
     })
 }
 
-/// Type, code and value of one record.
-pub(crate) fn parse_event(rec: &[u8]) -> Option<(u16, u16, i32)> {
-    let off = EVENT_SIZE - 8;
-    let b = rec.get(off..EVENT_SIZE)?;
-    Some((
-        u16::from_ne_bytes([b[0], b[1]]),
-        u16::from_ne_bytes([b[2], b[3]]),
-        i32::from_ne_bytes([b[4], b[5], b[6], b[7]]),
-    ))
+/// One record: the kernel's event time, type, code and value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Event {
+    pub(crate) time: Duration,
+    pub(crate) ty: u16,
+    pub(crate) code: u16,
+    pub(crate) value: i32,
+}
+
+/// Parses one record (`struct timeval` of two native `long`s first).
+pub(crate) fn parse_event(rec: &[u8]) -> Option<Event> {
+    const L: usize = std::mem::size_of::<usize>();
+    let rec = rec.get(..EVENT_SIZE)?;
+    let long = |b: &[u8]| {
+        let mut a = [0_u8; L];
+        a.copy_from_slice(b);
+        isize::from_ne_bytes(a)
+    };
+    let sec = u64::try_from(long(&rec[..L])).unwrap_or(0);
+    let usec = u32::try_from(long(&rec[L..2 * L]).clamp(0, 999_999)).unwrap_or(0);
+    let b = &rec[2 * L..];
+    Some(Event {
+        time: Duration::new(sec, usec * 1000),
+        ty: u16::from_ne_bytes([b[0], b[1]]),
+        code: u16::from_ne_bytes([b[2], b[3]]),
+        value: i32::from_ne_bytes([b[4], b[5], b[6], b[7]]),
+    })
 }
 
 /// Key state from the records of one device, sending only changes.
@@ -115,30 +156,64 @@ pub(crate) fn parse_event(rec: &[u8]) -> Option<(u16, u16, i32)> {
 struct KeyState {
     code: u16,
     down: bool,
+    /// After `SYN_DROPPED`: discard until the next `SYN_REPORT`.
+    dropping: bool,
 }
 
 impl KeyState {
-    fn on_event(&mut self, ty: u16, code: u16, value: i32) -> Option<Key> {
-        if ty != EV_KEY || code != self.code {
-            return None;
-        }
-        match value {
-            1 if !self.down => {
-                self.down = true;
-                Some(Key::Pressed)
-            }
-            0 if self.down => {
-                self.down = false;
-                Some(Key::Released)
-            }
-            _ => None,
+    fn new(code: u16) -> Self {
+        Self {
+            code,
+            down: false,
+            dropping: false,
         }
     }
 
-    /// The device went away: a held key is released.
-    fn lost(&mut self) -> Option<Key> {
-        std::mem::take(&mut self.down).then_some(Key::Released)
+    fn on_event(&mut self, ev: Event, out: &mut Vec<Key>) {
+        if ev.ty == EV_SYN && ev.code == SYN_DROPPED {
+            self.dropping = true;
+            out.extend(self.lost());
+            return;
+        }
+        if self.dropping {
+            if ev.ty == EV_SYN && ev.code == SYN_REPORT {
+                self.dropping = false;
+            }
+            return;
+        }
+        if ev.ty != EV_KEY || ev.code != self.code {
+            return;
+        }
+        match ev.value {
+            1 => {
+                // A press while down: the release was missed.
+                out.extend(self.lost());
+                self.down = true;
+                out.push(Key::Pressed(ev.time));
+            }
+            0 if self.down => {
+                self.down = false;
+                out.push(Key::Released(Some(ev.time)));
+            }
+            _ => {}
+        }
     }
+
+    /// A held key's release was lost.
+    fn lost(&mut self) -> Option<Key> {
+        std::mem::take(&mut self.down).then_some(Key::Released(None))
+    }
+}
+
+/// Pause before looking again after the `n`-th loss in a row (1 s, 2 s,
+/// 4 s ... at most [`LOSS_PAUSE_MAX`]), and whether that loss is logged.
+fn loss_pause(base: Duration, n: u32) -> (Duration, bool) {
+    let shift = n.saturating_sub(1).min(16);
+    (
+        base.saturating_mul(1 << shift)
+            .min(LOSS_PAUSE_MAX.max(base)),
+        n.is_power_of_two(),
+    )
 }
 
 /// Sleeps `d` in short steps; false when `stop` was set meanwhile.
@@ -182,7 +257,8 @@ fn run(
     stop: &AtomicBool,
 ) {
     let mut missing_logged = false;
-    let mut state = KeyState { code, down: false };
+    let mut state = KeyState::new(code);
+    let mut losses = 0_u32;
     while !stop.load(Ordering::Relaxed) {
         let Some(path) = find_device(paths, name) else {
             if !missing_logged {
@@ -198,19 +274,35 @@ fn run(
             continue;
         };
         missing_logged = false;
-        match read_device(&path, name, &mut state, tx, stop) {
+        match read_device(&path, name, &mut state, tx, stop, losses == 0) {
             Ended::Stop => return,
-            Ended::Lost(why) => {
+            Ended::Lost { why, delivered } => {
+                state.dropping = false;
                 if let Some(k) = state.lost() {
                     if tx.send(k).is_err() {
                         return;
                     }
                 }
-                log::info!(
-                    "remote button: {} ({why}); looking for {name:?} again",
-                    path.display()
-                );
-                if !nap(stop, timing.after_loss) {
+                // A device that delivered events was working: start over.
+                losses = if delivered {
+                    1
+                } else {
+                    losses.saturating_add(1)
+                };
+                let (pause, loud) = loss_pause(timing.after_loss, losses);
+                if loud {
+                    log::info!(
+                        "remote button: {} ({why}, {losses} in a row); looking for {name:?} again in {} s",
+                        path.display(),
+                        pause.as_secs_f32()
+                    );
+                } else {
+                    log::debug!(
+                        "remote button: {} ({why}, {losses} in a row)",
+                        path.display()
+                    );
+                }
+                if !nap(stop, pause) {
                     return;
                 }
             }
@@ -220,7 +312,11 @@ fn run(
 
 enum Ended {
     Stop,
-    Lost(String),
+    /// The device went away; `delivered`: it gave at least one record.
+    Lost {
+        why: String,
+        delivered: bool,
+    },
 }
 
 fn read_device(
@@ -229,42 +325,65 @@ fn read_device(
     state: &mut KeyState,
     tx: &mpsc::UnboundedSender<Key>,
     stop: &AtomicBool,
+    loud: bool,
 ) -> Ended {
     // Read-only, no grab, no write: other readers are not affected.
     let mut f = match std::fs::File::open(path) {
         Ok(f) => f,
-        Err(e) => return Ended::Lost(format!("cannot open it: {e}")),
+        Err(e) => {
+            return Ended::Lost {
+                why: format!("cannot open it: {e}"),
+                delivered: false,
+            };
+        }
     };
-    log::info!(
-        "remote button: watching {name:?} ({}) for key {}, passive read (no grab)",
-        path.display(),
-        state.code
-    );
+    if loud {
+        log::info!(
+            "remote button: watching {name:?} ({}) for key {}, passive read (no grab)",
+            path.display(),
+            state.code
+        );
+    } else {
+        log::debug!("remote button: watching {} again", path.display());
+    }
     if tx.send(Key::Found).is_err() {
         return Ended::Stop;
     }
     let mut buf = vec![0_u8; EVENT_SIZE * 32];
     let mut have = 0_usize;
+    let mut delivered = false;
+    let mut keys = Vec::new();
     loop {
         if stop.load(Ordering::Relaxed) {
             return Ended::Stop;
         }
         let n = match f.read(&mut buf[have..]) {
-            Ok(0) => return Ended::Lost("the device went away".to_owned()),
+            Ok(0) => {
+                return Ended::Lost {
+                    why: "the device went away".to_owned(),
+                    delivered,
+                };
+            }
             Ok(n) => n,
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(e) => return Ended::Lost(format!("read failed: {e}")),
+            Err(e) => {
+                return Ended::Lost {
+                    why: format!("read failed: {e}"),
+                    delivered,
+                };
+            }
         };
         have += n;
         let whole = have / EVENT_SIZE * EVENT_SIZE;
+        delivered |= whole > 0;
         for rec in buf[..whole].chunks_exact(EVENT_SIZE) {
-            let Some((ty, code, value)) = parse_event(rec) else {
-                continue;
-            };
-            if let Some(k) = state.on_event(ty, code, value) {
-                if tx.send(k).is_err() {
-                    return Ended::Stop;
-                }
+            if let Some(ev) = parse_event(rec) {
+                state.on_event(ev, &mut keys);
+            }
+        }
+        for k in keys.drain(..) {
+            if tx.send(k).is_err() {
+                return Ended::Stop;
             }
         }
         buf.copy_within(whole..have, 0);
@@ -277,9 +396,15 @@ pub(crate) mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
 
-    /// One record in this process's layout.
-    pub(crate) fn record(ty: u16, code: u16, value: i32) -> Vec<u8> {
-        let mut r = vec![0_u8; EVENT_SIZE - 8];
+    /// One record in this process's layout, at kernel time `ms`.
+    pub(crate) fn record_at(ms: u64, ty: u16, code: u16, value: i32) -> Vec<u8> {
+        const L: usize = std::mem::size_of::<usize>();
+        let sec = isize::try_from(ms / 1000).unwrap();
+        let usec = isize::try_from(ms % 1000 * 1000).unwrap();
+        let mut r = Vec::with_capacity(EVENT_SIZE);
+        r.extend_from_slice(&sec.to_ne_bytes());
+        r.extend_from_slice(&usec.to_ne_bytes());
+        assert_eq!(r.len(), 2 * L);
         r.extend_from_slice(&ty.to_ne_bytes());
         r.extend_from_slice(&code.to_ne_bytes());
         r.extend_from_slice(&value.to_ne_bytes());
@@ -319,8 +444,16 @@ pub(crate) mod tests {
                 16
             }
         );
-        let r = record(EV_KEY, 428, 1);
-        assert_eq!(parse_event(&r), Some((1, 428, 1)));
+        let r = record_at(1_234_567, EV_KEY, 428, 1);
+        assert_eq!(
+            parse_event(&r),
+            Some(Event {
+                time: Duration::from_millis(1_234_567),
+                ty: 1,
+                code: 428,
+                value: 1
+            })
+        );
         assert_eq!(parse_event(&r[..EVENT_SIZE - 1]), None);
     }
 
@@ -349,38 +482,121 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    fn ev(ms: u64, ty: u16, code: u16, value: i32) -> Event {
+        Event {
+            time: Duration::from_millis(ms),
+            ty,
+            code,
+            value,
+        }
+    }
+
+    fn feed(s: &mut KeyState, evs: &[Event]) -> Vec<Key> {
+        let mut out = Vec::new();
+        for e in evs {
+            s.on_event(*e, &mut out);
+        }
+        out
+    }
+
     #[test]
-    fn only_press_and_release_of_the_one_key_count() {
-        let mut s = KeyState {
-            code: 428,
-            down: false,
-        };
-        assert_eq!(s.on_event(EV_KEY, 103, 1), None);
-        assert_eq!(s.on_event(2, 428, 1), None);
-        assert_eq!(s.on_event(EV_KEY, 428, 0), None, "release without press");
-        assert_eq!(s.on_event(EV_KEY, 428, 1), Some(Key::Pressed));
-        assert_eq!(s.on_event(EV_KEY, 428, 1), None, "no second press");
-        assert_eq!(s.on_event(EV_KEY, 428, 2), None, "autorepeat");
-        assert_eq!(s.on_event(EV_KEY, 428, 0), Some(Key::Released));
+    fn only_press_and_release_of_the_one_key_count_with_their_kernel_time() {
+        let mut s = KeyState::new(428);
+        let t = Duration::from_millis;
+        assert!(feed(&mut s, &[ev(1, EV_KEY, 103, 1), ev(2, 2, 428, 1)]).is_empty());
+        assert!(
+            feed(&mut s, &[ev(3, EV_KEY, 428, 0)]).is_empty(),
+            "release without press"
+        );
+        assert_eq!(
+            feed(&mut s, &[ev(10, EV_KEY, 428, 1)]),
+            [Key::Pressed(t(10))]
+        );
+        assert!(
+            feed(&mut s, &[ev(20, EV_KEY, 428, 2)]).is_empty(),
+            "autorepeat"
+        );
+        assert_eq!(
+            feed(&mut s, &[ev(900, EV_KEY, 428, 0)]),
+            [Key::Released(Some(t(900)))]
+        );
         assert_eq!(s.lost(), None);
-        s.on_event(EV_KEY, 428, 1);
-        assert_eq!(s.lost(), Some(Key::Released));
+        feed(&mut s, &[ev(1000, EV_KEY, 428, 1)]);
+        assert_eq!(s.lost(), Some(Key::Released(None)));
+    }
+
+    #[test]
+    fn a_missed_release_and_dropped_events_never_leave_the_key_stuck() {
+        let mut s = KeyState::new(428);
+        let t = Duration::from_millis;
+        feed(&mut s, &[ev(10, EV_KEY, 428, 1)]);
+        // A second press without a release: the release was missed.
+        assert_eq!(
+            feed(&mut s, &[ev(500, EV_KEY, 428, 1)]),
+            [Key::Released(None), Key::Pressed(t(500))]
+        );
+        // The kernel dropped events: the held key is released (lost) and
+        // everything up to the next SYN_REPORT is discarded.
+        assert_eq!(
+            feed(
+                &mut s,
+                &[
+                    ev(600, EV_SYN, SYN_DROPPED, 0),
+                    ev(601, EV_KEY, 428, 0),
+                    ev(602, EV_KEY, 428, 1),
+                ]
+            ),
+            [Key::Released(None)]
+        );
+        assert!(feed(&mut s, &[ev(603, EV_SYN, SYN_REPORT, 0)]).is_empty());
+        // Afterwards the state follows the events again.
+        assert_eq!(
+            feed(&mut s, &[ev(700, EV_KEY, 428, 1)]),
+            [Key::Pressed(t(700))]
+        );
+        // Dropped while up: nothing to release.
+        let mut s = KeyState::new(428);
+        assert!(feed(&mut s, &[ev(1, EV_SYN, SYN_DROPPED, 0)]).is_empty());
+    }
+
+    #[test]
+    fn losses_in_a_row_back_off_and_log_less() {
+        let b = Duration::from_secs(1);
+        let pauses: Vec<(u64, bool)> = (1..=7)
+            .map(|n| {
+                let (p, loud) = loss_pause(b, n);
+                (p.as_secs(), loud)
+            })
+            .collect();
+        assert_eq!(
+            pauses,
+            [
+                (1, true),
+                (2, true),
+                (4, false),
+                (8, true),
+                (16, false),
+                (30, false),
+                (30, false)
+            ]
+        );
+        assert_eq!(loss_pause(b, 64), (Duration::from_secs(30), true));
     }
 
     #[test]
     fn the_reader_reports_presses_of_a_fake_device_and_a_loss_as_release() {
         let (root, paths) = fake_inputs("read", &[(0, "LGE RCU"), (2, "LGE M-RCU - Builtin [0]")]);
         let mut bytes = Vec::new();
-        for (ty, code, value) in [
-            (EV_KEY, 103, 1), // Up on the same node: ignored
-            (0, 0, 0),        // SYN_REPORT
-            (EV_KEY, 428, 1),
-            (0, 0, 0),
-            (EV_KEY, 428, 0),
-            (0, 0, 0),
-            (EV_KEY, 428, 1), // held when the device goes away
+        for (ms, ty, code, value) in [
+            (5, EV_KEY, 103, 1), // Up on the same node: ignored
+            (5, 0, 0, 0),        // SYN_REPORT
+            (1000, EV_KEY, 428, 1),
+            (1000, 0, 0, 0),
+            (1800, EV_KEY, 428, 0),
+            (1800, 0, 0, 0),
+            (3000, EV_KEY, 428, 1), // held when the device goes away
         ] {
-            bytes.extend(record(ty, code, value));
+            bytes.extend(record_at(ms, ty, code, value));
         }
         // A trailing partial record is ignored.
         bytes.extend_from_slice(&[1, 2, 3]);
@@ -413,10 +629,10 @@ pub(crate) mod tests {
             got,
             [
                 Key::Found,
-                Key::Pressed,
-                Key::Released,
-                Key::Pressed,
-                Key::Released
+                Key::Pressed(Duration::from_millis(1000)),
+                Key::Released(Some(Duration::from_millis(1800))),
+                Key::Pressed(Duration::from_millis(3000)),
+                Key::Released(None)
             ]
         );
         stop.store(true, Ordering::Relaxed);

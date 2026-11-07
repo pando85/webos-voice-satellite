@@ -1,6 +1,6 @@
 # Remote mic button: hold to talk (daemon side)
 
-- **Status:** built and tested on the PC only (unit tests and host integration tests with a fake input device, a fake `luna-send` and a fake LG socket). **Not run on a TV, not seen with a real Home Assistant.** Off by default (`[remote] mic_button = "off"`). Written 2026-11-07.
+- **Status:** built and tested on the PC only (unit tests and host integration tests with a fake input device, a fake `luna-send` and a fake LG socket). **Not run on a TV, not seen with a real Home Assistant.** Off by default (`[remote] mic_button = "off"`), and off is inert: nothing of the feature is started. Written 2026-11-07; revised the same day after an independent review of `785d25c` (section 11).
 - **Owner request:** "holding the Magic Remote's mic button talks to our HA assistant"; the daemon side only, independent of how LG's assistant is kept away, off by default.
 - **Not in this note (not built):** the on-screen overlay; any change to LG's voice services. How the satellite and LG's assistant share the key is [ADR 0013](../decisions/0013-remote-mic-button-coexistence.md), which is **proposed, not accepted** ([EXP-023](../experiments/EXP-023-remote-mic-button-handover.md) has not run). Until it is built, **LG's assistant still opens on every press** when the feature is on (section 7).
 - **Related:** [research note](../research/remote-mic-button.md), [EXP-022](../experiments/EXP-022-remote-mic-button-observe.md) (the key and the stream, verified on c3-a and c3-b), [ADR 0003](../decisions/0003-server-side-wake-word-for-mvp.md), [ADR 0012](../decisions/0012-config-switches-in-ha.md) (the config switch pattern), [AEC front-end](aec-frontend.md), [ESPHome API crate](../development/esphome-api.md).
@@ -14,7 +14,7 @@ With `mic_button = "ptt"`:
 | Action | What happens |
 | --- | --- |
 | Hold the mic button | A run starts at speech-to-text (no wake word). The audio comes from the **remote's own microphone** while it is held (the TV microphone if the remote's stream is not there). |
-| Release (held 300 ms or more) | The run's audio ends (`VoiceAssistantAudio{end: true}`): HA finalizes speech-to-text with what it has, then the intent and the spoken reply follow as usual. The remote's stream closes. |
+| Release (held 300 ms or more) | After 250 ms more audio (what is still in flight from the remote and LG's buffer), the run's audio ends (`VoiceAssistantAudio{end: true}`): HA finalizes speech-to-text with what it has, then the intent and the spoken reply follow as usual. The remote's stream closes. |
 | Tap (released before 300 ms) | **Tap-to-talk** on the **TV microphone**: the run goes on and Home Assistant's end-of-speech detection ends it, as with `SIGUSR1` today. The remote's stream closes at once. |
 | Hold longer than 15 s | The audio ends at 15 s; the release later does nothing. |
 
@@ -33,17 +33,20 @@ At a press the daemon checks, in this order (a refusal is logged at `warn` as `r
 
 Then:
 
-- **Join:** a run past the wake word is already streaming (a continued conversation after `continue_conversation`, an earlier push-to-talk run, or speech after the wake word): no new run is started; the remote's audio takes over from its first chunk, and the release ends that run's audio. The conversation id is kept by the voice layer either way.
+- **Join:** speech-to-text audio is streaming now (a continued conversation after `continue_conversation`, an earlier push-to-talk run, or speech after the wake word): no new run is started; the remote's audio takes over from its first chunk, and the release ends that run's audio. The conversation id is kept by the voice layer either way. "Streaming speech-to-text" is tracked explicitly by the daemon: set by `StartStreaming` without the wake word and by `WakeWordDetected`, cleared by `StopStreaming`, `RunEnd` and a disconnect. (The first version used the daemon's `in_run`, which stays set when the voice layer aborts a run and swallows HA's `RUN_END`; a press then "joined" the idle wake word session and sent remote audio to openWakeWord.)
 - **Start:** otherwise a push-to-talk run is requested (`AppCommand::StartPipeline { mode: PushToTalk }`, the existing path). The voice layer aborts the idle wake word session first and waits for its end ([voice layer](../development/esphome-api.md)); a reply that is playing is interrupted (barge-in, as with `SIGUSR1`); a ringing timer alarm stops (a run at speech-to-text stops it); music ducks as for any run.
+- **Only that run:** the voice layer marks the run its push-to-talk request started (`StartStreaming { push_to_talk: true }`) and reports a request that will not stream (`PushToTalkFailed`: refused while muted, without live capture, during an announcement or unsubscribed; or its start failed, timed out, or was dropped by an announcement, mute, capture loss, a disconnect or `StopPipeline`). The button takes over only the marked run; on the failure report, or when nothing streams within 12 s (`START_WAIT`: the voice layer's 10 s start timeout plus an aborted run's 1.5 s end), the press is given up. So a later continued-conversation, `start_conversation` or announcement run is never fed stale audio or ended by an old press.
 
 A second press without a release is ignored; a press within 50 ms of the last release is a bounce and ignored with its release. While the remote's mic run is active the satellite reports `busy: voice` in `run/voice.json` like any run, so a config change waits (ADR 0012).
 
 ## 3. The button
 
 - **Source (verified-on-target, c3-a and c3-b, EXP-022):** `EV_KEY` code 428, value 1 at the press and 0 at the release, no autorepeat seen, on the input device named `LGE M-RCU - Builtin [0]` (`event2` on both TVs that day).
-- **Reader (`crates/satellite/src/evdev.rs`):** a thread finds the node by its **exact name** in `/sys/class/input/eventN/device/name` (the lowest N first), never by index, opens `/dev/input/eventN` **read-only and without `EVIOCGRAB`** (every other reader, LG's compositor first, keeps all events), and keeps only `EV_KEY` events of the one code. Records follow the kernel layout for the process (16 bytes for the armv7 build, 24 for aarch64). When the node goes away (read error or end of file) a held key is reported released and the device is looked up again after 1 s; while it is missing, every 5 s. No event content is logged.
-- **Always passive:** the reader runs whatever `mic_button` says. With `"off"` a press is only logged at debug ("observed only"), which is ADR 0013 decision 1's "only observes".
-- **Hypothesis:** that the uinput node `LGE M-RCU - Builtin [0]` stays while the remote's Bluetooth link comes and goes (EXP-022 saw `hidraw0` vanish, not the uinput node). If it does vanish, the reader finds it again.
+- **Reader (`crates/satellite/src/evdev.rs`):** a thread finds the node by its **exact name** in `/sys/class/input/eventN/device/name` (the lowest N first), never by index, opens `/dev/input/eventN` **read-only and without `EVIOCGRAB`** (every other reader, LG's compositor first, keeps all events), and keeps only `EV_KEY` events of the one code. Records follow the kernel layout for the process (16 bytes for the armv7 build, 24 for aarch64). No event content is logged.
+- **Times:** each press and release carries the kernel's event time, and the hold length (tap or hold) is measured from those, not from when the thread read the events (the local release time is the press's local time plus the kernel's hold, never later than the read; without both kernel times, or across a clock step, the read time).
+- **Lost events:** `SYN_DROPPED` (the kernel's buffer overflowed) discards events up to the next `SYN_REPORT` and reports a held key released; a press while the key is already down (a missed release) is reported as a lost release followed by the press. A lost release ends the hold like a release but does not start the 50 ms bounce window.
+- **Device loss:** when the node goes away (read error or end of file) a held key is reported released (lost) and the device is looked up again after 1 s, doubling to 30 s for losses in a row, with a log line only at the 1st, 2nd, 4th, 8th ... loss; while it is missing, every 5 s, logged once. The uinput node `LGE M-RCU - Builtin [0]` survives the remote's Bluetooth disconnect (EXP-022 saw `hidraw0` vanish, not the uinput node), so a disconnect while held gives no release: the 15 s cap ends that hold.
+- **Off is inert:** with `mic_button = "off"` the daemon starts nothing of the feature: no reader thread, no input device opened, no machine, no remote microphone. A change of `mic_button` restarts the daemon anyway (section 8). (The first version kept a passive reader running when off; the owner asked for off to be inert.)
 
 ## 4. The audio of a button run
 
@@ -52,8 +55,9 @@ A second press without a release is ignored; a press within 50 ms of the last re
 - **Open (`crates/satellite/src/remote_mic.rs`):** at the press, `luna-send -i luna://com.webos.service.voiceinput/startStreaming '{"deviceType":"remote","subscribe":true}'` on a pseudo-terminal (the power watch's helper). EXP-022 B (c3-a): reply `{"subscribed":true,"returnValue":true,"socketPath":"/tmp/voiceinput_remote1.soc"}` 29 ms after the press. The socket path is **read from the reply** (an absolute path without `..` or control characters, at most 107 bytes), never assumed.
 - **Refusals:** `{"errorCode":"2003","errorText":"audio data is already capturing",...}` was seen once on c3-a and cleared within 0.65 s. A refusal, no answer within 1.5 s or a `luna-send` that ends is retried twice, 300 ms apart (3 calls); then the run keeps the TV microphone.
 - **Read:** a thread connects to the Unix socket (up to 1 s) and reads 16 kHz mono S16LE, the format that fits the measured 31.6 kB/s (EXP-022 B; the reply carries no format). Bytes are converted across read boundaries, passed through the remote's own front-end (section 4.3) and cut into 512-sample chunks, the size the TV microphone sends.
-- **Format check:** the stream must deliver its first chunk within 1 s of the connection, and over the first second after that chunk its rate must lie between 0.6 and 1.5 times 16 000 samples per second (8 kHz, 32 kHz or stereo fall outside). Otherwise it is closed with a warning and the TV microphone takes over. The format is not adapted (no resampling): another format means another firmware, which needs a new experiment.
-- **Close:** at the release, the cap, the run's end, the mute switch or a gate, an HA disconnect and the daemon's shutdown, the `luna-send` child is killed and reaped (which ends the subscription and LG's stream, as in EXP-022 B4) and the reader thread stops within 200 ms. The `RemoteMic` closes its session when dropped, too. `stopStreaming` is not called: its parameters are not known.
+- **Format and liveness checks:** the stream must deliver its first chunk within 1 s of the connection; over the first second after that chunk its byte rate must lie between 0.6 and 1.5 times 32 000 bytes per second (this catches 8 kHz mono and 32 kHz mono or 16 kHz stereo; it cannot tell S16LE from another two-byte format or byte order at the same rate); and once it delivers, a gap of 500 ms without a chunk is a stall. Any of these closes it with a warning and the TV microphone takes over. The format is not adapted (no resampling): another format means another firmware, which needs a new experiment.
+- **Close:** at the release (after the grace), the cap, the run's end, the mute switch or a gate, an HA disconnect and the daemon's shutdown, the `luna-send` child is killed and reaped (which ends the subscription and LG's stream, as in EXP-022 B4) and the reader thread stops within 200 ms. The `RemoteMic` closes its session when dropped, too; at shutdown the daemon waits (3 s at most) until every closed session's child is reaped. `stopStreaming` is not called: its parameters are not known.
+- **Crash safety:** every `luna-send` subscription child (this one and the power watch's) is started with `PR_SET_PDEATHSIG = SIGKILL`, so it dies with the daemon also when the daemon cannot kill it (a panic abort, the watchdog's exit, SIGKILL); a leftover `voiceinput` subscription could otherwise hold LG's remote stream until a reboot. This needs a `pre_exec` hook, the satellite crate's only `unsafe` (lint `unsafe_code = "deny"` with one `#[allow]` in `power::start_child`, the pattern the capture crate already uses for its ALSA ioctls).
 
 ### 4.2 Switching between the two microphones
 
@@ -61,7 +65,7 @@ The TV microphone's capture thread keeps running all the time (the wake word nee
 
 - The remote takes over **from its first chunk**, never earlier, so a stream that connects but stays silent costs no TV audio.
 - Remote audio that arrives before the run streams (HA takes from tens of ms up to about 1.5 s after an aborted wake word session) is kept, at most 2 s, and sent first, so the first words are not lost. If the run already streams the TV microphone when the remote's first chunk arrives (a join, or a slow stream), the switch happens at that chunk without the kept audio (HA already has that time from the TV).
-- A stream that fails, ends or fails the format check gives the run back to the TV microphone at once, also mid-run (a gap of up to one chunk).
+- A stream that fails, ends, stalls or fails the format check gives the run back to the TV microphone at once, also mid-run (a gap of up to one chunk, or the 500 ms of a stall).
 - A hold released before HA started the run (a slow HA): the remote's audio kept so far is sent when the run starts, then the audio ends. Without kept audio (the stream never opened) the run is left to HA's end-of-speech detection.
 
 ### 4.3 Front-end and echo cancellation
@@ -77,9 +81,12 @@ Revisit if the on-TV check (section 10) shows TV sound reaching HA's speech-to-t
 
 ## 5. The state machine
 
-`crates/satellite/src/remote_ptt.rs`, `Hold`, pure (no I/O): inputs are the button, the voice layer's `StartStreaming` (without wake word), `StopStreaming` and `RunEnd`, the stream's events and time; outputs are `StartRun`, `EndAudio`, `OpenStream`, `CloseStream`, `Audio(chunk)` and `RemoteFeeds(bool)`. Phases: `Idle`, `Held` (with "our run streams yet"), `EndPending` (released before the run streamed), `Tapped`, `WaitRelease`. Before our run's `StartStreaming` arrives, a `StopStreaming` belongs to the session the press replaced and is ignored. `Button` wraps it for the daemon: it runs the stream actions, checks the session generation of each stream event (a late event of a closed session is dropped), logs, and calls the hand-over seam.
+`crates/satellite/src/remote_ptt.rs`, `Hold`, pure (no I/O): inputs are the button, the voice layer's `StartStreaming { push_to_talk: true }`, `PushToTalkFailed`, `StopStreaming` and `RunEnd`, the stream's events and time; outputs are `StartRun`, `EndAudio`, `OpenStream`, `CloseStream`, `Audio(chunk)` and `RemoteFeeds(bool)`. Phases: `Idle`, `Held` (with "our run streams yet"), `Releasing` (the 250 ms grace after a hold's release), `EndPending` (released before the run streamed), `Tapped`, `WaitRelease`. Before our run's `StartStreaming` arrives, a `StopStreaming` belongs to the session the press replaced and is ignored. `Button` wraps it for the daemon: it turns the kernel event times into the release time, runs the stream actions, checks the session generation of each stream event (a late event of a closed session is dropped), logs, and calls the hand-over seam.
 
-New in the ESPHome API crate: **`AppCommand::EndAudio`** ends the audio of the run that streams gracefully (`VoiceAssistantAudio{end: true}` to HA and `StopStreaming` to the application); the run is not aborted and the wake word stays armed. Ignored when nothing streams. HA's side (documented, research section 3.1): `handle_stop(False)` ends the audio stream and speech-to-text finalizes.
+New in the ESPHome API crate:
+
+- **`AppCommand::EndAudio`** ends the audio of the run that streams gracefully (`VoiceAssistantAudio{end: true}` to HA and `StopStreaming` to the application); the run is not aborted and the wake word stays armed. Ignored when nothing streams. HA's side (documented, research section 3.1): `handle_stop(False)` ends the audio stream and speech-to-text finalizes.
+- **`StartStreaming { push_to_talk }`** is true only for the run of the last `StartPipeline(PushToTalk)`; **`AppEvent::PushToTalkFailed`** is sent once for a request that will not reach it (section 2). A newer request replaces a waiting one without a report.
 
 ## 6. Privacy
 
@@ -90,7 +97,7 @@ New in the ESPHome API crate: **`AppCommand::EndAudio`** ends the audio of the r
 
 ## 7. Seam for LG's hand-over (ADR 0013, proposed)
 
-`trait LgVoiceKey` in `remote_ptt.rs`: `acquire()` once when the key device is found with the feature on (ADR 0013 decision 3's "the key node is found by name"), `run_started()` and `run_ended()` around each accepted button run (for the decision 2(b) refinement, a pause limited to the run), `release()` at shutdown. The only implementation is `LeaveToLg`, which changes nothing and logs that LG's assistant keeps reacting. The volatile configd override, the SIGSTOP fallback, the state file, `ctl.sh restore-lg-voice` and the supervisor hooks are **not built**; they plug in here after the owner accepts ADR 0013 and EXP-023 has run. Implementations must be idempotent and must not block the event loop.
+`trait LgVoiceKey` in `remote_ptt.rs`: `acquire()` once when the key device is found (the feature is on whenever the reader runs) (ADR 0013 decision 3's "the key node is found by name"), `run_started()` and `run_ended()` around each accepted button run (for the decision 2(b) refinement, a pause limited to the run), `release()` at shutdown. The only implementation is `LeaveToLg`, which changes nothing and logs that LG's assistant keeps reacting. The volatile configd override, the SIGSTOP fallback, the state file, `ctl.sh restore-lg-voice` and the supervisor hooks are **not built**; they plug in here after the owner accepts ADR 0013 and EXP-023 has run. Implementations must be idempotent and must not block the event loop.
 
 ## 8. Configuration and Home Assistant
 
@@ -98,7 +105,7 @@ New in the ESPHome API crate: **`AppCommand::EndAudio`** ends the audio of the r
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `mic_button` | `"off"` | `"off"`: only observe the key. `"ptt"`: hold to talk. |
+| `mic_button` | `"off"` | `"off"`: nothing is started. `"ptt"`: hold to talk. |
 | `device_name` | `"LGE M-RCU - Builtin [0]"` | input device, exact name (1 to 128 characters) |
 | `key_code` | `428` | `EV_KEY` code (1 to 767) |
 | `remote_mic` | `true` | audio from the remote's microphone; `false`: TV microphone only |
@@ -107,15 +114,18 @@ New in the ESPHome API crate: **`AppCommand::EndAudio`** ends the audio of the r
 | `gain_db` | `0.0` | gain on the remote's microphone (-20 to 30) |
 
 - **Home Assistant:** a config switch **"Remote mic button"** (object id `remote_mic_button`, `mdi:remote`, entity category `config`), after "Echo cancellation" and "Music playback", following ADR 0012: a flip runs `ctl.sh config mic-button on|off` detached, which writes `mic_button = "ptt"` or `"off"` in `[remote]` (in place, or the table appended), checks the config, restarts the daemon and rolls back on failure, with the same cooldown and busy guards. Adding a third switch to ADR 0012's fixed table is the owner's request of 2026-11-07; ADR 0012 itself is not edited here.
-- **ctl.sh:** `ctl.sh config mic-button on|off`; `ctl.sh status` prints "remote mic button: off|ptt" and `status --json` has `"mic_button":"off"|"ptt"`. The TV app does not show it yet.
+- **ctl.sh:** `ctl.sh config mic-button on|off`; `ctl.sh status` prints "remote mic button: off|ptt" and `status --json` has `"mic_button":"off"|"ptt"` (a single-quoted TOML value, `mic_button = 'ptt'`, is read the same; a change replaces it in place). The TV app does not show it yet.
 - `--check-config` prints `remote=[mic_button=off device="..." key=428]` or `remote=[mic_button=ptt ... mic=remote max_hold_s=15 tap_ms=300 gain_db=0]` (what `ctl.sh` reads).
 
 ## 9. Tests (verified-on-host)
 
-- `remote_ptt::tests` (24): hold with kept audio and release, tap, tap cap, `tap_ms = 0`, cap while held, a run that never starts, each refusal (HA, mute, announcement, TV microphone) and its swallowed release, join, the replaced run's stop, release before the run streams (with and without kept audio), TV-microphone-only holds, stream failure before and during the run, no data, wrong rate, the 2 s limit of the kept audio, halt, a late open, duplicates and bounces, a new press over a tapped run, the hand-over seam's call order, `"off"` touching nothing, and the fallback without `luna-send`.
-- `evdev::tests`: record layout, lookup by exact name (not by index), key filtering, a fake device file with a press, a release, another key and a held press lost at the end of the file, a missing device.
-- `remote_mic::tests`: reply parsing (the c3-a lines), socket path checks, S16LE conversion across reads, and against a fake `luna-send` and a fake LG socket: a `2003` refusal retried then a stream of chunks at the right level, the subscription child killed and reaped on close; three refusals reported lost; no `luna-send`; no listener; the end of the stream; a dropped `RemoteMic` ending its child.
-- `capture::tests::the_tv_microphone_is_held_back_while_the_remote_feeds_the_run`; `voice::tests::end_audio_*` (ESPHome API crate); `config::tests::remote_section_*`; `config_switch` tests with the third switch; `packaging/webos/tests/tv_settings.sh` (`config mic-button`, status fields).
+- `remote_ptt::tests` (31): hold with kept audio, the release grace (audio still forwarded, HA ending it during the grace), tap, tap cap, `tap_ms = 0`, cap while held, the start limit (held, released, tapped), `PushToTalkFailed` in every waiting phase (no foreign run fed or ended), each refusal (HA, mute, announcement, TV microphone) and its swallowed release, join, the replaced run's stop, release before the run streams (with and without kept audio), TV-microphone-only holds, stream failure before and during the run, no data, a stall mid-run and before the run, wrong rate, the 2 s limit of the kept audio, halt, a late open, duplicates and bounces, a lost release (no bounce window), a new press over a tapped run, the release time from kernel times, and through `Button`: the hand-over seam's call order, the kernel-time tap decision, the fallback without `luna-send`, a failed push-to-talk.
+- `evdev::tests`: record layout with the kernel time, lookup by exact name (not by index), key filtering with times, a missed release and `SYN_DROPPED`, the loss back-off and its log rate, a fake device file with a press, a release, another key and a held press lost at the end of the file, a missing device.
+- `remote_mic::tests`: reply parsing (the c3-a lines), socket path checks, S16LE conversion across reads, and against a fake `luna-send` and a fake LG socket: a `2003` refusal retried then a stream of chunks at the right level, the subscription child reaped on shutdown, **reaped when shutdown follows a close** (review finding 3); three refusals reported lost; no `luna-send`; no listener; the end of the stream; a new open or a drop ending the old child.
+- `power::tests::a_subscription_child_dies_with_the_thread_that_spawned_it` (`PR_SET_PDEATHSIG`, with `kill_on_drop` bypassed).
+- `daemon::tests::the_mic_button_joins_only_while_speech_to_text_streams` (the stale `in_run` case), `daemon::tests::mic_button_off_starts_nothing`.
+- `voice::tests` (ESPHome API crate): `end_audio_*`, `only_the_push_to_talk_run_is_marked_and_its_follow_up_is_not`, `a_refused_push_to_talk_is_reported`, `a_failed_or_dropped_push_to_talk_start_is_reported_once`, `a_second_push_to_talk_replaces_the_first_silently`.
+- `capture::tests::the_tv_microphone_is_held_back_while_the_remote_feeds_the_run`; `config::tests::remote_section_*`; `config_switch` tests with the third switch; `packaging/webos/tests/tv_settings.sh` (`config mic-button`, single-quoted values, status fields).
 
 ## 10. What needs checking on a TV (not done)
 
@@ -129,3 +139,20 @@ On c3-a, with the owner's authorization and consent (LG's assistant also hears e
 6. Mute in HA, then press: refused and logged, no stream opened.
 7. The 15 s cap; a press during a reply and during a continued conversation.
 8. CPU of the reader threads (expected idle while nothing is pressed).
+
+## 11. Review of `785d25c` and what changed
+
+An independent review (2026-11-07) found the feature safe to deploy **off** and these problems **on**; all are fixed as described above:
+
+1. A stale `in_run` let a press join the idle wake word session (section 2, "Join").
+2. A refused or failed push-to-talk start left the machine waiting, so it could take over a later continued-conversation, `start_conversation` or `SIGUSR1` run (section 2, "Only that run"; voice crate events in section 5).
+3. Shutdown did not wait for the `luna-send` child of a session the machine had already closed (section 4.1, "Close").
+4. A `luna-send` subscription could outlive a crashed daemon (section 4.1, "Crash safety").
+5. The release cut audio still in flight (the 250 ms grace).
+6. A stream that stopped mid-run was not noticed (the 500 ms stall).
+7. The rate check's comment claimed more than it checks (section 4.1).
+8. `SYN_DROPPED` and a missed release could leave the key stuck (section 3).
+9. The tap/hold decision used the read time, not the kernel's event time (section 3).
+10. A device that kept failing was retried and logged every second (section 3).
+
+Owner priority added at the same time: off is inert (no reader), and `ctl.sh` reads a single-quoted `mic_button`.

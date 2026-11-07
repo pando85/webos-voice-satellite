@@ -402,8 +402,8 @@ disconnect_stop_s = 60
 [remote]
 # The Magic Remote's mic button (design: docs/design/remote-mic-button.md;
 # how it coexists with LG's assistant is ADR 0013, PROPOSED and not built).
-# "off" (default): the key is only observed (a passive read of its input
-# device, never grabbed; no run, no stream, nothing of LG's changed).
+# "off" (default): nothing of this feature is started (no reader, no device
+# opened, no run, no stream, nothing of LG's changed).
 # "ptt": hold the button to talk to Home Assistant: the press starts a run
 # at speech-to-text (no wake word), the release ends its audio. LG's own
 # assistant still opens on each press until the ADR 0013 hand-over exists.

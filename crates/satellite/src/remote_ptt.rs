@@ -24,8 +24,9 @@
 //!   **joined**: no new run, the audio switches to the remote. Otherwise a
 //!   push-to-talk run starts (an idle wake word session is aborted by the
 //!   voice layer; a reply that plays is interrupted, as with `SIGUSR1`).
-//! - **Release** after at least `tap_ms`: the audio ends (`EndAudio`, HA
-//!   finalizes speech-to-text) and the remote stream closes.
+//! - **Release** after at least `tap_ms`: after a [`RELEASE_GRACE`] for the
+//!   audio still in flight, the audio ends (`EndAudio`, HA finalizes
+//!   speech-to-text) and the remote stream closes.
 //! - **Tap** (release before `tap_ms`): tap-to-talk. The run goes on with
 //!   the **TV** microphone and Home Assistant's end-of-speech detection
 //!   ends it; the remote stream closes at once, so the remote's microphone
@@ -38,8 +39,15 @@
 //!   nothing. Audio of the remote that arrives before the run streams is
 //!   kept (at most [`PREROLL_MAX`] samples) and sent first, so the first
 //!   words are not lost while HA starts the run. A stream that fails, ends,
-//!   sends nothing within [`FIRST_DATA_WAIT`] or delivers the wrong rate
-//!   falls back to the TV microphone, also in the middle of a run.
+//!   sends nothing within [`FIRST_DATA_WAIT`], stalls for [`STALL`] or
+//!   delivers the wrong rate falls back to the TV microphone, also in the
+//!   middle of a run.
+//! - **Our run only:** the machine takes over only the run the voice layer
+//!   marks as the push-to-talk run it asked for (`StartStreaming {
+//!   push_to_talk: true }`). When the voice layer reports that request
+//!   refused or failed (`PushToTalkFailed`), or nothing streams within
+//!   [`START_WAIT`], the press is given up, so a later continued
+//!   conversation or `start_conversation` run is never fed or ended by it.
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -66,10 +74,23 @@ pub(crate) const RATE_WINDOW: Duration = Duration::from_millis(1000);
 /// Expected samples per second of the remote stream (16 kHz mono S16LE,
 /// 31.6 kB/s measured on c3-a, EXP-022 B).
 pub(crate) const EXPECTED_RATE: f64 = 16_000.0;
-/// Accepted measured rate, as a share of [`EXPECTED_RATE`]: 8 kHz (0.5) and
-/// 32 kHz or stereo (2.0) fall outside.
+/// Accepted measured rate, as a share of [`EXPECTED_RATE`] samples (two
+/// bytes each) per second. Only the byte rate is checked: 8 kHz mono (0.5)
+/// and 32 kHz mono or 16 kHz stereo (2.0) fall outside; another two-byte
+/// format or byte order at the same rate is not detected.
 const RATE_MIN: f64 = 0.6;
 const RATE_MAX: f64 = 1.5;
+/// After a hold's release, the run's audio flows this much longer before it
+/// ends, so chunks still in flight (Bluetooth, LG's buffer, the capture
+/// period) reach HA.
+pub(crate) const RELEASE_GRACE: Duration = Duration::from_millis(250);
+/// A stream that delivered and then sends nothing for this long is dropped
+/// (the TV microphone takes over).
+pub(crate) const STALL: Duration = Duration::from_millis(500);
+/// A press whose run has not started streaming after this long is given up
+/// (the voice layer's own start timeout is 10 s, plus up to 1.5 s for an
+/// aborted run's end).
+pub(crate) const START_WAIT: Duration = Duration::from_secs(12);
 
 /// The settings the machine uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -153,6 +174,11 @@ enum Phase {
         since: Instant,
         started: bool,
     },
+    /// Released after a hold whose run streams: the audio still flows until
+    /// `until` ([`RELEASE_GRACE`]), then ends.
+    Releasing {
+        until: Instant,
+    },
     /// Released after a hold before the run started: the audio kept so far
     /// is sent and ended as soon as the run streams.
     EndPending {
@@ -175,11 +201,12 @@ enum Stream {
     /// Asked for; no answer yet.
     Opening,
     /// The socket is connected. `first`: arrival of the first chunk;
-    /// `samples`: received after the first chunk; `checked`: the rate check
-    /// passed.
+    /// `last`: of the latest; `samples`: received after the first chunk;
+    /// `checked`: the rate check passed.
     Open {
         opened: Instant,
         first: Option<Instant>,
+        last: Instant,
         samples: u64,
         checked: bool,
     },
@@ -240,10 +267,25 @@ impl Hold {
 
     /// Next time [`Hold::on_tick`] has work to do.
     pub(crate) fn next_deadline(&self) -> Option<Instant> {
-        let cap = match self.phase {
-            Phase::Held { since, .. }
-            | Phase::EndPending { since }
-            | Phase::Tapped { since, .. } => Some(since + self.cfg.max_hold),
+        let phase = match self.phase {
+            Phase::Held {
+                since,
+                started: true,
+            }
+            | Phase::Tapped {
+                since,
+                started: true,
+            } => Some(since + self.cfg.max_hold),
+            Phase::Held {
+                since,
+                started: false,
+            }
+            | Phase::Tapped {
+                since,
+                started: false,
+            }
+            | Phase::EndPending { since } => Some(since + self.start_limit()),
+            Phase::Releasing { until } => Some(until),
             Phase::Idle | Phase::WaitRelease => None,
         };
         let stream = match self.stream {
@@ -252,12 +294,22 @@ impl Hold {
                 first: None,
                 ..
             } => Some(opened + FIRST_DATA_WAIT),
+            Stream::Open {
+                first: Some(_),
+                last,
+                ..
+            } => Some(last + STALL),
             _ => None,
         };
-        match (cap, stream) {
+        match (phase, stream) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
         }
+    }
+
+    /// How long a press waits for its run to stream.
+    fn start_limit(&self) -> Duration {
+        self.cfg.max_hold.min(START_WAIT)
     }
 
     // ---- the stream ----
@@ -332,6 +384,7 @@ impl Hold {
         self.stream = Stream::Open {
             opened: now,
             first: None,
+            last: now,
             samples: 0,
             checked: false,
         };
@@ -361,6 +414,7 @@ impl Hold {
             first,
             samples,
             checked,
+            ..
         } = self.stream
         else {
             return (Vec::new(), None);
@@ -383,6 +437,7 @@ impl Hold {
         self.stream = Stream::Open {
             opened,
             first: Some(first_at),
+            last: now,
             samples,
             checked,
         };
@@ -471,7 +526,10 @@ impl Hold {
                     self.close_stream(false);
                     self.phase = Phase::Tapped { since, started };
                 } else if started {
-                    self.end_audio_now();
+                    // The audio in flight still reaches HA; `on_tick` ends it.
+                    self.phase = Phase::Releasing {
+                        until: now + RELEASE_GRACE,
+                    };
                 } else {
                     // Keep what the remote sent: it is the whole utterance.
                     self.close_stream(true);
@@ -479,9 +537,23 @@ impl Hold {
                 }
             }
             Phase::WaitRelease => self.phase = Phase::Idle,
-            Phase::Idle | Phase::EndPending { .. } | Phase::Tapped { .. } => {}
+            Phase::Idle
+            | Phase::Releasing { .. }
+            | Phase::EndPending { .. }
+            | Phase::Tapped { .. } => {}
         }
         self.take()
+    }
+
+    /// A release that was lost (the device went away, the kernel dropped
+    /// events, a press came without a release): handled as a release at
+    /// `now`, but it does not start the bounce window, so a real press
+    /// right after it counts.
+    pub(crate) fn on_release_lost(&mut self, now: Instant) -> Vec<Act> {
+        let before = self.last_release;
+        let acts = self.on_release(now);
+        self.last_release = before;
+        acts
     }
 
     /// Ends the run's audio now: `EndAudio` after the last remote chunk,
@@ -548,7 +620,9 @@ impl Hold {
     /// abort, the end of the run): `StopStreaming` or `RunEnd`.
     pub(crate) fn on_audio_over(&mut self) -> Vec<Act> {
         match self.phase {
-            Phase::Held { started: true, .. } | Phase::Tapped { started: true, .. } => {
+            Phase::Held { started: true, .. }
+            | Phase::Tapped { started: true, .. }
+            | Phase::Releasing { .. } => {
                 self.close_stream(false);
                 self.phase = if self.key_down {
                     Phase::WaitRelease
@@ -577,45 +651,88 @@ impl Hold {
         self.take()
     }
 
-    /// Time passed: the cap of the hold and the first-data deadline of the
-    /// stream. Returns the actions and what happened, for the log.
+    /// The voice layer reports that the push-to-talk request will not
+    /// stream (`PushToTalkFailed`): the press is given up. Returns whether
+    /// a press was waiting for it.
+    pub(crate) fn on_ptt_failed(&mut self) -> (Vec<Act>, bool) {
+        let waiting = matches!(
+            self.phase,
+            Phase::Held { started: false, .. }
+                | Phase::Tapped { started: false, .. }
+                | Phase::EndPending { .. }
+        );
+        if waiting {
+            self.give_up();
+        }
+        (self.take(), waiting)
+    }
+
+    /// A press whose run will not stream: close everything, wait for the
+    /// release if the button is still down.
+    fn give_up(&mut self) {
+        self.close_stream(false);
+        self.phase = if self.key_down {
+            Phase::WaitRelease
+        } else {
+            Phase::Idle
+        };
+    }
+
+    /// Time passed: the cap of the hold, the start limit, the release grace,
+    /// and the stream's first-data and stall deadlines. Returns the actions
+    /// and what happened, for the log.
     pub(crate) fn on_tick(&mut self, now: Instant) -> (Vec<Act>, Option<TickNote>) {
         let mut note = None;
-        if let Stream::Open {
-            opened,
-            first: None,
-            ..
-        } = self.stream
-        {
-            if now >= opened + FIRST_DATA_WAIT {
+        match self.stream {
+            Stream::Open {
+                opened,
+                first: None,
+                ..
+            } if now >= opened + FIRST_DATA_WAIT => {
                 let lost = self.on_stream_lost();
                 self.out.extend(lost);
                 note = Some(TickNote::NoData);
             }
+            Stream::Open {
+                first: Some(_),
+                last,
+                ..
+            } if now >= last + STALL => {
+                let lost = self.on_stream_lost();
+                self.out.extend(lost);
+                note = Some(TickNote::Stall);
+            }
+            _ => {}
         }
         match self.phase {
-            Phase::Held { since, started } if now >= since + self.cfg.max_hold => {
-                if started {
-                    self.end_audio_now();
-                    note = Some(TickNote::Cap);
-                } else {
-                    self.close_stream(false);
-                    self.phase = Phase::WaitRelease;
-                    note = Some(TickNote::NotStarted);
-                }
+            Phase::Releasing { until } if now >= until => self.end_audio_now(),
+            Phase::Held {
+                since,
+                started: true,
+            } if now >= since + self.cfg.max_hold => {
+                self.end_audio_now();
+                note = Some(TickNote::Cap);
             }
-            Phase::Tapped { since, started } if now >= since + self.cfg.max_hold => {
-                if started {
-                    self.out.push(Act::EndAudio);
-                    note = Some(TickNote::Cap);
-                } else {
-                    note = Some(TickNote::NotStarted);
-                }
+            Phase::Tapped {
+                since,
+                started: true,
+            } if now >= since + self.cfg.max_hold => {
+                self.out.push(Act::EndAudio);
                 self.phase = Phase::Idle;
+                note = Some(TickNote::Cap);
             }
-            Phase::EndPending { since } if now >= since + self.cfg.max_hold => {
-                self.clear_preroll();
-                self.phase = Phase::Idle;
+            Phase::Held {
+                since,
+                started: false,
+            }
+            | Phase::Tapped {
+                since,
+                started: false,
+            }
+            | Phase::EndPending { since }
+                if now >= since + self.start_limit() =>
+            {
+                self.give_up();
                 note = Some(TickNote::NotStarted);
             }
             _ => {}
@@ -677,27 +794,28 @@ impl LgVoiceKey for LeaveToLg {
 pub(crate) enum TickNote {
     /// The longest hold was reached: the audio ended.
     Cap,
-    /// Home Assistant did not start the run before the cap.
+    /// The run did not start streaming in time.
     NotStarted,
     /// The remote stream sent nothing after it opened.
     NoData,
+    /// The remote stream stopped delivering.
+    Stall,
 }
 
-/// The feature in the daemon: the button reader's events, the machine, the
-/// remote microphone and the hand-over seam. It runs the stream actions
-/// itself and returns the others ([`Act::StartRun`], [`Act::EndAudio`],
-/// [`Act::Audio`], [`Act::RemoteFeeds`]) for the daemon. With `mic_button =
-/// "off"` the key is only observed: presses are logged at debug and nothing
-/// else happens.
+/// The feature in the daemon (only with `mic_button = "ptt"`; with
+/// `"off"` nothing of it is started): the button reader's events, the
+/// machine, the remote microphone and the hand-over seam. It runs the
+/// stream actions itself and returns the others ([`Act::StartRun`],
+/// [`Act::EndAudio`], [`Act::Audio`], [`Act::RemoteFeeds`]) for the daemon.
 pub(crate) struct Button {
-    ptt: bool,
     hold: Hold,
     mic: Option<RemoteMic>,
     lg: Box<dyn LgVoiceKey>,
     acquired: bool,
     /// [`Hold::active`] after the last event (for the run hooks).
     active: bool,
-    pressed_at: Option<Instant>,
+    /// The kernel time and the local time of the press being served.
+    pressed: Option<(Duration, Instant)>,
     stop: Arc<AtomicBool>,
 }
 
@@ -708,10 +826,33 @@ pub(crate) struct Started {
     pub(crate) stream: mpsc::UnboundedReceiver<(u64, StreamEvent)>,
 }
 
+/// The local time of a release: the press's local time plus the hold the
+/// kernel's event times measured (the receive time is late by however long
+/// the event waited), never later than `now`. Without both kernel times, or
+/// with a clock step between them, `now`.
+pub(crate) fn release_time(
+    pressed: Option<(Duration, Instant)>,
+    released: Option<Duration>,
+    now: Instant,
+) -> Instant {
+    let Some(((kp, local), kr)) = pressed.zip(released) else {
+        return now;
+    };
+    let Some(held) = kr.checked_sub(kp) else {
+        return now;
+    };
+    let at = local + held;
+    if at <= now && now.saturating_duration_since(at) < Duration::from_secs(5) {
+        at
+    } else {
+        now
+    }
+}
+
 impl Button {
-    /// Starts the reader thread (always passive) and, with hold-to-talk,
-    /// prepares the remote microphone (`luna`: `None` keeps every run on
-    /// the TV microphone).
+    /// Starts the reader thread and prepares the remote microphone (`luna`:
+    /// `None` keeps every run on the TV microphone). Call only with
+    /// `mic_button = "ptt"`.
     pub(crate) fn start(
         section: &RemoteSection,
         luna: Option<PathBuf>,
@@ -730,30 +871,25 @@ impl Button {
             key_tx,
             Arc::clone(&stop),
         )?;
-        let ptt = section.ptt();
-        let mic = (ptt && section.remote_mic)
+        let mic = section
+            .remote_mic
             .then(|| RemoteMic::new(MicConfig::new(luna, hpf_hz, section.gain_db), stream_tx));
-        if ptt {
-            log::info!(
-                "remote mic button: hold to talk (audio from the {}); LG's assistant hand-over is not built (ADR 0013 proposed): LG's assistant still opens on each press",
-                if mic.is_some() {
-                    "remote's microphone, TV microphone as fallback"
-                } else {
-                    "TV microphone"
-                }
-            );
-        } else {
-            log::info!("remote mic button: off (mic_button = \"off\"): the key is only observed");
-        }
+        log::info!(
+            "remote mic button: hold to talk (audio from the {}); LG's assistant hand-over is not built (ADR 0013 proposed): LG's assistant still opens on each press",
+            if mic.is_some() {
+                "remote's microphone, TV microphone as fallback"
+            } else {
+                "TV microphone"
+            }
+        );
         Ok(Started {
             button: Self {
-                ptt,
                 hold: Hold::new(HoldConfig::from_section(section)),
                 mic,
                 lg,
                 acquired: false,
                 active: false,
-                pressed_at: None,
+                pressed: None,
                 stop,
             },
             keys,
@@ -796,7 +932,7 @@ impl Button {
     pub(crate) fn on_key(&mut self, key: Key, now: Instant, ctx: Context) -> Vec<Act> {
         match key {
             Key::Found => {
-                if self.ptt && !self.acquired {
+                if !self.acquired {
                     self.acquired = true;
                     match self.lg.acquire() {
                         KeyOwner::Lg => log::info!(
@@ -809,41 +945,44 @@ impl Button {
                 }
                 Vec::new()
             }
-            Key::Pressed if !self.ptt => {
-                log::debug!("remote mic button pressed (mic_button = \"off\": observed only)");
-                Vec::new()
-            }
-            Key::Released if !self.ptt => Vec::new(),
-            Key::Pressed => {
+            Key::Pressed(kernel) => {
                 let (outcome, acts) = self.hold.on_press(now, ctx);
                 match outcome {
                     PressOutcome::Started => {
-                        self.pressed_at = Some(now);
+                        self.pressed = Some((kernel, now));
                         log::info!("remote mic button: pressed; push-to-talk run requested");
                         self.lg.run_started();
                     }
                     PressOutcome::Joined => {
-                        self.pressed_at = Some(now);
+                        self.pressed = Some((kernel, now));
                         log::info!(
                             "remote mic button: pressed during a run; it takes the remote's audio"
                         );
                         self.lg.run_started();
                     }
                     PressOutcome::Refused(why) => {
+                        self.pressed = None;
                         log::warn!("remote mic button: pressed, refused: {why}");
                     }
                     PressOutcome::Ignored => log::debug!("remote mic button: press ignored"),
                 }
                 self.apply(acts)
             }
-            Key::Released => {
-                if let Some(at) = self.pressed_at.take() {
+            Key::Released(kernel) => {
+                let pressed = self.pressed.take();
+                let at = release_time(pressed, kernel, now);
+                if let Some((_, local)) = pressed {
                     log::info!(
                         "remote mic button: released after {} ms",
-                        now.saturating_duration_since(at).as_millis()
+                        at.saturating_duration_since(local).as_millis()
                     );
                 }
-                let acts = self.hold.on_release(now);
+                let acts = if kernel.is_some() {
+                    self.hold.on_release(at)
+                } else {
+                    log::info!("remote mic button: the release was lost; handled as a release");
+                    self.hold.on_release_lost(now)
+                };
                 self.apply(acts)
             }
         }
@@ -882,7 +1021,8 @@ impl Button {
         self.apply(acts)
     }
 
-    /// Time passed (the cap, the stream's first data).
+    /// Time passed (the cap, the start limit, the release grace, the
+    /// stream's first data and stalls).
     pub(crate) fn on_tick(&mut self, now: Instant) -> Vec<Act> {
         let (acts, note) = self.hold.on_tick(now);
         match note {
@@ -890,19 +1030,31 @@ impl Button {
                 log::info!("remote mic button: longest hold reached; audio ended");
             }
             Some(TickNote::NotStarted) => {
-                log::warn!("remote mic button: Home Assistant did not start the run in time");
+                log::warn!("remote mic button: the run did not start in time; press given up");
             }
             Some(TickNote::NoData) => {
                 log::warn!("remote mic: the stream sent nothing; using the TV microphone");
+            }
+            Some(TickNote::Stall) => {
+                log::warn!("remote mic: the stream stalled; using the TV microphone");
             }
             None => {}
         }
         self.apply(acts)
     }
 
-    /// `StartStreaming { wake_word: false }`.
+    /// `StartStreaming { push_to_talk: true }`: the run this press asked for.
     pub(crate) fn on_run_started(&mut self) -> Vec<Act> {
         let acts = self.hold.on_run_started();
+        self.apply(acts)
+    }
+
+    /// `PushToTalkFailed`: the run this press asked for will not stream.
+    pub(crate) fn on_ptt_failed(&mut self) -> Vec<Act> {
+        let (acts, waiting) = self.hold.on_ptt_failed();
+        if waiting {
+            log::warn!("remote mic button: the push-to-talk run was refused or failed");
+        }
         self.apply(acts)
     }
 
@@ -921,8 +1073,9 @@ impl Button {
         self.apply(acts)
     }
 
-    /// Daemon shutdown: the stream closes (its child is reaped), the key
-    /// goes back to LG, the reader thread is told to stop.
+    /// Daemon shutdown: every stream session ends and its `luna-send` child
+    /// is reaped before this returns (bounded), the key goes back to LG, the
+    /// reader thread is told to stop.
     pub(crate) async fn shutdown(&mut self) -> Vec<Act> {
         let acts = self.halt("shutdown");
         if let Some(m) = self.mic.as_mut() {
@@ -952,6 +1105,13 @@ mod tests {
             remote_mic: true,
             max_hold: Duration::from_secs(15),
             tap: Duration::from_millis(300),
+        }
+    }
+
+    fn tv_only() -> HoldConfig {
+        HoldConfig {
+            remote_mic: false,
+            ..cfg()
         }
     }
 
@@ -986,12 +1146,20 @@ mod tests {
         (t, out)
     }
 
+    /// Feeds chunks at the real rate from `from` while before `to`.
+    fn feed_until(h: &mut Hold, from: Instant, to: Instant) -> (Instant, Vec<Act>) {
+        let n = to.saturating_duration_since(from).as_millis() / 32;
+        feed(h, from, u64::try_from(n).unwrap(), 1)
+    }
+
     fn audio_count(acts: &[Act]) -> usize {
         acts.iter().filter(|a| matches!(a, Act::Audio(_))).count()
     }
 
+    const ENDED: [Act; 3] = [Act::EndAudio, Act::CloseStream, Act::RemoteFeeds(false)];
+
     #[test]
-    fn hold_streams_the_remote_with_its_preroll_and_release_ends_the_audio() {
+    fn hold_streams_the_remote_with_its_preroll_and_the_release_ends_it_after_the_grace() {
         let t0 = Instant::now();
         let mut h = Hold::new(cfg());
         let (o, a) = h.on_press(t0, ok_ctx());
@@ -1006,20 +1174,40 @@ mod tests {
         assert_eq!(a[0], Act::RemoteFeeds(true));
         assert_eq!(audio_count(&a), 5);
         assert!(h.feeding());
-        let (_, a) = feed(&mut h, t, 10, 9);
-        assert_eq!(audio_count(&a), 10);
-        // Release after 2 s: end of audio, then the stream closes and the TV
-        // microphone flows again.
-        let a = h.on_release(ms(t0, 2000));
-        assert_eq!(
-            a,
-            [Act::EndAudio, Act::CloseStream, Act::RemoteFeeds(false)]
-        );
+        let (t, a) = feed_until(&mut h, t, ms(t0, 2000));
+        assert!(audio_count(&a) > 50);
+        // Release at 2 s: nothing ends yet, the audio in flight still flows.
+        assert!(h.on_release(ms(t0, 2000)).is_empty());
+        assert_eq!(h.next_deadline(), Some(ms(t0, 2000) + RELEASE_GRACE));
+        let (_, a) = feed(&mut h, t, 5, 9);
+        assert_eq!(audio_count(&a), 5);
+        let (a, n) = h.on_tick(ms(t0, 2249));
+        assert!(a.is_empty() && n.is_none());
+        // Then the end of the audio, the stream closes, the TV mic flows.
+        let (a, _) = h.on_tick(ms(t0, 2250));
+        assert_eq!(a, ENDED);
         assert!(!h.stream_wanted());
         assert_eq!(h.next_deadline(), None);
         // The run's own stop afterwards changes nothing.
         assert!(h.on_audio_over().is_empty());
         assert!(h.on_run_started().is_empty());
+    }
+
+    #[test]
+    fn ha_ending_the_audio_during_the_grace_needs_no_end_from_us() {
+        let t0 = Instant::now();
+        let mut h = Hold::new(cfg());
+        h.on_press(t0, ok_ctx());
+        h.on_stream_opened(ms(t0, 30));
+        h.on_run_started();
+        let (_, _) = feed_until(&mut h, ms(t0, 40), ms(t0, 1000));
+        assert!(h.on_release(ms(t0, 1000)).is_empty());
+        assert_eq!(
+            h.on_audio_over(),
+            [Act::CloseStream, Act::RemoteFeeds(false)]
+        );
+        let (a, _) = h.on_tick(ms(t0, 1300));
+        assert!(a.is_empty());
     }
 
     #[test]
@@ -1041,7 +1229,7 @@ mod tests {
     #[test]
     fn a_tap_whose_run_hears_no_end_is_capped() {
         let t0 = Instant::now();
-        let mut h = Hold::new(cfg());
+        let mut h = Hold::new(tv_only());
         h.on_press(t0, ok_ctx());
         h.on_run_started();
         h.on_release(ms(t0, 100));
@@ -1063,7 +1251,8 @@ mod tests {
         });
         h.on_press(t0, ok_ctx());
         h.on_run_started();
-        let a = h.on_release(ms(t0, 10));
+        assert!(h.on_release(ms(t0, 10)).is_empty());
+        let (a, _) = h.on_tick(ms(t0, 260));
         assert_eq!(a, [Act::EndAudio, Act::CloseStream]);
     }
 
@@ -1074,13 +1263,10 @@ mod tests {
         h.on_press(t0, ok_ctx());
         h.on_stream_opened(ms(t0, 30));
         h.on_run_started();
-        let (t, _) = feed(&mut h, ms(t0, 40), 3, 1);
+        let (t, _) = feed_until(&mut h, ms(t0, 40), ms(t0, 15_000));
         assert_eq!(h.next_deadline(), Some(ms(t0, 15_000)));
         let (a, n) = h.on_tick(ms(t0, 15_000));
-        assert_eq!(
-            a,
-            [Act::EndAudio, Act::CloseStream, Act::RemoteFeeds(false)]
-        );
+        assert_eq!(a, ENDED);
         assert_eq!(n, Some(TickNote::Cap));
         // Late chunks of the closed stream are dropped.
         let (a, _) = h.on_chunk(t, chunk(1));
@@ -1090,18 +1276,78 @@ mod tests {
     }
 
     #[test]
-    fn a_run_that_never_starts_is_given_up_at_the_cap() {
+    fn a_run_that_never_starts_is_given_up_at_the_start_limit() {
         let t0 = Instant::now();
         let mut h = Hold::new(cfg());
         h.on_press(t0, ok_ctx());
         h.on_stream_opened(ms(t0, 30));
-        feed(&mut h, ms(t0, 40), 3, 1);
-        let (a, n) = h.on_tick(ms(t0, 15_000));
+        let (t, _) = feed(&mut h, ms(t0, 40), 3, 1);
+        // The remote stops sending: a stall closes it (nothing was fed).
+        let stall = t - Duration::from_millis(32) + STALL;
+        assert_eq!(h.next_deadline(), Some(stall));
+        let (a, n) = h.on_tick(stall);
         assert_eq!(a, [Act::CloseStream]);
+        assert_eq!(n, Some(TickNote::Stall));
+        // START_WAIT (12 s) comes before the 15 s cap.
+        assert_eq!(h.next_deadline(), Some(t0 + START_WAIT));
+        let (a, n) = h.on_tick(t0 + START_WAIT);
+        assert!(a.is_empty());
         assert_eq!(n, Some(TickNote::NotStarted));
-        // A run that starts after that is not ours to end.
+        // A run that starts after that is not ours to feed or end.
         assert!(h.on_run_started().is_empty());
         assert!(h.on_release(ms(t0, 16_000)).is_empty());
+    }
+
+    #[test]
+    fn a_release_waiting_for_its_run_is_given_up_at_the_start_limit() {
+        let t0 = Instant::now();
+        let mut h = Hold::new(tv_only());
+        h.on_press(t0, ok_ctx());
+        assert!(h.on_release(ms(t0, 800)).is_empty());
+        assert_eq!(h.next_deadline(), Some(t0 + START_WAIT));
+        let (a, n) = h.on_tick(t0 + START_WAIT);
+        assert!(a.is_empty());
+        assert_eq!(n, Some(TickNote::NotStarted));
+        // A later run (a continued conversation, start_conversation) is
+        // never ended by this old press.
+        assert!(h.on_run_started().is_empty());
+        assert_eq!(h.next_deadline(), None);
+    }
+
+    #[test]
+    fn a_refused_or_failed_push_to_talk_gives_the_press_up_in_every_waiting_phase() {
+        let t0 = Instant::now();
+        // Held, before the run streams: the stream closes, the audio kept
+        // is dropped, the release does nothing.
+        let mut h = Hold::new(cfg());
+        h.on_press(t0, ok_ctx());
+        h.on_stream_opened(ms(t0, 30));
+        feed(&mut h, ms(t0, 40), 3, 1);
+        assert_eq!(h.on_ptt_failed(), (vec![Act::CloseStream], true));
+        assert!(h.on_run_started().is_empty(), "a foreign run is not fed");
+        assert!(h.on_release(ms(t0, 2000)).is_empty());
+        assert_eq!(h.next_deadline(), None);
+        // Released before the run streamed.
+        let mut h = Hold::new(cfg());
+        h.on_press(t0, ok_ctx());
+        h.on_stream_opened(ms(t0, 30));
+        let (t, _) = feed(&mut h, ms(t0, 40), 20, 1);
+        h.on_release(t);
+        assert_eq!(h.on_ptt_failed(), (vec![], true));
+        assert!(h.on_run_started().is_empty(), "no kept audio, no EndAudio");
+        assert_eq!(h.next_deadline(), None);
+        // A tap before the run streamed.
+        let mut h = Hold::new(tv_only());
+        h.on_press(t0, ok_ctx());
+        h.on_release(ms(t0, 100));
+        assert_eq!(h.on_ptt_failed(), (vec![], true));
+        assert_eq!(h.next_deadline(), None);
+        // Once the run streams the report is not about this press.
+        let mut h = Hold::new(tv_only());
+        h.on_press(t0, ok_ctx());
+        h.on_run_started();
+        assert_eq!(h.on_ptt_failed(), (vec![], false));
+        assert!(h.active());
     }
 
     #[test]
@@ -1174,14 +1420,11 @@ mod tests {
         // The TV microphone already feeds the run: switch at the remote's
         // first chunk, nothing kept to repeat.
         assert!(h.on_stream_opened(ms(t0, 40)).is_empty());
-        let (_, a) = feed(&mut h, ms(t0, 50), 4, 3);
+        let (_, a) = feed_until(&mut h, ms(t0, 50), ms(t0, 1500));
         assert_eq!(a[0], Act::RemoteFeeds(true));
-        assert_eq!(audio_count(&a), 4);
-        let a = h.on_release(ms(t0, 1500));
-        assert_eq!(
-            a,
-            [Act::EndAudio, Act::CloseStream, Act::RemoteFeeds(false)]
-        );
+        assert!(h.on_release(ms(t0, 1500)).is_empty());
+        let (a, _) = h.on_tick(ms(t0, 1750));
+        assert_eq!(a, ENDED);
     }
 
     #[test]
@@ -1225,10 +1468,7 @@ mod tests {
     #[test]
     fn a_release_before_the_run_streams_without_remote_audio_leaves_it_to_ha() {
         let t0 = Instant::now();
-        let mut h = Hold::new(HoldConfig {
-            remote_mic: false,
-            ..cfg()
-        });
+        let mut h = Hold::new(tv_only());
         let (_, a) = h.on_press(t0, ok_ctx());
         assert_eq!(a, [Act::StartRun]);
         assert!(h.on_release(ms(t0, 800)).is_empty());
@@ -1240,15 +1480,14 @@ mod tests {
     }
 
     #[test]
-    fn tv_microphone_only_hold_ends_the_audio_at_the_release() {
+    fn tv_microphone_only_hold_ends_the_audio_after_the_grace() {
         let t0 = Instant::now();
-        let mut h = Hold::new(HoldConfig {
-            remote_mic: false,
-            ..cfg()
-        });
+        let mut h = Hold::new(tv_only());
         h.on_press(t0, ok_ctx());
         assert!(h.on_run_started().is_empty());
-        assert_eq!(h.on_release(ms(t0, 900)), [Act::EndAudio]);
+        assert!(h.on_release(ms(t0, 900)).is_empty());
+        let (a, _) = h.on_tick(ms(t0, 1150));
+        assert_eq!(a, [Act::EndAudio]);
     }
 
     #[test]
@@ -1262,7 +1501,9 @@ mod tests {
         assert!(!h.stream_wanted());
         assert!(h.on_run_started().is_empty());
         // The release still ends the audio (of the TV microphone).
-        assert_eq!(h.on_release(ms(t0, 2000)), [Act::EndAudio]);
+        assert!(h.on_release(ms(t0, 2000)).is_empty());
+        let (a, _) = h.on_tick(ms(t0, 2250));
+        assert_eq!(a, [Act::EndAudio]);
     }
 
     #[test]
@@ -1279,7 +1520,31 @@ mod tests {
             [Act::CloseStream, Act::RemoteFeeds(false)]
         );
         assert!(!h.feeding());
-        assert_eq!(h.on_release(ms(t0, 2000)), [Act::EndAudio]);
+        assert!(h.on_release(ms(t0, 2000)).is_empty());
+        let (a, _) = h.on_tick(ms(t0, 2250));
+        assert_eq!(a, [Act::EndAudio]);
+    }
+
+    #[test]
+    fn a_stream_that_stalls_mid_run_gives_the_audio_back_to_the_tv() {
+        let t0 = Instant::now();
+        let mut h = Hold::new(cfg());
+        h.on_press(t0, ok_ctx());
+        h.on_stream_opened(ms(t0, 30));
+        h.on_run_started();
+        let (t, _) = feed(&mut h, ms(t0, 40), 10, 1);
+        assert!(h.feeding());
+        let last = t - Duration::from_millis(32);
+        assert_eq!(h.next_deadline(), Some(last + STALL));
+        let (a, n) = h.on_tick(last + STALL - Duration::from_millis(1));
+        assert!(a.is_empty() && n.is_none());
+        let (a, n) = h.on_tick(last + STALL);
+        assert_eq!(a, [Act::CloseStream, Act::RemoteFeeds(false)]);
+        assert_eq!(n, Some(TickNote::Stall));
+        // A chunk that arrives late is dropped; the cap still applies.
+        let (a, _) = h.on_chunk(last + STALL, chunk(1));
+        assert!(a.is_empty());
+        assert_eq!(h.next_deadline(), Some(ms(t0, 15_000)));
     }
 
     #[test]
@@ -1367,22 +1632,78 @@ mod tests {
     #[test]
     fn duplicate_presses_and_bounces_are_ignored() {
         let t0 = Instant::now();
-        let mut h = Hold::new(cfg());
+        let mut h = Hold::new(tv_only());
         h.on_press(t0, ok_ctx());
         let (o, a) = h.on_press(ms(t0, 10), ok_ctx());
         assert_eq!(o, PressOutcome::Ignored);
         assert!(a.is_empty());
         h.on_run_started();
-        h.on_release(ms(t0, 1000));
+        assert!(h.on_release(ms(t0, 1000)).is_empty());
         // A press 20 ms after the release is a bounce; so is its release.
         let (o, a) = h.on_press(ms(t0, 1020), ok_ctx());
         assert_eq!(o, PressOutcome::Ignored);
         assert!(a.is_empty());
         assert!(h.on_release(ms(t0, 1040)).is_empty());
+        // The grace of the real release still ends the audio.
+        let (a, _) = h.on_tick(ms(t0, 1250));
+        assert_eq!(a, [Act::EndAudio]);
         // A release without a press does nothing.
         assert!(h.on_release(ms(t0, 1100)).is_empty());
         let (o, _) = h.on_press(ms(t0, 2000), ok_ctx());
         assert_eq!(o, PressOutcome::Started);
+    }
+
+    #[test]
+    fn a_lost_release_is_no_bounce_for_the_next_press() {
+        let t0 = Instant::now();
+        let mut h = Hold::new(tv_only());
+        h.on_press(t0, ok_ctx());
+        h.on_run_started();
+        assert!(h.on_release_lost(ms(t0, 1000)).is_empty());
+        let (o, _) = h.on_press(ms(t0, 1005), ok_ctx());
+        assert_eq!(o, PressOutcome::Started);
+    }
+
+    #[test]
+    fn a_new_press_during_a_tapped_run_takes_it_over() {
+        let t0 = Instant::now();
+        let mut h = Hold::new(cfg());
+        h.on_press(t0, ok_ctx());
+        h.on_run_started();
+        h.on_release(ms(t0, 100));
+        // The tapped run streams the TV microphone; a hold joins it.
+        let (o, a) = h.on_press(
+            ms(t0, 2000),
+            Context {
+                run_streaming: true,
+                ..ok_ctx()
+            },
+        );
+        assert_eq!(o, PressOutcome::Joined);
+        assert_eq!(a, [Act::OpenStream]);
+        assert_eq!(h.next_deadline(), Some(ms(t0, 17_000)));
+    }
+
+    #[test]
+    fn the_release_time_comes_from_the_kernel_event_times() {
+        let t0 = Instant::now();
+        let k = Duration::from_millis;
+        let pressed = Some((k(10_000), t0));
+        // Read 400 ms after the press, but the kernel saw a 200 ms tap.
+        assert_eq!(
+            release_time(pressed, Some(k(10_200)), ms(t0, 400)),
+            ms(t0, 200)
+        );
+        // No kernel time (a lost release), no press, a clock step back, or
+        // a time in the future: the receive time.
+        for (p, r) in [
+            (pressed, None),
+            (None, Some(k(10_200))),
+            (pressed, Some(k(9_000))),
+            (pressed, Some(k(11_000))),
+        ] {
+            assert_eq!(release_time(p, r, ms(t0, 400)), ms(t0, 400));
+        }
     }
 
     /// A hand-over that records its calls.
@@ -1404,15 +1725,14 @@ mod tests {
         }
     }
 
-    fn button(ptt: bool, tag: &str) -> (Button, Arc<std::sync::Mutex<Vec<&'static str>>>, PathBuf) {
+    type Calls = Arc<std::sync::Mutex<Vec<&'static str>>>;
+
+    fn button(tag: &str, remote_mic: bool) -> (Button, Calls, PathBuf) {
         let (root, paths) = crate::evdev::tests::fake_inputs(tag, &[]);
         let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
         let section = RemoteSection {
-            mic_button: if ptt {
-                crate::config::MicButton::Ptt
-            } else {
-                crate::config::MicButton::Off
-            },
+            mic_button: crate::config::MicButton::Ptt,
+            remote_mic,
             ..RemoteSection::default()
         };
         let st = Button::start(
@@ -1428,26 +1748,30 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn the_hand_over_seam_is_called_around_the_feature_and_each_run() {
-        let (mut b, calls, root) = button(true, "seam");
+        let (mut b, calls, root) = button("seam", true);
         let t0 = Instant::now();
+        let k = Duration::from_millis;
         assert!(b.on_key(Key::Found, t0, ok_ctx()).is_empty());
         b.on_key(Key::Found, t0, ok_ctx());
-        let a = b.on_key(Key::Pressed, t0, ok_ctx());
+        let a = b.on_key(Key::Pressed(k(5000)), t0, ok_ctx());
         // The stream actions are the button's own; the run is the daemon's.
         assert_eq!(a, [Act::StartRun]);
         assert!(b.on_run_started().is_empty());
-        let a = b.on_key(Key::Released, ms(t0, 1500), ok_ctx());
-        assert_eq!(a, [Act::EndAudio]);
+        assert!(
+            b.on_key(Key::Released(Some(k(6500))), ms(t0, 1500), ok_ctx())
+                .is_empty()
+        );
+        assert_eq!(b.on_tick(ms(t0, 1750)), [Act::EndAudio]);
         // A refused press is no run.
         b.on_key(
-            Key::Pressed,
+            Key::Pressed(k(8000)),
             ms(t0, 3000),
             Context {
                 mic_off: true,
                 ..ok_ctx()
             },
         );
-        b.on_key(Key::Released, ms(t0, 3500), ok_ctx());
+        b.on_key(Key::Released(Some(k(8500))), ms(t0, 3500), ok_ctx());
         b.shutdown().await;
         assert_eq!(
             *calls.lock().unwrap(),
@@ -1457,23 +1781,31 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn with_mic_button_off_the_key_is_only_observed() {
-        let (mut b, calls, root) = button(false, "off");
+    async fn the_button_measures_the_hold_with_the_kernel_times() {
+        let (mut b, _calls, root) = button("ktime", false);
         let t0 = Instant::now();
-        b.on_key(Key::Found, t0, ok_ctx());
-        assert!(b.on_key(Key::Pressed, t0, ok_ctx()).is_empty());
-        assert!(b.on_key(Key::Released, ms(t0, 2000), ok_ctx()).is_empty());
-        assert_eq!(b.deadline(), None);
-        assert!(b.shutdown().await.is_empty());
-        assert!(calls.lock().unwrap().is_empty(), "LG's side untouched");
+        let k = Duration::from_millis;
+        b.on_key(Key::Pressed(k(20_000)), t0, ok_ctx());
+        b.on_run_started();
+        // Read late (400 ms) but held 200 ms by the kernel's times: a tap,
+        // so the run goes on to HA's end of speech (capped), no grace.
+        assert!(
+            b.on_key(Key::Released(Some(k(20_200))), ms(t0, 400), ok_ctx())
+                .is_empty()
+        );
+        assert_eq!(b.deadline(), Some(ms(t0, 15_000)));
+        b.shutdown().await;
         let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn without_luna_send_a_held_run_falls_back_to_the_tv_microphone() {
-        let (mut b, _calls, root) = button(true, "noluna");
+        let (mut b, _calls, root) = button("noluna", true);
         let t0 = Instant::now();
-        assert_eq!(b.on_key(Key::Pressed, t0, ok_ctx()), [Act::StartRun]);
+        assert_eq!(
+            b.on_key(Key::Pressed(Duration::ZERO), t0, ok_ctx()),
+            [Act::StartRun]
+        );
         // The session reports itself lost at once (no luna-send); the
         // daemon hands that event over.
         let g = b.mic.as_ref().unwrap().generation();
@@ -1484,31 +1816,28 @@ mod tests {
         // A stale event of an older session is ignored.
         assert!(b.on_stream(0, StreamEvent::Opened, ms(t0, 6)).is_empty());
         assert!(b.on_run_started().is_empty());
-        assert_eq!(
-            b.on_key(Key::Released, ms(t0, 1000), ok_ctx()),
-            [Act::EndAudio]
+        assert!(
+            b.on_key(
+                Key::Released(Some(Duration::from_millis(1000))),
+                ms(t0, 1000),
+                ok_ctx()
+            )
+            .is_empty()
         );
+        assert_eq!(b.on_tick(ms(t0, 1250)), [Act::EndAudio]);
         b.shutdown().await;
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    #[test]
-    fn a_new_press_during_a_tapped_run_takes_it_over() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_failed_push_to_talk_reaches_the_machine_through_the_button() {
+        let (mut b, calls, root) = button("pttfail", false);
         let t0 = Instant::now();
-        let mut h = Hold::new(cfg());
-        h.on_press(t0, ok_ctx());
-        h.on_run_started();
-        h.on_release(ms(t0, 100));
-        // The tapped run streams the TV microphone; a hold joins it.
-        let (o, a) = h.on_press(
-            ms(t0, 2000),
-            Context {
-                run_streaming: true,
-                ..ok_ctx()
-            },
-        );
-        assert_eq!(o, PressOutcome::Joined);
-        assert_eq!(a, [Act::OpenStream]);
-        assert_eq!(h.next_deadline(), Some(ms(t0, 17_000)));
+        b.on_key(Key::Pressed(Duration::ZERO), t0, ok_ctx());
+        assert!(b.on_ptt_failed().is_empty());
+        assert_eq!(b.deadline(), None);
+        assert_eq!(*calls.lock().unwrap(), ["run_started", "run_ended"]);
+        b.shutdown().await;
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -173,6 +173,7 @@ fn event_line(ev: &AppEvent) -> String {
         AppEvent::StartStreaming {
             wake_word,
             conversation_id,
+            ..
         } => format!(
             "StartStreaming {{ wake_word: {wake_word}, conversation_id: {conversation_id:?} }}"
         ),

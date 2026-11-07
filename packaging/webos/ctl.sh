@@ -407,7 +407,13 @@ aec_enabled_json() { if [ "$(cfg_section_value aec enabled)" = false ]; then pri
 music_enabled_json() { if [ "$(cfg_section_value music enabled)" = true ]; then printf true; else printf false; fi; }
 # [remote] mic_button (the Magic Remote's mic button, ADR 0013 proposed): off
 # unless it says ptt.
-mic_button_word() { if [ "$(cfg_section_value remote mic_button)" = ptt ]; then printf ptt; else printf off; fi; }
+# A TOML string may be in double or single quotes.
+mic_button_word() {
+    mb=$(cfg_section_value remote mic_button)
+    mb=${mb#\'}
+    mb=${mb%\'}
+    if [ "$mb" = ptt ]; then printf ptt; else printf off; fi
+}
 
 # The reply volume file: sink.volume_file of the config, relative to etc/
 # (the daemon's default is etc/reply_volume).

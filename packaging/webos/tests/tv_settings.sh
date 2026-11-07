@@ -425,6 +425,11 @@ out=$(cqc config mic-button on 2>/dev/null) && rc=0 || rc=$?
 check "mic-button on again: already" '[ "$rc" -eq 0 ] && echo "$out" | grep -q "\"result\":\"already\""'
 out=$(cqc config mic-button off 2>/dev/null) && rc=0 || rc=$?
 check "mic-button off: the quoted value is replaced in place" '[ "$rc" -eq 0 ] && echo "$out" | grep -q "\"after\":\"off\",\"result\":\"applied\"" && grep -qx "mic_button = \"off\"" "$QC" && ! grep -q ptt "$QC" && qsum | grep -q " remote=\[mic_button=off "'
+# A single-quoted TOML string is the same value.
+sed "s/^mic_button = \"off\"\$/mic_button = 'ptt'  # single quotes/" "$QC" >"$T/sq.toml" && cp "$T/sq.toml" "$QC"
+check "mic_button = 'ptt' (single quotes): the daemon and status both read ptt" 'qsum | grep -q " remote=\[mic_button=ptt " && cq status --json | grep -q "\"mic_button\":\"ptt\"," && cq status 2>/dev/null | grep -q "remote mic button: ptt"'
+out=$(cqc config mic-button off 2>/dev/null) && rc=0 || rc=$?
+check "mic-button off from a single-quoted value: replaced in place, comment kept" '[ "$rc" -eq 0 ] && echo "$out" | grep -q "\"before\":\"on\",\"after\":\"off\",\"result\":\"applied\"" && grep -qx "mic_button = \"off\"  # single quotes" "$QC" && qsum | grep -q " remote=\[mic_button=off "'
 for bad in ptt yes ""; do
     cq config mic-button "$bad" >/dev/null 2>&1 && rc=0 || rc=$?
     check "config mic-button '$bad': usage, exit 2" '[ "$rc" -eq 2 ]'
