@@ -10,6 +10,8 @@ Which physical ALSA endpoints correspond to built-in far-field microphones? Chan
 
 own-your-glass documents ALSA capture paths on another rooted LG TV. CleanYourTV captures a DIFFERENT audio path: the Magic Remote through LG voiceinput. Neither proves C3 built-in capture.
 
+The Magic Remote's own microphone (not ALSA on c3-a; LG's `voiceinput` remote stream on webOS 25 TVs) is covered in [remote mic button](remote-mic-button.md#2-the-remotes-own-microphone).
+
 ## Hypotheses and device validation
 
 **Status: HYPOTHESIS — target verification required**

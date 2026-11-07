@@ -16,6 +16,8 @@ Assist pipeline supports start_stage wake_word or stt. LG's built-in hotword pre
 
 Start MVP with server-side wake word if PCM is available, measure bandwidth/CPU and privacy; investigate on-TV and native LG detectors as interchangeable providers. VAD is not equivalent to wake word.
 
+Push-to-talk from the Magic Remote's mic button (key route, the remote's own voice stream through `voiceinput`, coexistence with LG's assistant): [remote mic button](remote-mic-button.md), 2026-11-07, desk research; proposed check [EXP-022](../experiments/EXP-022-remote-mic-button-observe.md).
+
 ## Planned experiments
 
 - [EXP-007](../experiments/README.md)
