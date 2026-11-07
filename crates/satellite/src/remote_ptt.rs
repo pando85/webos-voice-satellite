@@ -511,7 +511,11 @@ impl Hold {
     }
 
     /// The button went up (or its device went away while it was down).
-    pub(crate) fn on_release(&mut self, now: Instant) -> Vec<Act> {
+    /// `held`: how long the key was down by the kernel's event times; tap or
+    /// hold is decided from it, so an event handled late (a busy event loop)
+    /// does not change the decision. `None`: measured from the press's
+    /// handling to `now`.
+    pub(crate) fn on_release(&mut self, now: Instant, held: Option<Duration>) -> Vec<Act> {
         if !self.key_down {
             return Vec::new();
         }
@@ -519,7 +523,7 @@ impl Hold {
         self.last_release = Some(now);
         match self.phase {
             Phase::Held { since, started } => {
-                let held = now.saturating_duration_since(since);
+                let held = held.unwrap_or_else(|| now.saturating_duration_since(since));
                 if held < self.cfg.tap {
                     // Tap-to-talk on the TV microphone; the remote's
                     // microphone is live only while the button is held.
@@ -551,7 +555,7 @@ impl Hold {
     /// right after it counts.
     pub(crate) fn on_release_lost(&mut self, now: Instant) -> Vec<Act> {
         let before = self.last_release;
-        let acts = self.on_release(now);
+        let acts = self.on_release(now, None);
         self.last_release = before;
         acts
     }
@@ -826,27 +830,19 @@ pub(crate) struct Started {
     pub(crate) stream: mpsc::UnboundedReceiver<(u64, StreamEvent)>,
 }
 
-/// The local time of a release: the press's local time plus the hold the
-/// kernel's event times measured (the receive time is late by however long
-/// the event waited), never later than `now`. Without both kernel times, or
-/// with a clock step between them, `now`.
-pub(crate) fn release_time(
-    pressed: Option<(Duration, Instant)>,
+/// A kernel-measured hold longer than this is a clock step, not a hold.
+const KERNEL_HOLD_MAX: Duration = Duration::from_secs(120);
+
+/// How long the key was down by the kernel's event times (the press and the
+/// release), independent of when either event was handled. `None` without
+/// both times or across a clock step (the release before the press, or an
+/// implausibly long hold): the caller then measures with its own clock.
+pub(crate) fn kernel_hold(
+    pressed: Option<Duration>,
     released: Option<Duration>,
-    now: Instant,
-) -> Instant {
-    let Some(((kp, local), kr)) = pressed.zip(released) else {
-        return now;
-    };
-    let Some(held) = kr.checked_sub(kp) else {
-        return now;
-    };
-    let at = local + held;
-    if at <= now && now.saturating_duration_since(at) < Duration::from_secs(5) {
-        at
-    } else {
-        now
-    }
+) -> Option<Duration> {
+    let held = released?.checked_sub(pressed?)?;
+    (held <= KERNEL_HOLD_MAX).then_some(held)
 }
 
 impl Button {
@@ -970,15 +966,17 @@ impl Button {
             }
             Key::Released(kernel) => {
                 let pressed = self.pressed.take();
-                let at = release_time(pressed, kernel, now);
+                let held = kernel_hold(pressed.map(|(k, _)| k), kernel);
                 if let Some((_, local)) = pressed {
+                    let by = held.unwrap_or_else(|| now.saturating_duration_since(local));
                     log::info!(
-                        "remote mic button: released after {} ms",
-                        at.saturating_duration_since(local).as_millis()
+                        "remote mic button: released after {} ms{}",
+                        by.as_millis(),
+                        if held.is_some() { "" } else { " (local clock)" }
                     );
                 }
                 let acts = if kernel.is_some() {
-                    self.hold.on_release(at)
+                    self.hold.on_release(now, held)
                 } else {
                     log::info!("remote mic button: the release was lost; handled as a release");
                     self.hold.on_release_lost(now)
@@ -1177,7 +1175,7 @@ mod tests {
         let (t, a) = feed_until(&mut h, t, ms(t0, 2000));
         assert!(audio_count(&a) > 50);
         // Release at 2 s: nothing ends yet, the audio in flight still flows.
-        assert!(h.on_release(ms(t0, 2000)).is_empty());
+        assert!(h.on_release(ms(t0, 2000), None).is_empty());
         assert_eq!(h.next_deadline(), Some(ms(t0, 2000) + RELEASE_GRACE));
         let (_, a) = feed(&mut h, t, 5, 9);
         assert_eq!(audio_count(&a), 5);
@@ -1201,7 +1199,7 @@ mod tests {
         h.on_stream_opened(ms(t0, 30));
         h.on_run_started();
         let (_, _) = feed_until(&mut h, ms(t0, 40), ms(t0, 1000));
-        assert!(h.on_release(ms(t0, 1000)).is_empty());
+        assert!(h.on_release(ms(t0, 1000), None).is_empty());
         assert_eq!(
             h.on_audio_over(),
             [Act::CloseStream, Act::RemoteFeeds(false)]
@@ -1217,7 +1215,7 @@ mod tests {
         h.on_press(t0, ok_ctx());
         h.on_stream_opened(ms(t0, 30));
         feed(&mut h, ms(t0, 40), 3, 1);
-        let a = h.on_release(ms(t0, 250));
+        let a = h.on_release(ms(t0, 250), None);
         assert_eq!(a, [Act::CloseStream]);
         // The run starts later on the TV microphone: no remote audio, no end.
         assert!(h.on_run_started().is_empty());
@@ -1232,7 +1230,7 @@ mod tests {
         let mut h = Hold::new(tv_only());
         h.on_press(t0, ok_ctx());
         h.on_run_started();
-        h.on_release(ms(t0, 100));
+        h.on_release(ms(t0, 100), None);
         assert_eq!(h.next_deadline(), Some(ms(t0, 15_000)));
         let (a, n) = h.on_tick(ms(t0, 14_999));
         assert!(a.is_empty() && n.is_none());
@@ -1251,7 +1249,7 @@ mod tests {
         });
         h.on_press(t0, ok_ctx());
         h.on_run_started();
-        assert!(h.on_release(ms(t0, 10)).is_empty());
+        assert!(h.on_release(ms(t0, 10), None).is_empty());
         let (a, _) = h.on_tick(ms(t0, 260));
         assert_eq!(a, [Act::EndAudio, Act::CloseStream]);
     }
@@ -1271,7 +1269,7 @@ mod tests {
         // Late chunks of the closed stream are dropped.
         let (a, _) = h.on_chunk(t, chunk(1));
         assert!(a.is_empty());
-        assert!(h.on_release(ms(t0, 20_000)).is_empty());
+        assert!(h.on_release(ms(t0, 20_000), None).is_empty());
         assert_eq!(h.next_deadline(), None);
     }
 
@@ -1295,7 +1293,7 @@ mod tests {
         assert_eq!(n, Some(TickNote::NotStarted));
         // A run that starts after that is not ours to feed or end.
         assert!(h.on_run_started().is_empty());
-        assert!(h.on_release(ms(t0, 16_000)).is_empty());
+        assert!(h.on_release(ms(t0, 16_000), None).is_empty());
     }
 
     #[test]
@@ -1303,7 +1301,7 @@ mod tests {
         let t0 = Instant::now();
         let mut h = Hold::new(tv_only());
         h.on_press(t0, ok_ctx());
-        assert!(h.on_release(ms(t0, 800)).is_empty());
+        assert!(h.on_release(ms(t0, 800), None).is_empty());
         assert_eq!(h.next_deadline(), Some(t0 + START_WAIT));
         let (a, n) = h.on_tick(t0 + START_WAIT);
         assert!(a.is_empty());
@@ -1325,21 +1323,21 @@ mod tests {
         feed(&mut h, ms(t0, 40), 3, 1);
         assert_eq!(h.on_ptt_failed(), (vec![Act::CloseStream], true));
         assert!(h.on_run_started().is_empty(), "a foreign run is not fed");
-        assert!(h.on_release(ms(t0, 2000)).is_empty());
+        assert!(h.on_release(ms(t0, 2000), None).is_empty());
         assert_eq!(h.next_deadline(), None);
         // Released before the run streamed.
         let mut h = Hold::new(cfg());
         h.on_press(t0, ok_ctx());
         h.on_stream_opened(ms(t0, 30));
         let (t, _) = feed(&mut h, ms(t0, 40), 20, 1);
-        h.on_release(t);
+        h.on_release(t, None);
         assert_eq!(h.on_ptt_failed(), (vec![], true));
         assert!(h.on_run_started().is_empty(), "no kept audio, no EndAudio");
         assert_eq!(h.next_deadline(), None);
         // A tap before the run streamed.
         let mut h = Hold::new(tv_only());
         h.on_press(t0, ok_ctx());
-        h.on_release(ms(t0, 100));
+        h.on_release(ms(t0, 100), None);
         assert_eq!(h.on_ptt_failed(), (vec![], true));
         assert_eq!(h.next_deadline(), None);
         // Once the run streams the report is not about this press.
@@ -1396,7 +1394,7 @@ mod tests {
             let (o, a) = h.on_press(t0, ctx);
             assert_eq!(o, PressOutcome::Refused(why));
             assert!(a.is_empty(), "{a:?}");
-            assert!(h.on_release(ms(t0, 2000)).is_empty());
+            assert!(h.on_release(ms(t0, 2000), None).is_empty());
             assert_eq!(h.next_deadline(), None);
             // The next press works.
             let (o, _) = h.on_press(ms(t0, 3000), ok_ctx());
@@ -1422,7 +1420,7 @@ mod tests {
         assert!(h.on_stream_opened(ms(t0, 40)).is_empty());
         let (_, a) = feed_until(&mut h, ms(t0, 50), ms(t0, 1500));
         assert_eq!(a[0], Act::RemoteFeeds(true));
-        assert!(h.on_release(ms(t0, 1500)).is_empty());
+        assert!(h.on_release(ms(t0, 1500), None).is_empty());
         let (a, _) = h.on_tick(ms(t0, 1750));
         assert_eq!(a, ENDED);
     }
@@ -1445,7 +1443,7 @@ mod tests {
         // the release then does nothing.
         let a = h.on_audio_over();
         assert_eq!(a, [Act::CloseStream, Act::RemoteFeeds(false)]);
-        assert!(h.on_release(ms(t0, 3000)).is_empty());
+        assert!(h.on_release(ms(t0, 3000), None).is_empty());
     }
 
     #[test]
@@ -1456,7 +1454,7 @@ mod tests {
         h.on_stream_opened(ms(t0, 30));
         let (t, _) = feed(&mut h, ms(t0, 40), 20, 5);
         // Held for about 700 ms; HA has not started the run yet (slow).
-        let a = h.on_release(t);
+        let a = h.on_release(t, None);
         assert_eq!(a, [Act::CloseStream]);
         let a = h.on_run_started();
         assert_eq!(a.first(), Some(&Act::RemoteFeeds(true)));
@@ -1471,7 +1469,7 @@ mod tests {
         let mut h = Hold::new(tv_only());
         let (_, a) = h.on_press(t0, ok_ctx());
         assert_eq!(a, [Act::StartRun]);
-        assert!(h.on_release(ms(t0, 800)).is_empty());
+        assert!(h.on_release(ms(t0, 800), None).is_empty());
         // Nothing was kept: HA's end of speech ends the run, capped.
         assert!(h.on_run_started().is_empty());
         assert_eq!(h.next_deadline(), Some(ms(t0, 15_000)));
@@ -1485,7 +1483,7 @@ mod tests {
         let mut h = Hold::new(tv_only());
         h.on_press(t0, ok_ctx());
         assert!(h.on_run_started().is_empty());
-        assert!(h.on_release(ms(t0, 900)).is_empty());
+        assert!(h.on_release(ms(t0, 900), None).is_empty());
         let (a, _) = h.on_tick(ms(t0, 1150));
         assert_eq!(a, [Act::EndAudio]);
     }
@@ -1501,7 +1499,7 @@ mod tests {
         assert!(!h.stream_wanted());
         assert!(h.on_run_started().is_empty());
         // The release still ends the audio (of the TV microphone).
-        assert!(h.on_release(ms(t0, 2000)).is_empty());
+        assert!(h.on_release(ms(t0, 2000), None).is_empty());
         let (a, _) = h.on_tick(ms(t0, 2250));
         assert_eq!(a, [Act::EndAudio]);
     }
@@ -1520,7 +1518,7 @@ mod tests {
             [Act::CloseStream, Act::RemoteFeeds(false)]
         );
         assert!(!h.feeding());
-        assert!(h.on_release(ms(t0, 2000)).is_empty());
+        assert!(h.on_release(ms(t0, 2000), None).is_empty());
         let (a, _) = h.on_tick(ms(t0, 2250));
         assert_eq!(a, [Act::EndAudio]);
     }
@@ -1615,7 +1613,7 @@ mod tests {
         feed(&mut h, ms(t0, 40), 2, 1);
         assert_eq!(h.halt(), [Act::CloseStream, Act::RemoteFeeds(false)]);
         assert!(h.halt().is_empty());
-        assert!(h.on_release(ms(t0, 2000)).is_empty());
+        assert!(h.on_release(ms(t0, 2000), None).is_empty());
         assert_eq!(h.next_deadline(), None);
     }
 
@@ -1624,7 +1622,7 @@ mod tests {
         let t0 = Instant::now();
         let mut h = Hold::new(cfg());
         h.on_press(t0, ok_ctx());
-        h.on_release(ms(t0, 100));
+        h.on_release(ms(t0, 100), None);
         assert_eq!(h.on_stream_opened(ms(t0, 150)), [Act::CloseStream]);
         assert!(!h.stream_wanted());
     }
@@ -1638,17 +1636,17 @@ mod tests {
         assert_eq!(o, PressOutcome::Ignored);
         assert!(a.is_empty());
         h.on_run_started();
-        assert!(h.on_release(ms(t0, 1000)).is_empty());
+        assert!(h.on_release(ms(t0, 1000), None).is_empty());
         // A press 20 ms after the release is a bounce; so is its release.
         let (o, a) = h.on_press(ms(t0, 1020), ok_ctx());
         assert_eq!(o, PressOutcome::Ignored);
         assert!(a.is_empty());
-        assert!(h.on_release(ms(t0, 1040)).is_empty());
+        assert!(h.on_release(ms(t0, 1040), None).is_empty());
         // The grace of the real release still ends the audio.
         let (a, _) = h.on_tick(ms(t0, 1250));
         assert_eq!(a, [Act::EndAudio]);
         // A release without a press does nothing.
-        assert!(h.on_release(ms(t0, 1100)).is_empty());
+        assert!(h.on_release(ms(t0, 1100), None).is_empty());
         let (o, _) = h.on_press(ms(t0, 2000), ok_ctx());
         assert_eq!(o, PressOutcome::Started);
     }
@@ -1670,7 +1668,7 @@ mod tests {
         let mut h = Hold::new(cfg());
         h.on_press(t0, ok_ctx());
         h.on_run_started();
-        h.on_release(ms(t0, 100));
+        h.on_release(ms(t0, 100), None);
         // The tapped run streams the TV microphone; a hold joins it.
         let (o, a) = h.on_press(
             ms(t0, 2000),
@@ -1685,25 +1683,39 @@ mod tests {
     }
 
     #[test]
-    fn the_release_time_comes_from_the_kernel_event_times() {
+    fn the_hold_is_measured_by_the_kernel_event_times() {
+        let k = Duration::from_millis;
+        assert_eq!(kernel_hold(Some(k(10_000)), Some(k(10_200))), Some(k(200)));
+        // No kernel time (a lost release), no press, a clock step back or
+        // forward: unknown, the caller's own clock decides.
+        for (p, r) in [
+            (Some(k(10_000)), None),
+            (None, Some(k(10_200))),
+            (Some(k(10_000)), Some(k(9_000))),
+            (Some(k(10_000)), Some(k(10_000) + KERNEL_HOLD_MAX + k(1))),
+        ] {
+            assert_eq!(kernel_hold(p, r), None);
+        }
+    }
+
+    #[test]
+    fn the_kernel_hold_decides_tap_or_hold_whenever_the_events_were_handled() {
         let t0 = Instant::now();
         let k = Duration::from_millis;
-        let pressed = Some((k(10_000), t0));
-        // Read 400 ms after the press, but the kernel saw a 200 ms tap.
-        assert_eq!(
-            release_time(pressed, Some(k(10_200)), ms(t0, 400)),
-            ms(t0, 200)
-        );
-        // No kernel time (a lost release), no press, a clock step back, or
-        // a time in the future: the receive time.
-        for (p, r) in [
-            (pressed, None),
-            (None, Some(k(10_200))),
-            (pressed, Some(k(9_000))),
-            (pressed, Some(k(11_000))),
-        ] {
-            assert_eq!(release_time(p, r, ms(t0, 400)), ms(t0, 400));
-        }
+        // The press was handled late (a busy event loop): only 100 ms pass
+        // locally before the release, but the key was down 300 ms. A hold.
+        let mut h = Hold::new(tv_only());
+        h.on_press(t0, ok_ctx());
+        h.on_run_started();
+        assert!(h.on_release(ms(t0, 100), Some(k(300))).is_empty());
+        assert_eq!(h.next_deadline(), Some(ms(t0, 100) + RELEASE_GRACE));
+        // The release was handled late: 400 ms locally, 200 ms by the kernel.
+        // A tap.
+        let mut h = Hold::new(tv_only());
+        h.on_press(t0, ok_ctx());
+        h.on_run_started();
+        assert!(h.on_release(ms(t0, 400), Some(k(200))).is_empty());
+        assert_eq!(h.next_deadline(), Some(ms(t0, 15_000)));
     }
 
     /// A hand-over that records its calls.
@@ -1782,18 +1794,31 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn the_button_measures_the_hold_with_the_kernel_times() {
-        let (mut b, _calls, root) = button("ktime", false);
-        let t0 = Instant::now();
         let k = Duration::from_millis;
+        let t0 = Instant::now();
+        // Release read late (400 ms) but held 200 ms by the kernel's times:
+        // a tap, so the run goes on to HA's end of speech (capped).
+        let (mut b, _calls, root) = button("ktime", false);
         b.on_key(Key::Pressed(k(20_000)), t0, ok_ctx());
         b.on_run_started();
-        // Read late (400 ms) but held 200 ms by the kernel's times: a tap,
-        // so the run goes on to HA's end of speech (capped), no grace.
         assert!(
             b.on_key(Key::Released(Some(k(20_200))), ms(t0, 400), ok_ctx())
                 .is_empty()
         );
         assert_eq!(b.deadline(), Some(ms(t0, 15_000)));
+        b.shutdown().await;
+        let _ = std::fs::remove_dir_all(&root);
+        // Press handled late: the release comes 100 ms after it locally, but
+        // the kernel saw a 300 ms hold: a hold, ended after the grace.
+        let (mut b, _calls, root) = button("ktime-late-press", false);
+        b.on_key(Key::Pressed(k(30_000)), t0, ok_ctx());
+        b.on_run_started();
+        assert!(
+            b.on_key(Key::Released(Some(k(30_300))), ms(t0, 100), ok_ctx())
+                .is_empty()
+        );
+        assert_eq!(b.deadline(), Some(ms(t0, 100) + RELEASE_GRACE));
+        assert_eq!(b.on_tick(ms(t0, 350)), [Act::EndAudio]);
         b.shutdown().await;
         let _ = std::fs::remove_dir_all(&root);
     }

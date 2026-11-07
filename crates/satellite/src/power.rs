@@ -246,12 +246,15 @@ fn die_with_parent(cmd: &mut Command) {
     let parent = rustix::process::getpid();
     // SAFETY: the closure runs in the forked child before exec and only
     // makes two system calls (prctl and getppid), which are
-    // async-signal-safe; it allocates nothing and takes no lock.
+    // async-signal-safe; it allocates nothing (both error paths convert an
+    // `Errno`, a plain code, into an `io::Error` without a heap allocation)
+    // and takes no lock.
     unsafe {
         cmd.pre_exec(move || {
             rustix::process::set_parent_process_death_signal(Some(rustix::process::Signal::KILL))?;
             if rustix::process::getppid() != Some(parent) {
-                return Err(std::io::Error::other("the parent is gone"));
+                // The parent is gone already: do not run.
+                return Err(rustix::io::Errno::SRCH.into());
             }
             Ok(())
         });
