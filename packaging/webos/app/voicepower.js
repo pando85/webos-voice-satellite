@@ -432,7 +432,13 @@
   function soundValue(st, d) {
     if (d.id !== 'mic') { return typeof st[d.key] === 'boolean' ? st[d.key] : undefined; }
     if (typeof st.mic_button !== 'string') { return undefined; }
-    return st.mic_button === 'ptt' && st.mic_button_active !== false;
+    // On only when the running satellite says it holds the button.
+    return st.mic_button === 'ptt' && st.mic_button_active === true;
+  }
+
+  // Configured but no word from a running satellite yet: null or missing.
+  function micPending(st) {
+    return !!st && st.mic_button === 'ptt' && st.mic_button_active !== true && st.mic_button_active !== false;
   }
 
   // Configured but not running: the takeover of LG's voice key failed.
@@ -484,6 +490,15 @@
       } else if (typeof v !== 'boolean') {
         out.push({ word: 'Not known', cls: 'warn', checked: 'false', can: false, cmd: '', confirm: '',
           warn: d.label + ' is not reported by this version of the satellite. Apply the update first.' });
+      } else if (d.id === 'mic' && micPending(st) && st.running === false) {
+        // The satellite is stopped: nothing holds the button (LG has it).
+        var oc = soundConfirm('mic', false);
+        out.push({ word: 'Not running', cls: 'muted', checked: 'false', can: true,
+          cmd: 'config mic-button off', confirm: oc + CONFIRM_TAIL,
+          warn: 'The satellite is not running, so LG\'s assistant has the mic button. It takes the button when the satellite starts; OK twice turns this off.' });
+      } else if (d.id === 'mic' && micPending(st)) {
+        // Just enabled or restarting: the next status says whether it runs.
+        out.push({ word: 'Checking...', cls: 'muted', checked: 'false', can: false, cmd: '', confirm: '', warn: '' });
       } else if (d.id === 'mic' && micFailed(st)) {
         // Configured but not running: "on" again is a retry (a restart).
         var why = st.mic_button_error ? String(st.mic_button_error) : 'no reason given';

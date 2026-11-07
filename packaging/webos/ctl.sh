@@ -465,7 +465,7 @@ remove_hook_and_stop() {
     stop_setup_server
     if [ -f "$P/$MARKER" ]; then
         stop_daemon 10
-        lg_restore_after_stop
+        lg_restore_after_stop removing
     fi
 }
 
@@ -489,7 +489,7 @@ cmd_purge() {
     if [ -e "$P" ]; then
         [ -f "$P/$MARKER" ] || die "$P exists but is not a webos-satellite install; not removing it"
         stop_daemon 10
-        lg_restore_after_stop
+        lg_restore_after_stop removing
         overlay_remove
         cd /
         rm -rf "$P"
@@ -697,7 +697,7 @@ cmd_status() {
         ptt) mic_active=true ;;
         off | failed) mic_active=false ;;
         esac
-        mic_error=$(sed -n 's/.*"mic_button_error"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$RUN_DIR/voice.json" 2>/dev/null | head -n 1 | tr -c 'A-Za-z0-9 ._:;,()/=+-' ' ' | cut -c1-200)
+        mic_error=$(sed -n 's/.*"mic_button_error"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$RUN_DIR/voice.json" 2>/dev/null | head -n 1 | tr -d '\n' | tr -c "A-Za-z0-9 ._:;,()/=+'-" ' ' | cut -c1-200)
     fi
     overlay_on=$(overlay_enabled_json)
     if [ "$json" -eq 0 ]; then
@@ -1229,8 +1229,9 @@ volume_emit() { # REQUESTED BEFORE AFTER RESULT ERROR DAEMON
 # The daemon takes LG's voice key with an in-memory configd override
 # (com.webos.keyaction.voice = {"action":"ignore"}, "volatile": true) while
 # the mic button runs, and writes run/lg_voice_override before it does. This
-# removes the override (null, volatile) and confirms it with a read of that
-# one config name; only then is the state file removed. It never writes
+# removes the override (null, volatile) and confirms LG's "launch" with a read
+# of that one config name; only then is the state file removed (if unchanged
+# since the start: a token), all under the lock shared with the daemon. It never writes
 # without "volatile" and never reads a whole category. Repeatable: without
 # the state file it does nothing. Refused while the daemon runs (it holds the
 # key; turn the mic button off instead). Called by stop, restart, uninstall,
@@ -1246,6 +1247,46 @@ lg_emit() { # RESULT LG_VOICE_KEY ERROR
 }
 
 # Prints the result line; status 0 when LG has the key (or nothing to do).
+# The lock shared with the daemon's acquire and release (flock(2) on
+# run/lg_voice.lock, held through file descriptor 9 until lg_unlock): a
+# restore never interleaves with an acquire, by the supervisor, by hand or by
+# a stop. python3 (on the TVs) or flock(1) takes it; a lock that cannot be
+# taken in 30 s fails the restore (nothing is changed).
+lg_lock() {
+    mkdir -p "$P/run" 2>/dev/null || return 1
+    exec 9>>"$P/run/lg_voice.lock" || return 1
+    if command -v python3 >/dev/null 2>&1; then
+        python3 -c 'import fcntl, sys, time
+end = time.time() + 30
+while True:
+    try:
+        fcntl.flock(9, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        sys.exit(0)
+    except OSError:
+        if time.time() > end:
+            sys.exit(1)
+        time.sleep(0.1)' && return 0
+        return 1
+    fi
+    if command -v flock >/dev/null 2>&1; then
+        flock -x 9 && return 0
+    fi
+    return 1
+}
+
+lg_unlock() { exec 9>&-; }
+
+# The action of com.webos.keyaction.voice in a getConfigs reply (one line):
+# only from that key's object; empty when it is missing (missingConfigs),
+# null or not readable.
+lg_action() {
+    printf '%s' "$1" | sed -n 's/.*"com\.webos\.keyaction\.voice"[[:space:]]*:[[:space:]]*{[^}]*"action"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1
+}
+
+# Removes the override and confirms "launch" (LG's base value; anything else,
+# a missing key or an unreadable reply, is no success). The state file goes
+# only then, and only if it still holds what was read at the start (a newer
+# acquire's file stays). Prints the result line; status 0 when LG has the key.
 lg_restore() {
     sf=$P/run/$LG_VOICE_STATE
     if [ ! -f "$sf" ]; then
@@ -1256,30 +1297,51 @@ lg_restore() {
         lg_emit failed unknown "luna-send not found"
         return 1
     fi
-    setok=1
-    luna_call "$LG_SET" "$LG_NULL" || setok=0
-    seterr=$LUNA_ERR
+    if ! lg_lock; then
+        lg_emit failed unknown "the lock run/lg_voice.lock is held by an acquire or another restore"
+        return 1
+    fi
+    if [ ! -f "$sf" ]; then
+        lg_unlock
+        lg_emit nothing lg ""
+        return 0
+    fi
+    tok=$(cat "$sf" 2>/dev/null)
+    seterr=
+    luna_call "$LG_SET" "$LG_NULL" || seterr="setConfigs: $LUNA_ERR; "
     if luna_call "$LG_GET" "$LG_KEY"; then
-        act=$(printf '%s' "$LUNA_REPLY" | sed -n 's/.*"action"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)
-        if [ "$act" != ignore ]; then
-            rm -f "$sf"
-            note "LG's voice key given back (action ${act:-not set})"
+        act=$(lg_action "$LUNA_REPLY")
+        if [ "$act" = launch ]; then
+            if [ "$(cat "$sf" 2>/dev/null)" = "$tok" ]; then
+                rm -f "$sf"
+            else
+                note "run/$LG_VOICE_STATE changed during the restore (a newer acquire); kept"
+            fi
+            lg_unlock
+            note "LG's voice key given back (action launch)"
             lg_emit done lg ""
             return 0
         fi
-        lg_emit failed unknown "the key still reads ignore${seterr:+ ($seterr)}; try again or reboot the TV"
+        lg_unlock
+        lg_emit failed unknown "${seterr}the key reads ${act:-not set} after the restore, not launch; try again or reboot the TV"
         return 1
     fi
-    [ "$setok" -eq 1 ] || seterr="setConfigs: $seterr; "
+    lg_unlock
     lg_emit failed unknown "${seterr}getConfigs: $LUNA_ERR; try again or reboot the TV"
     return 1
 }
 
 # After a stop in this script: LG's key back, quietly (the line goes to
 # stderr), never failing the caller.
-lg_restore_after_stop() {
+lg_restore_after_stop() { # [removing]: uninstall or purge (ctl.sh goes away)
     [ -f "$P/run/$LG_VOICE_STATE" ] || return 0
-    lg_restore >&2 || note "LG's voice key could not be given back now: run ctl.sh restore-lg-voice or reboot the TV"
+    if ! lg_restore >&2; then
+        if [ "${1:-}" = removing ]; then
+            note "LG's voice key could not be given back: reboot the TV to give the mic button back to LG"
+        else
+            note "LG's voice key could not be given back now: run ctl.sh restore-lg-voice or reboot the TV"
+        fi
+    fi
     return 0
 }
 

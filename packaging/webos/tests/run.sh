@@ -138,6 +138,27 @@ check "a crash while LG's voice key is ours: the supervisor gives it back before
 check "the supervisor's restore was volatile and named the one key" 'grep -q "setConfigs {\"configs\":{\"com.webos.keyaction.voice\":null},\"volatile\":true}" "$T/calls"'
 sh "$P/bin/stop.sh" >/dev/null
 
+# A restore that hangs in the supervisor (configd does not answer) must not
+# outlive a stop: stop_daemon kills the supervisor's whole process group, so
+# no orphan restore can remove a newer acquire's state file later.
+mkdir -p "$T/hang"
+printf '#!/bin/sh\nexec sleep 30\n' >"$T/hang/luna-send-hang"
+chmod 755 "$T/hang/luna-send-hang"
+KA_DIR=$T WEBOS_SAT_LUNA_SEND=$T/hang/luna-send-hang WEBOS_SAT_ALLOW_NONROOT=1 sh "$P/bin/start.sh" --supervise >/dev/null
+ph=$(read_pid "$PIDFILE")
+echo "configd 1 hang" >"$P/run/lg_voice_override"
+kill -KILL "$ph"
+wait_for 5 'pgrep -f "$T/hang/luna-send-hang" >/dev/null' || true
+check "the supervisor's restore is running (configd hangs)" 'pgrep -f "$T/hang/luna-send-hang" >/dev/null'
+sh "$P/bin/stop.sh" >/dev/null 2>&1 || true
+wait_for 3 '! pgrep -f "$P/bin/ctl.sh restore-lg-voice" >/dev/null' || true
+check "stop kills the supervisor's process group: no ctl.sh restore is left to remove a state file later, and it was not removed" '! pgrep -f "$P/bin/ctl.sh restore-lg-voice" >/dev/null && ! supervisor_alive && [ "$(cat "$P/run/lg_voice_override")" = "configd 1 hang" ]'
+# The luna-send it had started is bounded by its own timeout (6 s): it
+# removes no file; at most its call reaches configd late.
+wait_for 15 '! pgrep -f "$T/hang/luna-send-hang" >/dev/null' || true
+check "the luna call it left ends by its own timeout" '! pgrep -f "$T/hang/luna-send-hang" >/dev/null'
+rm -f "$P/run/lg_voice_override"
+
 for what in loop capture; do
     code=70
     [ "$what" = loop ] || code=71

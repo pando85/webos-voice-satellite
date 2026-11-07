@@ -97,6 +97,12 @@ case $uri in
     ;;
 */getConfigs)
     case $payload in *voiceframework* | *categoryNames*) echo category >>"$F/kaviolation" ;; esac
+    # karewrite: a path to rewrite now (a newer acquire's state file).
+    if [ -s "$F/karewrite" ]; then echo "configd 2 newer" >"$(cat "$F/karewrite")"; rm -f "$F/karewrite"; fi
+    if [ ! -e "$F/kav" ] && [ -e "$F/kamissing" ]; then
+        printf '{\n    "configs": {},\n    "missingConfigs": [\n        "com.webos.keyaction.voice"\n    ],\n    "returnValue": true\n}\n'
+        exit 0
+    fi
     printf '{\n    "configs": {\n        "com.webos.keyaction.voice": {\n            "action": "%s"\n        }\n    },\n    "returnValue": true\n}\n' "$(cat "$F/kav" 2>/dev/null || echo launch)"
     ;;
 *)
@@ -688,9 +694,10 @@ cp "$T/base.toml" "$QC"
 printf '\n[remote]\nmic_button = "ptt"\n' >>"$QC"
 cp "$QC" "$T/ptt.toml"
 fakesup
-mic_json failed lg '"the read-back says \"launch\", not ignore; LG'"'"'s voice key was restored"'
+# The daemon writes the reason without double quotes or backslashes.
+mic_json failed lg '"the read-back says '"'"'launch'"'"', not ignore; LG'"'"'s voice key was restored"'
 st=$(cq status --json)
-check "status: configured ptt, not running, the reason, LG has the key" 'echo "$st" | grep -q "\"mic_button\":\"ptt\",\"mic_button_active\":false,\"mic_button_error\":\"the read-back says \(.*\)\",\"lg_voice_key\":\"lg\","'
+check "status: configured ptt, not running, the whole reason, LG has the key" 'echo "$st" | grep -q "\"mic_button\":\"ptt\",\"mic_button_active\":false,\"mic_button_error\":\"the read-back says .launch., not ignore; LG.s voice key was restored\",\"lg_voice_key\":\"lg\","'
 check "status text: not running, with the reason" 'cq status 2>/dev/null | grep -q "remote mic button NOT running: the read-back says" && cq status 2>/dev/null | grep -q "LG voice key: lg"'
 out=$(cqc config mic-button on 2>/dev/null) && rc=0 || rc=$?
 check "mic-button on with ptt configured but failed: a retry, not already (before off; restart, rolled back by the stand-in)" '! echo "$out" | grep -q "\"result\":\"already\"" && echo "$out" | grep -q "\"requested\":\"on\",\"before\":\"off\"" && cmp -s "$QC" "$T/ptt.toml"'
@@ -735,11 +742,37 @@ echo "configd 1" >"$sf"
 echo ignore >"$F/kav"
 echo stuck >"$F/kamode"
 out=$(cq restore-lg-voice 2>/dev/null) && rc=0 || rc=$?
-check "restore not confirmed (still ignore): failed, exit 1, state file kept for the next try" '[ "$rc" -eq 1 ] && echo "$out" | grep -q "\"restore\":\"failed\",\"lg_voice_key\":\"unknown\",\"error\":\"the key still reads ignore" && [ -e "$sf" ]'
+check "restore not confirmed (still ignore): failed, exit 1, state file kept for the next try" '[ "$rc" -eq 1 ] && echo "$out" | grep -q "\"restore\":\"failed\",\"lg_voice_key\":\"unknown\",\"error\":\"the key reads ignore after the restore, not launch" && [ -e "$sf" ]'
 echo refuse >"$F/kamode"
 out=$(cq restore-lg-voice 2>/dev/null) && rc=0 || rc=$?
 check "restore refused by configd: failed, state file kept" '[ "$rc" -eq 1 ] && echo "$out" | grep -q "\"restore\":\"failed\"" && [ -e "$sf" ]'
 rm -f "$F/kamode"
+# Success means launch read back: a key reported missing after the null is
+# no success (LG's assistant could stay off until a reboot otherwise).
+: >"$F/kamissing"
+out=$(cq restore-lg-voice 2>/dev/null) && rc=0 || rc=$?
+check "restore with the key missing afterwards (missingConfigs): failed, not launch, state file kept, unknown" '[ "$rc" -eq 1 ] && echo "$out" | grep -q "\"restore\":\"failed\",\"lg_voice_key\":\"unknown\",\"error\":\"the key reads not set after the restore, not launch" && [ -e "$sf" ] && cq status --json | grep -q "\"lg_voice_key\":\"unknown\","'
+rm -f "$F/kamissing"
+# A newer acquire's state file written during the restore stays.
+echo "$sf" >"$F/karewrite"
+out=$(cq restore-lg-voice 2>/dev/null) && rc=0 || rc=$?
+check "a state file rewritten during the restore (token changed): restore done, the newer file kept" '[ "$rc" -eq 0 ] && echo "$out" | grep -q "\"restore\":\"done\"" && [ "$(cat "$sf")" = "configd 2 newer" ]'
+# The lock shared with the daemon's acquire and release: a restore waits.
+echo ignore >"$F/kav"
+python3 -c 'import fcntl, os, sys, time
+fd = os.open(sys.argv[1], os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+fcntl.flock(fd, fcntl.LOCK_EX)
+open(sys.argv[2], "w").close()
+time.sleep(2)' "$Q/run/lg_voice.lock" "$T/locked" &
+lockpid=$!
+i=0; while [ ! -e "$T/locked" ] && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+t0=$(date +%s)
+out=$(cq restore-lg-voice 2>/dev/null) && rc=0 || rc=$?
+t1=$(date +%s)
+wait "$lockpid" 2>/dev/null || true
+check "restore waits for the lock an acquire holds (flock on run/lg_voice.lock), then runs" '[ "$rc" -eq 0 ] && [ $((t1 - t0)) -ge 1 ] && echo "$out" | grep -q "\"restore\":\"done\"" && [ ! -e "$sf" ] && [ ! -e "$F/kav" ]'
+echo "configd 1" >"$sf"
+echo ignore >"$F/kav"
 out=$(WEBOS_SAT_PREFIX=$Q WEBOS_SAT_ALLOW_NONROOT=1 WEBOS_SAT_LUNA_SEND=$T/no-luna-send sh "$PKG/ctl.sh" restore-lg-voice 2>/dev/null) && rc=0 || rc=$?
 check "restore without luna-send: failed, state file kept" '[ "$rc" -eq 1 ] && echo "$out" | grep -q "luna-send not found" && [ -e "$sf" ]'
 # Refused while the daemon runs (it holds the key); stop gives it back.

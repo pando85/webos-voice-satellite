@@ -566,8 +566,15 @@ const nextTick = () => T.timers.filter((t) => t.live && t.interval && t.ms === 1
   check('mic button configured but not running (takeover failed): Off (LG kept it), the reason, OK twice retries',
     micFail.word === 'Off (LG kept it)' && micFail.cls === 'warn' && micFail.checked === 'false' && micFail.cmd === 'config mic-button on'
     && /could not be taken from LG/.test(micFail.warn) && /the read-back says "launch", not ignore/.test(micFail.warn) && /^Turn on the remote mic button\?/.test(micFail.confirm));
-  const micStopped = SR({ aec_enabled: true, music_enabled: false, mic_button: 'ptt', mic_button_active: null })[2];
-  check('mic button configured, satellite not running: shown as configured (On)', micStopped.word === 'On');
+  const micStopped = SR({ running: false, aec_enabled: true, music_enabled: false, mic_button: 'ptt', mic_button_active: null })[2];
+  check('mic button configured, satellite not running: Not running (never On), can be turned off', micStopped.word === 'Not running'
+    && micStopped.checked === 'false' && micStopped.cmd === 'config mic-button off' && /LG\'s assistant has the mic button/.test(micStopped.warn));
+  const micWait = SR({ running: true, aec_enabled: true, music_enabled: false, mic_button: 'ptt', mic_button_active: null })[2];
+  check('mic button configured, no answer yet from the running satellite: Checking..., not pressable', micWait.word === 'Checking...' && !micWait.can && micWait.checked === 'false');
+  const micOld = SR({ running: true, aec_enabled: true, music_enabled: false, mic_button: 'ptt' })[2];
+  check('mic button configured, a status without mic_button_active: Checking..., never On', micOld.word === 'Checking...');
+  check('sound summary never says mic button on without mic_button_active true',
+    VP.soundSummary({ aec_enabled: true, music_enabled: false, mic_button: 'ptt', mic_button_active: null }) === 'Echo cancellation on, music off');
   check('mic button confirm: LG\'s assistant stops opening from the button, its toast, given back at restart',
     /LG\'s voice assistant no longer opens from that button/.test(VP.soundConfirm('mic', true)) && /not supported/.test(VP.soundConfirm('mic', true))
     && /every TV restart/.test(VP.soundConfirm('mic', true)));

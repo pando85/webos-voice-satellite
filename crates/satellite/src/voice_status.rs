@@ -151,9 +151,11 @@ impl MicButtonStatus {
             ",\"mic_button\":{},\"lg_voice_key\":{},\"mic_button_error\":{}",
             json_str(self.state),
             json_str(self.lg_voice_key),
-            self.error
-                .as_deref()
-                .map_or_else(|| "null".to_owned(), json_str)
+            // Without quotes or backslashes: `ctl.sh` reads it with sed.
+            self.error.as_deref().map_or_else(
+                || "null".to_owned(),
+                |e| json_str(&e.replace(['"', '\\'], "'"))
+            )
         )
     }
 }
@@ -329,7 +331,7 @@ mod tests {
         });
         s.music = Some("{\"enabled\":false}".to_owned());
         assert!(s.to_json().ends_with(
-            ",\"busy\":null,\"mic_button\":\"failed\",\"lg_voice_key\":\"lg\",\"mic_button_error\":\"the read-back says \\\"launch\\\"\",\"music\":{\"enabled\":false}}\n"
+            ",\"busy\":null,\"mic_button\":\"failed\",\"lg_voice_key\":\"lg\",\"mic_button_error\":\"the read-back says 'launch'\",\"music\":{\"enabled\":false}}\n"
         ), "{}", s.to_json());
         s.mic_button = Some(MicButtonStatus {
             state: "ptt",

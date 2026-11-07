@@ -590,6 +590,10 @@ struct Daemon {
     /// Open while the TV shows a picture ([`overlay::screen_on`]); closed
     /// until the first power update.
     screen_tx: watch::Sender<bool>,
+    /// HA's "LG voice key" sensor is listed.
+    lg_sensor_listed: bool,
+    /// When the persistent databases are looked at again after the takeover.
+    lg_recheck_at: Option<Instant>,
 }
 
 impl Daemon {
@@ -1056,6 +1060,72 @@ impl Daemon {
             }
             _ => {}
         }
+    }
+
+    /// A few seconds after the takeover: configd's persistent databases must
+    /// be as before it. If not, the override is removed at once and the mic
+    /// button stops, loudly (log, `voice.json`, HA's switch and sensor).
+    async fn lg_recheck(&mut self) {
+        let Some(t) = self.lg_takeover.as_ref() else {
+            return;
+        };
+        let Err(why) = t.check_persistence() else {
+            log::info!(
+                "remote mic button: configd's persistent databases unchanged since the takeover"
+            );
+            return;
+        };
+        log::error!(
+            "remote mic button: {why}; giving LG's voice key back and stopping the mic button"
+        );
+        self.stop_mic_button(why).await;
+    }
+
+    /// Stops a running mic button with a reason: the override goes, the
+    /// reader and the machine stop, HA's switch goes off and the reports
+    /// say why.
+    async fn stop_mic_button(&mut self, why: String) {
+        let mut key = KeyOwner::Lg;
+        if let Some(mut t) = self.lg_takeover.take() {
+            if let Err(e) = t.release().await {
+                log::error!("remote mic button: {e}");
+                key = KeyOwner::Unknown;
+            }
+        }
+        if let Some(mut b) = self.remote.take() {
+            let acts = b.shutdown().await;
+            self.run_remote_acts(acts).await;
+        }
+        let status = MicButtonStatus {
+            state: "failed",
+            lg_voice_key: key.word(),
+            error: Some(why),
+        };
+        let text = RemoteSetup {
+            started: None,
+            takeover: None,
+            status: status.clone(),
+        }
+        .sensor_text();
+        self.mic_status = Some(status);
+        if let Some(cs) = self.config_switches.as_mut() {
+            cs.set_mic_button_active(false);
+            self.cmd_tx
+                .send(AppCommand::SetSwitch {
+                    object_id: config_switch::MIC_BUTTON_ID.to_owned(),
+                    state: Some(false),
+                })
+                .await
+                .ok();
+        }
+        if self.lg_sensor_listed {
+            self.send(AppCommand::SetTextSensor {
+                object_id: LG_VOICE_KEY_ID.to_owned(),
+                state: Some(text),
+            })
+            .await;
+        }
+        self.publish_voice_status();
     }
 
     /// The mic button follows the voice layer's events.
@@ -1837,6 +1907,19 @@ impl RemoteSetup {
     }
 }
 
+/// Where the state file and the lock of LG's voice key live: `<install>/run`
+/// (the fixed place `ctl.sh`, the supervisor and `status` read), whatever
+/// `[report] dir` says; off the TV (no install) the report directory.
+pub(crate) fn lg_state_dir(settings: &Settings) -> PathBuf {
+    settings
+        .install_prefix
+        .as_ref()
+        .map_or_else(|| settings.report.dir_or_default(), |p| p.join("run"))
+}
+
+/// How long after the takeover the persistent databases are looked at again.
+const LG_RECHECK_AFTER: Duration = Duration::from_secs(5);
+
 /// The mic button (ADR 0013, docs/design/remote-mic-button.md). With
 /// `mic_button = "ptt"`: the key device must be there, LG's voice key is
 /// taken over (`crate::lg_voice`), then the reader, the machine and the
@@ -1850,7 +1933,7 @@ pub(crate) async fn setup_remote(
 ) -> RemoteSetup {
     let r = &settings.remote;
     let luna = power::find_binary(&settings.power.luna_send);
-    let state_dir = settings.report.dir_or_default();
+    let state_dir = lg_state_dir(settings);
     let off = |key: KeyOwner, error: Option<String>| MicButtonStatus {
         state: if error.is_some() { "failed" } else { "off" },
         lg_voice_key: key.word(),
@@ -1865,6 +1948,12 @@ pub(crate) async fn setup_remote(
                 log::warn!("remote mic button: {e}");
                 key = KeyOwner::Unknown;
             }
+        } else if state_dir.join(lg_voice::STATE_FILE).exists() {
+            log::warn!(
+                "remote mic button: {} is left from an earlier run but luna-send is not found: LG's voice key is unknown (ctl.sh restore-lg-voice or a TV restart)",
+                state_dir.join(lg_voice::STATE_FILE).display()
+            );
+            key = KeyOwner::Unknown;
         }
         return RemoteSetup {
             started: None,
@@ -2018,20 +2107,13 @@ pub(crate) async fn run(mut settings: Settings, triggers: TestTriggers) -> Resul
         esp.switches.extend(config_switch::entities());
         cs.spawn_last_change_log();
     }
-    // The Magic Remote's mic button: runs only with mic_button = "ptt" and
-    // LG's voice key taken over (ADR 0013); HA's switch shows what runs.
-    let remote_setup = setup_remote(&settings, crate::evdev::InputPaths::default()).await;
-    if let Some(cs) = config_switches.as_mut() {
-        cs.set_mic_button_active(remote_setup.started.is_some());
-    }
     let overlay_plan = OverlayPlan::new(&settings, luna.as_ref());
     if let Some(cs) = config_switches.as_mut() {
         cs.set_overlay_available(overlay_plan.available);
     }
-    let lg_sensor = power::find_binary(&settings.power.luna_send)
-        .is_some()
-        .then(|| remote_setup.sensor_text());
-    if lg_sensor.is_some() {
+    // HA's "LG voice key" sensor, where luna-send is (the TV).
+    let lg_sensor_listed = power::find_binary(&settings.power.luna_send).is_some();
+    if lg_sensor_listed {
         esp.text_sensors.push(lg_voice_key_entity());
     }
     // Reply volume.
@@ -2143,6 +2225,15 @@ pub(crate) async fn run(mut settings: Settings, triggers: TestTriggers) -> Resul
         )
         .map_err(|e| format!("cannot start the watchdog thread: {e}"))?;
     }
+    // The Magic Remote's mic button: runs only with mic_button = "ptt" and
+    // LG's voice key taken over (ADR 0013); HA's switch shows what runs.
+    // After every step that can fail, so no early return leaves the key
+    // taken over (the supervisor would give it back, but not at once).
+    let remote_setup = setup_remote(&settings, crate::evdev::InputPaths::default()).await;
+    if let Some(cs) = config_switches.as_mut() {
+        cs.set_mic_button_active(remote_setup.started.is_some());
+    }
+    let lg_sensor = lg_sensor_listed.then(|| remote_setup.sensor_text());
     if settings.mode == Mode::Wake {
         let _ = cmd_tx
             .send(AppCommand::StartPipeline {
@@ -2261,11 +2352,15 @@ pub(crate) async fn run(mut settings: Settings, triggers: TestTriggers) -> Resul
         config_switches,
         remote,
         stt_streaming: false,
+        lg_recheck_at: lg_takeover
+            .as_ref()
+            .map(|_| Instant::now() + LG_RECHECK_AFTER),
         lg_takeover,
         mic_status: Some(mic_status),
         overlay: Overlay::new(overlay_tx.is_some(), overlay_inst, Instant::now()),
         overlay_tx,
         screen_tx,
+        lg_sensor_listed,
     };
     d.publish_voice_status();
     d.publish_timers().await;
@@ -2338,6 +2433,10 @@ pub(crate) async fn run(mut settings: Settings, triggers: TestTriggers) -> Resul
             Some(k) = recv_opt(remote_keys.as_mut()) => d.on_remote_key(k).await,
             Some((g, ev)) = recv_opt(remote_stream.as_mut()) => d.on_remote_stream(g, ev).await,
             () = sleep_opt(d.remote.as_ref().and_then(Button::deadline)) => d.remote_tick().await,
+            () = sleep_opt(d.lg_recheck_at) => {
+                d.lg_recheck_at = None;
+                d.lg_recheck().await;
+            }
             () = tick_opt(tv_tick.as_mut()) => d.poll_tv().await,
             _ = sigterm.recv() => {
                 log::info!("SIGTERM: shutting down");
@@ -2738,6 +2837,8 @@ mod tests {
             overlay: Overlay::new(true, 7, Instant::now()),
             overlay_tx: None,
             screen_tx: watch::channel(false).0,
+            lg_sensor_listed: false,
+            lg_recheck_at: None,
         };
         (d, cmd_rx)
     }
@@ -3589,6 +3690,71 @@ esac"#,
         assert_eq!(r.status.lg_voice_key, "lg");
         assert!(!dir.join("val").exists());
         assert!(!dir.join("run").join(lg_voice::STATE_FILE).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_state_file_lives_under_the_install_not_the_report_dir() {
+        let mut s = Settings::default();
+        s.report.dir = Some(PathBuf::from("/elsewhere/reports"));
+        assert_eq!(lg_state_dir(&s), PathBuf::from("/elsewhere/reports"));
+        s.install_prefix = Some(PathBuf::from("/var/lib/webos-satellite"));
+        assert_eq!(
+            lg_state_dir(&s),
+            PathBuf::from("/var/lib/webos-satellite/run")
+        );
+    }
+
+    #[tokio::test]
+    async fn off_without_luna_send_reports_a_leftover_as_unknown() {
+        let dir = test_dir("micoffleft");
+        let s = no_luna(&dir);
+        std::fs::create_dir_all(dir.join("run")).unwrap();
+        std::fs::write(dir.join("run").join(lg_voice::STATE_FILE), "configd 1 t\n").unwrap();
+        let (_root, paths) = crate::evdev::tests::fake_inputs("micoffleft", &[]);
+        let r = setup_remote(&s, paths).await;
+        assert_eq!(r.status.state, "off");
+        assert_eq!(r.status.lg_voice_key, "unknown");
+        assert!(dir.join("run").join(lg_voice::STATE_FILE).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_persistent_change_after_the_takeover_stops_the_mic_button_loudly() {
+        let dir = test_dir("micrecheck");
+        std::fs::create_dir_all(dir.join("run")).unwrap();
+        let luna = fake_configd(&dir, false);
+        let db = dir.join("configd_db.json");
+        std::fs::write(&db, "{}").unwrap();
+        let mut t =
+            Takeover::with_persistent(LunaSend(luna), &dir.join("run"), std::slice::from_ref(&db));
+        t.acquire().await.unwrap();
+        let (mut d, mut rx) = test_daemon(&dir, RemoteOff::Normal, false);
+        d.config_switches = Some(ConfigSwitches::for_test(true, false));
+        d.lg_sensor_listed = true;
+        d.lg_takeover = Some(t);
+        // Unchanged: nothing happens.
+        d.lg_recheck().await;
+        assert!(d.lg_takeover.is_some());
+        // configd wrote its database meanwhile.
+        std::fs::write(&db, "{\"changed\":1}").unwrap();
+        d.lg_recheck().await;
+        assert!(d.lg_takeover.is_none());
+        assert!(!dir.join("val").exists(), "LG's value is back");
+        assert!(!dir.join("run").join(lg_voice::STATE_FILE).exists());
+        let st = d.mic_status.clone().unwrap();
+        assert_eq!((st.state, st.lg_voice_key), ("failed", "lg"));
+        assert!(st.error.unwrap().contains("configd_db.json changed"));
+        let mut cmds = Vec::new();
+        while let Ok(c) = rx.try_recv() {
+            cmds.push(c);
+        }
+        assert!(cmds.contains(&AppCommand::SetSwitch {
+            object_id: config_switch::MIC_BUTTON_ID.to_owned(),
+            state: Some(false)
+        }));
+        assert!(cmds.iter().any(|c| matches!(c, AppCommand::SetTextSensor { object_id, state: Some(t) }
+            if object_id == LG_VOICE_KEY_ID && t.contains("mic button off: configd's persistent database"))));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

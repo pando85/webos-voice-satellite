@@ -303,8 +303,18 @@ stop_daemon() {
         i=$((i + 1))
     done
     if supervisor_alive; then
-        note "supervisor still running; sending SIGKILL"
-        kill -KILL "$(read_pid "$SUPPID")" 2>/dev/null || true
+        # Its whole process group when it leads one (start.sh starts it with
+        # setsid): a child it runs (ctl.sh restore-lg-voice) must not outlive
+        # it and race the next start. Otherwise the supervisor alone.
+        sp=$(read_pid "$SUPPID")
+        pg=$(sed -n 's/^[0-9]* (.*) [A-Za-z] [0-9]* \([0-9]*\) .*/\1/p' "/proc/$sp/stat" 2>/dev/null)
+        if [ -n "$pg" ] && [ "$pg" = "$sp" ]; then
+            note "supervisor still running; sending SIGKILL to its process group $pg"
+            kill -KILL -- "-$pg" 2>/dev/null || kill -KILL "$sp" 2>/dev/null || true
+        else
+            note "supervisor still running; sending SIGKILL"
+            kill -KILL "$sp" 2>/dev/null || true
+        fi
     fi
     if rotator_alive; then
         kill -TERM "$(read_pid "$ROTPID")" 2>/dev/null || true
