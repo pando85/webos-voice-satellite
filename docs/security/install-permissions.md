@@ -91,13 +91,21 @@ Modes stay stricter than 0755/0644 where they were: binaries and scripts in `bin
 
 ## 8. What needs a TV check
 
-Not run; for the owner's next install of a version with this change (install only), then read-only:
+**Run on 2026-11-07 with the 0.5.1 install on c3-a and c3-b** (install only, then read-only; the update went through the installed 0.5.0 `bin/ctl.sh install`, as the TV app runs it): results after the list ([c3-a P4](../discovery/c3-a/P4-permanent-install.md#update-to-051-2026-11-07-install-permissions), [c3-b P4](../discovery/c3-b/P4-permanent-install.md#update-to-051-2026-11-07)). The checks as written before the run:
 
 1. After `ctl.sh install` from the app: `stat -c '%a %U %n'` of the app directory, `payload/` and its files: expected 755 (directories, scripts, binaries) and 644 (data), root, and the install log line "removed group/other write from the app's files" naming the app directory (was `drwxrwxrwx`).
 2. **Does an app update reset the modes?** Install the next ipk through appinstalld, then the same `stat` before opening the app: 0777 again (the installer resets) or 0755 (it keeps them). Either way `start.sh` fixes them at the next start; the result decides whether this note's "at every start" is needed or only belt and braces.
 3. The TV app still opens, `status` and the buttons work through the installed `ctl.sh` (HBC `exec` command text above), and the update path through `bin/ctl.sh install` applies the next version.
 4. `ctl.sh status` prints no `NOT TRUSTED` line and the daemon starts (no false refusal from the real TV's modes: `/var/lib` 0755 root was read on 2026-11-01).
 5. `[ -O /tmp ]` in BusyBox `sh` on the TV returns 0 as root (else the setup status poll falls back to one `stat` per call).
+
+**Results (verified-on-target, c3-a `03.30.74` and c3-b `03.30.73`, 2026-11-07):**
+
+1. **Pass on both.** The install logged `removed group/other write from the app's files: <app dir> (was drwxrwxrwx) <app dir>/payload (was drwxrwxrwx)`. Afterwards the app directory, `payload/` and the overlay app's directory are 0755 root, and the payload files 0755 (14) and 0644 (5) root (the ipk's tar modes).
+2. **Partly answered: app updates appear to reset the directories to 0777.** Right after `appinstalld` installed 0.5.1 (before `ctl.sh install`), the app directory and `payload/` were 0777 on both TVs, while the files kept the tar modes. That alone is inconclusive, because both were 0777 before as well. But c3-b's app directory was 0755 on 2026-11-03 (EXP-009 step 1b, first install) and 0777 before this update, after the app updates in between: an update resets the directory mode (`verified-on-target` that it changed; that `appinstalld` did it is the likely explanation, `hypothesis`). So the fix "at every install and start" is needed, not only belt and braces. To confirm: at the next update, `stat` the app directory right after `appinstall` (expected 0777 again, from 0755).
+3. **Pass on both, except the screens.** The TV app's own command text, run through `luna://org.webosbrew.hbchannel.service/exec`, chose the installed `bin/ctl.sh`, and `status --json` came back from 0.5.1 (`returnValue` true). The update path through `bin/ctl.sh install` applied 0.5.1 (from 0.5.0's `ctl.sh`). The app's screens were not opened (no owner at the TV).
+4. **Pass on both.** `ctl.sh status` printed no `NOT TRUSTED` line, and the daemon started and reconnected to HA (3.5 s and 3.0 s) with no WARN or ERROR line.
+5. **Pass on both.** `[ -O /tmp ]` (and `[ -O /var/lib/webos-satellite ]` on c3-a) is true as root in BusyBox `sh` (`/bin/busybox.nosuid`).
 
 Rollback: reinstall the previous ipk (`make tv-remove-ipk` and the older package, [development](../development.md#install-the-app-package-on-a-rooted-tv-persistent)); the changed modes (0755 app directory) are harmless and the installer replaces them on the next install.
 
