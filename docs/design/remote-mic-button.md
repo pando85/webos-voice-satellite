@@ -1,6 +1,7 @@
 # Remote mic button: hold to talk (daemon side)
 
 - **Status:** built and tested on the PC only (unit tests and host integration tests with a fake input device, a fake `luna-send` and a fake LG socket). **Not run on a TV, not seen with a real Home Assistant.** Off by default (`[remote] mic_button = "off"`), and off is inert: nothing of the feature is started. Written 2026-11-07; revised the same day after an independent review of `785d25c` (section 11), and again for the LG hand-over (section 7), which is built and host-tested but has **never run on a TV**: its first use is the owner's first enable session ([EXP-023](../experiments/EXP-023-remote-mic-button-handover.md) C1).
+- **Update 2026-11-07 (evening): the owner used the feature on c3-a with 0.5.0** and reported that it works very well, with one problem: **every press shows LG's toast "Función no disponible"** (`verified-on-target (owner-reported, no logs captured)`; [EXP-023 observations](../experiments/EXP-023-remote-mic-button-handover.md#observations-and-redacted-evidence-links), which list what stays unconfirmed in detail). Whether the toast can be avoided: [research section 10](../research/remote-mic-button.md#10-removing-the-mic-button-toast-2026-11-07) (not within ADR 0013's value) and EXP-025.
 - **Owner request:** "holding the Magic Remote's mic button talks to our HA assistant"; the daemon side only, independent of how LG's assistant is kept away, off by default.
 - **Coupled to LG's assistant (owner, 2026-11-07, [ADR 0013](../decisions/0013-remote-mic-button-coexistence.md) accepted for this path):** "We cannot have our feature enabled without disabling the LG one. Option must be in the UI and in esphome." The feature runs **only** while LG's voice key is taken over by an in-memory configd override (section 7); if that fails, the feature stays off and says why. The `voiceconductor` pause (ADR 0013 decision 2(b)) is not built.
 - **Not in this note (not built):** the on-screen overlay.
@@ -98,7 +99,7 @@ New in the ESPHome API crate:
 
 ## 7. LG's voice key: taken over while the feature runs (ADR 0013)
 
-The mechanism is LG's own (research section 9, static): the compositor's key filter (`KeyFilters/appLaunch.js`) forwards the mic key to LG's assistant only while the configd value `com.webos.keyaction.voice` has `"action":"launch"`; with any other action it shows "This function is not supported." and consumes the key. LG ships `"ignore"` for hotel mode. The satellite sets that value **in memory only**.
+The mechanism is LG's own (research section 9, static): the compositor's key filter (`KeyFilters/appLaunch.js`) forwards the mic key to LG's assistant only while the configd value `com.webos.keyaction.voice` has `"action":"launch"`; with any other action it shows "This function is not supported." and consumes the key. LG ships `"ignore"` for hotel mode. The satellite sets that value **in memory only**. The toast is confirmed on c3-a with 0.5.0: "Función no disponible" on every press (owner-reported, 2026-11-07); no other value of this key avoids it ([research section 10](../research/remote-mic-button.md#10-removing-the-mic-button-toast-2026-11-07)).
 
 **Where:** the state file `run/lg_voice_override` and the lock `run/lg_voice.lock` are always under the install (`<prefix>/run`), whatever `[report] dir` says, because `ctl.sh`, the supervisor and `status` look there (review of `506cbe7`). Acquire, every release by the daemon and every `ctl.sh` restore hold the lock (`flock(2)`: the daemon through `rustix`, `ctl.sh` through `python3`, else `flock(1)`), so no restore interleaves with an acquire. The state file holds `configd <epoch> <token>`; a restore removes it only if it still holds what that restore read at its start.
 
@@ -165,7 +166,9 @@ Removing the app package runs no script of ours (`packaging/webos/tv/appinstall.
 - `voice::tests` (ESPHome API crate): `end_audio_*`, `only_the_push_to_talk_run_is_marked_and_its_follow_up_is_not`, `a_refused_push_to_talk_is_reported`, `a_failed_or_dropped_push_to_talk_start_is_reported_once`, `a_second_push_to_talk_replaces_the_first_silently`.
 - `capture::tests::the_tv_microphone_is_held_back_while_the_remote_feeds_the_run`; `config::tests::remote_section_*`; `config_switch` tests with the third switch; `packaging/webos/tests/tv_settings.sh` (`config mic-button`, single-quoted values, status fields).
 
-## 10. What needs checking on a TV (not done)
+## 10. What needs checking on a TV
+
+> **Owner's hands-on session, 2026-11-07 (evening), c3-a, 0.5.0:** the feature "work very well"; each press shows LG's toast "Función no disponible"; "the rest was tested and works like a charm" (owner-reported, no logs captured). Which of the items below were done one by one, and their log signals, were not reported; they stay open in detail ([EXP-023 residual unknowns](../experiments/EXP-023-remote-mic-button-handover.md#observations-and-redacted-evidence-links)).
 
 On c3-a, with the owner's authorization and consent. The LG hand-over steps are EXP-023's [C1 through the satellite](../experiments/EXP-023-remote-mic-button-handover.md#c1-through-the-satellite-the-owners-first-enable-session): enable from the app, the log line `LG's voice key taken over`, no LG screen on a tap, the factory database absent, other keys normal, disable and LG's screen back, and optionally a SIGKILL with the supervisor's restore. Then:
 

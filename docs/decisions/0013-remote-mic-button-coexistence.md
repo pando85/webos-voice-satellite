@@ -1,6 +1,6 @@
 # ADR 0013: Remote mic button: coexistence with LG's voice assistant
 
-- **Status:** **Accepted (2026-11-07, owner) for the override-first path: decision 2(a) with decisions 1, 3, 4 and 5.** The owner: "we have to add options to switch that option in the TV while enabling this. We cannot have our feature enabled without disabling the LG one. Option must be in the UI and in esphome." So the satellite's mic button feature runs **only** while LG's voice key is taken over by the in-memory configd override; there is no "both assistants" mode. Decision 2(b) (the `voiceconductor` SIGSTOP) stays a **conditional fallback, not accepted and not implemented**: it is considered only if [EXP-023](../experiments/EXP-023-remote-mic-button-handover.md) C1 shows that the override does not work on this firmware, and then needs its own owner decision. **Implemented on the host (2026-11-07), not yet run on a TV:** the override's first on-TV use is the owner's first enable session, which is EXP-023 C1. Implementation notes: [design](../design/remote-mic-button.md) section 7.
+- **Status:** **Accepted (2026-11-07, owner) for the override-first path: decision 2(a) with decisions 1, 3, 4 and 5.** The owner: "we have to add options to switch that option in the TV while enabling this. We cannot have our feature enabled without disabling the LG one. Option must be in the UI and in esphome." So the satellite's mic button feature runs **only** while LG's voice key is taken over by the in-memory configd override; there is no "both assistants" mode. Decision 2(b) (the `voiceconductor` SIGSTOP) stays a **conditional fallback, not accepted and not implemented**: it is considered only if [EXP-023](../experiments/EXP-023-remote-mic-button-handover.md) C1 shows that the override does not work on this firmware, and then needs its own owner decision. **Implemented (0.5.0) and used on c3-a by the owner (2026-11-07, evening):** EXP-023 C1 through the satellite, owner-reported pass (`verified-on-target (owner-reported, no logs captured)`), with the predicted cost confirmed: LG's toast "Función no disponible" on every mic press ([EXP-023 observations](../experiments/EXP-023-remote-mic-button-handover.md#observations-and-redacted-evidence-links)). The debug-database bookkeeping question (Consequences, device safety) is still unrecorded. Whether the toast can be avoided: [research section 10](../research/remote-mic-button.md#10-removing-the-mic-button-toast-2026-11-07) (not with any value of this key; every remaining path needs an amendment or a new ADR). Implementation notes: [design](../design/remote-mic-button.md) section 7.
 - **History:** proposed earlier on 2026-11-07 with the owner's direction "a supported switch first, otherwise pause LG's voice service while the satellite runs".
 - **Scope:** what happens to LG's assistant when the satellite uses the Magic Remote's mic button for push-to-talk (the "mic button feature").
 - **Relaxes, if accepted:** the rule "avoid changing native LG voice services" ([AGENTS.md](../../AGENTS.md) device safety, [discovery rules](../discovery/README.md#safety-rules-learned)). It relaxes it for the two mechanisms named in decision 2 only.
@@ -71,13 +71,13 @@
 
   | LG feature | (a) configd override | (b) SIGSTOP of `voiceconductor` |
   | --- | --- | --- |
-  | Magic Remote mic key → LG assistant | Off; toast "This function is not supported." on each press (static reading; to confirm in EXP-023) | Off; no toast expected |
+  | Magic Remote mic key → LG assistant | Off; toast "This function is not supported." on each press (static reading); **confirmed on c3-a with 0.5.0: "Función no disponible" on every press** (owner-reported, 2026-11-07) | Off; no toast expected |
   | TONE+ earbuds voice button (`Key_webOS_TonePlusVoice`) | Off too (same `voiceAction` check) | Off |
   | "Hi LG" far-field wake word | Not touched by this mechanism (separate path from `voiceinput`); stays off anyway by ADR 0004 | Off (its trigger goes through `voiceconductor`) |
   | Alexa key, Search key | Not touched (separate branches) | Off (they call `voiceconductor`) |
   | Apps using `recordVoice`, `getVoiceUiEvents`, `interactor/*`; Settings pages that query `voiceconductor` | Not touched | Calls queue until SIGCONT; pages may wait for luna timeouts (hypothesis) |
 
-- **UX cost of (a):** an LG toast on every press, unless EXP-023 shows otherwise. The satellite's own feedback (earcon, later the overlay) should make the toast secondary. (b) has no toast but a wider blast radius.
+- **UX cost of (a):** an LG toast on every press (confirmed by the owner on c3-a, 2026-11-07). The satellite's own feedback (earcon, later the overlay) should make the toast secondary. (b) has no toast but a wider blast radius.
 - **Firmware-update risk:**
   - The key filter JS, the configd key name, the value LG honours, configd's `volatile` handling, and `voiceconductor`'s name can each change in an LG update (webOS upgrades are offered for the C3).
   - Mitigations: the self-check (decision 3) and read-backs; the per-firmware allow list (ADR 0006: the mechanism is enabled only on firmware where EXP-023 passed); the status field; and the fact that both mechanisms vanish on a reboot.
@@ -110,6 +110,6 @@ In [discovery/README.md](../discovery/README.md#safety-rules-learned), the sente
 
 ## Revisit when
 
-- EXP-023 has run: accept, amend (for example the toast, debug-DB writes, or (b) restricted to the run) or reject.
+- EXP-023 has run (C1 through the satellite, owner-reported, 2026-11-07): the toast is confirmed; amend only if the owner wants it gone through one of the paths in [research section 10](../research/remote-mic-button.md#10-removing-the-mic-button-toast-2026-11-07), each of which changes this ADR's scope; debug-DB writes still to be recorded.
 - A firmware update changes the key filter, the configd key or `voiceconductor`.
 - LG offers a documented setting to assign the mic key to a third party.

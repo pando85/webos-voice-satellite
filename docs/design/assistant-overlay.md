@@ -1,6 +1,7 @@
 # On-screen assistant overlay
 
 - **Status:** built on the host (daemon, overlay app, packaging, TV app row, HA switch; tests below). The window approach is checked on c3-a with our own probe and overlay packages ([EXP-024](../experiments/EXP-024-assistant-overlay-window.md)); the daemon side has **not run on a TV**, and the look is the owner's check (section 10). Decision record: [ADR 0014](../decisions/0014-assistant-overlay.md) (accepted). **Off by default** in the first release, until the owner's check (section 10). Revised after the independent review of `9fca695`.
+- **Update 2026-11-07 (evening):** the owner ran the section 10 check on c3-a with satellite **0.5.0** and reported that it "works like a charm" (`verified-on-target (owner-reported, no logs captured)`; items not reported one by one; [EXP-024](../experiments/EXP-024-assistant-overlay-window.md#owners-check-with-050-2026-11-07-evening)). The condition this note set for a default-on release (item 4, the owner's key check) is therefore **met**. **The default is not changed:** `[overlay] enabled` stays `false` until the owner decides to turn it on by default in a later release.
 - **Date:** 2026-11-07. TV facts are `verified-on-target` for **c3-a** (LG C3 42", webOS TV 8.3.0, firmware `03.30.74`) unless labelled otherwise.
 - **Owner request (2026-11-07):** "Go with the full version": a small transparent panel over whatever is playing that shows listening, thinking and the answer, like the voice bar on phones.
 
@@ -108,6 +109,8 @@ HA voice events ──> daemon on_event ──> Overlay (overlay.rs, pure) ─�
 
 ## 10. The owner's visual check
 
+> **Done 2026-11-07 (evening) on c3-a with 0.5.0, owner-reported pass** ("works like a charm"; no logs captured; which items were tried one by one was not reported). The mic-button toast "Función no disponible" seen in the same session is LG's, not the overlay's ([research section 10](../research/remote-mic-button.md#10-removing-the-mic-button-toast-2026-11-07)). Item 8's condition for a default-on release is met; the default is the owner's decision.
+
 After the release on c3-a (and later c3-b), with the TV on and something playing. The overlay is **off by default**: first turn it on (app Home, Sound, **On-screen assistant**, two presses; or the HA switch **On-screen assistant**).
 
 1. Say the wake word over a video (HDMI from the PC, then an app such as YouTube, then the home screen): within about half a second a dark panel appears at the bottom centre with moving bars and **Te escucho…**. The rest of the picture stays visible and the video keeps playing.
@@ -122,7 +125,8 @@ After the release on c3-a (and later c3-b), with the TV on and something playing
 
 ## 11. Open questions
 
-- Whether remote keys reach the overlay while it shows (section 10 item 4); if so, a follow-up experiment for a documented way to give the focus back.
+- ~~Whether remote keys reach the overlay while it shows (section 10 item 4)~~: the owner's check with 0.5.0 reports that it works (2026-11-07, owner-reported, no logs).
+- Whether to turn the overlay on by default in a later release (condition met; owner decision).
 - The look over native apps (Netflix, YouTube), over the home screen and on HDMI with HDR content; webosbrew's appinfo guide says an overlay app "is automatically closed when opening home screen" (`documented` by webosbrew, not checked here).
 - c3-b and other firmware: the window type and the package registration.
 - A real input level for the bars: it would need a frame per step (a `luna-send` each), which costs more than it shows.

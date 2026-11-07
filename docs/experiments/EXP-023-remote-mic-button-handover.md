@@ -1,6 +1,6 @@
 # EXP-023 — Magic Remote mic button: handing the key from LG's assistant to the satellite
 
-**Status:** PLANNED, **not run** (needs owner authorization per step). The read-only inspection and static analysis that motivate it ran on 2026-11-07 and are recorded in [research section 9](../research/remote-mic-button.md#9-hand-over-candidates-configd-and-the-key-filter-static-2026-11-07). **Update 2026-11-07:** [ADR 0013](../decisions/0013-remote-mic-button-coexistence.md) is accepted for the configd override and the satellite now applies it itself (design note section 7). **C1 is therefore run as the owner's first enable session of the mic button** ([C1 through the satellite](#c1-through-the-satellite-the-owners-first-enable-session) below), not with hand-typed `luna-send` calls; C0 stays optional, C2 only if C1 fails.
+**Status:** **C1 through the satellite: owner-reported PASS with one negative finding** (c3-a, satellite 0.5.0, 2026-11-07 evening; `verified-on-target (owner-reported, no logs captured)`; see [Observations](#observations-and-redacted-evidence-links)). Negative finding: every mic press shows LG's toast "Función no disponible" while the override is in place (follow-up: [research section 10](../research/remote-mic-button.md#10-removing-the-mic-button-toast-2026-11-07), EXP-025). C0 not run; C2 not needed (C1 did not fail) and not run. The hand-typed C1 steps were not run. Earlier status, kept: PLANNED, **not run** (needs owner authorization per step). The read-only inspection and static analysis that motivate it ran on 2026-11-07 and are recorded in [research section 9](../research/remote-mic-button.md#9-hand-over-candidates-configd-and-the-key-filter-static-2026-11-07). **Update 2026-11-07:** [ADR 0013](../decisions/0013-remote-mic-button-coexistence.md) is accepted for the configd override and the satellite now applies it itself (design note section 7). **C1 is therefore run as the owner's first enable session of the mic button** ([C1 through the satellite](#c1-through-the-satellite-the-owners-first-enable-session) below), not with hand-typed `luna-send` calls; C0 stays optional, C2 only if C1 fails.
 **Date:** written 2026-11-07
 **Device alias / model / firmware / webOS / architecture:** c3-a (LG C3 42 inch, firmware `03.30.74`, webOS TV 8.3.0, aarch64 kernel, 32-bit ARM userland), Magic Remote `LGE MR23`. c3-b is not part of this experiment.
 **Power and playback state:** `Active`, no playback started by the agent, LG hands-free ("Hi LG") **off** (unchanged), installed satellite running unchanged
@@ -145,11 +145,31 @@ kill -CONT "$VC"; grep State /proc/$VC/status          # expect "S (sleeping)" o
 
 ## Observations and redacted evidence links
 
-Not run.
+### Owner's hands-on session on c3-a with 0.5.0 (2026-11-07, evening)
+
+- **Who and what:** the owner turned the mic button feature on with satellite **0.5.0** on c3-a (firmware `03.30.74`) and used it (C1 through the satellite). No agent was connected to the TV; **no logs, status output or file listings were captured**. Label for everything in this subsection: `verified-on-target (owner-reported, no logs captured)`.
+- **The owner's words:** "the new feature work very well but when I click the button it shows in the TV 'Función no disponible'… The rest was tested and works like a charm in c3-a".
+- **What this supports:**
+  - the feature turns on and works on c3-a with 0.5.0 (hold to talk reaches Home Assistant, as reported in general terms);
+  - **H-C1b, the toast part: confirmed.** Each mic press shows an LG toast. Its text on this TV (UI language Spanish) is "Función no disponible".
+  - **H-C1a (live delivery), by inference:** the key filter shows that toast only in the branch where `com.webos.keyaction.voice` is not `launch` (`appLaunch.js`, static, research section 9.1). So the toast suggests that the in-memory override reached the key filter without a restart. This is an inference from the static code plus the owner's observation, not a logged fact.
+- **Negative finding:** while LG's key is overridden to `{"action":"ignore"}`, **every mic-button press makes the TV show the LG toast "Función no disponible"**. The English UI string is probably the key filter's source string "This function is not supported." (`hypothesis`; the Spanish catalogue was not read, see [research section 10](../research/remote-mic-button.md#10-removing-the-mic-button-toast-2026-11-07)). Whether it can be avoided is the subject of EXP-025.
+- **Residual unknowns (not reported in detail; each stays unconfirmed until a run with logs):**
+  1. Step 1 baseline: `status --json` before enabling, the `configd_*` file listing, LG's screen on a tap before enabling.
+  2. Step 2: the exact daemon log line `LG's voice key taken over`, the `status --json` fields (`mic_button_active`, `lg_voice_key` `ours (configd)`), the HA switch and the "LG voice key" sensor text.
+  3. Step 3 (persistence): that `configd_factory_db.json` stayed absent, whether `configd_debug_db.json` appeared, and how many `/tmp/configd_*_before_setConfigs.json` files were created. The daemon checks the factory database itself and would have turned the feature off loudly; that it did not is consistent with "works very well", but no file listing was seen.
+  4. C1.3 in detail: that **no LG voice screen** opened on a tap (not stated explicitly; "works very well" is read as yes), that 428 and `NL_BUTTON_CLICK` still appeared, and that no `voiceconductor` `setInputEvent` line was logged.
+  5. C1.4 in detail: the log lines `remote mic: stream open`, the release, `subscription closed`; the absence of `2003` refusals and of LG's "El procesamiento de audio es inestable" message; the stream rate.
+  6. C1.5: which other keys (Up, Back, Home, volume, wheel) were tried.
+  7. Step 7 / C1.7: that turning the feature off gave the key back (`lg_voice_key` `lg`, the state file gone) and that LG's voice screen opened again on a tap.
+  8. Step 8 (optional SIGKILL and the supervisor's restore): not known whether it was done.
+  9. Timings (time to take over, press to stream, toast timing relative to press and release) were not reported.
 
 ## Conclusion and confidence
 
-Not run. Static confidence for C1: medium. The key-filter code path is read directly from the shipped files. The configd `volatile` semantics come from the upstream source (`webosose/configd`, commit `99873ce`), and the shipped `configd` has the same symbols (`splitVolatileConfigs`, `getVolatileInstance`). That the subscription is notified on this firmware is unverified.
+**Owner-reported (2026-11-07, 0.5.0, c3-a):** C1 through the satellite works as the hand-over mechanism, with the predicted cost: LG's "not supported" toast ("Función no disponible") on every press. Confidence: medium (one owner session, no logs; the residual unknowns above). The toast is the open UX issue; [research section 10](../research/remote-mic-button.md#10-removing-the-mic-button-toast-2026-11-07) found no way to avoid it within ADR 0013's scope.
+
+Before the run (kept): Static confidence for C1: medium. The key-filter code path is read directly from the shipped files. The configd `volatile` semantics come from the upstream source (`webosose/configd`, commit `99873ce`), and the shipped `configd` has the same symbols (`splitVolatileConfigs`, `getVolatileInstance`). That the subscription is notified on this firmware is unverified.
 
 ## Rollback and cleanup
 
@@ -165,5 +185,6 @@ Not run. Static confidence for C1: medium. The key-filter code path is read dire
 
 - C1 on c3-b (`03.30.73`) and after any firmware update.
 - Whether "Hi LG", the TONE+ voice button (it reads the same `voiceAction` in `appLaunch.js`) and the Alexa key behave as predicted under C1. Hi LG stays off by [ADR 0004](../decisions/0004-mvp-capture-device-and-lg-handsfree-off.md).
-- Whether the "not supported" toast can be avoided by any supported means.
+- Whether the "not supported" toast can be avoided by any supported means: answered for the static side in [research section 10](../research/remote-mic-button.md#10-removing-the-mic-button-toast-2026-11-07) (not within ADR 0013's value; read-only checks in EXP-025).
+- A run of C1 with logs captured, to close the residual unknowns above.
 - Accept or amend [ADR 0013](../decisions/0013-remote-mic-button-coexistence.md) with the results.

@@ -1,6 +1,6 @@
 # EXP-024 — Assistant overlay window on webOS 8.3 (window type, second app, focus, cost, log leakage)
 
-**Status:** TARGET_VERIFIED on c3-a for window type, registration, launch and relaunch, foreground app, self-close, cost and log leakage; **INCONCLUSIVE for remote key routing** (no key was pressed; `document.hasFocus()` became true); visual appearance not checked (no screen capture, by rule)
+**Status:** **Update 2026-11-07 (evening): the owner's visual and remote check ([design section 10](../design/assistant-overlay.md#10-the-owners-visual-check)) passed on c3-a with satellite 0.5.0, owner-reported** (`verified-on-target (owner-reported, no logs captured)`; [below](#owners-check-with-050-2026-11-07-evening)). Earlier status, kept: TARGET_VERIFIED on c3-a for window type, registration, launch and relaunch, foreground app, self-close, cost and log leakage; **INCONCLUSIVE for remote key routing** (no key was pressed; `document.hasFocus()` became true); visual appearance not checked (no screen capture, by rule)
 **Date:** 2026-11-07 (three short sessions, about 18:05 to 18:30 CET)
 **Device alias / model / firmware / webOS / architecture:** c3-a, LG C3 42 inch, firmware `03.30.74`, webOS TV 8.3.0, Homebrew Channel 0.6.3, aarch64 kernel with 32-bit userland; satellite 0.4.6 running (not touched; the same daemon pid before and after)
 **Power and playback state:** `Active`; foreground app `com.webos.app.hdmi1` (the owner's PC on HDMI 1) throughout; load average about 12 (the TV's own software)
@@ -79,11 +79,18 @@ Can a homebrew web app draw a small transparent panel over whatever plays on web
 
 - The cold-launch marker (in the launch parameters) and the relaunch marker (in `heard`) of session 1b were **not found** in any of the places listed in step 1. H7 supported for those places. Limits as in EXP-012: memory-only buffers not searched; the parameters are visible in `/proc/<pid>/cmdline` of `luna-send` while it runs.
 
+### Owner's check with 0.5.0 (2026-11-07, evening)
+
+- The owner used satellite 0.5.0 on c3-a with the overlay and the mic button turned on, and reported: "the new feature work very well but when I click the button it shows in the TV 'Función no disponible'… The rest was tested and works like a charm in c3-a". The coordinator maps "the rest" to the overlay and its visual check (design section 10). Label: `verified-on-target (owner-reported, no logs captured)`.
+- So the open points of this experiment, **remote key routing while the panel shows** and **the look**, are answered as "works" by the owner's report. Which of the section 10 items were done one by one (video over HDMI, an app such as YouTube, the home screen, the error panel, the follow-up, the dark screen after power-off, turning it off), and any timing, were not reported; they stay unconfirmed in detail.
+- The "Función no disponible" toast is not the overlay's: it is LG's key filter reacting to the mic key while the satellite owns it ([EXP-023](EXP-023-remote-mic-button-handover.md#observations-and-redacted-evidence-links), [research section 10](../research/remote-mic-button.md#10-removing-the-mic-button-toast-2026-11-07)).
+- The overlay stays **off by default**. The design's condition for a default-on release (the owner's key check) is now met; turning it on by default is a separate owner decision.
+
 ## Conclusion and confidence
 
 - Use an **`overlay` window** in a **separate single-app package** (`<app id>.overlay`), installed through appinstalld by `ctl.sh install`; frames in the launch parameters, later frames by relaunch; the page closes itself after each run. High confidence for c3-a, firmware `03.30.74`.
 - `topui` and a second app inside the main package do not work on this firmware without a SAM restart.
-- Open: whether remote keys reach the overlay while it shows (focus became true in the web runtime); the look over video, HDMI, the home screen and native apps; behaviour in `Screen Off` and `Active Standby` (the daemon does not launch then, by design); c3-b and other firmware.
+- Open before the owner's check, now answered as "works" by the owner (2026-11-07, 0.5.0, no logs): whether remote keys reach the overlay while it shows (focus became true in the web runtime) and the look. Still open in detail: which contents were tried (video, HDMI, the home screen, native apps); behaviour in `Screen Off` and `Active Standby` (the daemon does not launch then, by design); c3-b and other firmware.
 
 ## Rollback and cleanup
 
@@ -91,6 +98,6 @@ Every probe app and the real overlay app were removed with `appinstall.sh remove
 
 ## Follow-ups / unresolved questions
 
-1. Owner's visual and remote check after the release (list in the [design, section 10](../design/assistant-overlay.md#10-the-owners-visual-check)).
+1. ~~Owner's visual and remote check after the release~~ done 2026-11-07 with 0.5.0, owner-reported pass (above); items not reported one by one (list in the [design, section 10](../design/assistant-overlay.md#10-the-owners-visual-check)).
 2. If keys do reach the overlay: look for a documented or observed way to give the focus back (the page exposes `webOSSystem.deactivate`, whose effect on an overlay window is not known; in OSE's WAM a background move closes an overlay window). Nothing is guessed here; it needs its own experiment.
 3. c3-b and other firmware: repeat steps 2 and 3.
