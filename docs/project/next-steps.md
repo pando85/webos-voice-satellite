@@ -32,7 +32,7 @@ Steps:
 3. Ten mic presses, taps and holds: our assistant runs every time, no LG toast, no LG assistant.
 4. Pointer, click, wheel, Back, arrows and OK all work normally.
 5. Leave the remote idle for 5 minutes, then press the mic button right away (the wake path).
-6. Kill test, while using the remote: `kill -9 $(cat /var/lib/webos-satellite/run/remote-proxy.pid)`. The remote keeps working, and the grab comes back within about 2.5 s. Until then a mic press shows LG's toast (the safety net of ADR 0016 decision 5).
+6. Kill test, while using the remote: `kill -9 $(head -n 1 /var/lib/webos-satellite/run/remote-proxy.pid)` (the file's second line names the target). The remote keeps working, and the grab comes back within about 2.5 s. Until then a mic press shows LG's toast (the safety net of ADR 0016 decision 5).
 7. Turn the feature off: the mic button opens LG's assistant again, and `lg_voice_key` reads `lg`.
 8. Diagnostics: forwarding delay median under 2 ms and maximum under 10 ms, and the helper's CPU use (with the pointer moving and at rest).
 
