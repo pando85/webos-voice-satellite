@@ -249,6 +249,20 @@ def main():
         got = drain_abs(tgt_r)
         check(rc == 0 and got == [(0, 960), (1, 540)], f"inject-test moves the target to the centre: {got}")
 
+        # 4d. trace logs type, code and value of each event (read only)
+        p = Proc(binary, ["trace", "--source", "rp-test-src", "--secs", "3"])
+        p.wait_line("trace:")
+        emit(src, B1, 1)
+        emit(src, B1, 0)
+        rc, out = p.finish(5, close_stdin=False)
+        check(rc == 0 and f"KEY {B1} 1" in out and f"KEY {B1} 0" in out, "trace logs each key event with its value")
+        drain(src_r, 0.1)
+
+        # 4e. inject-key refuses a target that lacks the arrow key (no arrow is ever sent
+        #     on the host: it would reach the desktop)
+        rc, out = Proc(binary, ["inject-key", "--target", "rp-test-tgt", "--key", "106"]).finish(close_stdin=False)
+        check(rc == 2 and "does not declare key 106" in out, "inject-key refuses a target without the key")
+
         # 5. refusals
         rc, out = Proc(binary, ["grab", "--source", "rp-test-src", "--target", "rp-test-wide", "--secs", "3"]).finish(close_stdin=False)
         check(rc == 2 and "absolute ranges differ" in out, "different abs ranges refused")

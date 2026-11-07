@@ -52,8 +52,12 @@ const USAGE: &str = "usage:
   remote-proxy inject-test --target NAME [--secs N]
   remote-proxy grab        --source NAME --target NAME [--secs N]
   remote-proxy clone-probe --source NAME [--secs N]
+  remote-proxy trace       --source NAME [--secs N]
+  remote-proxy inject-key  --target NAME --key 103|105|106|108 [--secs N]
 NAME is an exact input device name, e.g. \"LGE M-RCU - Builtin [0]\".
---secs: 1 to 60 (defaults: dry-run 30, inject-test 5, grab 60, clone-probe 20).
+trace: read only, logs every event (time, type, code, value).
+inject-key: one press and release of an arrow key (Up 103, Left 105, Right 106, Down 108) into the target.
+--secs: 1 to 60 (defaults: dry-run 30, inject-test 5, grab 60, clone-probe 20, trace 30, inject-key 5).
 Stops at the cap, on SIGHUP/SIGINT/SIGTERM, on stdin end of file, or on a line with q.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,7 +66,12 @@ enum Mode {
     InjectTest,
     Grab,
     CloneProbe,
+    Trace,
+    InjectKey,
 }
+
+/// The only keys `inject-key` may send: the arrows (they move focus, nothing else).
+const ARROW_KEYS: [u16; 4] = [103, 105, 106, 108];
 
 #[derive(Debug, PartialEq, Eq)]
 struct Args {
@@ -70,6 +79,7 @@ struct Args {
     source: Option<String>,
     target: Option<String>,
     secs: u64,
+    key: Option<u16>,
 }
 
 fn parse_args(argv: &[String]) -> Result<Args, String> {
@@ -78,11 +88,14 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
         Some("inject-test") => Mode::InjectTest,
         Some("grab") => Mode::Grab,
         Some("clone-probe") => Mode::CloneProbe,
+        Some("trace") => Mode::Trace,
+        Some("inject-key") => Mode::InjectKey,
         _ => return Err(USAGE.into()),
     };
     let mut source = None;
     let mut target = None;
     let mut secs = None;
+    let mut key = None;
     let mut it = argv[1..].iter();
     while let Some(a) = it.next() {
         let mut val = || {
@@ -97,18 +110,34 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
                 let v = val()?;
                 secs = Some(v.parse::<u64>().map_err(|_| format!("bad --secs {v:?}"))?);
             }
+            "--key" => {
+                let v = val()?;
+                let k = v.parse::<u16>().map_err(|_| format!("bad --key {v:?}"))?;
+                if !ARROW_KEYS.contains(&k) {
+                    return Err(format!(
+                        "--key must be an arrow key {ARROW_KEYS:?}, got {k}"
+                    ));
+                }
+                key = Some(k);
+            }
             other => return Err(format!("unknown argument {other:?}\n{USAGE}")),
         }
     }
     let default = match mode {
-        Mode::DryRun => 30,
-        Mode::InjectTest => 5,
+        Mode::DryRun | Mode::Trace => 30,
+        Mode::InjectTest | Mode::InjectKey => 5,
         Mode::Grab => 60,
         Mode::CloneProbe => 20,
     };
     let secs = deadman::cap_secs(secs.unwrap_or(default))?;
-    let needs_source = matches!(mode, Mode::DryRun | Mode::Grab | Mode::CloneProbe);
-    let needs_target = matches!(mode, Mode::InjectTest | Mode::Grab);
+    let needs_source = matches!(
+        mode,
+        Mode::DryRun | Mode::Grab | Mode::CloneProbe | Mode::Trace
+    );
+    let needs_target = matches!(mode, Mode::InjectTest | Mode::Grab | Mode::InjectKey);
+    if (mode == Mode::InjectKey) != key.is_some() {
+        return Err("--key is required by inject-key and used by nothing else".into());
+    }
     if needs_source && source.is_none() {
         return Err("--source is required".into());
     }
@@ -118,8 +147,8 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
     if !needs_target && target.is_some() {
         return Err("--target is not used by this mode".into());
     }
-    if mode == Mode::InjectTest && source.is_some() {
-        return Err("--source is not used by inject-test".into());
+    if matches!(mode, Mode::InjectTest | Mode::InjectKey) && source.is_some() {
+        return Err("--source is not used by this mode".into());
     }
     if source.is_some() && source == target {
         return Err("--source and --target must differ".into());
@@ -129,6 +158,7 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
         source,
         target,
         secs,
+        key,
     })
 }
 
@@ -597,6 +627,89 @@ fn test_stall_on_mic() {
     }
 }
 
+/// Read only: every event of the source with its time since start.
+fn trace(a: &Args) -> Result<i32, String> {
+    let root = sys_root();
+    let src = caps::find(&root, a.source.as_deref().unwrap_or_default())?;
+    let f = open_read(&src.dev)?;
+    describe(&src, &read_caps(&root, &src, &f)?);
+    let mut dm = DeadMan::start(a.secs)?;
+    println!(
+        "trace: reading {} (no grab, no write); columns: +ms type code value",
+        src.event
+    );
+    let start = now_realtime();
+    let mut evs = Vec::new();
+    let mut stats = Stats::default();
+    let reason = loop {
+        match dm.wait(Some(f.as_raw_fd())) {
+            Wake::Stop(r) => break r,
+            Wake::Tick => {}
+            Wake::Source => {
+                evs.clear();
+                if let Err(e) = read_events(&f, &mut evs) {
+                    print_summary(&stats, "read delay", 0, &e);
+                    return Ok(EXIT_DEVICE_LOST);
+                }
+                for ev in &evs {
+                    stats.count(ev);
+                    if ev.kind != EV_SYN {
+                        println!(
+                            "+{} {} {} {}",
+                            ev.time.saturating_sub(start).as_millis(),
+                            event::type_name(ev.kind),
+                            ev.code,
+                            ev.value
+                        );
+                    }
+                }
+            }
+        }
+    };
+    print_summary(&stats, "read delay", 0, &reason);
+    Ok(0)
+}
+
+/// One press and release of an arrow key into the target (no grab).
+#[allow(clippy::many_single_char_names)] // short names in one short function
+fn inject_key(a: &Args) -> Result<i32, String> {
+    let root = sys_root();
+    let tgt = caps::find(&root, a.target.as_deref().unwrap_or_default())?;
+    let key = a.key.unwrap_or_default();
+    if !ARROW_KEYS.contains(&key) {
+        return Err(format!("key {key} is not an arrow key"));
+    }
+    let f = open_write(&tgt.dev)?;
+    let c = read_caps(&root, &tgt, &f)?;
+    describe(&tgt, &c);
+    if !c.key.contains(&key) {
+        return Err(format!("{} does not declare key {key}", tgt.event));
+    }
+    let keys = Arc::new(KeyBits::default());
+    let emergency_target = f.try_clone().map_err(|e| format!("dup target: {e}"))?;
+    let _ = EMERGENCY.set(Emergency {
+        target: Some(emergency_target),
+        keys: Arc::clone(&keys),
+    });
+    let _dm = DeadMan::start(a.secs)?;
+    let mut w: &File = &f;
+    let down = [Event::new(EV_KEY, key, 1), Event::syn()];
+    w.write(&event::encode(&down))
+        .map_err(|e| format!("write {}: {e}", tgt.event))?;
+    keys.apply(&down);
+    std::thread::sleep(Duration::from_millis(100));
+    let up = [Event::new(EV_KEY, key, 0), Event::syn()];
+    let n = w
+        .write(&event::encode(&up))
+        .map_err(|e| format!("write {}: {e}", tgt.event))?;
+    keys.apply(&up);
+    println!(
+        "inject-key: KEY {key} press and release written to {} ({n} bytes per frame)",
+        tgt.event
+    );
+    Ok(0)
+}
+
 /// The pid of a process by `comm`, from `/proc`.
 fn pid_of(comm: &str) -> Option<u32> {
     std::fs::read_dir("/proc").ok()?.flatten().find_map(|e| {
@@ -696,6 +809,8 @@ fn run() -> Result<i32, String> {
         Mode::InjectTest => inject_test(&a),
         Mode::Grab => grab(&a),
         Mode::CloneProbe => clone_probe(&a),
+        Mode::Trace => trace(&a),
+        Mode::InjectKey => inject_key(&a),
     }
 }
 
@@ -743,6 +858,23 @@ mod tests {
         assert_eq!(a.secs, 5);
         assert!(args(&["bogus"]).is_err());
         assert!(args(&[]).is_err());
+    }
+
+    #[test]
+    fn inject_key_takes_only_arrow_keys() {
+        let a = args(&["inject-key", "--target", "B", "--key", "106"])
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!((a.key, a.secs), (Some(106), 5));
+        for bad in ["116", "114", "28", "428", "0", "x"] {
+            assert!(
+                args(&["inject-key", "--target", "B", "--key", bad]).is_err(),
+                "{bad}"
+            );
+        }
+        assert!(args(&["inject-key", "--target", "B"]).is_err());
+        assert!(args(&["inject-test", "--target", "B", "--key", "106"]).is_err());
+        let t = args(&["trace", "--source", "A"]).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(t.secs, 30);
     }
 
     #[test]
