@@ -87,9 +87,10 @@ enabled = false
 
 [remote]
 # The Magic Remote's mic button. "off": nothing of it is started. "ptt":
-# hold it to talk to Home Assistant (passive read of the key, no grab) (LG's assistant
-# still opens too: ADR 0013 is proposed, not built). Every key:
-# config/example.toml ([remote]). Restart after a change; the HA switch
+# hold it to talk to Home Assistant (passive read of the key, no grab).
+# It runs only while LG's assistant is kept off the button (an in-memory
+# override, given back on stop; ADR 0013). Every key: config/example.toml
+# ([remote]). Restart after a change; the app's Sound screen, the HA switch
 # "Remote mic button" and `ctl.sh config mic-button on|off` change this key
 # and restart.
 mic_button = "off"

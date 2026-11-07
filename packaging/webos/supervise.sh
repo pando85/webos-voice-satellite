@@ -13,6 +13,9 @@
 #   again (here or from autostart) until that file is removed by hand.
 # - DIR/disable present: does not (re)start.
 # - SIGTERM/SIGINT/SIGHUP: stops the daemon (SIGTERM) and exits.
+# - After every daemon exit (before a restart, and before supervision ends):
+#   if run/lg_voice_override exists, LG's voice key is given back with
+#   `ctl.sh restore-lg-voice` (ADR 0013); the next daemon takes it again.
 set -u
 here=$(cd "$(dirname "$0")" && pwd)
 # shellcheck source=lib.sh
@@ -22,7 +25,7 @@ prefix_arg=
 while [ $# -gt 0 ]; do
     case $1 in
     --prefix) [ $# -ge 2 ] || die "--prefix needs a value"; prefix_arg=$2; shift 2 ;;
-    -h | --help) sed -n '2,17p' "$0"; exit 0 ;;
+    -h | --help) sed -n '2,20p' "$0"; exit 0 ;;
     --) shift; break ;;
     *) die "unknown argument: $1 (see --help)" ;;
     esac
@@ -42,6 +45,19 @@ done
 
 slog() {
     echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) SUPER $*" >>"$LOG"
+}
+
+# LG's voice key back after a daemon exit, when the daemon left its state
+# file (a crash, a kill, a watchdog exit; a clean exit removes it itself).
+lg_restore() {
+    [ -f "$PREFIX/run/lg_voice_override" ] || return 0
+    slog "the daemon left LG's voice key taken over: giving it back (ctl.sh restore-lg-voice)"
+    if [ -f "$here/ctl.sh" ] &&
+        WEBOS_SAT_PREFIX=$PREFIX sh "$here/ctl.sh" restore-lg-voice >>"$LOG" 2>&1; then
+        slog "LG's voice key given back"
+    else
+        slog "LG's voice key could NOT be given back: run ctl.sh restore-lg-voice or reboot the TV"
+    fi
 }
 
 stopping=0
@@ -79,6 +95,7 @@ while [ "$stopping" -eq 0 ]; do
     done
     child=
     rm -f "$PIDFILE"
+    lg_restore
     if [ "$stopping" -ne 0 ]; then
         slog "stopped by signal (daemon exit $rc)"
         break

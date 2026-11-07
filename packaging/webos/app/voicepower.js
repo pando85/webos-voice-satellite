@@ -395,10 +395,14 @@
       full: e.full.replace('%s', c.selfcheck || 'no details') };
   }
 
-  // ---- Sound screen: echo cancellation and music ----------------------------
-  // Two keys of the satellite's config file, [aec] enabled (on by default,
-  // ADR 0011) and [music] enabled (off by default, ADR 0010), from the
-  // `aec_enabled` and `music_enabled` booleans of `ctl.sh status --json`.
+  // ---- Sound screen: echo cancellation, music and the remote mic button ------
+  // Three keys of the satellite's config file, [aec] enabled (on by default,
+  // ADR 0011), [music] enabled (off by default, ADR 0010) and [remote]
+  // mic_button (off by default, ADR 0013), from `aec_enabled`, `music_enabled`
+  // and `mic_button` of `ctl.sh status --json`. The mic button shows what
+  // runs: on only while the satellite holds the button (LG's voice key taken
+  // over); `mic_button_active` false with "ptt" configured means the takeover
+  // failed, and `mic_button_error` says why.
   // The daemon reads them at start only, so `ctl.sh config aec|music on|off`
   // rewrites the config and restarts it. TV app only: the phone page does not
   // offer them (a restart ends the phone session), so REQUEST has no entry.
@@ -412,12 +416,43 @@
     { id: 'aec', label: 'Echo cancellation', key: 'aec_enabled', action: 'aec',
       sub: 'Lets the TV hear you while it plays sound. Uses a little more CPU.' },
     { id: 'music', label: 'Music', key: 'music_enabled', action: 'music',
-      sub: 'Lets Home Assistant or Music Assistant play music on this TV. Experimental.' }
+      sub: 'Lets Home Assistant or Music Assistant play music on this TV. Experimental.' },
+    { id: 'mic', label: 'Remote mic button \u2192 Home Assistant', key: 'mic_button', action: 'mic-button',
+      sub: 'Replaces LG\'s voice assistant on the mic button while on. LG\'s toast "not supported" may appear.' }
   ];
 
-  function soundIndex(id) { return id === 'music' ? 1 : 0; }
+  function soundIndex(id) { return id === 'mic' ? 2 : (id === 'music' ? 1 : 0); }
+
+  // The value of a row from the status: a boolean, or undefined when this
+  // version does not report it. The mic button is on only while it runs.
+  function soundValue(st, d) {
+    if (d.id !== 'mic') { return typeof st[d.key] === 'boolean' ? st[d.key] : undefined; }
+    if (typeof st.mic_button !== 'string') { return undefined; }
+    return st.mic_button === 'ptt' && st.mic_button_active !== false;
+  }
+
+  // Configured but not running: the takeover of LG's voice key failed.
+  function micFailed(st) { return !!st && st.mic_button === 'ptt' && st.mic_button_active === false; }
+
+  // After a `config` result: the row's status value, until the next status read.
+  function soundApply(st, id, after) {
+    if (!st || (after !== 'on' && after !== 'off')) { return; }
+    var d = SOUND_ROWS[soundIndex(id)];
+    if (d.id === 'mic') {
+      st.mic_button = after === 'on' ? 'ptt' : 'off';
+      st.mic_button_active = after === 'on' ? null : false;
+      st.mic_button_error = null;
+    } else {
+      st[d.key] = after === 'on';
+    }
+  }
 
   function soundConfirm(id, turningOn) {
+    if (id === 'mic') {
+      return turningOn
+        ? 'Turn on the remote mic button? Holding the mic button on the Magic Remote then talks to Home Assistant, and LG\'s voice assistant no longer opens from that button (LG may show "This function is not supported"). The satellite gives the button back to LG when this is turned off, when the satellite stops, and at every TV restart. ' + RESTART
+        : 'Give the mic button back to LG? LG\'s voice assistant opens from the mic button again, and the button no longer talks to Home Assistant. ' + RESTART;
+    }
     if (id === 'music') {
       return turningOn
         ? 'Turn on music? Home Assistant and Music Assistant can then play music on this TV through the satellite. The satellite fetches the music from the address Home Assistant sends, only over its encrypted connection, never from the TV itself. Experimental: not yet tested on a TV. ' + RESTART
@@ -434,12 +469,19 @@
     var out = [];
     for (var i = 0; i < SOUND_ROWS.length; i++) {
       var d = SOUND_ROWS[i];
-      var v = st ? st[d.key] : undefined;
+      var v = st ? soundValue(st, d) : undefined;
       if (!st) {
         out.push({ word: 'Checking...', cls: 'muted', checked: 'false', can: false, cmd: '', confirm: '', warn: '' });
       } else if (typeof v !== 'boolean') {
         out.push({ word: 'Not known', cls: 'warn', checked: 'false', can: false, cmd: '', confirm: '',
           warn: d.label + ' is not reported by this version of the satellite. Apply the update first.' });
+      } else if (d.id === 'mic' && micFailed(st)) {
+        // Configured but not running: "on" again is a retry (a restart).
+        var why = st.mic_button_error ? String(st.mic_button_error) : 'no reason given';
+        var rc = soundConfirm('mic', true);
+        out.push({ word: 'Off (LG kept it)', cls: 'warn', checked: 'false', can: true,
+          cmd: 'config mic-button on', confirm: rc + CONFIRM_TAIL,
+          warn: 'The mic button could not be taken from LG\'s assistant, so LG keeps it: ' + why + '. Press OK twice to try again.' });
       } else {
         var c = soundConfirm(d.id, !v);
         out.push({ word: v ? 'On' : 'Off', cls: '', checked: v ? 'true' : 'false', can: true,
@@ -452,10 +494,11 @@
   // The Home tile's second line: "Echo cancellation on, music off".
   function soundSummary(st) {
     if (!st || typeof st.aec_enabled !== 'boolean' || typeof st.music_enabled !== 'boolean') { return 'Echo cancellation, music'; }
-    return 'Echo cancellation ' + (st.aec_enabled ? 'on' : 'off') + ', music ' + (st.music_enabled ? 'on' : 'off');
+    var tail = soundValue(st, SOUND_ROWS[2]) ? ', mic button on' : '';
+    return 'Echo cancellation ' + (st.aec_enabled ? 'on' : 'off') + ', music ' + (st.music_enabled ? 'on' : 'off') + tail;
   }
 
-  // One line for the JSON result of `ctl.sh config aec|music`, as [text, class].
+  // One line for the JSON result of `ctl.sh config aec|music|mic-button`, as [text, class].
   function soundResult(id, r) {
     var row = SOUND_ROWS[soundIndex(id)];
     var w = function (v) { return v === 'on' ? 'On' : (v === 'off' ? 'Off' : 'not known'); };
@@ -463,6 +506,10 @@
     if (r.result === 'applied') {
       var tail = r.daemon === 'restarted' ? ' The voice service restarted.'
         : (r.daemon === 'not running' ? ' The satellite is not running; it uses this when it starts.' : '');
+      if (id === 'mic' && r.after === 'on' && r.daemon === 'restarted') {
+        // Whether LG gave the button up is known only from the next status.
+        tail += ' It takes the button from LG\'s assistant now; this screen shows in a few seconds whether that worked.';
+      }
       return [row.label + ' is now ' + w(r.after) + '.' + tail, 'ok'];
     }
     if (r.result === 'already') { return ['Already ' + w(r.after || r.before) + '. Nothing changed.', 'ok']; }
@@ -590,6 +637,7 @@
     haSummary: haSummary, haCard: haCard, SETUP_UNAVAILABLE: SETUP_UNAVAILABLE, HA_CONN: HA_CONN, compat: compat, KEY: KEY, COMPAT: COMPAT, HA_STEPS: HA_STEPS, HA_CLEANUP: HA_CLEANUP, HA_DELETE_PATH: HA_DELETE_PATH,
     // Sound screen (TV app only)
     soundRows: soundRows, soundSummary: soundSummary, soundResult: soundResult, soundConfirm: soundConfirm, soundIndex: soundIndex,
+    soundApply: soundApply,
     SOUND_ROWS: SOUND_ROWS, SOUND_NOTE: SOUND_NOTE,
     // phone requests
     requestText: requestText, phoneResult: phoneResult, endedText: endedText, isIPv4: isIPv4,

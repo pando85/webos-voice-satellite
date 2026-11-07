@@ -59,7 +59,7 @@ function exec(args) {
 }
 const T = load({ exec });
 const { byId, doc, settle, advance, step, execs, key, click, ok, calls } = T;
-const ALLOWED = /^sh '\/media\/developer\/apps\/usr\/palm\/applications\/io\.github\.pando85\.voicesatellite\/payload\/ctl\.sh' (status --json|install|start|stop|autostart on|autostart off|mic off|mic on|pair|reset-pairing|clear-crashloop|uninstall|purge|report --json|selfcheck|ack-firmware|tv-settings --json|config (aec|music) (on|off)|setup start|setup status --json|setup stop|setup answer [0-9a-f]{8} (allow|refuse)) 2>&1$/;
+const ALLOWED = /^sh '\/media\/developer\/apps\/usr\/palm\/applications\/io\.github\.pando85\.voicesatellite\/payload\/ctl\.sh' (status --json|install|start|stop|autostart on|autostart off|mic off|mic on|pair|reset-pairing|clear-crashloop|uninstall|purge|report --json|selfcheck|ack-firmware|tv-settings --json|config (aec|music|mic-button) (on|off)|setup start|setup status --json|setup stop|setup answer [0-9a-f]{8} (allow|refuse)) 2>&1$/;
 const shown = (ids) => ids.filter((id) => !byId[id].hidden).sort().join();
 const polls = () => execs().filter((c) => c === 'setup status --json').length;
 // The 10 s refresh (the status read) without waiting for it.

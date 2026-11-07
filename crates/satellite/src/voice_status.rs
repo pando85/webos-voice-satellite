@@ -130,13 +130,39 @@ pub(crate) struct VoiceStatus {
     /// The `music` object (`crate::music`, design music-playback section K):
     /// `{"enabled":false}` with music off. `None` leaves the key out.
     pub(crate) music: Option<String>,
+    /// The Magic Remote's mic button as it runs (`None` leaves the keys out).
+    pub(crate) mic_button: Option<MicButtonStatus>,
+}
+
+/// The mic button feature as it runs (docs/design/remote-mic-button.md):
+/// `"mic_button"` is `off` (not configured), `ptt` (running, LG's voice key
+/// taken over) or `failed` (configured but not running: `mic_button_error`
+/// says why); `"lg_voice_key"` is `lg`, `ours (configd)` or `unknown`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MicButtonStatus {
+    pub(crate) state: &'static str,
+    pub(crate) lg_voice_key: &'static str,
+    pub(crate) error: Option<String>,
+}
+
+impl MicButtonStatus {
+    fn json(&self) -> String {
+        format!(
+            ",\"mic_button\":{},\"lg_voice_key\":{},\"mic_button_error\":{}",
+            json_str(self.state),
+            json_str(self.lg_voice_key),
+            self.error
+                .as_deref()
+                .map_or_else(|| "null".to_owned(), json_str)
+        )
+    }
 }
 
 impl VoiceStatus {
     /// One JSON line (schema 1).
     pub(crate) fn to_json(&self) -> String {
         format!(
-            "{{\"schema\":1,\"mic\":{},\"remote_off\":{},\"remote_off_active\":{},\"power_state\":{},\"pairing_until\":{},\"ha\":{},\"ha_since\":{},\"busy\":{}{}}}\n",
+            "{{\"schema\":1,\"mic\":{},\"remote_off\":{},\"remote_off_active\":{},\"power_state\":{},\"pairing_until\":{},\"ha\":{},\"ha_since\":{},\"busy\":{}{}{}}}\n",
             json_str(self.mic.word()),
             json_str(darken::file_word(self.remote_off)),
             self.remote_off_active,
@@ -149,6 +175,9 @@ impl VoiceStatus {
             self.ha_since,
             self.busy
                 .map_or_else(|| "null".to_owned(), |b| json_str(b.word())),
+            self.mic_button
+                .as_ref()
+                .map_or_else(String::new, MicButtonStatus::json),
             self.music
                 .as_deref()
                 .map_or_else(String::new, |m| format!(",\"music\":{m}")),
@@ -231,6 +260,7 @@ mod tests {
             ha_since: 1_762_000_000,
             busy: None,
             music: None,
+            mic_button: None,
         }
     }
 
@@ -256,6 +286,7 @@ mod tests {
             ha_since: 5,
             busy: Some(Busy::Alarm),
             music: None,
+            mic_button: None,
         };
         assert_eq!(
             s.to_json(),
@@ -286,6 +317,28 @@ mod tests {
         for (m, w) in [(Mic::Muted, "muted"), (Mic::Closed, "closed")] {
             assert!(status(m).to_json().contains(&format!("\"mic\":\"{w}\"")));
         }
+    }
+
+    #[test]
+    fn the_mic_button_fields_come_after_busy_and_before_music() {
+        let mut s = status(Mic::Listening);
+        s.mic_button = Some(MicButtonStatus {
+            state: "failed",
+            lg_voice_key: "lg",
+            error: Some("the read-back says \"launch\"".to_owned()),
+        });
+        s.music = Some("{\"enabled\":false}".to_owned());
+        assert!(s.to_json().ends_with(
+            ",\"busy\":null,\"mic_button\":\"failed\",\"lg_voice_key\":\"lg\",\"mic_button_error\":\"the read-back says \\\"launch\\\"\",\"music\":{\"enabled\":false}}\n"
+        ), "{}", s.to_json());
+        s.mic_button = Some(MicButtonStatus {
+            state: "ptt",
+            lg_voice_key: "ours (configd)",
+            error: None,
+        });
+        assert!(s.to_json().contains(
+            ",\"mic_button\":\"ptt\",\"lg_voice_key\":\"ours (configd)\",\"mic_button_error\":null,"
+        ));
     }
 
     #[test]

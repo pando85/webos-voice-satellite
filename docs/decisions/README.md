@@ -18,7 +18,7 @@ Record decisions once supported by evidence or by an explicit owner decision. Us
 | [0010](0010-music-playback.md) | Music playback through the Home Assistant integration | Accepted for option B (2026-11-05, owner); AirPlay rejected; design only, not implemented, defaults to confirm |
 | [0011](0011-aec-on-by-default.md) | Echo cancellation on by default (B + NS), as a user setting | Accepted (2026-11-05, owner); implemented in 0.4.3; benefit not significant in the live A/Bs |
 | [0012](0012-config-switches-in-ha.md) | Echo cancellation and music as HA config switches that run `ctl.sh config` | Accepted (2026-11-06, owner); implemented on the host, not run on a TV |
-| [0013](0013-remote-mic-button-coexistence.md) | Remote mic button: coexistence with LG's voice assistant (in-memory configd override of the voice key first, SIGSTOP of `voiceconductor` as fallback, restored on stop, crash and uninstall) | **Proposed** (2026-11-07); not accepted, not implemented; [EXP-023](../experiments/EXP-023-remote-mic-button-handover.md) not run |
+| [0013](0013-remote-mic-button-coexistence.md) | Remote mic button: coexistence with LG's voice assistant (in-memory configd override of the voice key first, SIGSTOP of `voiceconductor` as fallback, restored on stop, crash and uninstall) | Accepted (2026-11-07, owner) for the configd override; SIGSTOP fallback not accepted (only if [EXP-023](../experiments/EXP-023-remote-mic-button-handover.md) C1 fails); implemented on the host, not run on a TV |
 
 These ADRs record **owner decisions** supported by discovery on c3-a (ADR 0005 and 0007 also by checks on c3-b). They do not claim that the chosen route has been verified end to end; open verification work is in the [roadmap](../project/roadmap.md).
 

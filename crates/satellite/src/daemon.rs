@@ -40,6 +40,7 @@ use crate::config::{Hang, MicSource, Mode, RemoteOff, Settings, TestTriggers};
 use crate::config_switch::{self, ConfigSwitches};
 use crate::darken::{self, Action, Darkener};
 use crate::firmware::{self, Model, Verdict};
+use crate::lg_voice::{self, KeyOwner, LunaSend, Takeover};
 use crate::music::{End, Music};
 use crate::player::{Done, Kind, Player, redact_url};
 use crate::power::{self, PowerUpdate};
@@ -47,7 +48,7 @@ use crate::remote_mic::StreamEvent;
 use crate::remote_ptt::{self, Act, Button};
 use crate::selfcheck::Note;
 use crate::tv_control::{self, Tv, TvMsg};
-use crate::voice_status::{Busy, Ha, Mic, VoiceFile, VoiceStatus};
+use crate::voice_status::{Busy, Ha, Mic, MicButtonStatus, VoiceFile, VoiceStatus};
 use crate::volume::{self, SharedGain};
 use crate::watchdog::{self, Beats};
 use crate::{resume, volume::Origin};
@@ -577,6 +578,10 @@ struct Daemon {
     /// layer aborted a run and swallowed HA's `RUN_END`; the mic button
     /// joins only a run for which it is set.
     stt_streaming: bool,
+    /// LG's voice key, taken over while the mic button runs (ADR 0013).
+    lg_takeover: Option<Takeover<LunaSend>>,
+    /// The mic button as `run/voice.json` reports it.
+    mic_status: Option<MicButtonStatus>,
 }
 
 impl Daemon {
@@ -727,6 +732,7 @@ impl Daemon {
             ha,
             ha_since: self.ha_since,
             busy: self.busy(),
+            mic_button: self.mic_status.clone(),
             music: Some(self.music.as_ref().map_or_else(
                 || crate::music::DISABLED_JSON.to_owned(),
                 |m| m.status_json(Instant::now()),
@@ -1709,36 +1715,138 @@ fn status_version(v: &Verdict) -> &str {
     }
 }
 
-/// Starts the mic button (reader thread, machine, remote microphone) with
-/// `mic_button = "ptt"`. `None` with `"off"` (no thread, no device opened)
-/// or when the thread cannot start.
-fn start_remote(settings: &Settings) -> Option<remote_ptt::Started> {
+/// Object id of the diagnostic text sensor "LG voice key".
+pub(crate) const LG_VOICE_KEY_ID: &str = "lg_voice_key";
+
+/// The "LG voice key" diagnostic text sensor (listed where `luna-send` is).
+fn lg_voice_key_entity() -> webos_esphome_api::config::TextSensorEntity {
+    webos_esphome_api::config::TextSensorEntity {
+        object_id: LG_VOICE_KEY_ID.to_owned(),
+        name: "LG voice key".to_owned(),
+        icon: "mdi:account-voice".to_owned(),
+        device_class: String::new(),
+        entity_category: webos_esphome_api::proto::EntityCategory::Diagnostic,
+    }
+}
+
+/// The mic button feature after the start: what runs and what is reported.
+pub(crate) struct RemoteSetup {
+    pub(crate) started: Option<remote_ptt::Started>,
+    pub(crate) takeover: Option<Takeover<LunaSend>>,
+    pub(crate) status: MicButtonStatus,
+}
+
+impl RemoteSetup {
+    /// The text of HA's "LG voice key" sensor.
+    pub(crate) fn sensor_text(&self) -> String {
+        let s = &self.status;
+        let owner = match s.lg_voice_key {
+            "ours (configd)" => "Satellite (LG ignores the key)",
+            "unknown" => "Unknown (restore pending)",
+            _ => "LG assistant",
+        };
+        match &s.error {
+            Some(e) => format!("{owner}; mic button off: {e}")
+                .chars()
+                .take(250)
+                .collect(),
+            None => owner.to_owned(),
+        }
+    }
+}
+
+/// The mic button (ADR 0013, docs/design/remote-mic-button.md). With
+/// `mic_button = "ptt"`: the key device must be there, LG's voice key is
+/// taken over (`crate::lg_voice`), then the reader, the machine and the
+/// remote microphone start. If any step fails the feature does not run and
+/// LG's key stays as it was; the reason is logged and reported. With
+/// `"off"` nothing starts, but an override left by an earlier run is given
+/// back.
+pub(crate) async fn setup_remote(
+    settings: &Settings,
+    paths: crate::evdev::InputPaths,
+) -> RemoteSetup {
     let r = &settings.remote;
+    let luna = power::find_binary(&settings.power.luna_send);
+    let state_dir = settings.report.dir_or_default();
+    let off = |key: KeyOwner, error: Option<String>| MicButtonStatus {
+        state: if error.is_some() { "failed" } else { "off" },
+        lg_voice_key: key.word(),
+        error,
+    };
     if !r.ptt() {
         log::info!("remote mic button: off (mic_button = \"off\")");
-        return None;
+        let mut key = KeyOwner::Lg;
+        if let Some(l) = luna.clone() {
+            let mut t = Takeover::new(LunaSend(l), &state_dir);
+            if let Err(e) = t.release().await {
+                log::warn!("remote mic button: {e}");
+                key = KeyOwner::Unknown;
+            }
+        }
+        return RemoteSetup {
+            started: None,
+            takeover: None,
+            status: off(key, None),
+        };
     }
-    let luna = r
-        .remote_mic
-        .then(|| power::find_binary(&settings.power.luna_send))
-        .flatten();
-    if r.remote_mic && luna.is_none() {
-        log::info!(
-            "remote mic: {} not found; button runs use the TV microphone (normal off the TV)",
-            settings.power.luna_send.display()
+    let fail = |key: KeyOwner, why: String| {
+        log::warn!("remote mic button: NOT running: {why}");
+        RemoteSetup {
+            started: None,
+            takeover: None,
+            status: off(key, Some(why)),
+        }
+    };
+    if crate::evdev::find_device(&paths, &r.device_name).is_none() {
+        return fail(
+            KeyOwner::Lg,
+            format!("no input device named {:?}", r.device_name),
         );
     }
-    match Button::start(
-        r,
-        luna,
-        settings.dsp.hpf_hz,
-        crate::evdev::InputPaths::default(),
-        Box::new(remote_ptt::LeaveToLg),
-    ) {
-        Ok(st) => Some(st),
+    let Some(luna) = luna else {
+        return fail(
+            KeyOwner::Lg,
+            format!(
+                "{} not found, so LG's voice key cannot be taken over",
+                settings.power.luna_send.display()
+            ),
+        );
+    };
+    let mut takeover = Takeover::new(LunaSend(luna.clone()), &state_dir);
+    if let Err(why) = takeover.acquire().await {
+        let key = if state_dir.join(lg_voice::STATE_FILE).exists() {
+            KeyOwner::Unknown
+        } else {
+            KeyOwner::Lg
+        };
+        return fail(key, why);
+    }
+    log::info!(
+        "remote mic button: LG's voice key taken over (configd {} = ignore, in memory only; a reboot or ctl.sh restore-lg-voice gives it back)",
+        lg_voice::KEY
+    );
+    let mic_luna = r.remote_mic.then_some(luna);
+    match Button::start(r, mic_luna, settings.dsp.hpf_hz, paths) {
+        Ok(st) => RemoteSetup {
+            started: Some(st),
+            takeover: Some(takeover),
+            status: MicButtonStatus {
+                state: "ptt",
+                lg_voice_key: KeyOwner::Ours.word(),
+                error: None,
+            },
+        },
         Err(e) => {
-            log::warn!("remote mic button: cannot start the reader thread: {e}");
-            None
+            let why = format!("cannot start the reader thread: {e}");
+            let key = match takeover.release().await {
+                Ok(()) => KeyOwner::Lg,
+                Err(r) => {
+                    log::warn!("remote mic button: {r}");
+                    KeyOwner::Unknown
+                }
+            };
+            fail(key, why)
         }
     }
 }
@@ -1823,10 +1931,22 @@ pub(crate) async fn run(mut settings: Settings, triggers: TestTriggers) -> Resul
     // HA's two config switches, after the TV control and compatibility
     // entities so the built-in mute switch stays first and the others keep
     // their order (ADR 0012). Absent when ctl.sh is not found.
-    let config_switches = ConfigSwitches::new(&settings);
+    let mut config_switches = ConfigSwitches::new(&settings);
     if let Some(cs) = &config_switches {
         esp.switches.extend(config_switch::entities());
         cs.spawn_last_change_log();
+    }
+    // The Magic Remote's mic button: runs only with mic_button = "ptt" and
+    // LG's voice key taken over (ADR 0013); HA's switch shows what runs.
+    let remote_setup = setup_remote(&settings, crate::evdev::InputPaths::default()).await;
+    if let Some(cs) = config_switches.as_mut() {
+        cs.set_mic_button_active(remote_setup.started.is_some());
+    }
+    let lg_sensor = power::find_binary(&settings.power.luna_send)
+        .is_some()
+        .then(|| remote_setup.sensor_text());
+    if lg_sensor.is_some() {
+        esp.text_sensors.push(lg_voice_key_entity());
     }
     // Reply volume.
     let (reply_volume, origin) = volume::load(&settings.sink.volume_file, settings.sink.volume);
@@ -1963,6 +2083,14 @@ pub(crate) async fn run(mut settings: Settings, triggers: TestTriggers) -> Resul
             let _ = cmd_tx.send(cmd).await;
         }
     }
+    if let Some(text) = lg_sensor {
+        let _ = cmd_tx
+            .send(AppCommand::SetTextSensor {
+                object_id: LG_VOICE_KEY_ID.to_owned(),
+                state: Some(text),
+            })
+            .await;
+    }
     let server_task = tokio::spawn(server.run(ev_tx, cmd_rx));
 
     let (done_tx, mut done_rx) = mpsc::unbounded_channel();
@@ -1978,9 +2106,12 @@ pub(crate) async fn run(mut settings: Settings, triggers: TestTriggers) -> Resul
         Some((m, rx)) => (Some(m), Some(rx)),
         None => (None, None),
     };
-    // The Magic Remote's mic button: nothing at all is started unless
-    // mic_button = "ptt" (a change restarts the daemon).
-    let (remote, mut remote_keys, mut remote_stream) = match start_remote(&settings) {
+    let RemoteSetup {
+        started,
+        takeover: lg_takeover,
+        status: mic_status,
+    } = remote_setup;
+    let (remote, mut remote_keys, mut remote_stream) = match started {
         Some(st) => (Some(st.button), Some(st.keys), Some(st.stream)),
         None => (None, None, None),
     };
@@ -2039,6 +2170,8 @@ pub(crate) async fn run(mut settings: Settings, triggers: TestTriggers) -> Resul
         config_switches,
         remote,
         stt_streaming: false,
+        lg_takeover,
+        mic_status: Some(mic_status),
     };
     d.publish_voice_status();
     d.publish_timers().await;
@@ -2170,6 +2303,14 @@ pub(crate) async fn run(mut settings: Settings, triggers: TestTriggers) -> Resul
     if let Some(mut b) = d.remote.take() {
         let acts = b.shutdown().await;
         d.run_remote_acts(acts).await;
+    }
+    // LG's voice key back (the supervisor and ctl.sh restore-lg-voice do it
+    // too, from the state file, when this process cannot).
+    if let Some(mut t) = d.lg_takeover.take() {
+        match t.release().await {
+            Ok(()) => log::info!("remote mic button: LG's voice key given back"),
+            Err(e) => log::warn!("remote mic button: {e}"),
+        }
     }
     if let Some(m) = d.music.take() {
         m.shutdown().await;
@@ -2496,6 +2637,8 @@ mod tests {
             config_switches: None,
             remote: None,
             stt_streaming: false,
+            lg_takeover: None,
+            mic_status: None,
         };
         (d, cmd_rx)
     }
@@ -3225,10 +3368,163 @@ esac
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn mic_button_off_starts_nothing() {
+    fn no_luna(dir: &Path) -> Settings {
+        let mut s = Settings::default();
+        s.power.luna_send = dir.join("no-luna-send");
+        s.report.dir = Some(dir.join("run"));
+        s
+    }
+
+    #[tokio::test]
+    async fn mic_button_off_starts_nothing() {
         // Off is inert: no reader thread, no device opened, no machine.
-        assert!(start_remote(&Settings::default()).is_none());
+        let dir = test_dir("micoff");
+        let (_root, paths) =
+            crate::evdev::tests::fake_inputs("micoff", &[(2, "LGE M-RCU - Builtin [0]")]);
+        let r = setup_remote(&no_luna(&dir), paths).await;
+        assert!(r.started.is_none() && r.takeover.is_none());
+        assert_eq!(r.status.state, "off");
+        assert_eq!(r.status.lg_voice_key, "lg");
+        assert_eq!(r.sensor_text(), "LG assistant");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A fake `luna-send` that models configd's in-memory value in a file
+    /// next to it (`val`: absent = LG's `launch`); `refuse`: setConfigs
+    /// answers an error.
+    fn fake_configd(dir: &Path, refuse: bool) -> PathBuf {
+        let luna = dir.join("luna-send");
+        crate::testutil::write_script(
+            &luna,
+            &format!(
+                r#"D='{d}'
+echo "$5 $6" >> "$D/calls"
+case "$5" in
+*/setConfigs)
+  if [ {refuse} = 1 ]; then echo '{{"returnValue":false,"errorText":"denied"}}'; exit 0; fi
+  case "$6" in *'"action":"ignore"'*) echo ignore > "$D/val" ;; *null*) rm -f "$D/val" ;; esac
+  echo '{{"returnValue":true}}' ;;
+*/getConfigs)
+  v=$(cat "$D/val" 2>/dev/null || echo launch)
+  printf '{{"configs":{{"com.webos.keyaction.voice":{{"action":"%s"}}}},"returnValue":true}}\n' "$v" ;;
+*) exit 3 ;;
+esac"#,
+                d = dir.display(),
+                refuse = u8::from(refuse)
+            ),
+        );
+        luna
+    }
+
+    #[tokio::test]
+    async fn mic_button_on_takes_lgs_key_over_and_gives_it_back() {
+        let dir = test_dir("micon");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut s = no_luna(&dir);
+        s.power.luna_send = fake_configd(&dir, false);
+        s.remote.mic_button = crate::config::MicButton::Ptt;
+        s.remote.remote_mic = false;
+        let (_root, paths) =
+            crate::evdev::tests::fake_inputs("micon", &[(2, "LGE M-RCU - Builtin [0]")]);
+        let r = setup_remote(&s, paths).await;
+        assert_eq!(r.status.state, "ptt", "{:?}", r.status.error);
+        assert_eq!(r.status.lg_voice_key, "ours (configd)");
+        assert_eq!(r.sensor_text(), "Satellite (LG ignores the key)");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("val")).unwrap().trim(),
+            "ignore"
+        );
+        assert!(dir.join("run").join(lg_voice::STATE_FILE).exists());
+        // Every set was volatile and only the one key was read.
+        let calls = std::fs::read_to_string(dir.join("calls")).unwrap();
+        for l in calls.lines() {
+            assert!(l.contains("com.webos.keyaction.voice"), "{l}");
+            if l.contains("setConfigs") {
+                assert!(l.contains("\"volatile\":true"), "{l}");
+            }
+        }
+        let RemoteSetup {
+            started, takeover, ..
+        } = r;
+        let mut b = started.unwrap().button;
+        b.shutdown().await;
+        takeover.unwrap().release().await.unwrap();
+        assert!(!dir.join("val").exists(), "LG's value is back");
+        assert!(!dir.join("run").join(lg_voice::STATE_FILE).exists());
+        // A later start with the feature off finds nothing to give back.
+        s.remote.mic_button = crate::config::MicButton::Off;
+        let (_r2, p2) = crate::evdev::tests::fake_inputs("micon2", &[]);
+        assert_eq!(setup_remote(&s, p2).await.status.lg_voice_key, "lg");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_refused_takeover_leaves_lg_as_it_was_and_off_gives_back_a_leftover() {
+        let dir = test_dir("micref");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut s = no_luna(&dir);
+        s.power.luna_send = fake_configd(&dir, true);
+        s.remote.mic_button = crate::config::MicButton::Ptt;
+        let (_root, paths) =
+            crate::evdev::tests::fake_inputs("micref", &[(2, "LGE M-RCU - Builtin [0]")]);
+        let r = setup_remote(&s, paths).await;
+        assert!(r.started.is_none());
+        assert_eq!(r.status.state, "failed");
+        assert_eq!(r.status.lg_voice_key, "lg");
+        assert!(
+            r.status.error.as_deref().unwrap().contains("denied"),
+            "{:?}",
+            r.status.error
+        );
+        assert!(!dir.join("val").exists());
+        assert!(!dir.join("run").join(lg_voice::STATE_FILE).exists());
+        // A state file left by a crashed run, with the feature now off: the
+        // start gives LG's key back.
+        s.power.luna_send = fake_configd(&dir, false);
+        std::fs::create_dir_all(dir.join("run")).unwrap();
+        std::fs::write(dir.join("run").join(lg_voice::STATE_FILE), "configd 1\n").unwrap();
+        std::fs::write(dir.join("val"), "ignore\n").unwrap();
+        s.remote.mic_button = crate::config::MicButton::Off;
+        let (_r2, p2) = crate::evdev::tests::fake_inputs("micref2", &[]);
+        let r = setup_remote(&s, p2).await;
+        assert_eq!(r.status.lg_voice_key, "lg");
+        assert!(!dir.join("val").exists());
+        assert!(!dir.join("run").join(lg_voice::STATE_FILE).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn mic_button_on_without_a_takeover_does_not_run_and_says_why() {
+        let dir = test_dir("micfail");
+        let mut s = no_luna(&dir);
+        s.remote.mic_button = crate::config::MicButton::Ptt;
+        // No key device.
+        let (_r1, empty) = crate::evdev::tests::fake_inputs("micfail-none", &[]);
+        let r = setup_remote(&s, empty).await;
+        assert!(r.started.is_none());
+        assert_eq!(r.status.state, "failed");
+        assert!(
+            r.status
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("no input device")
+        );
+        // The device is there but luna-send is not: LG's key cannot be
+        // taken over, so the feature does not run.
+        let (_r2, paths) =
+            crate::evdev::tests::fake_inputs("micfail-dev", &[(2, "LGE M-RCU - Builtin [0]")]);
+        let r = setup_remote(&s, paths).await;
+        assert!(r.started.is_none() && r.takeover.is_none());
+        assert_eq!(r.status.state, "failed");
+        assert_eq!(r.status.lg_voice_key, "lg");
+        assert!(
+            r.sensor_text()
+                .starts_with("LG assistant; mic button off: "),
+            "{}",
+            r.sensor_text()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

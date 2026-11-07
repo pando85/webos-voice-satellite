@@ -70,6 +70,8 @@
 #                     etc/ and log/ (a reinstall reuses them)
 #   purge             delete the boot hook, stop, delete DIR entirely
 #                     (config, key, pairing state, logs)
+#   restore-lg-voice  give the Magic Remote's mic button back to LG's
+#                     assistant (ADR 0013): repeatable; refused while running
 #
 # DIR is /var/lib/webos-satellite. Environment (tests, other layouts):
 # WEBOS_SAT_PREFIX (DIR), WEBOS_SAT_INITD (default /var/lib/webosbrew/init.d),
@@ -86,7 +88,7 @@ here=$(cd "$(dirname "$0")" && pwd)
 . "$here/lib.sh"
 
 usage() {
-    sed -n '2,82p' "$0" >&2
+    sed -n '2,84p' "$0" >&2
     exit 2
 }
 
@@ -175,6 +177,7 @@ cmd_install() {
         was_running=1
         note "stopping the running daemon for the update"
         stop_daemon 10
+        lg_restore_after_stop
     fi
     tmpcfg=
     if [ -n "$cfg" ]; then
@@ -226,6 +229,7 @@ cmd_stop() {
     installed || die "not installed"
     locked
     stop_daemon 10
+    lg_restore_after_stop
     note "stopped"
 }
 
@@ -341,6 +345,7 @@ remove_hook_and_stop() {
     stop_setup_server
     if [ -f "$P/$MARKER" ]; then
         stop_daemon 10
+        lg_restore_after_stop
     fi
 }
 
@@ -363,6 +368,7 @@ cmd_purge() {
     if [ -e "$P" ]; then
         [ -f "$P/$MARKER" ] || die "$P exists but is not a webos-satellite install; not removing it"
         stop_daemon 10
+        lg_restore_after_stop
         cd /
         rm -rf "$P"
     fi
@@ -407,6 +413,18 @@ aec_enabled_json() { if [ "$(cfg_section_value aec enabled)" = false ]; then pri
 music_enabled_json() { if [ "$(cfg_section_value music enabled)" = true ]; then printf true; else printf false; fi; }
 # [remote] mic_button (the Magic Remote's mic button, ADR 0013 proposed): off
 # unless it says ptt.
+# Who handles the Magic Remote's mic button (ADR 0013): what a running
+# daemon reports, else the state file: "lg", "ours (configd)" or "unknown"
+# (a state file is left and no daemon confirms it: restore-lg-voice clears it).
+LG_VOICE_STATE=lg_voice_override
+lg_voice_key_word() {
+    if running && voice_fresh; then
+        lk=$(sed -n 's/.*"lg_voice_key"[[:space:]]*:[[:space:]]*"\([a-z ()]*\)".*/\1/p' "$RUN_DIR/voice.json" 2>/dev/null | head -n 1)
+        case $lk in lg | 'ours (configd)' | unknown) printf '%s' "$lk"; return 0 ;; esac
+    fi
+    if [ -f "$P/run/$LG_VOICE_STATE" ]; then printf unknown; else printf lg; fi
+}
+
 # A TOML string may be in double or single quotes.
 mic_button_word() {
     mb=$(cfg_section_value remote mic_button)
@@ -546,6 +564,16 @@ cmd_status() {
     aec_on=$(aec_enabled_json)
     music_on=$(music_enabled_json)
     mic_button=$(mic_button_word)
+    lg_voice_key=$(lg_voice_key_word)
+    mic_active=null
+    mic_error=
+    if running && voice_fresh; then
+        case $(voice_field mic_button) in
+        ptt) mic_active=true ;;
+        off | failed) mic_active=false ;;
+        esac
+        mic_error=$(sed -n 's/.*"mic_button_error"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$RUN_DIR/voice.json" 2>/dev/null | head -n 1 | tr -c 'A-Za-z0-9 ._:;,()/=+-' ' ' | cut -c1-200)
+    fi
     if [ "$json" -eq 0 ]; then
         note "package: ${pkg_version:-none} ($PAYLOAD)"
         note "installed: $is_inst ${inst_version:+$inst_version }in $P${build:+ ($build)}"
@@ -576,6 +604,10 @@ cmd_status() {
         note "reply volume: $vol_text, remote power-off: ${remote_off:-normal}"
         on_off() { if [ "$1" = true ]; then echo on; else echo off; fi; }
         note "echo cancellation: $(on_off "$aec_on"), music: $(on_off "$music_on"), remote mic button: $mic_button (config; ctl.sh config aec|music|mic-button on|off)"
+        if [ "$mic_active" = false ] && [ "$mic_button" = ptt ]; then
+            note "remote mic button NOT running${mic_error:+: $mic_error}"
+        fi
+        note "LG voice key: $lg_voice_key (ctl.sh restore-lg-voice gives it back to LG)"
         return 0
     fi
     printf '{"package_version":%s,' "$(json_str "$pkg_version")"
@@ -593,7 +625,8 @@ cmd_status() {
     printf '"remote_off":%s,"reply_volume":%s,' "$(json_str "${remote_off:-normal}")" "$(json_str "$reply_volume")"
     printf '"reply_volume_default":%s,' "$(json_str "$reply_volume_default")"
     printf '"aec_enabled":%s,"music_enabled":%s,' "$aec_on" "$music_on"
-    printf '"mic_button":%s,' "$(json_str "$mic_button")"
+    printf '"mic_button":%s,"mic_button_active":%s,"mic_button_error":%s,"lg_voice_key":%s,' \
+        "$(json_str "$mic_button")" "$mic_active" "$( [ -n "$mic_error" ] && json_str "$mic_error" || printf null)" "$(json_str "$lg_voice_key")"
     printf '"pairing_window_s":%s,' "$(json_str "$(cfg_value window_s | sed 's/[^0-9]//g')")"
     printf '"pairing":%s,"ha":%s,' "$(pairing_json)" "$(ha_json)"
     printf '"prefix":%s,"log":[' "$(json_str "$P")"
@@ -1057,6 +1090,74 @@ volume_emit() { # REQUESTED BEFORE AFTER RESULT ERROR DAEMON
         "$(json_str "$1")" "$(json_str "$2")" "$(json_str "$3")" "$(json_str "$4")" "$(json_str "$6")" "$(json_str "$5")"
 }
 
+# --- restore-lg-voice: the mic button back to LG (ADR 0013) -------------------
+# The daemon takes LG's voice key with an in-memory configd override
+# (com.webos.keyaction.voice = {"action":"ignore"}, "volatile": true) while
+# the mic button runs, and writes run/lg_voice_override before it does. This
+# removes the override (null, volatile) and confirms it with a read of that
+# one config name; only then is the state file removed. It never writes
+# without "volatile" and never reads a whole category. Repeatable: without
+# the state file it does nothing. Refused while the daemon runs (it holds the
+# key; turn the mic button off instead). Called by stop, restart, uninstall,
+# purge, the config restart, and by the supervisor after every daemon exit.
+# A reboot clears the override by itself.
+LG_SET=luna://com.webos.service.config/setConfigs
+LG_GET=luna://com.webos.service.config/getConfigs
+LG_NULL='{"configs":{"com.webos.keyaction.voice":null},"volatile":true}'
+LG_KEY='{"configNames":["com.webos.keyaction.voice"]}'
+
+lg_emit() { # RESULT LG_VOICE_KEY ERROR
+    printf '{"schema":1,"restore":%s,"lg_voice_key":%s,"error":%s}\n' "$(json_str "$1")" "$(json_str "$2")" "$(json_str "$3")"
+}
+
+# Prints the result line; status 0 when LG has the key (or nothing to do).
+lg_restore() {
+    sf=$P/run/$LG_VOICE_STATE
+    if [ ! -f "$sf" ]; then
+        lg_emit nothing lg ""
+        return 0
+    fi
+    if [ ! -x "$(command -v "$LUNA" 2>/dev/null)" ]; then
+        lg_emit failed unknown "luna-send not found"
+        return 1
+    fi
+    setok=1
+    luna_call "$LG_SET" "$LG_NULL" || setok=0
+    seterr=$LUNA_ERR
+    if luna_call "$LG_GET" "$LG_KEY"; then
+        act=$(printf '%s' "$LUNA_REPLY" | sed -n 's/.*"action"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)
+        if [ "$act" != ignore ]; then
+            rm -f "$sf"
+            note "LG's voice key given back (action ${act:-not set})"
+            lg_emit done lg ""
+            return 0
+        fi
+        lg_emit failed unknown "the key still reads ignore${seterr:+ ($seterr)}; try again or reboot the TV"
+        return 1
+    fi
+    [ "$setok" -eq 1 ] || seterr="setConfigs: $seterr; "
+    lg_emit failed unknown "${seterr}getConfigs: $LUNA_ERR; try again or reboot the TV"
+    return 1
+}
+
+# After a stop in this script: LG's key back, quietly (the line goes to
+# stderr), never failing the caller.
+lg_restore_after_stop() {
+    [ -f "$P/run/$LG_VOICE_STATE" ] || return 0
+    lg_restore >&2 || note "LG's voice key could not be given back now: run ctl.sh restore-lg-voice or reboot the TV"
+    return 0
+}
+
+cmd_restore_lg_voice() {
+    need_root
+    # The daemon itself (the supervisor calls this between two daemon runs).
+    if is_ours "$(read_pid "$PIDFILE")"; then
+        lg_emit refused "$(lg_voice_key_word)" "the satellite is running: turn the mic button off (ctl.sh config mic-button off) or stop it first"
+        return 1
+    fi
+    lg_restore
+}
+
 # --- config aec|music|mic-button: one config key and a restart (ADR 0011,
 # ADR 0010, docs/design/remote-mic-button.md) ---
 # [aec] enabled, [music] enabled and [remote] mic_button are read by the
@@ -1132,6 +1233,7 @@ $2 = $3" "$CFG" >"$4"
 # status 1 when it is not running afterwards. Notes go to stderr.
 cfg_restart() {
     (stop_daemon 10) >&2 || return 1
+    lg_restore_after_stop
     sh "$P/bin/start.sh" --supervise >&2 || return 1
 }
 
@@ -1221,10 +1323,21 @@ cmd_config_set() { # aec|music|mic-button on|off, already validated
     fi
     before=$(cfg_state "$st" "$sum")
     [ -n "$before" ] || { cfg_emit "$st" "$want" "" "" refused "the daemon does not report this setting" none; return; }
-    if [ "$before" = "$want" ]; then
+    # The mic button is on only while it runs (LG's key taken over): a
+    # running daemon that reports it not running (the takeover failed) makes
+    # "on" a retry (the same config, a restart), and "off" still writes off.
+    eff=$before
+    if [ "$st" = mic-button ] && running && voice_fresh; then
+        case $(voice_field mic_button) in
+        ptt) eff=on ;;
+        off | failed) eff=off ;;
+        esac
+    fi
+    if [ "$before" = "$want" ] && [ "$eff" = "$want" ]; then
         cfg_emit "$st" "$want" "$before" "$before" already "" none
         return
     fi
+    before=$eff
     left=$(cfg_cooldown_left)
     if [ "$left" -gt 0 ]; then
         ago=$((CFG_COOLDOWN - left))
@@ -1551,6 +1664,7 @@ restart)
     installed || die "not installed"
     locked
     stop_daemon 10
+    lg_restore_after_stop
     sh "$P/bin/start.sh" --supervise
     ;;
 autostart) cmd_autostart "$@" ;;
@@ -1567,6 +1681,7 @@ setup) cmd_setup "$@" ;;
 clear-crashloop) [ $# -eq 0 ] || usage; need_root; rm -f "$CRASHLOOP"; note "crash-loop marker removed" ;;
 uninstall) [ $# -eq 0 ] || usage; cmd_uninstall ;;
 purge) [ $# -eq 0 ] || usage; cmd_purge ;;
+restore-lg-voice) [ $# -eq 0 ] || usage; cmd_restore_lg_voice ;;
 -h | --help) usage ;;
 *) usage ;;
 esac

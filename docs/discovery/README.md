@@ -50,7 +50,7 @@ Naming: `D<n>-*` files are roadmap discovery steps; `P1-*` files are Phase 1 val
 - **Start sound tests low.** Raise playback levels in steps and only at the owner-approved reference level (+12 dB gain on the JBL Go 3 at system volume 82 %, as used in the D3 tests).
 - **No TV playback without owner consent**, including test tones, replies and TTS through the TV's own audio. Announce the test to the room beforehand.
 - Recordings are opt-in, short and local, with consent from anyone whose voice may be captured. Delete them from the TV and the host after analysis. Never commit audio.
-- LG hands-free must stay off while the satellite uses `hw:LGSIC,0` ([ADR 0004](../decisions/0004-mvp-capture-device-and-lg-handsfree-off.md)). Do not change native LG voice services.
+- LG hands-free must stay off while the satellite uses `hw:LGSIC,0` ([ADR 0004](../decisions/0004-mvp-capture-device-and-lg-handsfree-off.md)). Do not change native LG voice services (exception: [ADR 0013](../decisions/0013-remote-mic-button-coexistence.md), the satellite's in-memory configd override of the voice key at runtime only).
 - Reboots, service changes, mounts and persistence need explicit authorization. `/tmp` content is lost at reboot, which makes it the preferred place for experiment binaries.
 - Never execute unreviewed binaries or remote install pipes on the TV; inspect and checksum first.
 - The JBL Go 3 rig switches itself off when idle; an unattended session cannot switch it on again. Check that it connects (`bluetoothctl connect`) before relying on it.

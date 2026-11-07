@@ -1,6 +1,6 @@
 # EXP-023 — Magic Remote mic button: handing the key from LG's assistant to the satellite
 
-**Status:** PLANNED, **not run** (needs owner authorization per step). The read-only inspection and static analysis that motivate it ran on 2026-11-07 and are recorded in [research section 9](../research/remote-mic-button.md#9-hand-over-candidates-configuration-and-static-analysis-2026-11-07).
+**Status:** PLANNED, **not run** (needs owner authorization per step). The read-only inspection and static analysis that motivate it ran on 2026-11-07 and are recorded in [research section 9](../research/remote-mic-button.md#9-hand-over-candidates-configd-and-the-key-filter-static-2026-11-07). **Update 2026-11-07:** [ADR 0013](../decisions/0013-remote-mic-button-coexistence.md) is accepted for the configd override and the satellite now applies it itself (design note section 7). **C1 is therefore run as the owner's first enable session of the mic button** ([C1 through the satellite](#c1-through-the-satellite-the-owners-first-enable-session) below), not with hand-typed `luna-send` calls; C0 stays optional, C2 only if C1 fails.
 **Date:** written 2026-11-07
 **Device alias / model / firmware / webOS / architecture:** c3-a (LG C3 42 inch, firmware `03.30.74`, webOS TV 8.3.0, aarch64 kernel, 32-bit ARM userland), Magic Remote `LGE MR23`. c3-b is not part of this experiment.
 **Power and playback state:** `Active`, no playback started by the agent, LG hands-free ("Hi LG") **off** (unchanged), installed satellite running unchanged
@@ -102,6 +102,21 @@ $L luna://com.webos.service.config/getConfigs '{"configNames":["com.webos.keyact
 ```
 
 - **C1.7:** the owner taps the mic button, silent. LG's voice screen must open again. Close it with Back.
+
+### C1 through the satellite (the owner's first enable session)
+
+The satellite (0.4.7 or later) does C1.1, C1.2 and C1.6 itself: at its start with `[remote] mic_button = "ptt"` it reads the key (`launch` expected), writes `run/lg_voice_override`, sets the volatile override, reads it back and checks that `/var/preferences/configd_factory_db.json` was not created; any failure gives the key back and keeps the feature off with the reason in the log, `ctl.sh status` and HA. Turning the feature off, `ctl.sh stop`, `uninstall`, `purge` and the supervisor (after any daemon exit) give the key back. Prerequisites: the version deployed with `mic_button = "off"` (a separate install), the owner at the TV, LG hands-free off, consent for the C1.4 phrase. Steps:
+
+1. **Baseline (read-only):** `ctl.sh status --json` shows `mic_button` `off`, `lg_voice_key` `lg`; `ls -l /var/preferences/` (record whether `configd_factory_db.json` and `configd_debug_db.json` exist) and `ls /tmp/configd_*_before_setConfigs.json 2>/dev/null | wc -l`. The owner taps the mic button once, silent: LG's voice screen opens (close it with Back).
+2. **Enable** from the TV app (Home, Sound, "Remote mic button → Home Assistant", OK twice). Record the result line, then: daemon log `remote mic button: LG's voice key taken over (configd com.webos.keyaction.voice = ignore, in memory only ...)`; `status --json` `mic_button_active` true, `lg_voice_key` `ours (configd)`; HA: switch "Remote mic button" on, sensor "LG voice key" "Satellite (LG ignores the key)". Expected failure signal: `remote mic button: NOT running: ...` (record the reason; the app shows "Off (LG kept it)").
+3. **Persistence check:** `configd_factory_db.json` still absent (the daemon also checks); record whether `configd_debug_db.json` appeared and how many new `/tmp/configd_*_before_setConfigs.json` files exist (C1 rollback).
+4. **C1.3:** one silent tap: no LG voice screen; note the toast text if any. The satellite starts a run (tap-to-talk on the TV microphone; HA's end of speech ends it).
+5. **C1.4 (consent):** hold about 3 s with "uno dos tres": HA shows a run with the transcript; the log shows `remote mic: stream open`, the release, `subscription closed`; no `2003`, no LG message.
+6. **C1.5:** Up, Back, Home, volume and the wheel behave normally.
+7. **Disable** from the app ("Give the mic button back to LG?", OK twice): log `LG's voice key given back`, `status --json` `lg_voice_key` `lg`, `run/lg_voice_override` gone. **C1.7:** one silent tap: LG's voice screen opens again.
+8. **Optional, owner's choice:** with the feature on, `kill -KILL` of the daemon: the supervisor log says `LG's voice key given back`, the restarted daemon takes it again (`taken over`). Then disable as in step 7.
+
+Rollback at any point: turn the feature off, or `ctl.sh stop` then `ctl.sh restore-lg-voice`; a TV restart also clears the in-memory override.
 
 ### C2: pause `voiceconductor` (only if C1 fails, separate approval)
 

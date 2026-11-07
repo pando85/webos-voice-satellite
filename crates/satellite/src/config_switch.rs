@@ -286,6 +286,7 @@ async fn log_last_change(path: &Path, every: Duration, tries: u32) -> Option<Out
 
 /// The switches' state in this process and the guard state.
 #[derive(Debug)]
+#[allow(clippy::struct_excessive_bools)] // one bool per switch state
 pub(crate) struct ConfigSwitches {
     /// The install directory (`WEBOS_SAT_PREFIX` of `ctl.sh`).
     prefix: PathBuf,
@@ -295,7 +296,10 @@ pub(crate) struct ConfigSwitches {
     state_dir: PathBuf,
     aec: bool,
     music: bool,
+    /// `mic_button = "ptt"` in the config this process started with.
     mic_button: bool,
+    /// The feature runs (LG's voice key taken over): what HA's switch shows.
+    mic_button_active: bool,
     in_flight: Arc<AtomicBool>,
     slow_after: Duration,
 }
@@ -324,6 +328,7 @@ impl ConfigSwitches {
             aec: settings.aec.enabled,
             music: settings.music.enabled,
             mic_button: settings.remote.ptt(),
+            mic_button_active: false,
             in_flight: Arc::new(AtomicBool::new(false)),
             slow_after: SLOW_AFTER,
         })
@@ -352,9 +357,16 @@ impl ConfigSwitches {
             aec,
             music,
             mic_button: false,
+            mic_button_active: false,
             in_flight: Arc::new(AtomicBool::new(false)),
             slow_after: SLOW_AFTER,
         }
+    }
+
+    /// The mic button as it runs: `active` only when the feature started
+    /// with LG's voice key taken over. Call before the first states go out.
+    pub(crate) fn set_mic_button_active(&mut self, active: bool) {
+        self.mic_button_active = active;
     }
 
     /// When this process is the restarted one, logs what the `ctl.sh` that
@@ -375,11 +387,24 @@ impl ConfigSwitches {
         });
     }
 
+    /// The state HA's switch shows: the config value, except for the mic
+    /// button, which is on only while it runs.
     pub(crate) fn current(&self, setting: Setting) -> bool {
         match setting {
             Setting::Aec => self.aec,
             Setting::Music => self.music,
-            Setting::MicButton => self.mic_button,
+            Setting::MicButton => self.mic_button_active,
+        }
+    }
+
+    /// The state a request is compared with: for the mic button, an "on"
+    /// is compared with what runs (a takeover that failed can be retried:
+    /// `ctl.sh config` restarts the daemon), an "off" with the config (a
+    /// failed takeover still has `ptt` in the config, which an "off" removes).
+    fn compared(&self, setting: Setting, want: bool) -> bool {
+        match setting {
+            Setting::MicButton if !want => self.mic_button,
+            _ => self.current(setting),
         }
     }
 
@@ -409,7 +434,7 @@ impl ConfigSwitches {
             object_id: id.to_owned(),
         };
         let decision = decide(
-            self.current(setting),
+            self.compared(setting, want),
             want,
             busy,
             self.in_flight.load(Ordering::Relaxed),
@@ -736,10 +761,40 @@ mod tests {
         s.remote.mic_button = crate::config::MicButton::Ptt;
         let c = ConfigSwitches::new(&s).unwrap();
         assert!(!c.current(Setting::Aec) && c.current(Setting::Music));
+        // Configured, but HA sees it on only once it runs.
+        assert!(!c.current(Setting::MicButton));
+        let mut c = c;
+        c.set_mic_button_active(true);
         assert!(c.current(Setting::MicButton));
         assert_eq!(c.prefix, dir);
         assert_eq!(c.ctl, dir.join("bin").join("ctl.sh"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_failed_mic_button_takeover_can_be_retried_and_turned_off() {
+        let d = tmp("micbtn");
+        let (tx, _rx) = mpsc::channel(4);
+        // Configured ptt, but the takeover failed: HA shows off.
+        let mut c = ConfigSwitches::fixture(true, false, &d, &d.join("run"));
+        c.mic_button = true;
+        c.set_mic_button_active(false);
+        assert_eq!(
+            c.initial_commands()[2],
+            AppCommand::SetSwitch {
+                object_id: MIC_BUTTON_ID.into(),
+                state: Some(false)
+            }
+        );
+        // "on" is compared with what runs: a retry is a change.
+        assert!(!c.compared(Setting::MicButton, true));
+        // "off" is compared with the config: ptt there, so a change too.
+        assert!(c.compared(Setting::MicButton, false));
+        // Not configured and not running: "off" changes nothing.
+        c.mic_button = false;
+        assert!(c.on_request(Setting::MicButton, false, None, &tx).is_none());
+        assert!(!c.in_flight.load(Ordering::Relaxed));
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[tokio::test]

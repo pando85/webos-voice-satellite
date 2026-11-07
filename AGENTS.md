@@ -33,7 +33,7 @@ Documentation from **webOS OSE** is not proof that the same API is exposed on **
 - Audio recordings are opt-in, short, local, and never committed. Obtain consent from anyone whose voice may be captured.
 - Never log ambient speech or credentials by default; restrict server access, validate TLS, and document microphone mute/listening indicators.
 - Don't execute remote install pipes or arbitrary binaries on the TVs. Inspect scripts before running them.
-- Maintain rollback paths and avoid changing native LG voice services during discovery.
+- Maintain rollback paths. Do not change native LG voice services, with one exception ([ADR 0013](docs/decisions/0013-remote-mic-button-coexistence.md)): while the satellite runs with the mic button feature enabled, it may set the in-memory (`"volatile": true`) configd override `com.webos.keyaction.voice`. It must be restored on feature off, stop, crash and uninstall, and must never be made persistent. Pausing `voiceconductor` is not covered by this exception. Experiments that exercise the override still need the owner's authorization per run.
 
 ## When to use REA
 

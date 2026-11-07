@@ -100,7 +100,7 @@
       </div>
     </section>
 
-    <!-- Sound: echo cancellation and music (config keys; a change restarts the daemon) -->
+    <!-- Sound: echo cancellation, music and the remote mic button (config keys; a change restarts the daemon) -->
     <section id="sound" class="screen" hidden>
       <div class="vgrid">
         <div class="vrows">
@@ -115,6 +115,12 @@
             <span id="s-music-state" class="vr-state muted">Checking...</span><span id="s-music-sw" class="sw na"></span>
             <span class="vr-sub">Lets Home Assistant or Music Assistant play music on this TV. Experimental.</span>
             <span id="s-music-confirm" class="vr-confirm" hidden><span id="s-music-confirm-text"></span><span class="bar"><i></i></span></span>
+          </button>
+          <button id="s-row-mic" class="vrow" role="switch" aria-checked="false">
+            <span class="vr-label">Remote mic button &#8594; Home Assistant<span class="vr-tag">Satellite</span></span>
+            <span id="s-mic-state" class="vr-state muted">Checking...</span><span id="s-mic-sw" class="sw na"></span>
+            <span class="vr-sub">Replaces LG's voice assistant on the mic button while on. LG's toast "not supported" may appear.</span>
+            <span id="s-mic-confirm" class="vr-confirm" hidden><span id="s-mic-confirm-text"></span><span class="bar"><i></i></span></span>
           </button>
           <p id="s-msg" class="msg" aria-live="polite"></p>
         </div>

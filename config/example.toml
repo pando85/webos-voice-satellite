@@ -401,15 +401,18 @@ disconnect_stop_s = 60
 
 [remote]
 # The Magic Remote's mic button (design: docs/design/remote-mic-button.md;
-# how it coexists with LG's assistant is ADR 0013, PROPOSED and not built).
-# "off" (default): nothing of this feature is started (no reader, no device
-# opened, no run, no stream, nothing of LG's changed).
+# ADR 0013). "off" (default): nothing of this feature is started (no reader,
+# no device opened, no run, no stream, nothing of LG's changed).
 # "ptt": hold the button to talk to Home Assistant: the press starts a run
-# at speech-to-text (no wake word), the release ends its audio. LG's own
-# assistant still opens on each press until the ADR 0013 hand-over exists.
-# The TV app's Sound screen does not show it yet; the HA switch "Remote mic
-# button" (remote_mic_button) and `ctl.sh config mic-button on|off` change
-# this key and restart.
+# at speech-to-text (no wake word), the release ends its audio. It runs only
+# while LG's assistant is kept off the button: at the start the satellite
+# sets LG's voice key action (configd com.webos.keyaction.voice) to "ignore",
+# in memory only, and gives it back when it stops (also after a crash, by the
+# supervisor; by hand: ctl.sh restore-lg-voice; a TV restart clears it too).
+# If that fails the feature stays off and says why (log, ctl.sh status, HA).
+# LG may show "This function is not supported" on a press. The TV app's
+# Sound screen, the HA switch "Remote mic button" (remote_mic_button) and
+# `ctl.sh config mic-button on|off` change this key and restart.
 mic_button = "off"
 # The key's input device, by its exact name (never an eventN index), and the
 # EV_KEY code (428 on LG C3, webOS 8.3, EXP-022).

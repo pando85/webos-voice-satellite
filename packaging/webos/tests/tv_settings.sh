@@ -81,6 +81,24 @@ case $uri in
     [ "$mode" = ignore ] || echo "$payload" | sed -n 's/.*"settingStatus":\(true\|false\).*/\1/p' >"$F/thinq"
     printf '{\n    "serviceName": "thinQ",\n    "returnValue": true,\n    "settingStatus": true\n}\n'
     ;;
+*/setConfigs)
+    # configd's in-memory value of com.webos.keyaction.voice in $F/kav
+    # (absent: LG's "launch"); kamode: ok | refuse | stuck (set ignored).
+    km=$(cat "$F/kamode" 2>/dev/null || echo ok)
+    case $payload in *'"volatile":true'*) ;; *) echo nonvolatile >>"$F/kaviolation" ;; esac
+    [ "$km" != refuse ] || { fail "denied"; exit 0; }
+    if [ "$km" = ok ]; then
+        case $payload in
+        *'"action":"ignore"'*) echo ignore >"$F/kav" ;;
+        *null*) rm -f "$F/kav" ;;
+        esac
+    fi
+    printf '{\n    "returnValue": true\n}\n'
+    ;;
+*/getConfigs)
+    case $payload in *voiceframework* | *categoryNames*) echo category >>"$F/kaviolation" ;; esac
+    printf '{\n    "configs": {\n        "com.webos.keyaction.voice": {\n            "action": "%s"\n        }\n    },\n    "returnValue": true\n}\n' "$(cat "$F/kav" 2>/dev/null || echo launch)"
+    ;;
 *)
     echo "unexpected luna call" >&2
     fail "unexpected"
@@ -643,7 +661,81 @@ voice_json '"music"'
 out=$(cqc config music on 2>/dev/null) && rc=0 || rc=$?
 check "busy file but nothing running: applied, daemon not running" '[ "$rc" -eq 0 ] && echo "$out" | grep -q "\"result\":\"applied\",\"daemon\":\"not running\"" && qsum | grep -q " music=\[on "'
 rm -f "$Q/run/voice.json" "$stamp"
+
+# The mic button is on only while it runs (LG's key taken over, ADR 0013):
+# with mic_button = "ptt" in the config but a daemon that reports it failed,
+# "on" is a retry (the same config and a restart) and "off" writes off.
+mic_json() { # MIC_BUTTON LG_VOICE_KEY ERROR(json)
+    printf '{"schema":1,"mic":"listening","remote_off":"normal","remote_off_active":true,"power_state":"Active","pairing_until":null,"ha":"connected","ha_since":1762000000,"busy":null,"mic_button":"%s","lg_voice_key":"%s","mic_button_error":%s,"music":{"enabled":true}}\n' "$1" "$2" "$3" >"$Q/run/voice.json"
+}
+cp "$T/base.toml" "$QC"
+printf '\n[remote]\nmic_button = "ptt"\n' >>"$QC"
+cp "$QC" "$T/ptt.toml"
+fakesup
+mic_json failed lg '"the read-back says \"launch\", not ignore; LG'"'"'s voice key was restored"'
+st=$(cq status --json)
+check "status: configured ptt, not running, the reason, LG has the key" 'echo "$st" | grep -q "\"mic_button\":\"ptt\",\"mic_button_active\":false,\"mic_button_error\":\"the read-back says \(.*\)\",\"lg_voice_key\":\"lg\","'
+check "status text: not running, with the reason" 'cq status 2>/dev/null | grep -q "remote mic button NOT running: the read-back says" && cq status 2>/dev/null | grep -q "LG voice key: lg"'
+out=$(cqc config mic-button on 2>/dev/null) && rc=0 || rc=$?
+check "mic-button on with ptt configured but failed: a retry, not already (before off; restart, rolled back by the stand-in)" '! echo "$out" | grep -q "\"result\":\"already\"" && echo "$out" | grep -q "\"requested\":\"on\",\"before\":\"off\"" && cmp -s "$QC" "$T/ptt.toml"'
+cq stop >/dev/null 2>&1
+rm -f "$Q/crashloop"
+kill "$FAKEPID" 2>/dev/null || true
+fakesup
+mic_json failed lg null
+out=$(cqc config mic-button off 2>/dev/null) && rc=0 || rc=$?
+check "mic-button off with ptt configured but failed: writes off (not already)" '! echo "$out" | grep -q "\"result\":\"already\"" && echo "$out" | grep -q "\"requested\":\"off\",\"before\":\"off\""'
+cq stop >/dev/null 2>&1
+rm -f "$Q/crashloop"
+kill "$FAKEPID" 2>/dev/null || true
+cp "$T/ptt.toml" "$QC"
+fakesup
+mic_json ptt 'ours (configd)' null
+out=$(cqc config mic-button on 2>/dev/null) && rc=0 || rc=$?
+check "mic-button on while it runs: already" '[ "$rc" -eq 0 ] && echo "$out" | grep -q "\"result\":\"already\""'
+check "status: running, ours" 'cq status --json | grep -q "\"mic_button_active\":true,\"mic_button_error\":null,\"lg_voice_key\":\"ours (configd)\","'
+kill "$FAKEPID" 2>/dev/null || true
+rm -f "$Q/run/supervise.pid" "$Q/run/voice.json" "$stamp"
+cp "$T/base.toml" "$QC"
 cp "$HOST_BIN" "$Q/bin/webos-satellite"
+
+# --- restore-lg-voice (ADR 0013): repeatable, only from the state file, only
+# volatile writes and the one config name; refused while the daemon runs;
+# run by stop, uninstall and purge ---
+sf=$Q/run/lg_voice_override
+rm -f "$F/calls" "$F/kav" "$F/kaviolation" "$F/kamode" "$sf"
+out=$(cq restore-lg-voice 2>/dev/null) && rc=0 || rc=$?
+check "restore-lg-voice without the state file: nothing to do, exit 0, no luna call" '[ "$rc" -eq 0 ] && [ "$out" = "{\"schema\":1,\"restore\":\"nothing\",\"lg_voice_key\":\"lg\",\"error\":\"\"}" ] && [ ! -e "$F/calls" ]'
+check "status: LG has the key (no state file)" 'cq status --json | grep -q "\"lg_voice_key\":\"lg\","'
+echo "configd 1" >"$sf"
+echo ignore >"$F/kav"
+check "status: a state file and no daemon: unknown" 'cq status --json | grep -q "\"lg_voice_key\":\"unknown\","'
+out=$(cq restore-lg-voice 2>/dev/null) && rc=0 || rc=$?
+check "restore-lg-voice with the state file: done, LG's value back, state file removed" '[ "$rc" -eq 0 ] && echo "$out" | grep -q "\"restore\":\"done\",\"lg_voice_key\":\"lg\"" && [ ! -e "$F/kav" ] && [ ! -e "$sf" ]'
+check "restore-lg-voice: setConfigs with null and volatile, getConfigs of the one name, nothing else" 'grep -q "setConfigs {\"configs\":{\"com.webos.keyaction.voice\":null},\"volatile\":true}" "$F/calls" && grep -q "getConfigs {\"configNames\":\[\"com.webos.keyaction.voice\"\]}" "$F/calls" && [ "$(wc -l <"$F/calls")" -eq 2 ] && [ ! -e "$F/kaviolation" ]'
+out=$(cq restore-lg-voice 2>/dev/null) && rc=0 || rc=$?
+check "restore-lg-voice again: nothing (repeatable)" '[ "$rc" -eq 0 ] && echo "$out" | grep -q "\"restore\":\"nothing\""'
+echo "configd 1" >"$sf"
+echo ignore >"$F/kav"
+echo stuck >"$F/kamode"
+out=$(cq restore-lg-voice 2>/dev/null) && rc=0 || rc=$?
+check "restore not confirmed (still ignore): failed, exit 1, state file kept for the next try" '[ "$rc" -eq 1 ] && echo "$out" | grep -q "\"restore\":\"failed\",\"lg_voice_key\":\"unknown\",\"error\":\"the key still reads ignore" && [ -e "$sf" ]'
+echo refuse >"$F/kamode"
+out=$(cq restore-lg-voice 2>/dev/null) && rc=0 || rc=$?
+check "restore refused by configd: failed, state file kept" '[ "$rc" -eq 1 ] && echo "$out" | grep -q "\"restore\":\"failed\"" && [ -e "$sf" ]'
+rm -f "$F/kamode"
+out=$(WEBOS_SAT_PREFIX=$Q WEBOS_SAT_ALLOW_NONROOT=1 WEBOS_SAT_LUNA_SEND=$T/no-luna-send sh "$PKG/ctl.sh" restore-lg-voice 2>/dev/null) && rc=0 || rc=$?
+check "restore without luna-send: failed, state file kept" '[ "$rc" -eq 1 ] && echo "$out" | grep -q "luna-send not found" && [ -e "$sf" ]'
+# Refused while the daemon runs (it holds the key); stop gives it back.
+cq start >/dev/null 2>&1
+check "daemon started for the restore checks" 'is_ours "$(qpid)"'
+out=$(cq restore-lg-voice 2>/dev/null) && rc=0 || rc=$?
+check "restore-lg-voice while the daemon runs: refused, nothing called" '[ "$rc" -eq 1 ] && echo "$out" | grep -q "\"restore\":\"refused\"" && [ -e "$sf" ] && [ -e "$F/kav" ]'
+echo "configd 1" >"$sf"
+echo ignore >"$F/kav"
+cq stop >/dev/null 2>&1
+check "ctl.sh stop gives LG's key back (state file removed, value back)" '! is_ours "$(qpid)" && [ ! -e "$sf" ] && [ ! -e "$F/kav" ]'
+check "no setConfigs without volatile and no category read in all of the above" '[ ! -e "$F/kaviolation" ]'
 
 echo "== not installed, uninstall keeps the log, purge removes it =="
 out=$(WEBOS_SAT_PREFIX=$T/none WEBOS_SAT_ALLOW_NONROOT=1 WEBOS_SAT_LUNA_SEND=$T/luna-send sh "$PKG/ctl.sh" tv-settings --json 2>&1) && rc=0 || rc=$?
@@ -651,11 +743,19 @@ check "tv-settings when not installed: exit 1, no JSON" '[ "$rc" -eq 1 ] && echo
 out=$(WEBOS_SAT_PREFIX=$T/none WEBOS_SAT_ALLOW_NONROOT=1 WEBOS_SAT_LUNA_SEND=$T/luna-send sh "$PKG/ctl.sh" set remote-off keep 2>&1) && rc=0 || rc=$?
 check "set remote-off when not installed: exit 1" '[ "$rc" -eq 1 ]'
 [ -s "$P/etc/tv-settings.log" ] || echo x >"$P/etc/tv-settings.log"
+mkdir -p "$P/run"
+echo "configd 1" >"$P/run/lg_voice_override"
+echo ignore >"$F/kav"
 ctl uninstall >/dev/null 2>&1 || true
 check "uninstall keeps etc/tv-settings.log" '[ -s "$P/etc/tv-settings.log" ]'
+check "uninstall gives LG's voice key back first" '[ ! -e "$F/kav" ]'
 : >"$P/.webos-satellite-install"
+mkdir -p "$P/run"
+echo "configd 1" >"$P/run/lg_voice_override"
+echo ignore >"$F/kav"
 ctl purge >/dev/null 2>&1 || true
 check "purge removes the install, log included" '[ ! -e "$P/etc/tv-settings.log" ] && [ ! -e "$P" ]'
+check "purge gives LG's voice key back first" '[ ! -e "$F/kav" ]'
 
 echo
 if [ "$fails" -eq 0 ]; then

@@ -1,6 +1,8 @@
 //! Hold-to-talk with the Magic Remote's mic button (`[remote] mic_button =
 //! "ptt"`, off by default; design: docs/design/remote-mic-button.md; the
-//! coexistence with LG's assistant: ADR 0013, proposed, see [`LgVoiceKey`]).
+//! coexistence with LG's assistant: ADR 0013, see [`crate::lg_voice`], which
+//! the daemon runs around this feature: the feature runs only while LG's
+//! voice key is taken over).
 //!
 //! Three parts:
 //!
@@ -256,6 +258,7 @@ impl Hold {
 
     /// A press is being served (held, released waiting for its run, or a
     /// tapped run).
+    #[cfg(test)]
     pub(crate) fn active(&self) -> bool {
         !matches!(self.phase, Phase::Idle | Phase::WaitRelease)
     }
@@ -745,54 +748,6 @@ impl Hold {
     }
 }
 
-/// Hand-over of the mic button from LG's assistant: the seam for
-/// [ADR 0013](../../../docs/decisions/0013-remote-mic-button-coexistence.md)
-/// (**proposed**, not accepted; EXP-023 has not run). Its mechanisms (a
-/// volatile configd override of `com.webos.keyaction.voice`, else a SIGSTOP
-/// of `voiceconductor`), the state file and `ctl.sh restore-lg-voice` are
-/// **not built**: the only implementation is [`LeaveToLg`], which changes
-/// nothing, so LG's assistant still reacts to every press.
-///
-/// The daemon calls, in this order: [`LgVoiceKey::acquire`] once when hold-to-
-/// talk starts (after the key device was found by name, the self-check of
-/// ADR 0013 decision 3), [`LgVoiceKey::run_started`] and
-/// [`LgVoiceKey::run_ended`] around each button run (for a pause limited to
-/// the run, ADR 0013 decision 2(b) refinement), and [`LgVoiceKey::release`]
-/// when the feature stops (shutdown). An implementation must be idempotent
-/// and must not block the event loop (spawn its luna calls).
-pub(crate) trait LgVoiceKey: Send {
-    /// Takes the key from LG; returns what is in force afterwards.
-    fn acquire(&mut self) -> KeyOwner;
-    /// Gives the key back to LG.
-    fn release(&mut self);
-    /// A run from the button starts (the press was accepted).
-    fn run_started(&mut self) {}
-    /// That run's audio is over (released, capped, ended or halted).
-    fn run_ended(&mut self) {}
-}
-
-/// Who handles the mic button besides the satellite.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum KeyOwner {
-    /// LG's assistant still opens on every press (both react).
-    Lg,
-    /// LG's assistant was kept away by the named mechanism.
-    #[cfg_attr(not(test), allow(dead_code))] // the ADR 0013 mechanisms are not built
-    Ours(&'static str),
-}
-
-/// The hand-over that is built today: none (ADR 0013 is proposed).
-#[derive(Debug, Default)]
-pub(crate) struct LeaveToLg;
-
-impl LgVoiceKey for LeaveToLg {
-    fn acquire(&mut self) -> KeyOwner {
-        KeyOwner::Lg
-    }
-
-    fn release(&mut self) {}
-}
-
 /// What [`Hold::on_tick`] did, for the daemon's log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TickNote {
@@ -814,10 +769,6 @@ pub(crate) enum TickNote {
 pub(crate) struct Button {
     hold: Hold,
     mic: Option<RemoteMic>,
-    lg: Box<dyn LgVoiceKey>,
-    acquired: bool,
-    /// [`Hold::active`] after the last event (for the run hooks).
-    active: bool,
     /// The kernel time and the local time of the press being served.
     pressed: Option<(Duration, Instant)>,
     stop: Arc<AtomicBool>,
@@ -854,7 +805,6 @@ impl Button {
         luna: Option<PathBuf>,
         hpf_hz: f32,
         paths: InputPaths,
-        lg: Box<dyn LgVoiceKey>,
     ) -> std::io::Result<Started> {
         let (key_tx, keys) = mpsc::unbounded_channel();
         let (stream_tx, stream) = mpsc::unbounded_channel();
@@ -871,7 +821,7 @@ impl Button {
             .remote_mic
             .then(|| RemoteMic::new(MicConfig::new(luna, hpf_hz, section.gain_db), stream_tx));
         log::info!(
-            "remote mic button: hold to talk (audio from the {}); LG's assistant hand-over is not built (ADR 0013 proposed): LG's assistant still opens on each press",
+            "remote mic button: hold to talk (audio from the {})",
             if mic.is_some() {
                 "remote's microphone, TV microphone as fallback"
             } else {
@@ -882,9 +832,6 @@ impl Button {
             button: Self {
                 hold: Hold::new(HoldConfig::from_section(section)),
                 mic,
-                lg,
-                acquired: false,
-                active: false,
                 pressed: None,
                 stop,
             },
@@ -898,7 +845,7 @@ impl Button {
         self.hold.next_deadline()
     }
 
-    /// Runs the stream actions, calls the run hooks, returns the rest.
+    /// Runs the stream actions, returns the rest.
     fn apply(&mut self, acts: Vec<Act>) -> Vec<Act> {
         let mut rest = Vec::with_capacity(acts.len());
         for a in acts {
@@ -916,11 +863,6 @@ impl Button {
                 other => rest.push(other),
             }
         }
-        let active = self.hold.active();
-        if self.active && !active {
-            self.lg.run_ended();
-        }
-        self.active = active;
         rest
     }
 
@@ -928,17 +870,7 @@ impl Button {
     pub(crate) fn on_key(&mut self, key: Key, now: Instant, ctx: Context) -> Vec<Act> {
         match key {
             Key::Found => {
-                if !self.acquired {
-                    self.acquired = true;
-                    match self.lg.acquire() {
-                        KeyOwner::Lg => log::info!(
-                            "remote mic button: key device found; LG's assistant keeps reacting to the button (no hand-over built)"
-                        ),
-                        KeyOwner::Ours(how) => {
-                            log::info!("remote mic button: LG's assistant kept away ({how})");
-                        }
-                    }
-                }
+                log::debug!("remote mic button: key device open");
                 Vec::new()
             }
             Key::Pressed(kernel) => {
@@ -947,14 +879,12 @@ impl Button {
                     PressOutcome::Started => {
                         self.pressed = Some((kernel, now));
                         log::info!("remote mic button: pressed; push-to-talk run requested");
-                        self.lg.run_started();
                     }
                     PressOutcome::Joined => {
                         self.pressed = Some((kernel, now));
                         log::info!(
                             "remote mic button: pressed during a run; it takes the remote's audio"
                         );
-                        self.lg.run_started();
                     }
                     PressOutcome::Refused(why) => {
                         self.pressed = None;
@@ -1072,16 +1002,12 @@ impl Button {
     }
 
     /// Daemon shutdown: every stream session ends and its `luna-send` child
-    /// is reaped before this returns (bounded), the key goes back to LG, the
-    /// reader thread is told to stop.
+    /// is reaped before this returns (bounded), the reader thread is told to
+    /// stop. (LG's key is given back by the daemon, `crate::lg_voice`.)
     pub(crate) async fn shutdown(&mut self) -> Vec<Act> {
         let acts = self.halt("shutdown");
         if let Some(m) = self.mic.as_mut() {
             m.shutdown().await;
-        }
-        if self.acquired {
-            self.lg.release();
-            self.acquired = false;
         }
         self.stop.store(true, Ordering::Relaxed);
         acts
@@ -1718,53 +1644,23 @@ mod tests {
         assert_eq!(h.next_deadline(), Some(ms(t0, 15_000)));
     }
 
-    /// A hand-over that records its calls.
-    struct FakeLg(Arc<std::sync::Mutex<Vec<&'static str>>>);
-
-    impl LgVoiceKey for FakeLg {
-        fn acquire(&mut self) -> KeyOwner {
-            self.0.lock().unwrap().push("acquire");
-            KeyOwner::Ours("fake")
-        }
-        fn release(&mut self) {
-            self.0.lock().unwrap().push("release");
-        }
-        fn run_started(&mut self) {
-            self.0.lock().unwrap().push("run_started");
-        }
-        fn run_ended(&mut self) {
-            self.0.lock().unwrap().push("run_ended");
-        }
-    }
-
-    type Calls = Arc<std::sync::Mutex<Vec<&'static str>>>;
-
-    fn button(tag: &str, remote_mic: bool) -> (Button, Calls, PathBuf) {
+    fn button(tag: &str, remote_mic: bool) -> (Button, PathBuf) {
         let (root, paths) = crate::evdev::tests::fake_inputs(tag, &[]);
-        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
         let section = RemoteSection {
             mic_button: crate::config::MicButton::Ptt,
             remote_mic,
             ..RemoteSection::default()
         };
-        let st = Button::start(
-            &section,
-            None,
-            120.0,
-            paths,
-            Box::new(FakeLg(Arc::clone(&calls))),
-        )
-        .unwrap();
-        (st.button, calls, root)
+        let st = Button::start(&section, None, 120.0, paths).unwrap();
+        (st.button, root)
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn the_hand_over_seam_is_called_around_the_feature_and_each_run() {
-        let (mut b, calls, root) = button("seam", true);
+    async fn a_hold_through_the_button_starts_and_ends_the_run() {
+        let (mut b, root) = button("hold", true);
         let t0 = Instant::now();
         let k = Duration::from_millis;
         assert!(b.on_key(Key::Found, t0, ok_ctx()).is_empty());
-        b.on_key(Key::Found, t0, ok_ctx());
         let a = b.on_key(Key::Pressed(k(5000)), t0, ok_ctx());
         // The stream actions are the button's own; the run is the daemon's.
         assert_eq!(a, [Act::StartRun]);
@@ -1774,21 +1670,7 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(b.on_tick(ms(t0, 1750)), [Act::EndAudio]);
-        // A refused press is no run.
-        b.on_key(
-            Key::Pressed(k(8000)),
-            ms(t0, 3000),
-            Context {
-                mic_off: true,
-                ..ok_ctx()
-            },
-        );
-        b.on_key(Key::Released(Some(k(8500))), ms(t0, 3500), ok_ctx());
         b.shutdown().await;
-        assert_eq!(
-            *calls.lock().unwrap(),
-            ["acquire", "run_started", "run_ended", "release"]
-        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1798,7 +1680,7 @@ mod tests {
         let t0 = Instant::now();
         // Release read late (400 ms) but held 200 ms by the kernel's times:
         // a tap, so the run goes on to HA's end of speech (capped).
-        let (mut b, _calls, root) = button("ktime", false);
+        let (mut b, root) = button("ktime", false);
         b.on_key(Key::Pressed(k(20_000)), t0, ok_ctx());
         b.on_run_started();
         assert!(
@@ -1810,7 +1692,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         // Press handled late: the release comes 100 ms after it locally, but
         // the kernel saw a 300 ms hold: a hold, ended after the grace.
-        let (mut b, _calls, root) = button("ktime-late-press", false);
+        let (mut b, root) = button("ktime-late-press", false);
         b.on_key(Key::Pressed(k(30_000)), t0, ok_ctx());
         b.on_run_started();
         assert!(
@@ -1825,7 +1707,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn without_luna_send_a_held_run_falls_back_to_the_tv_microphone() {
-        let (mut b, _calls, root) = button("noluna", true);
+        let (mut b, root) = button("noluna", true);
         let t0 = Instant::now();
         assert_eq!(
             b.on_key(Key::Pressed(Duration::ZERO), t0, ok_ctx()),
@@ -1856,12 +1738,11 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn a_failed_push_to_talk_reaches_the_machine_through_the_button() {
-        let (mut b, calls, root) = button("pttfail", false);
+        let (mut b, root) = button("pttfail", false);
         let t0 = Instant::now();
         b.on_key(Key::Pressed(Duration::ZERO), t0, ok_ctx());
         assert!(b.on_ptt_failed().is_empty());
         assert_eq!(b.deadline(), None);
-        assert_eq!(*calls.lock().unwrap(), ["run_started", "run_ended"]);
         b.shutdown().await;
         let _ = std::fs::remove_dir_all(&root);
     }

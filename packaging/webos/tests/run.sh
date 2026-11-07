@@ -115,6 +115,29 @@ rm -f "$T/kill"
 sh "$P/bin/stop.sh" >/dev/null
 check "stop.sh stops daemon and supervisor, no restart" '! supervisor_alive && ! is_ours "$pid2" && sleep 2 && [ -z "$(read_pid "$PIDFILE")" ]'
 
+# ADR 0013: a daemon that dies while it holds LG's voice key (state file
+# run/lg_voice_override) gets the key given back by the supervisor before the
+# restart (ctl.sh restore-lg-voice; a fake luna-send models configd's
+# in-memory value in $T/kav).
+cat >"$T/luna-send" <<'FAKE'
+#!/bin/sh
+echo "$5 $6" >>"${KA_DIR:?}/calls"
+case $5 in
+*/setConfigs) case $6 in *null*) rm -f "$KA_DIR/kav" ;; esac; printf '{"returnValue": true}\n' ;;
+*/getConfigs) printf '{"configs":{"com.webos.keyaction.voice":{"action":"%s"}},"returnValue":true}\n' "$(cat "$KA_DIR/kav" 2>/dev/null || echo launch)" ;;
+esac
+FAKE
+chmod 755 "$T/luna-send"
+KA_DIR=$T WEBOS_SAT_LUNA_SEND=$T/luna-send WEBOS_SAT_ALLOW_NONROOT=1 sh "$P/bin/start.sh" --supervise >/dev/null
+pk=$(read_pid "$PIDFILE")
+echo ignore >"$T/kav"
+echo "configd 1" >"$P/run/lg_voice_override"
+kill -KILL "$pk"
+wait_for 10 'pk2=$(read_pid "$PIDFILE"); [ -n "$pk2" ] && [ "$pk2" != "$pk" ] && is_ours "$pk2"' || true
+check "a crash while LG's voice key is ours: the supervisor gives it back before the restart" '[ ! -e "$P/run/lg_voice_override" ] && [ ! -e "$T/kav" ] && grep -q "SUPER LG.s voice key given back" "$LOG" && [ -n "${pk2:-}" ] && [ "$pk2" != "$pk" ]'
+check "the supervisor's restore was volatile and named the one key" 'grep -q "setConfigs {\"configs\":{\"com.webos.keyaction.voice\":null},\"volatile\":true}" "$T/calls"'
+sh "$P/bin/stop.sh" >/dev/null
+
 for what in loop capture; do
     code=70
     [ "$what" = loop ] || code=71
