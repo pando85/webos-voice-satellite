@@ -249,6 +249,15 @@ def main():
         got = drain_abs(tgt_r)
         check(rc == 0 and got == [(0, 960), (1, 540)], f"inject-test moves the target to the centre: {got}")
 
+        # 4c2. inject-pointer: a 20-frame sweep starting away from the current position
+        #      (the target sits at 960/540 after 4c, so a repeat of 960/540 would be dropped)
+        rc, out = Proc(binary, ["inject-pointer", "--target", "rp-test-tgt"]).finish(5, close_stdin=False)
+        got = drain_abs(tgt_r, 0.5)
+        xs = [v for c, v in got if c == 0]
+        ys = [v for c, v in got if c == 1]
+        check(rc == 0 and len(xs) == 20 and xs[0] == 480 and xs[-1] == 1440 and ys == [547],
+              f"inject-pointer sweeps 20 frames, first Y moved off the current value ({len(xs)} X, Y {ys})")
+
         # 4d. trace logs type, code and value of each event (read only)
         p = Proc(binary, ["trace", "--source", "rp-test-src", "--secs", "3"])
         p.wait_line("trace:")

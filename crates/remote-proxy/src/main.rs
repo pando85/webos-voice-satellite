@@ -54,9 +54,13 @@ const USAGE: &str = "usage:
   remote-proxy clone-probe --source NAME [--secs N]
   remote-proxy trace       --source NAME [--secs N]
   remote-proxy inject-key  --target NAME --key 103|105|106|108 [--secs N]
+  remote-proxy inject-pointer --target NAME [--show-key 1198|1199] [--secs N]
 NAME is an exact input device name, e.g. \"LGE M-RCU - Builtin [0]\".
 trace: read only, logs every event (time, type, code, value).
 inject-key: one press and release of an arrow key (Up 103, Left 105, Right 106, Down 108) into the target.
+inject-pointer: 20 pointer frames over 1 s, a sweep across the middle of the screen starting away from
+  the target's current position (equal values are dropped by the kernel); optionally first one press and
+  release of LG's code 1198 or 1199 (seen on the remote's device when the pointer wakes).
 --secs: 1 to 60 (defaults: dry-run 30, inject-test 5, grab 60, clone-probe 20, trace 30, inject-key 5).
 Stops at the cap, on SIGHUP/SIGINT/SIGTERM, on stdin end of file, or on a line with q.";
 
@@ -68,7 +72,11 @@ enum Mode {
     CloneProbe,
     Trace,
     InjectKey,
+    InjectPointer,
 }
+
+/// LG's private codes `inject-pointer` may send before the sweep (EXP-026 trace).
+const SHOW_KEYS: [u16; 2] = [1198, 1199];
 
 /// The only keys `inject-key` may send: the arrows (they move focus, nothing else).
 const ARROW_KEYS: [u16; 4] = [103, 105, 106, 108];
@@ -82,6 +90,8 @@ struct Args {
     key: Option<u16>,
 }
 
+// One flat argument check per mode; splitting it would hide the rules.
+#[allow(clippy::too_many_lines)]
 fn parse_args(argv: &[String]) -> Result<Args, String> {
     let mode = match argv.first().map(String::as_str) {
         Some("dry-run") => Mode::DryRun,
@@ -90,6 +100,7 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
         Some("clone-probe") => Mode::CloneProbe,
         Some("trace") => Mode::Trace,
         Some("inject-key") => Mode::InjectKey,
+        Some("inject-pointer") => Mode::InjectPointer,
         _ => return Err(USAGE.into()),
     };
     let mut source = None;
@@ -120,12 +131,25 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
                 }
                 key = Some(k);
             }
+            "--show-key" => {
+                let v = val()?;
+                let k = v
+                    .parse::<u16>()
+                    .map_err(|_| format!("bad --show-key {v:?}"))?;
+                if !SHOW_KEYS.contains(&k) {
+                    return Err(format!("--show-key must be one of {SHOW_KEYS:?}, got {k}"));
+                }
+                if mode != Mode::InjectPointer {
+                    return Err("--show-key is used by inject-pointer only".into());
+                }
+                key = Some(k);
+            }
             other => return Err(format!("unknown argument {other:?}\n{USAGE}")),
         }
     }
     let default = match mode {
         Mode::DryRun | Mode::Trace => 30,
-        Mode::InjectTest | Mode::InjectKey => 5,
+        Mode::InjectTest | Mode::InjectKey | Mode::InjectPointer => 5,
         Mode::Grab => 60,
         Mode::CloneProbe => 20,
     };
@@ -134,9 +158,15 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
         mode,
         Mode::DryRun | Mode::Grab | Mode::CloneProbe | Mode::Trace
     );
-    let needs_target = matches!(mode, Mode::InjectTest | Mode::Grab | Mode::InjectKey);
-    if (mode == Mode::InjectKey) != key.is_some() {
-        return Err("--key is required by inject-key and used by nothing else".into());
+    let needs_target = matches!(
+        mode,
+        Mode::InjectTest | Mode::Grab | Mode::InjectKey | Mode::InjectPointer
+    );
+    if mode == Mode::InjectKey && key.is_none() {
+        return Err("--key is required by inject-key".into());
+    }
+    if key.is_some() && !matches!(mode, Mode::InjectKey | Mode::InjectPointer) {
+        return Err("--key is used by inject-key only".into());
     }
     if needs_source && source.is_none() {
         return Err("--source is required".into());
@@ -147,7 +177,11 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
     if !needs_target && target.is_some() {
         return Err("--target is not used by this mode".into());
     }
-    if matches!(mode, Mode::InjectTest | Mode::InjectKey) && source.is_some() {
+    if matches!(
+        mode,
+        Mode::InjectTest | Mode::InjectKey | Mode::InjectPointer
+    ) && source.is_some()
+    {
         return Err("--source is not used by this mode".into());
     }
     if source.is_some() && source == target {
@@ -710,6 +744,86 @@ fn inject_key(a: &Args) -> Result<i32, String> {
     Ok(0)
 }
 
+/// The sweep: `n` points across the middle of `[min, max]`, left to right, on
+/// a row; the first point differs from the current position in both axes
+/// (the input core drops an `ABS` event equal to the device's current value).
+fn sweep(x: &sys::AbsInfo, y: &sys::AbsInfo, n: i32) -> Vec<(i32, i32)> {
+    let (x0, x1) = (
+        x.minimum + (x.maximum - x.minimum) / 4,
+        x.minimum + 3 * (x.maximum - x.minimum) / 4,
+    );
+    let mut row = y.minimum + (y.maximum - y.minimum) / 2;
+    if row == y.value {
+        row += 7;
+    }
+    let mut pts: Vec<(i32, i32)> = (0..n)
+        .map(|i| (x0 + (x1 - x0) * i / (n - 1).max(1), row))
+        .collect();
+    if pts[0].0 == x.value {
+        pts[0].0 += 3;
+    }
+    pts
+}
+
+/// A pointer sweep into the target (no grab), optionally after LG's code 1198 or 1199.
+fn inject_pointer(a: &Args) -> Result<i32, String> {
+    let root = sys_root();
+    let tgt = caps::find(&root, a.target.as_deref().unwrap_or_default())?;
+    let f = open_write(&tgt.dev)?;
+    let c = read_caps(&root, &tgt, &f)?;
+    describe(&tgt, &c);
+    if !c.abs.contains(&ABS_X) || !c.abs.contains(&ABS_Y) {
+        return Err(format!("{} has no ABS_X/ABS_Y", tgt.event));
+    }
+    let ax = log_abs("target", &f, &[ABS_X, ABS_Y])?;
+    println!("target current position: {} {}", ax[0].value, ax[1].value);
+    let keys = Arc::new(KeyBits::default());
+    let emergency_target = f.try_clone().map_err(|e| format!("dup target: {e}"))?;
+    let _ = EMERGENCY.set(Emergency {
+        target: Some(emergency_target),
+        keys: Arc::clone(&keys),
+    });
+    let _dm = DeadMan::start(a.secs)?;
+    let mut w: &File = &f;
+    if let Some(k) = a.key {
+        if !SHOW_KEYS.contains(&k) || !c.key.contains(&k) {
+            return Err(format!("show key {k} not allowed or not declared"));
+        }
+        for v in [1, 0] {
+            let fr = [Event::new(EV_KEY, k, v), Event::syn()];
+            w.write(&event::encode(&fr))
+                .map_err(|e| format!("write {}: {e}", tgt.event))?;
+            keys.apply(&fr);
+        }
+        println!("inject-pointer: KEY {k} press and release written");
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    let pts = sweep(&ax[0], &ax[1], 20);
+    for (i, &(x, y)) in pts.iter().enumerate() {
+        let fr = [
+            Event::new(EV_ABS, ABS_X, x),
+            Event::new(EV_ABS, ABS_Y, y),
+            Event::syn(),
+        ];
+        w.write(&event::encode(&fr))
+            .map_err(|e| format!("write {}: {e}", tgt.event))?;
+        if i + 1 < pts.len() {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    let (first, last) = (pts[0], pts[pts.len() - 1]);
+    println!(
+        "inject-pointer: {} frames written to {}, from {} {} to {} {} over about 1 s",
+        pts.len(),
+        tgt.event,
+        first.0,
+        first.1,
+        last.0,
+        last.1
+    );
+    Ok(0)
+}
+
 /// The pid of a process by `comm`, from `/proc`.
 fn pid_of(comm: &str) -> Option<u32> {
     std::fs::read_dir("/proc").ok()?.flatten().find_map(|e| {
@@ -811,6 +925,7 @@ fn run() -> Result<i32, String> {
         Mode::CloneProbe => clone_probe(&a),
         Mode::Trace => trace(&a),
         Mode::InjectKey => inject_key(&a),
+        Mode::InjectPointer => inject_pointer(&a),
     }
 }
 
@@ -875,6 +990,34 @@ mod tests {
         assert!(args(&["inject-test", "--target", "B", "--key", "106"]).is_err());
         let t = args(&["trace", "--source", "A"]).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(t.secs, 30);
+    }
+
+    #[test]
+    fn inject_pointer_args_and_sweep() {
+        let a = args(&["inject-pointer", "--target", "B", "--show-key", "1198"])
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!((a.key, a.secs), (Some(1198), 5));
+        assert!(args(&["inject-pointer", "--target", "B"]).is_ok());
+        assert!(args(&["inject-pointer", "--target", "B", "--show-key", "428"]).is_err());
+        assert!(args(&["inject-key", "--target", "B", "--show-key", "1198"]).is_err());
+        let x = sys::AbsInfo {
+            value: 480,
+            minimum: 0,
+            maximum: 1920,
+            ..Default::default()
+        };
+        let y = sys::AbsInfo {
+            value: 540,
+            minimum: 0,
+            maximum: 1080,
+            ..Default::default()
+        };
+        let p = sweep(&x, &y, 20);
+        assert_eq!(p.len(), 20);
+        // starts away from the current position in both axes, moves every frame
+        assert!(p[0].0 != 480 && p[0].1 != 540);
+        assert!(p.windows(2).all(|w| w[1].0 > w[0].0));
+        assert_eq!(p[19].0, 1440);
     }
 
     #[test]
