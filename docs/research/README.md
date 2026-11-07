@@ -17,6 +17,7 @@ Topic notes (features researched after the feasibility phase):
 
 - [Magic Remote mic button](remote-mic-button.md): the press, the remote's microphone, LG's assistant and its toast
 - [Mic-button key interception](mic-button-key-interception.md): portable ways to take the mic key with no LG toast and no LG assistant (evdev grab and re-emit, compositor and service options), ranked
+- [Home Assistant side audio processing](ha-side-audio-processing.md): where HA processes satellite audio (enhancer, VAD, wake word, STT), why ESPHome `audio_settings` are ignored, options against false wakes and noise transcribed as words, "normalise, then detect", and a staged plan with an offline replay experiment
 
 Use the [source ledger](sources.md) to distinguish vendor-documented facts from observations on **other** devices. Never represent the presence of webOS Open Source Edition APIs as a confirmed LG commercial TV interface.
 
