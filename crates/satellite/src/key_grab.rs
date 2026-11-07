@@ -13,17 +13,22 @@
 //! helper ends:
 //! 1. the helper's own loop watchdog (1 s);
 //! 2. the parent link: the helper's stdin is a pipe from here (end of file
-//!    ends it) and it is started with `PR_SET_PDEATHSIG = SIGKILL`;
-//! 3. here: no line for [`STALL`] after `ready` (heartbeats come every
-//!    500 ms) and the helper is killed, then restarted with backoff;
+//!    ends it) and it is started with `PR_SET_PDEATHSIG = SIGTERM` (handled:
+//!    it releases held keys, then exits);
+//! 3. here: no line for [`STALL`] (2.5 s, above the helper's own watchdog
+//!    1 s + its 250 ms check + the 500 ms heartbeat period, so layer 1
+//!    normally acts first) after `ready`, and the helper is killed, then
+//!    restarted with backoff; a new helper releases any key a killed one left
+//!    down in the target before it grabs;
 //! 4. the supervisor and `ctl.sh` kill a helper left by a dead daemon (pid
-//!    file `run/remote-proxy.pid`).
+//!    file `run/remote-proxy.pid`, and a scan for our binary).
 //!
 //! ADR 0013's configd override stays in place as the safety net: when the
 //! helper is down, a press shows LG's toast instead of LG's assistant.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -49,7 +54,7 @@ pub(crate) const HELPER: &str = "remote-proxy";
 pub(crate) const PID_FILE: &str = "remote-proxy.pid";
 
 /// After `ready`: longest silence before the helper counts as stalled.
-pub(crate) const STALL: Duration = Duration::from_millis(1500);
+pub(crate) const STALL: Duration = Duration::from_millis(2500);
 /// Before `ready`: the helper may wait up to 2 s for keys to be released.
 const START_WAIT: Duration = Duration::from_secs(5);
 /// How long a stop waits for the helper's own clean exit before `SIGKILL`.
@@ -60,13 +65,18 @@ const BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// A run that lasted this long resets the backoff.
 const STABLE_RUN: Duration = Duration::from_secs(60);
 
+/// The only key the helper takes out of the stream (ADR 0016: the mic key;
+/// LG's `KEY_VOICE`, Linux `KEY_VOICEMAIL`).
+pub(crate) const MIC_KEY: u16 = 428;
+
 /// Everything the supervisor needs to run the helper.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Plan {
     pub(crate) helper: PathBuf,
     pub(crate) target: String,
-    pub(crate) catch: u16,
-    /// Where the pid file goes.
+    /// The daemon's key device: it must be among the grabbed sources.
+    pub(crate) require: String,
+    /// `<install>/run` (0700, root's): the pid file goes there only.
     pub(crate) run_dir: PathBuf,
 }
 
@@ -78,8 +88,10 @@ impl Plan {
             self.target.clone(),
             "--source-prefix".to_owned(),
             SOURCE_PREFIX.to_owned(),
+            "--require-source".to_owned(),
+            self.require.clone(),
             "--catch".to_owned(),
-            self.catch.to_string(),
+            MIC_KEY.to_string(),
         ];
         if check {
             a.push("--check".to_owned());
@@ -88,53 +100,62 @@ impl Plan {
     }
 }
 
-/// Decides whether the grab may be used: the config allows it, the firmware
-/// is on the verified list (or a target is configured by hand), and the
-/// helper exists. `Err` says why not (the configd override alone is then
-/// used, as before ADR 0016).
+/// Decides whether the grab may be used: the config allows it, the key is
+/// the mic key (428), the firmware is on the verified list (always; a
+/// configured target only chooses among that firmware's siblings), and the
+/// installed helper exists. `Err` says why not (the configd override alone is
+/// then used, as before ADR 0016).
 pub(crate) fn plan(
     r: &RemoteSection,
     firmware: Option<&str>,
     install_prefix: Option<&Path>,
-    run_dir: &Path,
 ) -> Result<Plan, String> {
     if r.key_grab == KeyGrab::Off {
         return Err("key_grab = \"off\"".to_owned());
     }
-    let from_table = firmware.and_then(|f| {
+    if r.key_code != MIC_KEY {
+        return Err(format!("key_code not {MIC_KEY}"));
+    }
+    if !r.device_name.starts_with(SOURCE_PREFIX) {
+        return Err(format!("device_name is not a {SOURCE_PREFIX}n] slot"));
+    }
+    let Some(table_target) = firmware.and_then(|f| {
         VERIFIED_FIRMWARE
             .iter()
             .find(|(v, _)| *v == f)
             .map(|(_, t)| (*t).to_owned())
-    });
-    let target = match (&r.grab_target, from_table) {
-        (Some(t), _) => t.clone(),
-        (None, Some(t)) => t,
-        (None, None) => {
-            return Err(format!(
-                "firmware {} has not passed EXP-026 (the grab is verified on {})",
-                firmware.unwrap_or("unknown"),
-                VERIFIED_FIRMWARE
-                    .iter()
-                    .map(|(v, _)| *v)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ));
-        }
+    }) else {
+        return Err(format!(
+            "firmware {} has not passed EXP-026 (the grab is verified on {})",
+            firmware.unwrap_or("unknown"),
+            VERIFIED_FIRMWARE
+                .iter()
+                .map(|(v, _)| *v)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
     };
-    let helper = match (&r.grab_helper, install_prefix) {
-        (Some(h), _) => h.clone(),
-        (None, Some(p)) => p.join("bin").join(HELPER),
-        (None, None) => return Err("no install directory, so no helper".to_owned()),
+    let target = r.grab_target.clone().unwrap_or(table_target);
+    if !target.starts_with(SOURCE_PREFIX) {
+        return Err(format!("grab_target is not a {SOURCE_PREFIX}n] slot"));
+    }
+    if target == r.device_name {
+        return Err("grab_target is the key device itself".to_owned());
+    }
+    let Some(prefix) = install_prefix else {
+        return Err("no install directory, so no helper".to_owned());
     };
+    // Only the installed copy: it passes the install trust checks every
+    // start (root's, not writable by others, in a trusted directory).
+    let helper = prefix.join("bin").join(HELPER);
     if !helper.is_file() {
         return Err(format!("{} not found", helper.display()));
     }
     Ok(Plan {
         helper,
         target,
-        catch: r.key_code,
-        run_dir: run_dir.to_path_buf(),
+        require: r.device_name.clone(),
+        run_dir: prefix.join("run"),
     })
 }
 
@@ -147,7 +168,7 @@ pub(crate) async fn preflight(p: &Plan) -> Result<String, String> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    crate::power::die_with_parent(&mut cmd);
+    crate::power::die_with_parent_on(&mut cmd, rustix::process::Signal::TERM);
     let out = match timeout(Duration::from_secs(5), cmd.output()).await {
         Ok(Ok(o)) => o,
         Ok(Err(e)) => return Err(format!("{}: {e}", p.helper.display())),
@@ -255,6 +276,7 @@ pub(crate) fn describe(s: &GrabStatus) -> String {
             "on: {} -> {} (restarts {}, delay median {} us, max {} us)",
             s.sources, s.target, s.restarts, s.median_us, s.max_us
         ),
+        "failed" => "failed (the grab's supervisor ended)".to_owned(),
         "restarting" => format!(
             "restarting (restarts {}; last end: {})",
             s.restarts,
@@ -269,16 +291,84 @@ pub(crate) struct Handle {
     stop: watch::Sender<bool>,
     task: tokio::task::JoinHandle<()>,
     pub(crate) status: Arc<Mutex<GrabStatus>>,
+    /// The running helper's pid (0: none).
+    pid: Arc<AtomicU32>,
 }
 
 impl Handle {
-    /// Stops the helper (its clean exit releases held keys and the grab;
-    /// `SIGKILL` after [`STOP_WAIT`]) and waits for the supervisor.
+    /// Stops the helper and returns only once it has exited: its clean exit
+    /// (end of file on its stdin) releases held keys and the grab; after
+    /// [`STOP_WAIT`] it is killed and waited for. Should the supervisor not
+    /// end in time, the helper is killed here by its pid and waited for.
     pub(crate) async fn stop(self) {
         let _ = self.stop.send(true);
-        if timeout(STOP_WAIT * 3, self.task).await.is_err() {
-            log::warn!("remote grab: the supervisor did not stop in time");
+        let mut task = self.task;
+        if timeout(STOP_WAIT * 3, &mut task).await.is_ok() {
+            return;
         }
+        log::warn!("remote grab: the supervisor did not stop in time; killing the helper");
+        task.abort();
+        let pid = self.pid.load(Ordering::SeqCst);
+        if pid != 0 {
+            kill_and_wait(pid).await;
+        }
+    }
+}
+
+/// `SIGKILL` to `pid` (our helper) and a wait until it is gone or a zombie
+/// (its fds, and so the grab, are released then), at most 1 s.
+async fn kill_and_wait(pid: u32) {
+    let Some(p) = i32::try_from(pid)
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
+    else {
+        return;
+    };
+    let _ = rustix::process::kill_process(p, rustix::process::Signal::KILL);
+    for _ in 0..20 {
+        let gone = std::fs::read_to_string(format!("/proc/{pid}/stat")).map_or(true, |s| {
+            s.rsplit(')')
+                .next()
+                .is_some_and(|r| r.trim_start().starts_with('Z'))
+        });
+        if gone {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    log::error!("remote grab: helper pid {pid} did not end after SIGKILL");
+}
+
+/// Marks the grab failed when the supervisor ends without a stop (a panic).
+struct Alive(Arc<Mutex<GrabStatus>>);
+
+impl Drop for Alive {
+    fn drop(&mut self) {
+        set(&self.0, |s| {
+            if s.state != "stopped" {
+                s.state = "failed";
+            }
+        });
+    }
+}
+
+/// Writes the pid file without following a link: an existing entry (file or
+/// planted link) is removed, then the file is created new, mode 0600.
+fn write_pid_file(path: &Path, pid: u32) {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let _ = std::fs::remove_file(path);
+    let r = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .and_then(|mut f| f.write_all(format!("{pid}\n").as_bytes()));
+    if let Err(e) = r {
+        log::warn!(
+            "remote grab: cannot write {}: {e} (ctl.sh finds a left helper by its binary instead)",
+            path.display()
+        );
     }
 }
 
@@ -295,11 +385,14 @@ pub(crate) fn spawn_with(plan: Plan, tx: mpsc::UnboundedSender<Key>, stall: Dura
         ..GrabStatus::default()
     }));
     let st = Arc::clone(&status);
-    let task = tokio::spawn(async move { supervise(plan, tx, stop_rx, st, stall).await });
+    let pid = Arc::new(AtomicU32::new(0));
+    let p2 = Arc::clone(&pid);
+    let task = tokio::spawn(async move { supervise(plan, tx, stop_rx, st, stall, p2).await });
     Handle {
         stop: stop_tx,
         task,
         status,
+        pid,
     }
 }
 
@@ -315,7 +408,9 @@ async fn supervise(
     mut stop: watch::Receiver<bool>,
     status: Arc<Mutex<GrabStatus>>,
     stall: Duration,
+    pid: Arc<AtomicU32>,
 ) {
+    let _alive = Alive(Arc::clone(&status));
     let pid_file = plan.run_dir.join(PID_FILE);
     let mut backoff = BACKOFF_FIRST;
     loop {
@@ -323,7 +418,7 @@ async fn supervise(
             break;
         }
         let started = tokio::time::Instant::now();
-        let end = run_once(&plan, &tx, &mut stop, &status, &pid_file, stall).await;
+        let end = run_once(&plan, &tx, &mut stop, &status, &pid_file, stall, &pid).await;
         let _ = std::fs::remove_file(&pid_file);
         if *stop.borrow() {
             break;
@@ -350,7 +445,6 @@ async fn supervise(
 }
 
 /// One run of the helper; returns why it ended.
-#[allow(clippy::too_many_lines)] // one select loop over the helper's lines
 async fn run_once(
     plan: &Plan,
     tx: &mpsc::UnboundedSender<Key>,
@@ -358,6 +452,7 @@ async fn run_once(
     status: &Mutex<GrabStatus>,
     pid_file: &Path,
     stall: Duration,
+    pid_slot: &AtomicU32,
 ) -> String {
     let mut cmd = Command::new(&plan.helper);
     cmd.args(plan.args(false))
@@ -365,14 +460,29 @@ async fn run_once(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    crate::power::die_with_parent(&mut cmd);
+    crate::power::die_with_parent_on(&mut cmd, rustix::process::Signal::TERM);
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => return format!("cannot start {}: {e}", plan.helper.display()),
     };
     if let Some(pid) = child.id() {
-        let _ = std::fs::write(pid_file, format!("{pid}\n"));
+        pid_slot.store(pid, Ordering::SeqCst);
+        write_pid_file(pid_file, pid);
     }
+    let why = serve_child(&mut child, tx, stop, status, stall).await;
+    pid_slot.store(0, Ordering::SeqCst);
+    why
+}
+
+/// Reads the running helper's lines until it ends or a stop; returns why.
+#[allow(clippy::too_many_lines)] // one select loop over the helper's lines
+async fn serve_child(
+    child: &mut tokio::process::Child,
+    tx: &mpsc::UnboundedSender<Key>,
+    stop: &mut watch::Receiver<bool>,
+    status: &Mutex<GrabStatus>,
+    stall: Duration,
+) -> String {
     // The parent link: kept open while the helper should run.
     let stdin = child.stdin.take();
     if let Some(err) = child.stderr.take() {
@@ -416,7 +526,7 @@ async fn run_once(
                         });
                         let _ = tx.send(Key::Found);
                     }
-                    Line::Key { code, value, time } if code == plan.catch => match value {
+                    Line::Key { code, value, time } if code == MIC_KEY => match value {
                         1 => {
                             held = true;
                             let _ = tx.send(Key::Pressed(time));
@@ -497,31 +607,56 @@ mod tests {
     #[test]
     fn the_plan_follows_the_firmware_table_the_config_and_the_helper() {
         let d = tmp("plan");
-        let run = d.join("run");
         let r = section();
         // no helper yet
         assert!(
-            plan(&r, Some("03.30.74"), Some(&d), &run)
+            plan(&r, Some("03.30.74"), Some(&d))
                 .unwrap_err()
                 .contains("not found")
         );
         script(&d, "exit 0");
-        let p = plan(&r, Some("03.30.74"), Some(&d), &run).unwrap();
+        let p = plan(&r, Some("03.30.74"), Some(&d)).unwrap();
         assert_eq!(p.target, "LGE M-RCU - Builtin [2]");
-        assert_eq!(p.catch, 428);
+        assert_eq!(p.require, "LGE M-RCU - Builtin [0]");
         assert_eq!(p.helper, d.join("bin").join(HELPER));
+        assert_eq!(p.run_dir, d.join("run"));
+        assert!(
+            p.args(false)
+                .windows(2)
+                .any(|w| w[0] == "--catch" && w[1] == "428")
+        );
         // other firmware: not verified
-        let e = plan(&r, Some("03.30.73"), Some(&d), &run).unwrap_err();
+        let e = plan(&r, Some("03.30.73"), Some(&d)).unwrap_err();
         assert!(e.contains("03.30.73") && e.contains("03.30.74"), "{e}");
-        assert!(plan(&r, None, Some(&d), &run).is_err());
-        // a configured target overrides the table (the owner's experiments)
+        assert!(plan(&r, None, Some(&d)).is_err());
+        // a configured target never bypasses the firmware gate ...
         let r2 = RemoteSection {
             grab_target: Some("LGE M-RCU - Builtin [1]".into()),
             ..section()
         };
+        assert!(
+            plan(&r2, Some("03.30.73"), Some(&d))
+                .unwrap_err()
+                .contains("has not passed EXP-026")
+        );
+        // ... and only chooses among the slots on a verified one
         assert_eq!(
-            plan(&r2, Some("03.30.73"), Some(&d), &run).unwrap().target,
+            plan(&r2, Some("03.30.74"), Some(&d)).unwrap().target,
             "LGE M-RCU - Builtin [1]"
+        );
+        let r2b = RemoteSection {
+            grab_target: Some("IoT keypad".into()),
+            ..section()
+        };
+        assert!(plan(&r2b, Some("03.30.74"), Some(&d)).is_err());
+        // only the mic key
+        let r4 = RemoteSection {
+            key_code: 115,
+            ..section()
+        };
+        assert_eq!(
+            plan(&r4, Some("03.30.74"), Some(&d)).unwrap_err(),
+            "key_code not 428"
         );
         // off
         let r3 = RemoteSection {
@@ -529,10 +664,12 @@ mod tests {
             ..section()
         };
         assert!(
-            plan(&r3, Some("03.30.74"), Some(&d), &run)
+            plan(&r3, Some("03.30.74"), Some(&d))
                 .unwrap_err()
                 .contains("off")
         );
+        // no install directory: no helper
+        assert!(plan(&r, Some("03.30.74"), None).is_err());
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -581,7 +718,7 @@ mod tests {
         Plan {
             helper,
             target: "T".into(),
-            catch: 428,
+            require: "S".into(),
             run_dir: d.join("run"),
         }
     }
@@ -663,6 +800,57 @@ mod tests {
         assert_eq!(next(&mut rx, 3000).await, Some(Key::Found));
         handle.stop().await;
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[tokio::test]
+    async fn stop_returns_only_after_the_helper_has_exited_and_the_pid_file_is_not_followed() {
+        let d = tmp("stopwait");
+        // A planted link at the pid file's name must not be written through.
+        let outside = d.join("outside");
+        std::fs::write(&outside, "keep").unwrap();
+        std::os::unix::fs::symlink(&outside, d.join("run").join(PID_FILE)).unwrap();
+        // A helper that ignores its stdin's end (a hung release path).
+        let h = script(&d, "echo 'ready event2 event4'; exec sleep 30");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let handle = spawn(plan_for(&d, h), tx);
+        assert_eq!(next(&mut rx, 3000).await, Some(Key::Found));
+        let pidf = d.join("run").join(PID_FILE);
+        assert!(!pidf.symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "keep");
+        let pid: u32 = std::fs::read_to_string(&pidf)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        handle.stop().await;
+        let alive = std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|st| {
+            !st.rsplit(')')
+                .next()
+                .unwrap_or("")
+                .trim_start()
+                .starts_with('Z')
+        });
+        assert!(!alive, "the helper still runs after stop()");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn anything_but_grabbing_is_described_as_such() {
+        let mut st = GrabStatus {
+            state: "grabbing",
+            sources: "event2".into(),
+            target: "event4".into(),
+            ..GrabStatus::default()
+        };
+        assert!(describe(&st).starts_with("on: event2 -> event4"));
+        for s in ["starting", "stopped"] {
+            st.state = s;
+            assert_eq!(describe(&st), s);
+        }
+        st.state = "failed";
+        assert!(describe(&st).starts_with("failed"));
+        st.state = "restarting";
+        assert!(describe(&st).starts_with("restarting"));
     }
 
     #[tokio::test]

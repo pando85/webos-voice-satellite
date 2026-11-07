@@ -585,6 +585,8 @@ struct Daemon {
     mic_status: Option<MicButtonStatus>,
     /// The input grab's live status (ADR 0016), while it runs.
     grab_status: Option<Arc<std::sync::Mutex<crate::key_grab::GrabStatus>>>,
+    /// The last text sent to HA's "LG voice key" sensor.
+    lg_text: Option<String>,
     /// The on-screen assistant overlay (`[overlay] enabled`) and the task
     /// that starts its app (`None` without `luna-send` or when it is off).
     overlay: Overlay,
@@ -748,18 +750,49 @@ impl Daemon {
             ha,
             ha_since: self.ha_since,
             busy: self.busy(),
-            mic_button: self.mic_status.clone().map(|mut m| {
-                if let Some(g) = self.grab_status.as_ref().and_then(|g| g.lock().ok()) {
-                    m.key_grab = Some(crate::key_grab::describe(&g));
-                }
-                m
-            }),
+            mic_button: self.live_mic_status(),
             music: Some(self.music.as_ref().map_or_else(
                 || crate::music::DISABLED_JSON.to_owned(),
                 |m| m.status_json(Instant::now()),
             )),
         };
         self.voice_file.publish(Instant::now().into_std(), &status);
+    }
+
+    /// The mic button's status with the input grab's live state: "ours (grab +
+    /// configd)" (no LG toast) only while the helper actually grabs; starting,
+    /// restarting, failed or a dead supervisor read as "ours (configd)" (LG's
+    /// toast shows), ADR 0016.
+    fn live_mic_status(&self) -> Option<MicButtonStatus> {
+        let mut m = self.mic_status.clone()?;
+        if let Some(g) = self.grab_status.as_ref().and_then(|g| g.lock().ok()) {
+            m.key_grab = Some(crate::key_grab::describe(&g));
+            if m.lg_voice_key == KeyOwner::Ours.word() && g.state == "grabbing" {
+                m.lg_voice_key = KeyOwner::OursGrab.word();
+            }
+        }
+        Some(m)
+    }
+
+    /// Follows the input grab's live state: HA's "LG voice key" sensor when
+    /// its text changes, and `voice.json`. Called every poll tick.
+    async fn sync_grab_status(&mut self) {
+        if self.grab_status.is_none() {
+            return;
+        }
+        let Some(m) = self.live_mic_status() else {
+            return;
+        };
+        let text = sensor_text_for(&m);
+        if self.lg_sensor_listed && self.lg_text.as_deref() != Some(text.as_str()) {
+            self.send(AppCommand::SetTextSensor {
+                object_id: LG_VOICE_KEY_ID.to_owned(),
+                state: Some(text.clone()),
+            })
+            .await;
+        }
+        self.lg_text = Some(text);
+        self.publish_voice_status();
     }
 
     /// The end of the open pairing window as seconds since the Unix epoch, or
@@ -1095,6 +1128,14 @@ impl Daemon {
     /// say why.
     async fn stop_mic_button(&mut self, why: String) {
         let _beat = Heartbeat::start(&self.beats);
+        // The grab (ADR 0016) ends first and its helper has exited before LG's
+        // key is given back: a press in between shows LG's toast, never LG's
+        // assistant through a still-grabbed remote.
+        if let Some(mut b) = self.remote.take() {
+            let acts = b.shutdown().await;
+            self.run_remote_acts(acts).await;
+        }
+        self.grab_status = None;
         let mut key = KeyOwner::Lg;
         if let Some(mut t) = self.lg_takeover.take() {
             if let Err(e) = t.release().await {
@@ -1102,23 +1143,14 @@ impl Daemon {
                 key = KeyOwner::Unknown;
             }
         }
-        if let Some(mut b) = self.remote.take() {
-            let acts = b.shutdown().await;
-            self.run_remote_acts(acts).await;
-        }
         let status = MicButtonStatus {
             state: "failed",
             lg_voice_key: key.word(),
             error: Some(why),
             key_grab: None,
         };
-        self.grab_status = None;
-        let text = RemoteSetup {
-            started: None,
-            takeover: None,
-            status: status.clone(),
-        }
-        .sensor_text();
+        let text = sensor_text_for(&status);
+        self.lg_text = Some(text.clone());
         self.mic_status = Some(status);
         if let Some(cs) = self.config_switches.as_mut() {
             cs.set_mic_button_active(false);
@@ -1903,20 +1935,24 @@ pub(crate) struct RemoteSetup {
 impl RemoteSetup {
     /// The text of HA's "LG voice key" sensor.
     pub(crate) fn sensor_text(&self) -> String {
-        let s = &self.status;
-        let owner = match s.lg_voice_key {
-            "ours (configd)" => "Satellite (LG ignores the key)",
-            "ours (grab + configd)" => "Satellite (input grab; LG never sees the key)",
-            "unknown" => "Unknown (restore pending)",
-            _ => "LG assistant",
-        };
-        match &s.error {
-            Some(e) => format!("{owner}; mic button off: {e}")
-                .chars()
-                .take(250)
-                .collect(),
-            None => owner.to_owned(),
-        }
+        sensor_text_for(&self.status)
+    }
+}
+
+/// The text of HA's "LG voice key" sensor for a status.
+pub(crate) fn sensor_text_for(s: &MicButtonStatus) -> String {
+    let owner = match s.lg_voice_key {
+        "ours (configd)" => "Satellite (LG ignores the key; LG's toast shows)",
+        "ours (grab + configd)" => "Satellite (input grab; no LG toast)",
+        "unknown" => "Unknown (restore pending)",
+        _ => "LG assistant",
+    };
+    match &s.error {
+        Some(e) => format!("{owner}; mic button off: {e}")
+            .chars()
+            .take(250)
+            .collect(),
+        None => owner.to_owned(),
     }
 }
 
@@ -2039,12 +2075,10 @@ pub(crate) async fn setup_remote(
         lg_voice::KEY
     );
     let mic_luna = r.remote_mic.then_some(luna);
-    let (source, grab_off) = choose_key_source(settings, &state_dir, paths).await;
-    let owner = if grab_off.is_none() {
-        KeyOwner::OursGrab
-    } else {
-        KeyOwner::Ours
-    };
+    let (source, grab_off) = choose_key_source(settings, paths).await;
+    // "ours (grab + configd)" only once the helper actually grabs: the daemon
+    // derives it from the live state (`Daemon::live_mic_status`).
+    let owner = KeyOwner::Ours;
     match Button::start(r, mic_luna, settings.dsp.hpf_hz, source) {
         Ok(st) => RemoteSetup {
             started: Some(st),
@@ -2078,7 +2112,6 @@ pub(crate) async fn setup_remote(
 /// toast on a press). The second value says why the grab is not used.
 async fn choose_key_source(
     settings: &Settings,
-    run_dir: &Path,
     paths: crate::evdev::InputPaths,
 ) -> (KeySource, Option<String>) {
     let fw = firmware::read(&settings.safety.firmware_info)
@@ -2088,7 +2121,6 @@ async fn choose_key_source(
         &settings.remote,
         fw.as_deref(),
         settings.install_prefix.as_deref(),
-        run_dir,
     );
     let why = match plan {
         Ok(p) => match crate::key_grab::preflight(&p).await {
@@ -2323,6 +2355,7 @@ pub(crate) async fn run(mut settings: Settings, triggers: TestTriggers) -> Resul
         cs.set_mic_button_active(remote_setup.started.is_some());
     }
     let lg_sensor = lg_sensor_listed.then(|| remote_setup.sensor_text());
+    let lg_sensor_text = lg_sensor.clone();
     if settings.mode == Mode::Wake {
         let _ = cmd_tx
             .send(AppCommand::StartPipeline {
@@ -2452,6 +2485,7 @@ pub(crate) async fn run(mut settings: Settings, triggers: TestTriggers) -> Resul
         lg_takeover,
         mic_status: Some(mic_status),
         grab_status,
+        lg_text: lg_sensor_text,
         overlay: Overlay::new(overlay_tx.is_some(), overlay_inst, Instant::now()),
         overlay_tx,
         screen_tx,
@@ -2546,6 +2580,7 @@ pub(crate) async fn run(mut settings: Settings, triggers: TestTriggers) -> Resul
             _ = kill_poll.tick() => {
                 beats.event_loop.fetch_add(1, Ordering::Relaxed);
                 d.poll_kill_switch().await;
+                d.sync_grab_status().await;
                 d.poll_power().await;
                 d.alarm_poll().await;
                 d.publish_timers().await;
@@ -2931,6 +2966,7 @@ mod tests {
             lg_takeover: None,
             mic_status: None,
             grab_status: None,
+            lg_text: None,
             overlay: Overlay::new(true, 7, Instant::now()),
             overlay_tx: None,
             screen_tx: watch::channel(false).0,
@@ -3729,7 +3765,10 @@ esac"#,
         let r = setup_remote(&s, paths).await;
         assert_eq!(r.status.state, "ptt", "{:?}", r.status.error);
         assert_eq!(r.status.lg_voice_key, "ours (configd)");
-        assert_eq!(r.sensor_text(), "Satellite (LG ignores the key)");
+        assert_eq!(
+            r.sensor_text(),
+            "Satellite (LG ignores the key; LG's toast shows)"
+        );
         assert_eq!(
             std::fs::read_to_string(dir.join("val")).unwrap().trim(),
             "ignore"
@@ -3874,6 +3913,92 @@ esac"#,
         }));
         assert!(cmds.iter().any(|c| matches!(c, AppCommand::SetTextSensor { object_id, state: Some(t) }
             if object_id == LG_VOICE_KEY_ID && t.contains("mic button off: configd's persistent database"))));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_stop_ends_the_grab_helper_before_lgs_key_is_given_back() {
+        let dir = test_dir("micorder");
+        std::fs::create_dir_all(dir.join("run")).unwrap();
+        // configd: on the restore (null) it records whether the helper had
+        // already exited.
+        let luna = dir.join("luna-send");
+        crate::testutil::write_script(
+            &luna,
+            &format!(
+                r#"D='{d}'
+case "$5" in
+*/setConfigs)
+  case "$6" in
+  *'"action":"ignore"'*) echo ignore > "$D/val" ;;
+  *null*) if [ -e "$D/helper-gone" ]; then echo gone; else echo running; fi > "$D/order"; rm -f "$D/val" ;;
+  esac
+  echo '{{"returnValue":true}}' ;;
+*/getConfigs)
+  v=$(cat "$D/val" 2>/dev/null || echo launch)
+  printf '{{"configs":{{"com.webos.keyaction.voice":{{"action":"%s"}}}},"returnValue":true}}\n' "$v" ;;
+*) exit 3 ;;
+esac"#,
+                d = dir.display()
+            ),
+        );
+        // The helper: grabs, beats, and on its stdin's end takes 300 ms to
+        // release before it marks itself gone.
+        let helper = dir.join("remote-proxy");
+        crate::testutil::write_script(
+            &helper,
+            &format!(
+                "echo 'ready event2 event4'; ( while :; do echo 'hb 0 0 0'; sleep 0.2; done ) & b=$!; \
+                 cat >/dev/null; kill $b; sleep 0.3; touch '{d}/helper-gone'; echo 'end stdin end of file'",
+                d = dir.display()
+            ),
+        );
+        let db = dir.join("configd_db.json");
+        std::fs::write(&db, "{}").unwrap();
+        let mut t =
+            Takeover::with_persistent(LunaSend(luna), &dir.join("run"), std::slice::from_ref(&db));
+        t.acquire().await.unwrap();
+        let section = crate::config::RemoteSection {
+            mic_button: crate::config::MicButton::Ptt,
+            remote_mic: false,
+            ..crate::config::RemoteSection::default()
+        };
+        let plan = crate::key_grab::Plan {
+            helper,
+            target: "LGE M-RCU - Builtin [2]".into(),
+            require: "LGE M-RCU - Builtin [0]".into(),
+            run_dir: dir.join("run"),
+        };
+        let st = Button::start(&section, None, 120.0, KeySource::Grab(plan)).unwrap();
+        let (mut d, _rx) = test_daemon(&dir, RemoteOff::Normal, false);
+        d.grab_status = st.grab_status.clone();
+        d.remote = Some(st.button);
+        d.mic_status = Some(MicButtonStatus {
+            state: "ptt",
+            lg_voice_key: KeyOwner::Ours.word(),
+            error: None,
+            key_grab: Some("starting".into()),
+        });
+        d.lg_takeover = Some(t);
+        // Wait until the helper grabs: the live status then says "no toast".
+        for _ in 0..40 {
+            if d.live_mic_status().unwrap().lg_voice_key == "ours (grab + configd)" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            d.live_mic_status().unwrap().lg_voice_key,
+            "ours (grab + configd)"
+        );
+        std::fs::write(&db, "{\"changed\":1}").unwrap();
+        d.lg_recheck().await;
+        assert_eq!(
+            std::fs::read_to_string(dir.join("order")).unwrap().trim(),
+            "gone",
+            "LG's key was given back while the helper still ran"
+        );
+        assert!(d.remote.is_none() && d.lg_takeover.is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

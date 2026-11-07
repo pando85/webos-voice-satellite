@@ -533,13 +533,28 @@ lg_restore_after_stop_script() {
 # (PR_SET_PDEATHSIG, end of file on its stdin pipe); this is the dead-man's
 # last layer for one left anyway: SIGKILL by its pid file, only when that pid
 # runs our helper binary. The kernel releases its grab of the remote.
+# Without a usable pid file (lost, unwritable), every process named
+# remote-proxy whose executable is our helper (also after an update replaced
+# the file: "<path> (deleted)") is killed.
+is_grab_helper() { # PID
+    ge=$(readlink "/proc/$1/exe" 2>/dev/null) || return 1
+    [ "$ge" = "$GRAB_BIN" ] || [ "$ge" = "$GRAB_BIN (deleted)" ]
+}
 stop_grab_helper() {
     gp=$(read_pid "$GRAB_PID")
-    if [ -n "$gp" ] && [ "$(readlink "/proc/$gp/exe" 2>/dev/null)" = "$GRAB_BIN" ]; then
+    if [ -n "$gp" ] && is_grab_helper "$gp"; then
         note "stopping the remote grab helper pid $gp"
         kill -KILL "$gp" 2>/dev/null || true
     fi
     rm -f "$GRAB_PID"
+    for gd in /proc/[0-9]*; do
+        [ "$(cat "$gd/comm" 2>/dev/null)" = remote-proxy ] || continue
+        gp=${gd#/proc/}
+        if is_grab_helper "$gp"; then
+            note "stopping a remote grab helper left without its pid file: pid $gp"
+            kill -KILL "$gp" 2>/dev/null || true
+        fi
+    done
 }
 
 stop_daemon() {

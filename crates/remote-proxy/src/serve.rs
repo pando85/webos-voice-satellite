@@ -46,6 +46,8 @@ pub(crate) struct ServeArgs {
     prefix: String,
     catch: Vec<u16>,
     check: bool,
+    /// A device that must be among the sources (the daemon's key device).
+    require: Option<String>,
 }
 
 pub(crate) fn parse(argv: &[String]) -> Result<ServeArgs, String> {
@@ -53,6 +55,7 @@ pub(crate) fn parse(argv: &[String]) -> Result<ServeArgs, String> {
     let mut prefix = DEFAULT_PREFIX.to_owned();
     let mut catch = Vec::new();
     let mut check = false;
+    let mut require = None;
     let mut it = argv.iter();
     while let Some(a) = it.next() {
         let mut val = || {
@@ -74,6 +77,7 @@ pub(crate) fn parse(argv: &[String]) -> Result<ServeArgs, String> {
                 }
             }
             "--check" => check = true,
+            "--require-source" => require = Some(val()?),
             other => return Err(format!("serve: unknown argument {other:?}")),
         }
     }
@@ -89,6 +93,7 @@ pub(crate) fn parse(argv: &[String]) -> Result<ServeArgs, String> {
         prefix,
         catch,
         check,
+        require,
     })
 }
 
@@ -118,22 +123,22 @@ fn discover(a: &ServeArgs) -> Result<(Node, File, Caps, Vec<Source>), String> {
         let file = open_read(&node.dev)?;
         let c = read_caps(&root, &node, &file)?;
         if let Some(d) = c.first_difference(&tc) {
-            eprintln!(
-                "serve: {} {:?} skipped: capabilities differ from the target ({d})",
+            // A slot of the remote that cannot be re-sent through the target
+            // would stay ungrabbed: its mic key would reach LG. Refuse.
+            return Err(format!(
+                "{} {:?} has capabilities that differ from the target's ({d}); not grabbing",
                 node.event, node.name
-            );
-            continue;
+            ));
         }
         let r: Vec<sys::AbsInfo> = axes
             .iter()
             .map(|&x| sys::abs_info(&file, x).map_err(|e| format!("EVIOCGABS({x}): {e}")))
             .collect::<Result<_, _>>()?;
         if !same_ranges(&r, &tr) {
-            eprintln!(
-                "serve: {} {:?} skipped: ABS ranges differ from the target",
+            return Err(format!(
+                "{} {:?} has ABS ranges that differ from the target's; not grabbing",
                 node.event, node.name
-            );
-            continue;
+            ));
         }
         sources.push(Source {
             node,
@@ -146,6 +151,11 @@ fn discover(a: &ServeArgs) -> Result<(Node, File, Caps, Vec<Source>), String> {
             "no source device named {:?}* with the target's capabilities",
             a.prefix
         ));
+    }
+    if let Some(req) = &a.require {
+        if !sources.iter().any(|s| &s.node.name == req) {
+            return Err(format!("{req:?} is not among the sources; not grabbing"));
+        }
     }
     if !a.catch.iter().all(|k| tc.key.contains(k)) {
         return Err(format!(
@@ -188,14 +198,35 @@ pub(crate) fn serve(argv: &[String]) -> Result<i32, String> {
     });
     let mut dm = DeadMan::start_with(None)?;
 
+    // Keys an earlier helper left down in the target (a SIGKILL gives it no
+    // chance to release them) are released first.
+    let held = sys::key_state(&tf).map_err(|e| format!("EVIOCGKEY on target: {e}"))?;
+    let rel = release_all(&held);
+    if !rel.is_empty() {
+        let mut w: &File = &tf;
+        w.write(&event::encode(&rel))
+            .map_err(|e| format!("target write: {e}"))?;
+        eprintln!(
+            "serve: released {} key(s) left down in {}",
+            rel.len() - 1,
+            tgt.event
+        );
+    }
+
     // Grab each source only with no key down on it, so the compositor never
-    // keeps a key it saw go down.
+    // keeps a key it saw go down; a key that went down between the check and
+    // the grab is caught by a second check after it (then ungrab and wait).
     let until = Instant::now() + KEY_DOWN_WAIT;
     for s in &sources {
         loop {
             let st = sys::key_state(&s.file).map_err(|e| format!("EVIOCGKEY: {e}"))?;
             if st.iter().all(|&b| b == 0) {
-                break;
+                sys::grab(&s.file, true).map_err(|e| format!("EVIOCGRAB {}: {e}", s.node.event))?;
+                let after = sys::key_state(&s.file).map_err(|e| format!("EVIOCGKEY: {e}"))?;
+                if after.iter().all(|&b| b == 0) {
+                    break;
+                }
+                let _ = sys::grab(&s.file, false);
             }
             if Instant::now() >= until {
                 for g in &sources {
@@ -206,7 +237,6 @@ pub(crate) fn serve(argv: &[String]) -> Result<i32, String> {
             }
             dm.wait_fds(&[])?;
         }
-        sys::grab(&s.file, true).map_err(|e| format!("EVIOCGRAB {}: {e}", s.node.event))?;
     }
     say(&format!("ready {} {}", names(&sources), tgt.event))?;
     eprintln!(
@@ -222,7 +252,14 @@ pub(crate) fn serve(argv: &[String]) -> Result<i32, String> {
     let mut evs = Vec::new();
     let mut acts = Vec::new();
     let fds: Vec<RawFd> = sources.iter().map(|s| s.file.as_raw_fd()).collect();
+    let files: Vec<File> = sources
+        .iter()
+        .map(|s| s.file.try_clone())
+        .collect::<Result<_, _>>()
+        .map_err(|e| format!("dup source: {e}"))?;
     let mut code = 0;
+    // Caught keys reported down to the parent and not yet up.
+    let mut caught_down: Vec<u16> = Vec::new();
     let reason = 'run: loop {
         let ready = match dm.wait_fds(&fds) {
             Ok(r) => r,
@@ -259,6 +296,11 @@ pub(crate) fn serve(argv: &[String]) -> Result<i32, String> {
                         value,
                         time,
                     } => {
+                        match value {
+                            0 => caught_down.retain(|&k| k != c),
+                            1 if !caught_down.contains(&c) => caught_down.push(c),
+                            _ => {}
+                        }
                         if let Err(e) = say(&format!(
                             "key {c} {value} {} {}",
                             time.as_secs(),
@@ -268,10 +310,23 @@ pub(crate) fn serve(argv: &[String]) -> Result<i32, String> {
                         }
                     }
                     Action::Resync => {
-                        let st = sys::key_state(&s.file).unwrap_or([0; 256]);
+                        // The keys still down anywhere: one remote may use
+                        // several slots, so the sources' states are OR-ed.
+                        let st = combined_state(&files);
                         let rel = keys.resync_release_frame(&st);
                         if !rel.is_empty() {
                             let _ = write_frame(&tf, &rel, &keys);
+                        }
+                        let now = crate::now_realtime();
+                        for c in stale_caught(&caught_down, &st) {
+                            caught_down.retain(|&k| k != c);
+                            if let Err(e) = say(&format!(
+                                "key {c} 0 {} {}",
+                                now.as_secs(),
+                                now.subsec_micros()
+                            )) {
+                                break 'run e;
+                            }
                         }
                     }
                 }
@@ -310,6 +365,44 @@ fn write_frame(tf: &File, frame: &[Event], keys: &KeyBits) -> Result<(), String>
         Ok(n) => Err(format!("short write to target: {n} of {}", bytes.len())),
         Err(e) => Err(format!("target write: {e}")),
     }
+}
+
+/// A frame releasing every key set in `state` (`EVIOCGKEY` bytes), with
+/// `SYN_REPORT`; empty when nothing is down.
+fn release_all(state: &[u8]) -> Vec<Event> {
+    let mut f: Vec<Event> = crate::caps::codes(state)
+        .into_iter()
+        .map(|c| Event::new(crate::event::EV_KEY, c, 0))
+        .collect();
+    if !f.is_empty() {
+        f.push(Event::syn());
+    }
+    f
+}
+
+/// The OR of the sources' key states (bit n in byte n/8).
+fn combined_state(files: &[File]) -> [u8; 256] {
+    let mut all = [0u8; 256];
+    for f in files {
+        if let Ok(st) = sys::key_state(f) {
+            for (a, b) in all.iter_mut().zip(st) {
+                *a |= b;
+            }
+        }
+    }
+    all
+}
+
+/// Caught keys reported down that are up in `state` (their release was lost
+/// in a `SYN_DROPPED`).
+fn stale_caught(down: &[u16], state: &[u8]) -> Vec<u16> {
+    down.iter()
+        .copied()
+        .filter(|&c| {
+            let c = usize::from(c);
+            state.get(c / 8).is_none_or(|b| b & (1 << (c % 8)) == 0)
+        })
+        .collect()
 }
 
 /// (median, max) of `v` in microseconds; (0, 0) when empty.
@@ -352,6 +445,34 @@ mod tests {
         assert!(p(&["--target", "T", "--catch", "4000"]).is_err());
         assert!(p(&["--target", "T", "--source-prefix", ""]).is_err());
         assert!(p(&["--target", "T", "--secs", "5"]).is_err());
+    }
+
+    #[test]
+    fn releases_and_stale_caught_keys_from_a_key_state() {
+        let mut st = [0u8; 256];
+        assert_eq!(release_all(&st), Vec::new());
+        st[103 / 8] |= 1 << (103 % 8);
+        st[428 / 8] |= 1 << (428 % 8);
+        let rel = release_all(&st);
+        assert_eq!(
+            rel,
+            vec![
+                Event::new(crate::event::EV_KEY, 103, 0),
+                Event::new(crate::event::EV_KEY, 428, 0),
+                Event::syn()
+            ]
+        );
+        assert_eq!(stale_caught(&[428], &st), Vec::<u16>::new());
+        st[428 / 8] = 0;
+        assert_eq!(stale_caught(&[428], &st), vec![428]);
+        let b = p(&[
+            "--target",
+            "T",
+            "--require-source",
+            "LGE M-RCU - Builtin [0]",
+        ])
+        .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(b.require.as_deref(), Some("LGE M-RCU - Builtin [0]"));
     }
 
     #[test]

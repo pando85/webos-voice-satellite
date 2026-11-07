@@ -81,6 +81,13 @@ def emit(fd, code, value):
     time.sleep(0.05)
 
 
+def key_down(fd, code):
+    """EVIOCGKEY: is `code` down on the device of `fd`?"""
+    buf = bytearray(256)
+    fcntl.ioctl(fd, 0x81004518, buf)
+    return bool(buf[code // 8] & (1 << (code % 8)))
+
+
 def drain_abs(fd, wait=0.3):
     out = []
     end = time.time() + wait
@@ -340,9 +347,15 @@ def main():
 
         # 4f. serve (the ADR 0016 helper): --check, then grab with the parent link on stdin
         rc, out = Proc(binary, ["serve", "--source-prefix", "rp-test-", "--target", "rp-test-tgt", "--check"]).finish()
-        check(rc == 0 and out.strip().splitlines()[-1].startswith("ok ") and "skipped" in out,
-              f"serve --check finds the source and skips the odd devices: {out.strip().splitlines()[-1]}")
-        p = Proc(binary, ["serve", "--source-prefix", "rp-test-", "--target", "rp-test-tgt"])
+        check(rc == 2 and "differ from the target" in out and "not grabbing" in out,
+              "serve refuses when a candidate slot cannot be re-sent through the target")
+        rc, out = Proc(binary, ["serve", "--source-prefix", "rp-test-src", "--target", "rp-test-tgt",
+                                "--require-source", "rp-test-nope", "--check"]).finish()
+        check(rc == 2 and "not among the sources" in out, "serve refuses when the required key device is not a source")
+        rc, out = Proc(binary, ["serve", "--source-prefix", "rp-test-src", "--target", "rp-test-tgt",
+                                "--require-source", "rp-test-src", "--catch", "428", "--check"]).finish()
+        check(rc == 0 and out.strip().splitlines()[-1].startswith("ok "), f"serve --check passes: {out.strip().splitlines()[-1]}")
+        p = Proc(binary, ["serve", "--source-prefix", "rp-test-src", "--target", "rp-test-tgt"])
         check(p.wait_line("ready "), "serve reports ready")
         drain(tgt_r, 0.1)
         emit(src, B1, 1)
@@ -364,7 +377,7 @@ def main():
             "import subprocess,sys,time;"
             "p=subprocess.Popen(sys.argv[1:],stdin=subprocess.PIPE,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL);"
             "print(p.pid,flush=True);time.sleep(60)",
-            binary, "serve", "--source-prefix", "rp-test-", "--target", "rp-test-tgt"], stdout=subprocess.PIPE, text=True)
+            binary, "serve", "--source-prefix", "rp-test-src", "--target", "rp-test-tgt"], stdout=subprocess.PIPE, text=True)
         hpid = int(parent.stdout.readline())
         time.sleep(0.8)
         drain(tgt_r, 0.1)
@@ -379,6 +392,26 @@ def main():
         check(gone < 1.5 and (B2, 0) in rel, f"parent killed: helper gone in {gone:.2f} s, held key released ({rel})")
         emit(src, B2, 0)
         check((B2, 0) in drain(src_r), "grab released after the parent's death")
+
+        # 4g2. serve SIGKILLed while a key is held: the key stays down in the target
+        #      (nothing could release it); the next serve releases it at start
+        p = Proc(binary, ["serve", "--source-prefix", "rp-test-src", "--target", "rp-test-tgt"])
+        p.wait_line("ready ")
+        drain(tgt_r, 0.1)
+        emit(src, B3, 1)
+        check(drain(tgt_r) == [(B3, 1)], "serve forwards a press")
+        p.p.kill()
+        p.finish(3, close_stdin=False)
+        check(key_down(tgt_r, B3), "after SIGKILL the key is still down in the target")
+        emit(src, B3, 0)
+        drain(src_r, 0.1)
+        p = Proc(binary, ["serve", "--source-prefix", "rp-test-src", "--target", "rp-test-tgt"])
+        check(p.wait_line("ready "), "a new serve starts")
+        rel = drain(tgt_r)
+        check((B3, 0) in rel and not key_down(tgt_r, B3) and "released 1 key" in "\n".join(p.all),
+              f"the new serve released the key left down in the target ({rel})")
+        p.finish()
+        drain(tgt_r, 0.1)
 
         # 4h. serve: a source device disappears -> exit 5, held key released
         extra = make_dev("rp-test-src2", keys)

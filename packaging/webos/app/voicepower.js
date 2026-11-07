@@ -517,7 +517,9 @@
           // without it (other firmware, no helper) or while the helper
           // restarts, LG's toast shows on a press.
           var kg = typeof st.key_grab === 'string' ? st.key_grab : '';
-          if (st.lg_voice_key === 'ours (grab + configd)' && kg.indexOf('restarting') !== 0) {
+          // Only an actually grabbing helper ("on: ...") means no toast;
+          // starting, restarting, failed and off all show it.
+          if (st.lg_voice_key === 'ours (grab + configd)' && kg.indexOf('on: ') === 0) {
             row.word = 'On, no LG toast';
           } else if (kg) {
             row.word = 'On (LG toast shows)';

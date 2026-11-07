@@ -439,11 +439,10 @@ gain_db = 0.0
 # stays as the safety net (a press while the helper restarts shows the toast).
 # Elsewhere, or with "off", only the configd override is used.
 key_grab = "auto"
-# Optional, for experiments only: the sibling that receives the re-sent events
-# (default: the firmware table's, "LGE M-RCU - Builtin [2]" on webOS 8.3), and
-# the helper's path (default <install>/bin/remote-proxy).
+# Optional, on a verified firmware only: the sibling that receives the re-sent events
+# (default: the firmware table's, "LGE M-RCU - Builtin [2]" on webOS 8.3; any other
+# "LGE M-RCU - Builtin [n]" of identical capabilities). The helper is always <install>/bin/remote-proxy.
 # grab_target = "LGE M-RCU - Builtin [2]"
-# grab_helper = "/var/lib/webos-satellite/bin/remote-proxy"
 
 [overlay]
 # The on-screen assistant overlay (design: docs/design/assistant-overlay.md,

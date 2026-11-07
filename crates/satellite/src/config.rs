@@ -1119,8 +1119,6 @@ pub(crate) struct RemoteSection {
     /// The sibling that receives the re-sent events (exact name). Unset: the
     /// firmware table's choice (`LGE M-RCU - Builtin [2]` on webOS 8.3).
     pub(crate) grab_target: Option<String>,
-    /// The helper binary. Unset: `<install>/bin/remote-proxy`.
-    pub(crate) grab_helper: Option<PathBuf>,
 }
 
 /// Name of the Magic Remote's key device on c3-a and c3-b (EXP-022).
@@ -1140,7 +1138,6 @@ impl Default for RemoteSection {
             gain_db: 0.0,
             key_grab: KeyGrab::Auto,
             grab_target: None,
-            grab_helper: None,
         }
     }
 }
@@ -1174,17 +1171,19 @@ impl RemoteSection {
             return Err(err("remote.gain_db must be between -20 and 30"));
         }
         if let Some(t) = &self.grab_target {
-            if t.trim().is_empty() || t.len() > 128 || t.chars().any(char::is_control) {
-                return Err(err("remote.grab_target must be 1 to 128 characters"));
+            if t.len() > 128
+                || t.chars().any(char::is_control)
+                || !t.starts_with("LGE M-RCU - Builtin [")
+            {
+                return Err(err(
+                    "remote.grab_target must be an \"LGE M-RCU - Builtin [n]\" name of at most 128 characters",
+                ));
             }
             if *t == self.device_name {
                 return Err(err(
                     "remote.grab_target must differ from remote.device_name",
                 ));
             }
-        }
-        if self.grab_helper.as_ref().is_some_and(|p| !p.is_absolute()) {
-            return Err(err("remote.grab_helper must be an absolute path"));
         }
         Ok(())
     }
@@ -3177,7 +3176,7 @@ level = "debug"
     fn remote_key_grab_fields_parse_and_validate() {
         let base = Path::new("/x/etc");
         let s = Settings::from_toml(
-            "[device]\nallow_plaintext = true\n[remote]\nkey_grab = \"off\"\ngrab_target = \"LGE M-RCU - Builtin [1]\"\ngrab_helper = \"/opt/rp\"\n",
+            "[device]\nallow_plaintext = true\n[remote]\nkey_grab = \"off\"\ngrab_target = \"LGE M-RCU - Builtin [1]\"\n",
             base,
         )
         .unwrap();
@@ -3187,13 +3186,13 @@ level = "debug"
             s.remote.grab_target.as_deref(),
             Some("LGE M-RCU - Builtin [1]")
         );
-        assert_eq!(s.remote.grab_helper, Some(PathBuf::from("/opt/rp")));
         assert_eq!(RemoteSection::default().key_grab, KeyGrab::Auto);
         for bad in [
             "key_grab = \"on\"",
             "grab_target = \"\"",
             "grab_target = \"LGE M-RCU - Builtin [0]\"",
-            "grab_helper = \"rel/path\"",
+            "grab_target = \"Other device\"",
+            "grab_helper = \"/opt/rp\"",
         ] {
             let r = Settings::from_toml(
                 &format!("[device]\nallow_plaintext = true\n[remote]\n{bad}\n"),

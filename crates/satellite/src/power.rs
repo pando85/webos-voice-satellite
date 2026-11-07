@@ -241,8 +241,15 @@ fn open_pty() -> std::io::Result<(std::fs::File, std::os::fd::OwnedFd)> {
 /// remote stream until a reboot. The daemon spawns from its single runtime
 /// thread, which lives as long as the process. If the parent is already
 /// gone when the child starts, the child does not run.
-#[allow(unsafe_code)]
 pub(crate) fn die_with_parent(cmd: &mut Command) {
+    die_with_parent_on(cmd, rustix::process::Signal::KILL);
+}
+
+/// [`die_with_parent`] with another signal: the input grab's helper gets
+/// `SIGTERM`, which it handles (it releases the keys it holds down in the
+/// target before it exits; ADR 0016), with its own watchdog as the backstop.
+#[allow(unsafe_code)]
+pub(crate) fn die_with_parent_on(cmd: &mut Command, sig: rustix::process::Signal) {
     let parent = rustix::process::getpid();
     // SAFETY: the closure runs in the forked child before exec and only
     // makes two system calls (prctl and getppid), which are
@@ -251,7 +258,7 @@ pub(crate) fn die_with_parent(cmd: &mut Command) {
     // and takes no lock.
     unsafe {
         cmd.pre_exec(move || {
-            rustix::process::set_parent_process_death_signal(Some(rustix::process::Signal::KILL))?;
+            rustix::process::set_parent_process_death_signal(Some(sig))?;
             if rustix::process::getppid() != Some(parent) {
                 // The parent is gone already: do not run.
                 return Err(rustix::io::Errno::SRCH.into());

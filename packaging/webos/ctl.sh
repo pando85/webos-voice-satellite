@@ -1448,6 +1448,8 @@ cmd_restore_lg_voice() {
         lg_emit refused "$(lg_voice_key_word)" "the satellite is running: turn the mic button off (ctl.sh config mic-button off) or stop it first"
         return 1
     fi
+    # A grab helper left by a dead daemon goes first (ADR 0016).
+    stop_grab_helper >&2
     lg_restore
 }
 

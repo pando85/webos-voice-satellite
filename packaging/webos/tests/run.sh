@@ -203,6 +203,26 @@ sh "$P/bin/stop.sh" >/dev/null 2>&1 || true
 check "stop.sh leaves a process alone whose pid is in the file but that is not our helper" 'kill -0 "$OTHER" 2>/dev/null && [ ! -e "$P/run/remote-proxy.pid" ]'
 kill "$OTHER" 2>/dev/null || true
 wait "$GP" 2>/dev/null || true
+# Without a pid file, after an update replaced the binary (exe reads
+# "<path> (deleted)"): the scan by name and executable finds it.
+"$P/bin/remote-proxy" 300 &
+GP=$!
+rm -f "$P/bin/remote-proxy"
+cp "$(command -v sleep)" "$P/bin/remote-proxy"
+chmod 755 "$P/bin/remote-proxy"
+sleep 300 &
+OTHER=$!
+sh "$P/bin/stop.sh" >/dev/null 2>&1 || true
+check "stop.sh finds a grab helper without a pid file by name and executable (also a replaced binary), and leaves other processes alone" '! kill -0 "$GP" 2>/dev/null && kill -0 "$OTHER" 2>/dev/null'
+kill "$OTHER" 2>/dev/null || true
+wait "$GP" 2>/dev/null || true
+# ctl.sh restore-lg-voice (the daemon is not running) ends a left helper first.
+"$P/bin/remote-proxy" 300 &
+GP=$!
+echo "$GP" >"$P/run/remote-proxy.pid"
+KA_DIR=$T WEBOS_SAT_LUNA_SEND=$T/luna-send WEBOS_SAT_ALLOW_NONROOT=1 WEBOS_SAT_PREFIX=$P sh "$P/bin/ctl.sh" restore-lg-voice >/dev/null 2>&1 || true
+check "ctl.sh restore-lg-voice kills a grab helper left by a dead daemon" '! kill -0 "$GP" 2>/dev/null'
+wait "$GP" 2>/dev/null || true
 rm -f "$P/bin/remote-proxy"
 
 for what in loop capture; do
