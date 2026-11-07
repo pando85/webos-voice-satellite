@@ -237,6 +237,10 @@ MT-11                                      [profiles + classes design]
 9. **Raw tap (MT-12):** default no; any raw buffer around real wakes records household audio.
 10. **TV sessions:** each MT-5 session and the 5-minute app-audio reference check (MT-9) need authorization under the install-only rule.
 
+## 5b. Future items outside this plan
+
+- **Remote key proxy features** (owner request, 2026-11-07, ideas only): button remapping, long and double press, assistant controls, a "remote in use" signal, key blocking and key injection, built on the grab of [ADR 0016](../decisions/0016-remote-key-grab.md) (proposed). Not scheduled here; see [future features](../design/remote-key-proxy-future-features.md). They depend on ADR 0016 being accepted, shipped (target 0.6.0) and soaked.
+
 ## 6. Not doing, and why
 
 | Not doing | Why |
