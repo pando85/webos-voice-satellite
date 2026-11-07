@@ -18,6 +18,7 @@ Labels follow [AGENTS.md](../../AGENTS.md): **documented** (upstream source or d
 6. **No maintained Wyoming "denoise proxy" exists.** wyoming-satellite has `--mic-noise-suppression` and `--mic-auto-gain` (`webrtc-noise-gain`), but on the satellite and not as a server. The closest server-side project is a speaker-verification proxy in front of STT ([wyoming-voice-match](https://github.com/jxlarrea/wyoming-voice-match)). (documented)
 7. **Recommendation:** fix the decision stages first, then STT-only denoising. Leave the audio before the wake word alone until the data show that non-speech noise drives the false wakes. Ranked plan in [section 6](#6-recommendation-a-staged-plan).
 8. **"Filter everything centrally, then use a normal model"** is not better by default ([section 8](#8-normalise-then-detect-one-central-filter-and-one-normal-model)): a central filter cannot do AEC, cannot undo what each device already did, does not equalise microphones or distance, and keeps TV dialogue and people talking, which a wake word false accept is most likely made of. The literature finds that enhancement before keyword spotting helps models trained on clean speech, not models trained with noise augmentation (as openWakeWord-recipe models are). Whether it helps here is cheap to measure offline with no retrain ([section 9](#9-offline-replay-experiment-no-retrain)).
+9. **Offline replay result (2026-11-07, [section 10](#10-results-of-the-offline-replay-2026-11-07)):** no filter (HA's speex at level 2, RNNoise, a second WebRTC NS pass) lowered the deployed custom wake word's false accepts on 8.3 h of held-out room audio (0.96/h unfiltered, 0.96 to 1.44/h filtered), and speex and RNNoise lowered the recall of the custom models in every take set (not significant individually). Only the stock openWakeWord model gained: RNNoise cut its false accepts from 3.6/h to 0.6/h (p < 0.001), recall not measurable. **Pre-wake filtering: no help for the custom models, a likely recall cost; do not add it.**
 
 ## 1. Where HA processes satellite audio (HA 2026.10.4)
 
@@ -166,12 +167,12 @@ Order: changes that do not touch the wake word input first, cheapest first. Each
 | Stage | Change | Measure | Wake word re-eval |
 | --- | --- | --- | --- |
 | **0. Baseline** | None. Classify false wakes on the existing negatives by context (TV playing or not, speech-like or not) with aggregate audio features; count, offline, how many false-wake windows the current STT turns into non-empty text (counts and word counts only, no text output) | False accepts per hour per TV; share of false wakes in non-speech noise; noise-to-text rate | — |
-| **1. STT decision settings** | `--vad-filter` with default Silero settings, then a threshold sweep; try a shorter initial prompt; VAD sensitivity aggressive vs default | Noise-to-text rate on the false-wake windows; command accuracy on a small consented command set (gap a); STT latency | No |
+| **1. STT decision settings** (`--vad-filter` applied in the reference deployment on 2026-11-07; effect not yet measured) | `--vad-filter` with default Silero settings, then a threshold sweep; try a shorter initial prompt; VAD sensitivity aggressive vs default | Noise-to-text rate on the false-wake windows; command accuracy on a small consented command set (gap a); STT latency | No |
 | **2. Wake word decision settings** | Threshold or calibration sweep on the existing sets; a consecutive-frames trigger rule and a VAD gate simulated in the offline scorer | Recall on the real sessions and false accepts per hour with intervals; pick an operating point | Yes, but offline on existing data and no retrain |
-| **2b. Offline replay through candidate filters** | The existing real takes and negatives through 2 to 3 filters, scored with the current models ([section 9](#9-offline-replay-experiment-no-retrain)); can run in parallel with stage 1 | Recall and false accepts per hour, filtered vs unfiltered, per model kind | Offline only; decides whether stage 5 is worth a retrain |
+| **2b. Offline replay through candidate filters** (**done 2026-11-07**, [section 10](#10-results-of-the-offline-replay-2026-11-07)) | The existing real takes and negatives through 2 to 3 filters, scored with the current models ([section 9](#9-offline-replay-experiment-no-retrain)); can run in parallel with stage 1 | Recall and false accepts per hour, filtered vs unfiltered, per model kind | Offline only; decides whether stage 5 is worth a retrain |
 | **3. STT-only denoising** | A Wyoming STT proxy (or an STT image patch) with RNNoise or DeepFilterNet, then WebRTC NS for comparison | As stage 1, plus CPU or GPU cost per command | No |
 | **4. Wake proxy with a gate or verifier** | Only if stage 2's offline results justify it | Live false wakes per day and recall checks | Yes (decision only) |
-| **5. Denoising in front of the wake word** | Only if stage 0 shows non-speech noise drives the false wakes, stage 2b shows a gain, and stages 2 to 4 are not enough | Offline replay of negatives and sessions through the candidate; then retrain with the stage in the emulation | **Yes, retrain likely** |
+| **5. Denoising in front of the wake word** (**not recommended after stage 2b**) | Only if stage 0 shows non-speech noise drives the false wakes, stage 2b shows a gain, and stages 2 to 4 are not enough. Stage 2b showed no gain for the deployed model | Offline replay of negatives and sessions through the candidate; then retrain with the stage in the emulation | **Yes, retrain likely** |
 
 **Top three by expected impact for effort:**
 
@@ -241,6 +242,8 @@ Not better by default. A central filter belongs **in front of STT**, where it ca
 
 ## 9. Offline replay experiment (no retrain)
 
+_Run on 2026-11-07 with the owner's approval; results in [section 10](#10-results-of-the-offline-replay-2026-11-07). As run: files were filtered in 10 min pieces, each preceded by 10 s of its own audio that was filtered and dropped (some negatives are 6 h long); F4 was not run._
+
 **Question:** does an HA-side filter in front of the wake word reduce false accepts per hour without losing recall, for (a) a stock-recipe model (synthetic, unfiltered training audio), (b) a model trained with this satellite's front-end emulation in the loop, (c) the deployed custom wake word, and (d) a stock openWakeWord model?
 
 **Data:** HA debug recordings are the wake word's exact input (section 1.1), so replaying them through a filter is exactly what the wake word would see behind that filter. Use the private real takes (two sessions at 1.5 m and 3 m with the TV on and off, plus a button-take session on the second TV) and about 30 h of room-audio negatives from both TVs. Everything runs on the PC by script; no audio is listened to, printed or committed; outputs are aggregates only.
@@ -263,3 +266,50 @@ Not better by default. A central filter belongs **in front of STT**, where it ca
 - **Interpretation:** a gain for the stock-recipe model only supports "normalise, then detect"; a gain for every model supports adding the filter and retraining with it; a loss for the front-end-trained models measures the artifact cost (section 8.2); no change on false accepts supports the view that they are speech-driven (section 8.3).
 - **Limits:** the takes contain one phrase, so the deployed wake word's recall is not measurable on them (only its false accepts and its response to the shorter phrase); two speakers; one room per TV.
 - **Rollback:** nothing is deployed; delete the mirror directories.
+
+## 10. Results of the offline replay (2026-11-07)
+
+Run on the PC only, by script, under a 6 GB, 4-CPU cap, one job at a time. No audio was listened to, transcribed or printed; only counts and rates were read. The filtered audio is kept privately next to the original data (never committed).
+
+**Set-up as run:** filters F1 (second WebRTC NS pass, 224 samples of latency removed), F2 (RNNoise, latency removed by the tool) and F3 (HA's speex enhancer at level 2, 160 samples removed) applied to 34.2 h of satellite wake-stage audio (every raw wake file of the take sessions and all room negatives). Every output has the input's length; the residual delay was checked on the loudest 10 s of each 10 min piece: speex and WebRTC NS 233 of 233 pieces aligned (WebRTC NS within 14 samples, under 1 ms, against an 80 ms scoring step), RNNoise 157 of 159 checkable pieces aligned (74 pieces were silenced by more than 30 dB and could not be checked). Scores: the server's own runtime (`pyopen-wakeword`), each model at its calibrated operating point (the raw threshold its released file maps to 0.5), 2 s refractory. Statistics: Poisson 95 % intervals for false accepts per hour, an exact conditional binomial test for comparing two rates on the same hours.
+
+**Models (anonymised):** M1, a custom single-word model with the stock openWakeWord recipe (synthetic, unfiltered training audio); M5, the same word trained with this satellite's front-end emulation in the loop; D, the deployed custom wake word (a two-word phrase that contains M1's word, trained with the front-end emulation); S, a stock openWakeWord model. Takes: two sessions of speaker 1 on TV 1 (1.5 m and 3 m, TV on and off; session 2 is held out from all training, session 1 is in M5's training data) and one button-take session of speaker 2 on TV 2 (in M5's training data). The takes are of M1's single word, so D's recall cannot be measured; its responses to the single word ("word alone") and to near-words are false accepts. Session 1 and speaker 2's takes were among D's training negatives; the held-out session was not.
+
+**False accepts per hour on the held-out room-audio test split (8.31 h, both TVs; k, rate, 95 % interval):**
+
+| Model | Unfiltered | F3 speex level 2 | F2 RNNoise | F1 WebRTC NS again |
+| --- | --- | --- | --- | --- |
+| M1 (stock recipe) | 1 (0.12, 0.00 to 0.67) | 0 (0.00, 0.00 to 0.44) | 1 (0.12, 0.00 to 0.67) | 2 (0.24, 0.03 to 0.87) |
+| M5 (front-end in the loop) | 3 (0.36, 0.07 to 1.05) | 2 (0.24, 0.03 to 0.87) | 1 (0.12, 0.00 to 0.67) | 5 (0.60, 0.20 to 1.40) |
+| D (deployed) | 8 (0.96, 0.42 to 1.90) | 12 (1.44, 0.75 to 2.52) | 11 (1.32, 0.66 to 2.37) | 8 (0.96, 0.42 to 1.90) |
+| S (stock openWakeWord) | 30 (3.61, 2.44 to 5.15) | 17 (2.04, 1.19 to 3.27) | **5 (0.60, 0.20 to 1.40)** | 29 (3.49, 2.34 to 5.01) |
+
+**Recall of the single word at the calibrated operating point (hits / takes):**
+
+| Model, take set | Unfiltered | F3 speex | F2 RNNoise | F1 WebRTC NS |
+| --- | --- | --- | --- | --- |
+| M1, speaker 1, held-out session | 10/40 | 7/40 | 7/40 | 14/40 |
+| M1, speaker 1, session 1 | 7/40 | 5/40 | 6/40 | 6/40 |
+| M1, speaker 2 | 5/21 | 5/21 | 3/21 | 7/21 |
+| M5, speaker 1, held-out session | 30/40 | 26/40 | 25/40 | 28/40 |
+| M5, speaker 1, session 1 (trained on) | 28/40 | 28/40 | 22/40 | 27/40 |
+| M5, speaker 2 (trained on) | 12/21 | 8/21 | 10/21 | 12/21 |
+| **M5, all 101 takes** | **70** | **62** | **57** | **67** |
+| D, word alone (all 101 takes) | 0 | 0 | 0 | 0 |
+| D, near-words (24 cues) | 0 | 0 | 1 | 0 |
+
+**CPU per hour of audio** (the filter call alone on 2.7 h of real audio, AMD Ryzen 9 5950X, one thread; verified-on-host): speex 2.8 s (0.08 % of a core, Python frame loop); WebRTC NS 19.4 s (0.54 %, including a pass-through echo canceller and process and file overhead); RNNoise 85 s (2.4 %, including 3x resampling and process and file overhead, in a size-optimised build). These are upper bounds for the DSP itself, which section 8.4 measured lower.
+
+**Reading:**
+
+- **The deployed custom wake word gains nothing.** Its false accepts do not fall with any filter (8, 12, 11, 8 in 8.31 h; speex against unfiltered p = 0.50). Its responses to the word alone stay at zero, and to near-words at zero or one. This fits section 8.3: what triggers it in this room survives denoising, so it is most likely speech-like (hypothesis; the triggers were not classified).
+- **The custom models lose recall with speex and RNNoise.** M5, trained with the device front-end in the loop, drops from 70 to 62 (speex) and 57 (RNNoise) of 101 takes, in the same direction in all three take sets. Each change alone is not significant with these counts, and the takes are paired, which aggregate counts cannot test. A second WebRTC NS pass is neutral (67 of 101 for M5; M1 within noise). This matches the literature in section 8.2: added processing artifacts the model never saw cost recall.
+- **The stock-recipe custom model (M1)** has too little recall at its operating point (17 to 35 %) to show an effect either way; its false accepts were already near zero.
+- **The stock openWakeWord model gains from RNNoise:** false accepts fall from 30 to 5 in 8.31 h (p = 2 × 10⁻⁵); speex lowers them to 17 (p = 0.08). Its recall cannot be measured on these takes. So "normalise, then detect" has some support for a stock model's false accepts on this audio, at an unknown recall cost, and none for the models trained for this front-end.
+- **Limits:** one room per TV, two speakers, takes of one word, models at fixed operating points (a filter could move the best threshold), and the deployed model's own recall untested.
+
+**Implications for stages 3 to 5:**
+
+- **Stage 3 (denoising in front of STT only)** is unaffected by these results and stays recommended for evaluation. RNNoise removed most of the energy of the quiet, noise-only audio (median change -1.5 dB, 5th percentile -23 dB per file), which is the kind of input that STT turns into words; measure it against the STT VAD filter already applied in stage 1.
+- **Stage 4 (wake word proxy with a VAD gate or a verifier)** stays a candidate: it leaves the model's input unchanged. The stock model's large gain from RNNoise suggests that part of its false accepts come from non-speech audio, which a gate could reject without touching recall on speech (hypothesis; simulate in the offline scorer first).
+- **Stage 5 (denoising in front of the wake word): not recommended.** No filter lowered the deployed model's false accepts, and two of the three cost recall in the models trained for this front-end. Revisit only if the wake word is replaced by a stock model, and then measure its recall first.
