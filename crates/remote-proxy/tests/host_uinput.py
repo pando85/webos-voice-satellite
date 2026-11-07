@@ -6,6 +6,9 @@ desktop: the seat ACL and the `input` group). Not run by `cargo test`. Usage:
 
     python3 -I crates/remote-proxy/tests/host_uinput.py target/debug/remote-proxy
 
+`... host_uinput.py BINARY --soak SECS` runs only the serve soak (100 Hz pointer
+frames, a mic press every 2 s).
+
 Only harmless codes are used: BTN_TRIGGER_HAPPY1..3 (0x2c0..0x2c2, joystick
 buttons a desktop ignores) and 428 (the mic key, which must never reach the
 target). No pointer, no wheel, no keyboard keys, so the desktop is not driven.
@@ -148,8 +151,71 @@ class Proc:
         return self.p.returncode, "\n".join(self.all)
 
 
+def soak(binary, secs):
+    """serve under load: pointer frames at 100 Hz and a mic press every 2 s."""
+    keys = [MIC, B1, B2, B3]
+    src = make_dev("rp-soak-src", keys)
+    tgt = make_dev("rp-soak-tgt", keys)
+    try:
+        node_of("rp-soak-src"); tn = node_of("rp-soak-tgt"); time.sleep(0.3)
+        tr = os.open(tn, os.O_RDONLY | os.O_NONBLOCK)
+        p = Proc(binary, ["serve", "--source-prefix", "rp-soak-", "--target", "rp-soak-tgt"])
+        check(p.wait_line("ready "), "soak: ready")
+        pid = p.p.pid
+        t_end = time.time() + secs
+        sent = presses = got = 0
+        i = 0
+        while time.time() < t_end:
+            x = 100 + (i % 1000)
+            os.write(src, EVENT.pack(0, 0, EV_ABS, 0, x) + EVENT.pack(0, 0, EV_SYN, 0, 0))
+            sent += 1
+            if i % 200 == 0:
+                os.write(src, EVENT.pack(0, 0, EV_KEY, MIC, 1) + EVENT.pack(0, 0, EV_SYN, 0, 0)
+                         + EVENT.pack(0, 0, EV_KEY, MIC, 0) + EVENT.pack(0, 0, EV_SYN, 0, 0))
+                presses += 1
+            i += 1
+            try:
+                while True:
+                    d = os.read(tr, EVENT.size * 64)
+                    got += sum(1 for k in range(0, len(d), EVENT.size) if EVENT.unpack(d[k:k + EVENT.size])[2] == EV_ABS)
+            except BlockingIOError:
+                pass
+            time.sleep(0.01)
+        time.sleep(0.3)
+        try:
+            while True:
+                d = os.read(tr, EVENT.size * 64)
+                got += sum(1 for k in range(0, len(d), EVENT.size) if EVENT.unpack(d[k:k + EVENT.size])[2] == EV_ABS)
+        except BlockingIOError:
+            pass
+        st = open(f"/proc/{pid}/stat").read().split()
+        cpu_s = (int(st[13]) + int(st[14])) / os.sysconf("SC_CLK_TCK")
+        rss_kb = int([l for l in open(f"/proc/{pid}/status") if l.startswith("VmRSS")][0].split()[1])
+        rc, out = p.finish(5)
+        hbs = [l for l in out.splitlines() if l.startswith("hb ")]
+        keys_seen = sum(1 for l in out.splitlines() if l.startswith("key 428 1 "))
+        last = hbs[-1].split() if hbs else ["hb", "0", "0", "0"]
+        maxes = max(int(l.split()[3]) for l in hbs) if hbs else -1
+        print(f"soak {secs} s: frames sent {sent}, forwarded ABS {got}, mic presses {presses} seen {keys_seen}, "
+              f"heartbeats {len(hbs)}, worst window max {maxes} us, helper CPU {cpu_s:.2f} s, RSS {rss_kb} kB")
+        check(rc == 0 and got == sent and keys_seen == presses and len(hbs) >= secs * 2 - 2,
+              "soak: every frame forwarded, every press reported, heartbeats steady")
+        os.close(tr)
+    finally:
+        for fd in (src, tgt):
+            try:
+                fcntl.ioctl(fd, UI_DEV_DESTROY)
+            except OSError:
+                pass
+            os.close(fd)
+    print(f"{len(failures)} failure(s)")
+    sys.exit(1 if failures else 0)
+
+
 def main():
     binary = os.path.abspath(sys.argv[1])
+    if len(sys.argv) > 3 and sys.argv[2] == "--soak":
+        soak(binary, int(sys.argv[3]))
     keys = [MIC, B1, B2, B3]
     src = make_dev("rp-test-src", keys)
     tgt = make_dev("rp-test-tgt", keys)
@@ -271,6 +337,63 @@ def main():
         #     on the host: it would reach the desktop)
         rc, out = Proc(binary, ["inject-key", "--target", "rp-test-tgt", "--key", "106"]).finish(close_stdin=False)
         check(rc == 2 and "does not declare key 106" in out, "inject-key refuses a target without the key")
+
+        # 4f. serve (the ADR 0016 helper): --check, then grab with the parent link on stdin
+        rc, out = Proc(binary, ["serve", "--source-prefix", "rp-test-", "--target", "rp-test-tgt", "--check"]).finish()
+        check(rc == 0 and out.strip().splitlines()[-1].startswith("ok ") and "skipped" in out,
+              f"serve --check finds the source and skips the odd devices: {out.strip().splitlines()[-1]}")
+        p = Proc(binary, ["serve", "--source-prefix", "rp-test-", "--target", "rp-test-tgt"])
+        check(p.wait_line("ready "), "serve reports ready")
+        drain(tgt_r, 0.1)
+        emit(src, B1, 1)
+        emit(src, MIC, 1)
+        emit(src, MIC, 0)
+        got = drain(tgt_r)
+        check(got == [(B1, 1)], f"serve forwards everything but the caught key: {got}")
+        check(p.wait_line("hb ", 1.5), "serve sends heartbeats")
+        rc, out = p.finish()
+        rel = drain(tgt_r)
+        check(rc == 0 and "key 428 1 " in out and "key 428 0 " in out and "end stdin end of file" in out,
+              "serve reports the caught key's press and release, and ends on the parent link's end of file")
+        check(rel == [(B1, 0)], f"serve releases the held key in the target on exit: {rel}")
+        emit(src, B1, 0)
+        drain(src_r, 0.1)
+
+        # 4g. serve: the parent dies (SIGKILL) -> its pipe ends -> the helper releases and exits
+        parent = subprocess.Popen([sys.executable, "-I", "-c",
+            "import subprocess,sys,time;"
+            "p=subprocess.Popen(sys.argv[1:],stdin=subprocess.PIPE,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL);"
+            "print(p.pid,flush=True);time.sleep(60)",
+            binary, "serve", "--source-prefix", "rp-test-", "--target", "rp-test-tgt"], stdout=subprocess.PIPE, text=True)
+        hpid = int(parent.stdout.readline())
+        time.sleep(0.8)
+        drain(tgt_r, 0.1)
+        emit(src, B2, 1)
+        check(drain(tgt_r) == [(B2, 1)], "serve under a parent forwards")
+        parent.kill(); parent.wait()
+        t0 = time.time()
+        while time.time() - t0 < 3 and os.path.exists(f"/proc/{hpid}") and "zombie" not in open(f"/proc/{hpid}/status").read().lower():
+            time.sleep(0.05)
+        gone = time.time() - t0
+        rel = drain(tgt_r)
+        check(gone < 1.5 and (B2, 0) in rel, f"parent killed: helper gone in {gone:.2f} s, held key released ({rel})")
+        emit(src, B2, 0)
+        check((B2, 0) in drain(src_r), "grab released after the parent's death")
+
+        # 4h. serve: a source device disappears -> exit 5, held key released
+        extra = make_dev("rp-test-src2", keys)
+        node_of("rp-test-src2")
+        time.sleep(0.3)
+        p = Proc(binary, ["serve", "--source-prefix", "rp-test-src", "--target", "rp-test-tgt"])
+        check(p.wait_line("ready "), "serve grabs two sources")
+        drain(tgt_r, 0.1)
+        os.write(extra, EVENT.pack(0, 0, EV_KEY, B3, 1) + EVENT.pack(0, 0, EV_SYN, 0, 0))
+        time.sleep(0.1)
+        fcntl.ioctl(extra, UI_DEV_DESTROY)
+        os.close(extra)
+        rc, out = p.finish(5, close_stdin=False)
+        rel = drain(tgt_r)
+        check(rc == 5 and "lost" in out and (B3, 0) in rel, f"a vanished source ends serve with code 5 and releases its key (rc {rc}, {rel})")
 
         # 5. refusals
         rc, out = Proc(binary, ["grab", "--source", "rp-test-src", "--target", "rp-test-wide", "--secs", "3"]).finish(close_stdin=False)

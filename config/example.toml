@@ -431,6 +431,19 @@ max_hold_s = 15
 tap_ms = 300
 # Fixed gain on the remote microphone in dB (-20 to 30); no echo canceller.
 gain_db = 0.0
+# How LG is kept off the key (ADR 0016). "auto" (default): on firmware where
+# EXP-026 passed (03.30.74, LG C3) the satellite's helper bin/remote-proxy
+# takes the remote's input device exclusively and re-sends every event except
+# the mic key into an idle sibling device, so LG's compositor never sees the
+# key: no "not supported" toast, no LG assistant. The configd override above
+# stays as the safety net (a press while the helper restarts shows the toast).
+# Elsewhere, or with "off", only the configd override is used.
+key_grab = "auto"
+# Optional, for experiments only: the sibling that receives the re-sent events
+# (default: the firmware table's, "LGE M-RCU - Builtin [2]" on webOS 8.3), and
+# the helper's path (default <install>/bin/remote-proxy).
+# grab_target = "LGE M-RCU - Builtin [2]"
+# grab_helper = "/var/lib/webos-satellite/bin/remote-proxy"
 
 [overlay]
 # The on-screen assistant overlay (design: docs/design/assistant-overlay.md,

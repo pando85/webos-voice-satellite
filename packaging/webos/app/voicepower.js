@@ -420,7 +420,7 @@
     { id: 'music', label: 'Music', key: 'music_enabled', action: 'music',
       sub: 'Lets Home Assistant or Music Assistant play music on this TV. Experimental.' },
     { id: 'mic', label: 'Remote mic button \u2192 Home Assistant', key: 'mic_button', action: 'mic-button',
-      sub: 'Replaces LG\'s voice assistant on the mic button while on. LG\'s toast "not supported" may appear.' },
+      sub: 'Replaces LG\'s voice assistant on the mic button while on. On verified TVs the key never reaches LG (no toast); elsewhere LG\'s toast "not supported" may appear.' },
     { id: 'overlay', label: 'On-screen assistant', key: 'overlay_enabled', action: 'overlay',
       sub: 'Shows listening, what you said and the answer in a small panel over the picture. No sound. Off by default for now.' }
   ];
@@ -512,6 +512,18 @@
         var c = soundConfirm(d.id, !v);
         var row = { word: v ? 'On' : 'Off', cls: '', checked: v ? 'true' : 'false', can: true,
           cmd: 'config ' + d.action + (v ? ' off' : ' on'), confirm: c + CONFIRM_TAIL, warn: c };
+        if (d.id === 'mic' && v) {
+          // ADR 0016: with the input grab LG never sees the key (no toast);
+          // without it (other firmware, no helper) or while the helper
+          // restarts, LG's toast shows on a press.
+          var kg = typeof st.key_grab === 'string' ? st.key_grab : '';
+          if (st.lg_voice_key === 'ours (grab + configd)' && kg.indexOf('restarting') !== 0) {
+            row.word = 'On, no LG toast';
+          } else if (kg) {
+            row.word = 'On (LG toast shows)';
+            row.warn = 'The mic button works, but LG shows its "not supported" toast on a press: ' + kg + '. ' + c;
+          }
+        }
         if (d.id === 'overlay' && st.overlay_available === false) {
           // The setting still changes; the panel cannot show until fixed.
           row.word += ' (unavailable)';

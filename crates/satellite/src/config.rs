@@ -1061,6 +1061,18 @@ impl MusicSection {
     }
 }
 
+/// How the mic key is kept away from LG (ADR 0016): `auto` grabs the
+/// remote's input device where the firmware passed EXP-026 (the key never
+/// reaches LG's compositor: no toast, no LG assistant); `off` uses only ADR
+/// 0013's configd override (LG shows its toast on each press).
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum KeyGrab {
+    #[default]
+    Auto,
+    Off,
+}
+
 /// What the Magic Remote's mic button does for the satellite.
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -1101,6 +1113,14 @@ pub(crate) struct RemoteSection {
     /// Fixed gain on the remote microphone, in dB (the TV mic's `dsp.gain_db`
     /// is for a far-field mic and not used here).
     pub(crate) gain_db: f32,
+    /// The input grab of ADR 0016 (`auto`: where the firmware passed
+    /// EXP-026; `off`: the configd override alone).
+    pub(crate) key_grab: KeyGrab,
+    /// The sibling that receives the re-sent events (exact name). Unset: the
+    /// firmware table's choice (`LGE M-RCU - Builtin [2]` on webOS 8.3).
+    pub(crate) grab_target: Option<String>,
+    /// The helper binary. Unset: `<install>/bin/remote-proxy`.
+    pub(crate) grab_helper: Option<PathBuf>,
 }
 
 /// Name of the Magic Remote's key device on c3-a and c3-b (EXP-022).
@@ -1118,6 +1138,9 @@ impl Default for RemoteSection {
             max_hold_s: 15,
             tap_ms: 300,
             gain_db: 0.0,
+            key_grab: KeyGrab::Auto,
+            grab_target: None,
+            grab_helper: None,
         }
     }
 }
@@ -1150,6 +1173,19 @@ impl RemoteSection {
         if !self.gain_db.is_finite() || !(-20.0..=30.0).contains(&self.gain_db) {
             return Err(err("remote.gain_db must be between -20 and 30"));
         }
+        if let Some(t) = &self.grab_target {
+            if t.trim().is_empty() || t.len() > 128 || t.chars().any(char::is_control) {
+                return Err(err("remote.grab_target must be 1 to 128 characters"));
+            }
+            if *t == self.device_name {
+                return Err(err(
+                    "remote.grab_target must differ from remote.device_name",
+                ));
+            }
+        }
+        if self.grab_helper.as_ref().is_some_and(|p| !p.is_absolute()) {
+            return Err(err("remote.grab_helper must be an absolute path"));
+        }
         Ok(())
     }
 
@@ -1163,13 +1199,17 @@ impl RemoteSection {
             );
         }
         format!(
-            "mic_button=ptt device={:?} key={} mic={} max_hold_s={} tap_ms={} gain_db={}",
+            "mic_button=ptt device={:?} key={} mic={} max_hold_s={} tap_ms={} gain_db={} key_grab={}",
             self.device_name,
             self.key_code,
             if self.remote_mic { "remote" } else { "tv" },
             self.max_hold_s,
             self.tap_ms,
-            self.gain_db
+            self.gain_db,
+            match self.key_grab {
+                KeyGrab::Auto => "auto",
+                KeyGrab::Off => "off",
+            }
         )
     }
 }
@@ -3134,6 +3174,37 @@ level = "debug"
     }
 
     #[test]
+    fn remote_key_grab_fields_parse_and_validate() {
+        let base = Path::new("/x/etc");
+        let s = Settings::from_toml(
+            "[device]\nallow_plaintext = true\n[remote]\nkey_grab = \"off\"\ngrab_target = \"LGE M-RCU - Builtin [1]\"\ngrab_helper = \"/opt/rp\"\n",
+            base,
+        )
+        .unwrap();
+        s.validate().unwrap();
+        assert_eq!(s.remote.key_grab, KeyGrab::Off);
+        assert_eq!(
+            s.remote.grab_target.as_deref(),
+            Some("LGE M-RCU - Builtin [1]")
+        );
+        assert_eq!(s.remote.grab_helper, Some(PathBuf::from("/opt/rp")));
+        assert_eq!(RemoteSection::default().key_grab, KeyGrab::Auto);
+        for bad in [
+            "key_grab = \"on\"",
+            "grab_target = \"\"",
+            "grab_target = \"LGE M-RCU - Builtin [0]\"",
+            "grab_helper = \"rel/path\"",
+        ] {
+            let r = Settings::from_toml(
+                &format!("[device]\nallow_plaintext = true\n[remote]\n{bad}\n"),
+                base,
+            )
+            .and_then(|s| s.validate().map(|()| s));
+            assert!(r.is_err(), "{bad}");
+        }
+    }
+
+    #[test]
     fn remote_section_defaults_summary_and_validation() {
         let base = Path::new("/cfg");
         let s = Settings::from_toml("[device]\nallow_plaintext = true\n", base).unwrap();
@@ -3156,7 +3227,7 @@ level = "debug"
         assert!(s.remote.ptt());
         assert!(
             s.summary().contains(
-                "remote=[mic_button=ptt device=\"LGE M-RCU - Builtin [0]\" key=428 mic=remote max_hold_s=15 tap_ms=300 gain_db=0]"
+                "remote=[mic_button=ptt device=\"LGE M-RCU - Builtin [0]\" key=428 mic=remote max_hold_s=15 tap_ms=300 gain_db=0 key_grab=auto]"
             ),
             "{}",
             s.summary()
@@ -3168,7 +3239,7 @@ level = "debug"
         .unwrap();
         s.validate().unwrap();
         assert!(s.summary().contains(
-            "remote=[mic_button=ptt device=\"Other\" key=582 mic=tv max_hold_s=30 tap_ms=0 gain_db=6]"
+            "remote=[mic_button=ptt device=\"Other\" key=582 mic=tv max_hold_s=30 tap_ms=0 gain_db=6 key_grab=auto]"
         ));
 
         for bad in [

@@ -772,11 +772,24 @@ pub(crate) struct Button {
     /// The kernel time and the local time of the press being served.
     pressed: Option<(Duration, Instant)>,
     stop: Arc<AtomicBool>,
+    /// The input grab's supervisor (ADR 0016), when the key comes from it.
+    grab: Option<crate::key_grab::Handle>,
+}
+
+/// Where the button's presses come from.
+pub(crate) enum KeySource {
+    /// A passive reader of the device (no grab): LG's compositor sees the key
+    /// too (ADR 0013's override turns that into LG's toast).
+    Passive(InputPaths),
+    /// The `remote-proxy serve` helper (ADR 0016): the key never reaches LG.
+    Grab(crate::key_grab::Plan),
 }
 
 /// What [`Button::start`] returns: the feature and its two event streams.
 pub(crate) struct Started {
     pub(crate) button: Button,
+    /// The grab's live status (ADR 0016), when the grab runs.
+    pub(crate) grab_status: Option<Arc<std::sync::Mutex<crate::key_grab::GrabStatus>>>,
     pub(crate) keys: mpsc::UnboundedReceiver<Key>,
     pub(crate) stream: mpsc::UnboundedReceiver<(u64, StreamEvent)>,
 }
@@ -797,26 +810,34 @@ pub(crate) fn kernel_hold(
 }
 
 impl Button {
-    /// Starts the reader thread and prepares the remote microphone (`luna`:
-    /// `None` keeps every run on the TV microphone). Call only with
-    /// `mic_button = "ptt"`.
+    /// Starts the key source (the passive reader thread, or the grab's
+    /// supervisor; the latter needs a tokio runtime) and prepares the remote
+    /// microphone (`luna`: `None` keeps every run on the TV microphone).
+    /// Call only with `mic_button = "ptt"`.
     pub(crate) fn start(
         section: &RemoteSection,
         luna: Option<PathBuf>,
         hpf_hz: f32,
-        paths: InputPaths,
+        source: KeySource,
     ) -> std::io::Result<Started> {
         let (key_tx, keys) = mpsc::unbounded_channel();
         let (stream_tx, stream) = mpsc::unbounded_channel();
         let stop = Arc::new(AtomicBool::new(false));
-        evdev::spawn(
-            paths,
-            section.device_name.clone(),
-            section.key_code,
-            Timing::default(),
-            key_tx,
-            Arc::clone(&stop),
-        )?;
+        let grab = match source {
+            KeySource::Passive(paths) => {
+                evdev::spawn(
+                    paths,
+                    section.device_name.clone(),
+                    section.key_code,
+                    Timing::default(),
+                    key_tx,
+                    Arc::clone(&stop),
+                )?;
+                None
+            }
+            KeySource::Grab(plan) => Some(crate::key_grab::spawn(plan, key_tx)),
+        };
+        let grab_status = grab.as_ref().map(|g| Arc::clone(&g.status));
         let mic = section
             .remote_mic
             .then(|| RemoteMic::new(MicConfig::new(luna, hpf_hz, section.gain_db), stream_tx));
@@ -834,7 +855,9 @@ impl Button {
                 mic,
                 pressed: None,
                 stop,
+                grab,
             },
+            grab_status,
             keys,
             stream,
         })
@@ -1010,6 +1033,11 @@ impl Button {
             m.shutdown().await;
         }
         self.stop.store(true, Ordering::Relaxed);
+        // The grab goes before LG's voice key is given back (the caller
+        // releases the override after this): ADR 0016 decision 5.
+        if let Some(g) = self.grab.take() {
+            g.stop().await;
+        }
         acts
     }
 }
@@ -1651,7 +1679,7 @@ mod tests {
             remote_mic,
             ..RemoteSection::default()
         };
-        let st = Button::start(&section, None, 120.0, paths).unwrap();
+        let st = Button::start(&section, None, 120.0, KeySource::Passive(paths)).unwrap();
         (st.button, root)
     }
 

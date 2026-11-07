@@ -143,6 +143,9 @@ pub(crate) struct MicButtonStatus {
     pub(crate) state: &'static str,
     pub(crate) lg_voice_key: &'static str,
     pub(crate) error: Option<String>,
+    /// The input grab of ADR 0016: what runs, or why not (`None`: the key
+    /// is left out, the feature is off).
+    pub(crate) key_grab: Option<String>,
 }
 
 impl MicButtonStatus {
@@ -156,7 +159,9 @@ impl MicButtonStatus {
                 || "null".to_owned(),
                 |e| json_str(&e.replace(['"', '\\'], "'"))
             )
-        )
+        ) + &self.key_grab.as_deref().map_or_else(String::new, |g| {
+            format!(",\"key_grab\":{}", json_str(&g.replace(['"', '\\'], "'")))
+        })
     }
 }
 
@@ -327,6 +332,7 @@ mod tests {
         s.mic_button = Some(MicButtonStatus {
             state: "failed",
             lg_voice_key: "lg",
+            key_grab: None,
             error: Some("the read-back says \"launch\"".to_owned()),
         });
         s.music = Some("{\"enabled\":false}".to_owned());
@@ -336,6 +342,7 @@ mod tests {
         s.mic_button = Some(MicButtonStatus {
             state: "ptt",
             lg_voice_key: "ours (configd)",
+            key_grab: None,
             error: None,
         });
         assert!(s.to_json().contains(

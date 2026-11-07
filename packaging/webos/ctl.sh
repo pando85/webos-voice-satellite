@@ -595,8 +595,8 @@ LG_VOICE_STATE=lg_voice_override
 daemon_alive() { is_ours "$(read_pid "$PIDFILE")"; }
 lg_voice_key_word() {
     if daemon_alive && voice_fresh; then
-        lk=$(sed -n 's/.*"lg_voice_key"[[:space:]]*:[[:space:]]*"\([a-z ()]*\)".*/\1/p' "$RUN_DIR/voice.json" 2>/dev/null | head -n 1)
-        case $lk in lg | 'ours (configd)' | unknown) printf '%s' "$lk"; return 0 ;; esac
+        lk=$(sed -n 's/.*"lg_voice_key"[[:space:]]*:[[:space:]]*"\([a-z ()+]*\)".*/\1/p' "$RUN_DIR/voice.json" 2>/dev/null | head -n 1)
+        case $lk in lg | 'ours (configd)' | 'ours (grab + configd)' | unknown) printf '%s' "$lk"; return 0 ;; esac
     fi
     if [ -f "$P/run/$LG_VOICE_STATE" ]; then printf unknown; else printf lg; fi
 }
@@ -750,7 +750,10 @@ cmd_status() {
     lg_voice_key=$(lg_voice_key_word)
     mic_active=null
     mic_error=
+    key_grab=
     if daemon_alive && voice_fresh; then
+        # The input grab of ADR 0016: what runs, or why not.
+        key_grab=$(sed -n 's/.*"key_grab"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$RUN_DIR/voice.json" 2>/dev/null | head -n 1 | tr -d '\n' | tr -c "A-Za-z0-9 ._:;,()/=+>'-" ' ' | cut -c1-200)
         case $(voice_field mic_button) in
         ptt) mic_active=true ;;
         off | failed) mic_active=false ;;
@@ -793,6 +796,7 @@ cmd_status() {
             note "remote mic button NOT running${mic_error:+: $mic_error}"
         fi
         note "LG voice key: $lg_voice_key (ctl.sh restore-lg-voice gives it back to LG)"
+        [ -z "$key_grab" ] || note "remote input grab (ADR 0016): $key_grab"
         if ! overlay_app_present; then
             ova="unavailable: its app is not installed (ctl.sh install)"
         elif ! command -v "$LUNA" >/dev/null 2>&1; then
@@ -819,8 +823,9 @@ cmd_status() {
     printf '"remote_off":%s,"reply_volume":%s,' "$(json_str "${remote_off:-normal}")" "$(json_str "$reply_volume")"
     printf '"reply_volume_default":%s,' "$(json_str "$reply_volume_default")"
     printf '"aec_enabled":%s,"music_enabled":%s,' "$aec_on" "$music_on"
-    printf '"mic_button":%s,"mic_button_active":%s,"mic_button_error":%s,"lg_voice_key":%s,' \
-        "$(json_str "$mic_button")" "$mic_active" "$( [ -n "$mic_error" ] && json_str "$mic_error" || printf null)" "$(json_str "$lg_voice_key")"
+    printf '"mic_button":%s,"mic_button_active":%s,"mic_button_error":%s,"lg_voice_key":%s,"key_grab":%s,' \
+        "$(json_str "$mic_button")" "$mic_active" "$( [ -n "$mic_error" ] && json_str "$mic_error" || printf null)" "$(json_str "$lg_voice_key")" \
+        "$( [ -n "$key_grab" ] && json_str "$key_grab" || printf null)"
     printf '"overlay_enabled":%s,"overlay_app":%s,"overlay_available":%s,' "$overlay_on" "$(json_bool overlay_app_present)" "$(json_bool overlay_can_show)"
     printf '"pairing_window_s":%s,' "$(json_str "$(cfg_value window_s | sed 's/[^0-9]//g')")"
     printf '"pairing":%s,"ha":%s,' "$(pairing_json)" "$(ha_json)"

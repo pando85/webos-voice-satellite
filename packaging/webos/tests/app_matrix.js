@@ -562,6 +562,14 @@ const nextTick = () => T.timers.filter((t) => t.live && t.interval && t.ms === 1
   const micOn = SR({ aec_enabled: true, music_enabled: false, mic_button: 'ptt', mic_button_active: true, lg_voice_key: 'ours (configd)' })[2];
   check('mic button running: On, turning it off gives the button back to LG', micOn.word === 'On' && micOn.checked === 'true'
     && micOn.cmd === 'config mic-button off' && /^Give the mic button back to LG\?/.test(micOn.warn));
+  const micGrab = SR({ aec_enabled: true, music_enabled: false, mic_button: 'ptt', mic_button_active: true, lg_voice_key: 'ours (grab + configd)', key_grab: 'on: event2,event3 -> event4 (restarts 0, delay median 104 us, max 3166 us)' })[2];
+  check('mic button with the input grab (ADR 0016): On, no LG toast, still turns off', micGrab.word === 'On, no LG toast' && micGrab.checked === 'true'
+    && micGrab.cmd === 'config mic-button off' && micGrab.cls === '');
+  const micNoGrab = SR({ aec_enabled: true, music_enabled: false, mic_button: 'ptt', mic_button_active: true, lg_voice_key: 'ours (configd)', key_grab: 'off: firmware 03.30.73 has not passed EXP-026' })[2];
+  check('mic button without the grab: On (LG toast shows), the reason in the warning', micNoGrab.word === 'On (LG toast shows)'
+    && /not supported/.test(micNoGrab.warn) && /03.30.73/.test(micNoGrab.warn) && micNoGrab.cmd === 'config mic-button off');
+  const micRestart = SR({ aec_enabled: true, music_enabled: false, mic_button: 'ptt', mic_button_active: true, lg_voice_key: 'ours (grab + configd)', key_grab: 'restarting (restarts 1; last end: no heartbeat)' })[2];
+  check('mic button while the grab helper restarts: On (LG toast shows)', micRestart.word === 'On (LG toast shows)' && /restarting/.test(micRestart.warn));
   const micFail = SR({ aec_enabled: true, music_enabled: false, mic_button: 'ptt', mic_button_active: false, mic_button_error: 'the read-back says "launch", not ignore', lg_voice_key: 'lg' })[2];
   check('mic button configured but not running (takeover failed): Off (LG kept it), the reason, OK twice retries',
     micFail.word === 'Off (LG kept it)' && micFail.cls === 'warn' && micFail.checked === 'false' && micFail.cmd === 'config mic-button on'

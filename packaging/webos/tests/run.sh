@@ -187,6 +187,24 @@ KA_DIR=$T WEBOS_SAT_LUNA_SEND=$T/luna-send WEBOS_SAT_ALLOW_NONROOT=1 sh "$P/bin/
 check "stop.sh gives a leftover state file's key back itself" '[ ! -e "$P/run/lg_voice_override" ] && [ ! -e "$T/kav" ]'
 rm -f "$P/run/lg_voice_override"
 
+# The remote grab helper (ADR 0016) left by a dead daemon: stop.sh kills it
+# by its pid file, only when that pid runs the installed helper binary.
+cp "$(command -v sleep)" "$P/bin/remote-proxy"
+chmod 755 "$P/bin/remote-proxy"
+"$P/bin/remote-proxy" 300 &
+GP=$!
+echo "$GP" >"$P/run/remote-proxy.pid"
+sleep 300 &
+OTHER=$!
+sh "$P/bin/stop.sh" >/dev/null 2>&1 || true
+check "stop.sh kills a grab helper left behind (pid file, our binary) and removes the pid file" '! kill -0 "$GP" 2>/dev/null && [ ! -e "$P/run/remote-proxy.pid" ]'
+echo "$OTHER" >"$P/run/remote-proxy.pid"
+sh "$P/bin/stop.sh" >/dev/null 2>&1 || true
+check "stop.sh leaves a process alone whose pid is in the file but that is not our helper" 'kill -0 "$OTHER" 2>/dev/null && [ ! -e "$P/run/remote-proxy.pid" ]'
+kill "$OTHER" 2>/dev/null || true
+wait "$GP" 2>/dev/null || true
+rm -f "$P/bin/remote-proxy"
+
 for what in loop capture; do
     code=70
     [ "$what" = loop ] || code=71
@@ -390,6 +408,32 @@ setup_stand_in aarch64 ok
 sel_install aarch64 --binary "$HOST_BIN"
 check "--binary: no setup server installed" '[ "$rc" -eq 0 ] && [ ! -e "$dir/bin/webos-satellite-setup" ]'
 rm -f "$SEL"/webos-satellite-setup-*
+
+echo "== install.sh: the remote grab helper (ADR 0016) =="
+grab_stand_in() { # ARCH ok|bad
+    f=$SEL/remote-proxy-$1
+    if [ "$2" = ok ]; then
+        printf '#!/bin/sh\n[ "$1" != --version ] || { echo "remote-proxy 0.0.1 (%s)"; exit 0; }\nexit 0\n' \
+            "$(triple_of_arch "$1")" >"$f"
+    else
+        printf '#!/bin/sh\necho "Exec format error" >&2\nexit 126\n' >"$f"
+    fi
+    chmod 755 "$f"
+}
+grab_is() { "$dir/bin/remote-proxy" --version | grep -q "^remote-proxy .*($1)"; }
+grab_stand_in armv7 ok
+grab_stand_in aarch64 ok
+sel_install aarch64
+check "uname aarch64: the aarch64 grab helper, mode 0700, no temporary file" '[ "$rc" -eq 0 ] && grab_is $A64 && [ "$(stat -c %a "$dir/bin/remote-proxy")" = 700 ] && [ ! -e "$dir/bin/.remote-proxy.new" ]'
+grab_stand_in aarch64 bad
+sel_install aarch64
+check "the aarch64 grab helper does not run: the armv7 one" '[ "$rc" -eq 0 ] && grab_is $A32'
+grab_stand_in armv7 bad
+sel_install aarch64
+check "no grab helper runs: install succeeds with a warning, none left" '[ "$rc" -eq 0 ] && [ ! -e "$dir/bin/remote-proxy" ] && echo "$out" | grep -q "LG.s key override alone"'
+rm -f "$SEL"/remote-proxy-*
+sel_install aarch64
+check "no grab helper in the package: noted, none installed" '[ "$rc" -eq 0 ] && [ ! -e "$dir/bin/remote-proxy" ] && echo "$out" | grep -q "no remote grab helper in this package"'
 
 if [ "$fails" -eq 0 ]; then
     echo "all checks passed"

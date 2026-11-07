@@ -46,7 +46,7 @@ use crate::overlay::{self, Overlay};
 use crate::player::{Done, Kind, Player, redact_url};
 use crate::power::{self, PowerUpdate};
 use crate::remote_mic::StreamEvent;
-use crate::remote_ptt::{self, Act, Button};
+use crate::remote_ptt::{self, Act, Button, KeySource};
 use crate::selfcheck::Note;
 use crate::tv_control::{self, Tv, TvMsg};
 use crate::voice_status::{Busy, Ha, Mic, MicButtonStatus, VoiceFile, VoiceStatus};
@@ -583,6 +583,8 @@ struct Daemon {
     lg_takeover: Option<Takeover<LunaSend>>,
     /// The mic button as `run/voice.json` reports it.
     mic_status: Option<MicButtonStatus>,
+    /// The input grab's live status (ADR 0016), while it runs.
+    grab_status: Option<Arc<std::sync::Mutex<crate::key_grab::GrabStatus>>>,
     /// The on-screen assistant overlay (`[overlay] enabled`) and the task
     /// that starts its app (`None` without `luna-send` or when it is off).
     overlay: Overlay,
@@ -746,7 +748,12 @@ impl Daemon {
             ha,
             ha_since: self.ha_since,
             busy: self.busy(),
-            mic_button: self.mic_status.clone(),
+            mic_button: self.mic_status.clone().map(|mut m| {
+                if let Some(g) = self.grab_status.as_ref().and_then(|g| g.lock().ok()) {
+                    m.key_grab = Some(crate::key_grab::describe(&g));
+                }
+                m
+            }),
             music: Some(self.music.as_ref().map_or_else(
                 || crate::music::DISABLED_JSON.to_owned(),
                 |m| m.status_json(Instant::now()),
@@ -1103,7 +1110,9 @@ impl Daemon {
             state: "failed",
             lg_voice_key: key.word(),
             error: Some(why),
+            key_grab: None,
         };
+        self.grab_status = None;
         let text = RemoteSetup {
             started: None,
             takeover: None,
@@ -1897,6 +1906,7 @@ impl RemoteSetup {
         let s = &self.status;
         let owner = match s.lg_voice_key {
             "ours (configd)" => "Satellite (LG ignores the key)",
+            "ours (grab + configd)" => "Satellite (input grab; LG never sees the key)",
             "unknown" => "Unknown (restore pending)",
             _ => "LG assistant",
         };
@@ -1956,6 +1966,7 @@ const LG_RECHECK_AFTER: Duration = Duration::from_secs(5);
 /// LG's key stays as it was; the reason is logged and reported. With
 /// `"off"` nothing starts, but an override left by an earlier run is given
 /// back.
+#[allow(clippy::too_many_lines)] // linear: off, checks, takeover, key source, start
 pub(crate) async fn setup_remote(
     settings: &Settings,
     paths: crate::evdev::InputPaths,
@@ -1967,6 +1978,7 @@ pub(crate) async fn setup_remote(
         state: if error.is_some() { "failed" } else { "off" },
         lg_voice_key: key.word(),
         error,
+        key_grab: None,
     };
     if !r.ptt() {
         log::info!("remote mic button: off (mic_button = \"off\")");
@@ -2027,14 +2039,23 @@ pub(crate) async fn setup_remote(
         lg_voice::KEY
     );
     let mic_luna = r.remote_mic.then_some(luna);
-    match Button::start(r, mic_luna, settings.dsp.hpf_hz, paths) {
+    let (source, grab_off) = choose_key_source(settings, &state_dir, paths).await;
+    let owner = if grab_off.is_none() {
+        KeyOwner::OursGrab
+    } else {
+        KeyOwner::Ours
+    };
+    match Button::start(r, mic_luna, settings.dsp.hpf_hz, source) {
         Ok(st) => RemoteSetup {
             started: Some(st),
             takeover: Some(takeover),
             status: MicButtonStatus {
                 state: "ptt",
-                lg_voice_key: KeyOwner::Ours.word(),
+                lg_voice_key: owner.word(),
                 error: None,
+                key_grab: Some(
+                    grab_off.map_or_else(|| "starting".to_owned(), |w| format!("off: {w}")),
+                ),
             },
         },
         Err(e) => {
@@ -2049,6 +2070,42 @@ pub(crate) async fn setup_remote(
             fail(key, why)
         }
     }
+}
+
+/// Where the mic key comes from (ADR 0016): the input grab where the
+/// firmware passed EXP-026, the helper is installed and its check passes;
+/// otherwise the passive reader with ADR 0013's override alone (LG shows its
+/// toast on a press). The second value says why the grab is not used.
+async fn choose_key_source(
+    settings: &Settings,
+    run_dir: &Path,
+    paths: crate::evdev::InputPaths,
+) -> (KeySource, Option<String>) {
+    let fw = firmware::read(&settings.safety.firmware_info)
+        .ok()
+        .map(|i| i.version);
+    let plan = crate::key_grab::plan(
+        &settings.remote,
+        fw.as_deref(),
+        settings.install_prefix.as_deref(),
+        run_dir,
+    );
+    let why = match plan {
+        Ok(p) => match crate::key_grab::preflight(&p).await {
+            Ok(line) => {
+                log::info!(
+                    "remote grab: check passed ({line}); the mic key is taken at the input layer (ADR 0016)"
+                );
+                return (KeySource::Grab(p), None);
+            }
+            Err(why) => why,
+        },
+        Err(why) => why,
+    };
+    log::info!(
+        "remote grab: not used ({why}); LG's toast may show on a press (ADR 0013 override only)"
+    );
+    (KeySource::Passive(paths), Some(why))
 }
 
 /// Runs the daemon until SIGTERM/SIGINT.
@@ -2320,9 +2377,14 @@ pub(crate) async fn run(mut settings: Settings, triggers: TestTriggers) -> Resul
         takeover: lg_takeover,
         status: mic_status,
     } = remote_setup;
-    let (remote, mut remote_keys, mut remote_stream) = match started {
-        Some(st) => (Some(st.button), Some(st.keys), Some(st.stream)),
-        None => (None, None, None),
+    let (remote, mut remote_keys, mut remote_stream, grab_status) = match started {
+        Some(st) => (
+            Some(st.button),
+            Some(st.keys),
+            Some(st.stream),
+            st.grab_status,
+        ),
+        None => (None, None, None, None),
     };
     let mut player = Player::new(settings.sink.clone(), volume_gain.clone(), done_tx);
     player.set_fetch_loopback(triggers.fetch_loopback);
@@ -2389,6 +2451,7 @@ pub(crate) async fn run(mut settings: Settings, triggers: TestTriggers) -> Resul
             .map(|_| Instant::now() + LG_RECHECK_AFTER),
         lg_takeover,
         mic_status: Some(mic_status),
+        grab_status,
         overlay: Overlay::new(overlay_tx.is_some(), overlay_inst, Instant::now()),
         overlay_tx,
         screen_tx,
@@ -2867,6 +2930,7 @@ mod tests {
             stt_streaming: false,
             lg_takeover: None,
             mic_status: None,
+            grab_status: None,
             overlay: Overlay::new(true, 7, Instant::now()),
             overlay_tx: None,
             screen_tx: watch::channel(false).0,

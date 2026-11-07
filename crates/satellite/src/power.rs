@@ -242,7 +242,7 @@ fn open_pty() -> std::io::Result<(std::fs::File, std::os::fd::OwnedFd)> {
 /// thread, which lives as long as the process. If the parent is already
 /// gone when the child starts, the child does not run.
 #[allow(unsafe_code)]
-fn die_with_parent(cmd: &mut Command) {
+pub(crate) fn die_with_parent(cmd: &mut Command) {
     let parent = rustix::process::getpid();
     // SAFETY: the closure runs in the forked child before exec and only
     // makes two system calls (prctl and getppid), which are

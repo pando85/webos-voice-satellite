@@ -124,13 +124,21 @@ while [ ! -e "\$D/stop" ]; do sleep 0.1; done
 SETUPEOF
     chmod 755 "$1"
 }
+# Stand-in remote grab helper (ADR 0016): answers --version only.
+mkproxy() { # OUT TAG
+    printf '#!/bin/sh\n# test build %s\n[ "$1" != --version ] || { echo "remote-proxy 0.0.1 (test)"; exit 0; }\nexit 2\n' "$2" >"$1"
+    chmod 755 "$1"
+}
 build() { # VERSION TAG OUTDIR
     mkbin "$T/a32-$2" "$2"
     mkbin "$T/a64-$2" "$2"
     mksetup "$T/s32-$2" "$2"
     mksetup "$T/s64-$2" "$2"
+    mkproxy "$T/p32-$2" "$2"
+    mkproxy "$T/p64-$2" "$2"
     SOURCE_DATE_EPOCH=1700000000 python3 "$BUILD" build --no-elf-check --version "$1" \
         --armv7 "$T/a32-$2" --aarch64 "$T/a64-$2" --setup-armv7 "$T/s32-$2" --setup-aarch64 "$T/s64-$2" \
+        --proxy-armv7 "$T/p32-$2" --proxy-aarch64 "$T/p64-$2" \
         --out "$3" >/dev/null
 }
 # Number of live processes (this one excluded) whose command line, NULs read
@@ -198,11 +206,14 @@ sys.exit(0 if all(base + n in d and d[base + n][0].mode == 0o755 and n in sums f
 SOURCE_DATE_EPOCH=1700000000 python3 "$BUILD" build --no-elf-check --version 0.0.1 \
     --armv7 "$T/a32-one" --aarch64 "$T/a64-one" --out "$T/nosetup" >/dev/null
 check "check: a package without the setup server passes, and is refused with --require-setup" 'python3 "$BUILD" check --no-elf-check "$T/nosetup/${ID}_0.0.1_all.ipk" >/dev/null && ! python3 "$BUILD" check --no-elf-check --require-setup "$T/nosetup/${ID}_0.0.1_all.ipk" >/dev/null 2>&1'
+check "check: with --require-proxy the package passes; a package without the grab helper is refused with it" 'python3 "$BUILD" check --no-elf-check --require-proxy "$IPK1" >/dev/null && python3 "$BUILD" check --no-elf-check "$T/nosetup/${ID}_0.0.1_all.ipk" >/dev/null && ! python3 "$BUILD" check --no-elf-check --require-proxy "$T/nosetup/${ID}_0.0.1_all.ipk" >/dev/null 2>&1'
+check "build: only one grab helper build is refused" '! python3 "$BUILD" build --no-elf-check --version 0.0.1 --armv7 "$T/a32-one" --aarch64 "$T/a64-one" --proxy-armv7 "$T/p32-one" --out "$T/bad" >/dev/null 2>&1'
 check "build: only one setup server build is refused" '! python3 "$BUILD" build --no-elf-check --version 0.0.1 --armv7 "$T/a32-one" --aarch64 "$T/a64-one" --setup-armv7 "$T/s32-one" --out "$T/bad" >/dev/null 2>&1'
 check "check: a wrong expected version is refused" '! python3 "$BUILD" check --no-elf-check --version 9.9.9 "$IPK1" >/dev/null 2>&1'
 check "check: host binaries are refused as TV builds without --no-elf-check" '! python3 "$BUILD" check "$IPK1" >/dev/null 2>&1'
 SOURCE_DATE_EPOCH=1700000000 python3 "$BUILD" build --no-elf-check --version 0.0.1 \
     --armv7 "$T/a32-one" --aarch64 "$T/a64-one" --setup-armv7 "$T/s32-one" --setup-aarch64 "$T/s64-one" \
+    --proxy-armv7 "$T/p32-one" --proxy-aarch64 "$T/p64-one" \
     --out "$T/v1b" >/dev/null
 check "reproducible: a second build is byte-identical" 'cmp -s "$IPK1" "$T/v1b/${ID}_0.0.1_all.ipk"'
 check "manifest: HBC fields and the ipk hash" 'python3 -c "
@@ -226,6 +237,7 @@ check "install: the generated config passes --check-config" 'grep -q "config is 
 check "install: no boot hook unless asked (opt-in)" '[ ! -e "$T/initd/webos-satellite" ]'
 check "install: does not start the daemon" '! json "s[\"running\"]"'
 check "install: the setup server comes from the aarch64 build (uname aarch64), mode 0700, answers --version" 'cmp -s "$S/bin/webos-satellite-setup" "$T/s64-one" && [ "$(stat -c %a "$S/bin/webos-satellite-setup")" = 700 ] && "$S/bin/webos-satellite-setup" --version | grep -q "^webos-satellite-setup "'
+check "install: the grab helper comes from the aarch64 build, mode 0700, and passes the trust check like every bin/ file" 'cmp -s "$S/bin/remote-proxy" "$T/p64-one" && [ "$(stat -c %a "$S/bin/remote-proxy")" = 700 ] && [ ! -e "$S/bin/.remote-proxy.new" ]'
 check "install: no temporary setup file, no session directory, no setup process" '[ ! -e "$S/bin/.webos-satellite-setup.new" ] && [ ! -e "$T/setup" ] && [ "$(setup_servers)" = 0 ]'
 mac1=$(grep '^mac_seed' "$S/etc/config.toml")
 check "install: the overlay app is installed through appinstalld (its own package, overlay window), status says so" '[ "$(installs)" = 1 ] && python3 -c "
@@ -278,8 +290,10 @@ echo "== permissions of the app's files (docs/security/install-permissions.md) =
 # before anything runs from the package.
 chmod 777 "$APP"
 chmod o+w "$APP/payload/install.sh"
+chmod 777 "$APP/payload/remote-proxy-aarch64"
 out=$($CTL install --force 2>&1) && rc=0 || rc=$?
 check "install: an app directory 0777 and a world-writable payload script are fixed (0755) and named; the install goes on" '[ "$rc" -eq 0 ] && [ "$(stat -c %a "$APP")" = 755 ] && [ "$(stat -c %a "$APP/payload/install.sh")" = 755 ] && echo "$out" | grep -q "removed group/other write from the app.s files:.*$APP (was drwxrwxrwx)"'
+check "install: a world-writable grab helper in the payload is fixed (0755) before it is copied; the installed one is 0700" '[ "$(stat -c %a "$APP/payload/remote-proxy-aarch64")" = 755 ] && [ "$(stat -c %a "$S/bin/remote-proxy")" = 700 ]'
 cfg_sum2=$(sha256sum <"$S/etc/config.toml")
 out=$(WEBOS_SAT_TEST_TRUST_UID=99999 $CTL install --force 2>&1) && rc=0 || rc=$?
 check "install: app files of another user are refused before anything runs from them; the install is unchanged" '[ "$rc" -ne 0 ] && echo "$out" | grep -q "refusing to use the package files in .* is owned by uid $(id -u), not root" && [ "$(sha256sum <"$S/etc/config.toml")" = "$cfg_sum2" ] && [ "$(cat "$S/VERSION")" = 0.0.1 ]'

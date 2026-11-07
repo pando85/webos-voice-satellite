@@ -39,6 +39,13 @@ SETUP_ARGS    := --setup-armv7 $(OUT_SETUP_ARM) --setup-aarch64 $(OUT_SETUP_A64)
 SETUP_CHECK   := --require-setup
 endif
 
+# The remote's input grab helper (ADR 0016, crates/remote-proxy), std-only,
+# same targets; always in the package (install.sh treats it as optional).
+PROXY_BIN     := remote-proxy
+OUT_PROXY_ARM := target/$(TARGET_ARM)/release/$(PROXY_BIN)
+OUT_PROXY_A64 := target/$(TARGET_A64)/release/$(PROXY_BIN)
+PROXY_ARGS    := --proxy-armv7 $(OUT_PROXY_ARM) --proxy-aarch64 $(OUT_PROXY_A64)
+
 # webOS app package (.ipk); docs/design/packaging.md. The version is the
 # workspace version in Cargo.toml.
 APP_ID        ?= io.github.pando85.voicesatellite
@@ -48,7 +55,7 @@ IPK           := $(IPK_DIR)/$(APP_ID)_$(VERSION)_all.ipk
 IPK_BUILD     := python3 $(PKG)/ipk/build_ipk.py
 TV_APP_DIR    ?= /media/developer/apps/usr/palm/applications/$(APP_ID)
 
-.PHONY: build-setup build-setup64 build-setup-all
+.PHONY: build-setup build-setup64 build-setup-all build-proxy build-proxy64 build-proxy-all
 .PHONY: build-tv build-tv64 build-tv-all package-tv test test-full lint fmt deploy-tv run-tv-selftest clean-tv tv-install-tmp tv-uninstall-tmp
 .PHONY: ipk ipk-check test-packaging test-ipk tv-install-ipk tv-remove-ipk
 
@@ -67,7 +74,7 @@ build-tv64:
 	@file $(OUT_A64)
 	@sha256sum $(OUT_A64)
 
-build-tv-all: build-tv build-tv64 $(SETUP_DEPS)
+build-tv-all: build-tv build-tv64 $(SETUP_DEPS) build-proxy-all
 
 # The phone setup server, std-only, same targets.
 build-setup:
@@ -80,6 +87,17 @@ build-setup64:
 
 build-setup-all: build-setup build-setup64
 
+# The remote's input grab helper (ADR 0016).
+build-proxy:
+	cargo zigbuild --release -p webos-remote-proxy --target $(TARGET_ARM)
+	@file $(OUT_PROXY_ARM)
+
+build-proxy64:
+	cargo zigbuild --release -p webos-remote-proxy --target $(TARGET_A64)
+	@file $(OUT_PROXY_A64)
+
+build-proxy-all: build-proxy build-proxy64
+
 # Package directory and tarball: the ops scripts plus both builds, named
 # webos-satellite-armv7 and webos-satellite-aarch64, and SHA256SUMS.
 # On the TV: sh install.sh --prefix DIR --config FILE [--arch armv7|aarch64].
@@ -91,7 +109,10 @@ package-tv: build-tv-all
 	cp $(OUT_A64) $(PKG_OUT)/$(BIN)-aarch64
 	chmod 755 $(PKG_OUT)/$(BIN)-armv7 $(PKG_OUT)/$(BIN)-aarch64
 	$(if $(SETUP_DEPS),cp $(OUT_SETUP_ARM) $(PKG_OUT)/$(SETUP_BIN)-armv7 && cp $(OUT_SETUP_A64) $(PKG_OUT)/$(SETUP_BIN)-aarch64 && chmod 755 $(PKG_OUT)/$(SETUP_BIN)-armv7 $(PKG_OUT)/$(SETUP_BIN)-aarch64)
-	cd $(PKG_OUT) && sha256sum $(BIN)-armv7 $(BIN)-aarch64 $(if $(SETUP_DEPS),$(SETUP_BIN)-armv7 $(SETUP_BIN)-aarch64) *.sh >SHA256SUMS
+	cp $(OUT_PROXY_ARM) $(PKG_OUT)/$(PROXY_BIN)-armv7
+	cp $(OUT_PROXY_A64) $(PKG_OUT)/$(PROXY_BIN)-aarch64
+	chmod 755 $(PKG_OUT)/$(PROXY_BIN)-armv7 $(PKG_OUT)/$(PROXY_BIN)-aarch64
+	cd $(PKG_OUT) && sha256sum $(BIN)-armv7 $(BIN)-aarch64 $(if $(SETUP_DEPS),$(SETUP_BIN)-armv7 $(SETUP_BIN)-aarch64) $(PROXY_BIN)-armv7 $(PROXY_BIN)-aarch64 *.sh >SHA256SUMS
 	tar -C $(dir $(PKG_OUT)) -czf $(PKG_TAR) $(notdir $(PKG_OUT))
 	@cat $(PKG_OUT)/SHA256SUMS
 	@echo "package: $(PKG_OUT) and $(PKG_TAR)"
@@ -99,8 +120,8 @@ package-tv: build-tv-all
 # Both TV builds plus the scripts and the status app in one reproducible
 # ipk (target/ipk/<id>_<version>_all.ipk), its sha256 and an HBC manifest.
 ipk: build-tv-all
-	$(IPK_BUILD) build --app-id $(APP_ID) --version $(VERSION) --armv7 $(OUT_ARM) --aarch64 $(OUT_A64) $(SETUP_ARGS) --out $(IPK_DIR)
-	$(IPK_BUILD) check --app-id $(APP_ID) --version $(VERSION) $(SETUP_CHECK) $(IPK)
+	$(IPK_BUILD) build --app-id $(APP_ID) --version $(VERSION) --armv7 $(OUT_ARM) --aarch64 $(OUT_A64) $(SETUP_ARGS) $(PROXY_ARGS) --out $(IPK_DIR)
+	$(IPK_BUILD) check --app-id $(APP_ID) --version $(VERSION) $(SETUP_CHECK) --require-proxy $(IPK)
 	@$(if $(SETUP_DEPS),,echo "note: this ipk has no phone setup server (WITH_SETUP=$(WITH_SETUP): crates/setup-server is not a workspace member yet, or it was turned off)")
 
 # Structure check of an existing ipk (ar/tar layout, control, appinfo, payload).
@@ -167,7 +188,7 @@ clean-tv:
 tv-install-tmp: package-tv
 	@test -n "$(TV_CONFIG)" || { echo "set TV_CONFIG=<config.toml> (and TV_PSK=<key file>)"; exit 2; }
 	timeout $(TIMEOUT) ssh $(SSH_OPTS) $(TV) 'rm -rf $(TV_STAGE) && mkdir -m 700 $(TV_STAGE)'
-	timeout $(TIMEOUT) scp $(SSH_OPTS) $(PKG_OUT)/*.sh $(PKG_OUT)/$(BIN)-armv7 $(PKG_OUT)/$(BIN)-aarch64 $(if $(SETUP_DEPS),$(PKG_OUT)/$(SETUP_BIN)-armv7 $(PKG_OUT)/$(SETUP_BIN)-aarch64) $(TV_CONFIG) $(TV_PSK) $(TV):$(TV_STAGE)/
+	timeout $(TIMEOUT) scp $(SSH_OPTS) $(PKG_OUT)/*.sh $(PKG_OUT)/$(BIN)-armv7 $(PKG_OUT)/$(BIN)-aarch64 $(if $(SETUP_DEPS),$(PKG_OUT)/$(SETUP_BIN)-armv7 $(PKG_OUT)/$(SETUP_BIN)-aarch64) $(PKG_OUT)/$(PROXY_BIN)-armv7 $(PKG_OUT)/$(PROXY_BIN)-aarch64 $(TV_CONFIG) $(TV_PSK) $(TV):$(TV_STAGE)/
 	timeout $(TIMEOUT) ssh $(SSH_OPTS) $(TV) 'cd $(TV_STAGE) && sh ./install.sh --prefix $(TV_PREFIX) --arch $(TV_ARCH) --config ./$(notdir $(TV_CONFIG)) $(if $(TV_PSK),--psk-file ./$(notdir $(TV_PSK))); rc=$$?; cd /; rm -rf $(TV_STAGE); exit $$rc'
 
 # Stops the daemon and removes TV_PREFIX (and the staging directory) from the TV.

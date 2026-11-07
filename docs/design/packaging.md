@@ -38,6 +38,7 @@ usr/palm/applications/<id>/
   payload/
     ctl.sh install.sh lib.sh start.sh stop.sh status.sh supervise.sh autostart.sh rotate.sh uninstall.sh
     webos-satellite-armv7 webos-satellite-aarch64     (static musl builds)
+    remote-proxy-armv7 remote-proxy-aarch64           (the remote's input grab helper, ADR 0016; optional at install)
     config.default.toml  webos-satellite.hook  VERSION  SHA256SUMS
 usr/palm/packages/<id>/packageinfo.json
 ```

@@ -273,6 +273,9 @@ set_paths() {
     SETUP_DIR=${WEBOS_SAT_SETUP_DIR:-/tmp/webos-satellite-setup}
     SETUP_PID=$SETUP_DIR/setup.pid
     SETUP_LOG=$PREFIX/log/setup.log
+    # The input grab helper of ADR 0016 (started by the daemon only).
+    GRAB_BIN=$PREFIX/bin/remote-proxy
+    GRAB_PID=$PREFIX/run/remote-proxy.pid
 }
 
 # Default kill-switch file of the daemon (safety.kill_switch in the config).
@@ -526,6 +529,19 @@ lg_restore_after_stop_script() {
     return 0
 }
 
+# The input grab helper (ADR 0016, `remote-proxy serve`) dies with the daemon
+# (PR_SET_PDEATHSIG, end of file on its stdin pipe); this is the dead-man's
+# last layer for one left anyway: SIGKILL by its pid file, only when that pid
+# runs our helper binary. The kernel releases its grab of the remote.
+stop_grab_helper() {
+    gp=$(read_pid "$GRAB_PID")
+    if [ -n "$gp" ] && [ "$(readlink "/proc/$gp/exe" 2>/dev/null)" = "$GRAB_BIN" ]; then
+        note "stopping the remote grab helper pid $gp"
+        kill -KILL "$gp" 2>/dev/null || true
+    fi
+    rm -f "$GRAB_PID"
+}
+
 stop_daemon() {
     wait_s=${1:-10}
     stop_setup_server
@@ -553,6 +569,7 @@ stop_daemon() {
     else
         note "daemon not running"
     fi
+    stop_grab_helper
     # The supervisor may be giving LG's voice key back (ctl.sh
     # restore-lg-voice after the daemon's exit, ADR 0013): it may take its
     # lock (up to 30 s) and two luna calls, so it gets 45 s then, 5 s

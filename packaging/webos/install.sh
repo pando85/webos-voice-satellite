@@ -200,6 +200,38 @@ else
     fi
 fi
 [ -n "$setup_chosen" ] || rm -f "$PREFIX/bin/webos-satellite-setup"
+
+# The remote's input grab helper (ADR 0016): never fatal; without it the mic
+# button runs with ADR 0013's override alone (LG's toast on a press).
+gnew=$PREFIX/bin/.remote-proxy.new
+try_grab() { # ARCH
+    rm -f "$gnew"
+    cp "$here/remote-proxy-$1" "$gnew" && chmod 700 "$gnew" &&
+        binary_runs "$gnew" "$(triple_of_arch "$1")" remote-proxy
+}
+grab_chosen=
+if [ -n "$binary" ]; then
+    note "--binary: the remote grab helper is not installed"
+elif [ ! -f "$here/remote-proxy-armv7" ] && [ ! -f "$here/remote-proxy-aarch64" ]; then
+    note "no remote grab helper in this package"
+else
+    for a in $chosen armv7; do
+        [ -f "$here/remote-proxy-$a" ] || continue
+        if try_grab "$a"; then
+            grab_chosen=$a
+            break
+        fi
+        note "the $a remote grab helper does not run here (--version failed)"
+    done
+    if [ -n "$grab_chosen" ]; then
+        mv -f "$gnew" "$PREFIX/bin/remote-proxy"
+        note "remote grab helper: the $grab_chosen build"
+    else
+        rm -f "$gnew"
+        note "WARNING: no remote grab helper runs here; the mic button uses LG's key override alone"
+    fi
+fi
+[ -n "$grab_chosen" ] || rm -f "$PREFIX/bin/remote-proxy"
 for f in lib.sh start.sh stop.sh status.sh uninstall.sh rotate.sh supervise.sh autostart.sh ctl.sh; do
     # ctl.sh is part of the webOS app package; older trees lack it.
     [ -f "$here/$f" ] || [ "$f" = ctl.sh ] || die "missing $here/$f"

@@ -109,21 +109,44 @@ pub(crate) enum Action {
     /// Write this frame (ends with `SYN_REPORT`) to the sibling, then
     /// [`KeyBits::apply`] it. `time` is the source frame's kernel time.
     Forward { frame: Vec<Event>, time: Duration },
-    /// A mic key event (value 1 press, 0 release, 2 repeat), never forwarded.
-    Mic { value: i32, time: Duration },
+    /// An event of a caught key (value 1 press, 0 release, 2 repeat), never
+    /// forwarded.
+    Caught {
+        code: u16,
+        value: i32,
+        time: Duration,
+    },
     /// The kernel dropped events: read `EVIOCGKEY` of the source and write
     /// [`KeyBits::resync_release_frame`].
     Resync,
 }
 
-/// Frame assembly and the mic-key filter.
-#[derive(Debug, Default)]
+/// Frame assembly and the caught-key filter.
+#[derive(Debug)]
 pub(crate) struct Forwarder {
     frame: Vec<Event>,
     dropping: bool,
+    /// `EV_KEY` codes taken out of the stream (ADR 0016: the mic key only;
+    /// the list is the extension point for future features).
+    catch: Vec<u16>,
+}
+
+impl Default for Forwarder {
+    fn default() -> Self {
+        Self::new(vec![MIC_KEY])
+    }
 }
 
 impl Forwarder {
+    /// A forwarder that takes `catch` out of the stream.
+    pub(crate) fn new(catch: Vec<u16>) -> Self {
+        Self {
+            frame: Vec::new(),
+            dropping: false,
+            catch,
+        }
+    }
+
     /// Feeds one source event.
     pub(crate) fn push(&mut self, ev: Event, out: &mut Vec<Action>) {
         if ev.kind == EV_SYN && ev.code == SYN_DROPPED {
@@ -139,8 +162,9 @@ impl Forwarder {
             }
             return;
         }
-        if ev.kind == EV_KEY && ev.code == MIC_KEY {
-            out.push(Action::Mic {
+        if ev.kind == EV_KEY && self.catch.contains(&ev.code) {
+            out.push(Action::Caught {
+                code: ev.code,
                 value: ev.value,
                 time: ev.time,
             });
@@ -261,11 +285,36 @@ mod tests {
         let mics: Vec<i32> = out
             .iter()
             .filter_map(|a| match a {
-                Action::Mic { value, .. } => Some(*value),
+                Action::Caught { value, .. } => Some(*value),
                 _ => None,
             })
             .collect();
         assert_eq!(mics, vec![1, 0]);
+    }
+
+    #[test]
+    fn a_configured_catch_list_takes_exactly_those_keys() {
+        let mut f = Forwarder::new(vec![398, 399]);
+        let out = feed(
+            &mut f,
+            &[
+                Event::new(EV_KEY, 398, 1),
+                Event::new(EV_KEY, MIC_KEY, 1),
+                Event::syn(),
+            ],
+        );
+        assert_eq!(
+            frames(&out),
+            vec![vec![Event::new(EV_KEY, MIC_KEY, 1), Event::syn()]]
+        );
+        assert!(out.iter().any(|a| matches!(
+            a,
+            Action::Caught {
+                code: 398,
+                value: 1,
+                ..
+            }
+        )));
     }
 
     #[test]

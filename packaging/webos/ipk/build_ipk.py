@@ -15,12 +15,14 @@ Design: docs/design/packaging.md.
 usage:
   build_ipk.py build --armv7 BIN --aarch64 BIN
                      [--setup-armv7 BIN --setup-aarch64 BIN]
+                     [--proxy-armv7 BIN --proxy-aarch64 BIN]
                      [--app-id ID] [--version V] [--out DIR] [--no-elf-check]
   build_ipk.py check IPK [--app-id ID] [--version V] [--no-elf-check]
-                     [--require-setup]
+                     [--require-setup] [--require-proxy]
 
 The phone setup server (webos-satellite-setup, ADR 0009) goes in as two more
-builds, both or neither.
+builds, both or neither; so does the remote's input grab helper
+(remote-proxy, ADR 0016).
 
 The assistant overlay (docs/design/assistant-overlay.md, ADR 0014) is a second
 web app, `<id>.overlay`, with an `overlay` window. It is built as its own
@@ -71,6 +73,7 @@ VERSION_RE = re.compile(r"^(0|[1-9]\d{0,8})\.(0|[1-9]\d{0,8})\.(0|[1-9]\d{0,8})$
 FORBIDDEN_PREFIXES = ("com.palm", "com.webos", "com.lge", "com.palmdts")
 ELF_MACHINE = {"armv7": (1, 40), "aarch64": (2, 183)}  # (EI_CLASS, e_machine)
 SETUP_NAMES = [f"webos-satellite-setup-{a}" for a in ELF_MACHINE]
+PROXY_NAMES = [f"remote-proxy-{a}" for a in ELF_MACHINE]
 
 
 def die(msg: str) -> None:
@@ -285,6 +288,17 @@ def build(args: argparse.Namespace) -> Path:
             if not args.no_elf_check:
                 elf_check(path, arch)
 
+    proxy_bins = {}
+    if args.proxy_armv7 or args.proxy_aarch64:
+        if not (args.proxy_armv7 and args.proxy_aarch64):
+            die("give both --proxy-armv7 and --proxy-aarch64, or neither")
+        proxy_bins = {"armv7": Path(args.proxy_armv7), "aarch64": Path(args.proxy_aarch64)}
+        for arch, path in proxy_bins.items():
+            if not path.is_file():
+                die(f"missing {arch} remote grab helper binary: {path}")
+            if not args.no_elf_check:
+                elf_check(path, arch)
+
     payload: dict[str, tuple[bytes, int]] = {}
     for name in PAYLOAD_SCRIPTS:
         payload[name] = ((PKG / name).read_bytes(), 0o755)
@@ -294,6 +308,8 @@ def build(args: argparse.Namespace) -> Path:
         payload[f"webos-satellite-{arch}"] = (path.read_bytes(), 0o755)
     for arch, path in setup_bins.items():
         payload[f"webos-satellite-setup-{arch}"] = (path.read_bytes(), 0o755)
+    for arch, path in proxy_bins.items():
+        payload[f"remote-proxy-{arch}"] = (path.read_bytes(), 0o755)
     payload["VERSION"] = (f"{version}\n".encode(), 0o644)
     payload["overlay.ipk"] = (overlay_package(app_id, version, mtime), 0o644)
     sums = "".join(f"{hashlib.sha256(data).hexdigest()}  {name}\n"
@@ -476,6 +492,11 @@ def check(args: argparse.Namespace) -> None:
     need(have_setup or not args.require_setup, "the phone setup server is not in the package (--require-setup)")
     if have_setup:
         expected |= set(SETUP_NAMES)
+    have_proxy = [n for n in PROXY_NAMES if n in payload]
+    need(len(have_proxy) in (0, len(PROXY_NAMES)), f"only one build of the remote grab helper: {have_proxy}")
+    need(have_proxy or not args.require_proxy, "the remote grab helper is not in the package (--require-proxy)")
+    if have_proxy:
+        expected |= set(PROXY_NAMES)
     need(set(payload) == expected, f"payload files differ: {sorted(set(payload) ^ expected)}")
     need(payload.get("VERSION") == f"{version}\n".encode(), "payload VERSION differs")
     for line in (payload.get("SHA256SUMS") or b"").decode().splitlines():
@@ -483,7 +504,7 @@ def check(args: argparse.Namespace) -> None:
         need(hashlib.sha256(payload.get(name, b"")).hexdigest() == digest, f"SHA256SUMS mismatch for {name}")
     need(len((payload.get("SHA256SUMS") or b"").decode().splitlines()) == len(expected) - 1,
          "SHA256SUMS does not cover every payload file")
-    for name in PAYLOAD_SCRIPTS + ["webos-satellite-armv7", "webos-satellite-aarch64"] + have_setup:
+    for name in PAYLOAD_SCRIPTS + ["webos-satellite-armv7", "webos-satellite-aarch64"] + have_setup + have_proxy:
         info = data.get(f"{appdir}/payload/{name}", (None, None))[0]
         need(info is not None and info.mode == 0o755, f"payload/{name} mode is not 0755")
     for name in PAYLOAD_SCRIPTS:
@@ -491,7 +512,8 @@ def check(args: argparse.Namespace) -> None:
             need((payload.get(name) or b"").startswith(b"#!/bin/sh"), f"payload/{name} is not a sh script")
     if not args.no_elf_check:
         for arch in ELF_MACHINE:
-            for name in [f"webos-satellite-{arch}"] + ([f"webos-satellite-setup-{arch}"] if have_setup else []):
+            for name in ([f"webos-satellite-{arch}"] + ([f"webos-satellite-setup-{arch}"] if have_setup else [])
+                         + ([f"remote-proxy-{arch}"] if have_proxy else [])):
                 blob = payload.get(name) or b""
                 want_class, want_machine = ELF_MACHINE[arch]
                 need(blob[:4] == b"\x7fELF" and blob[4] == want_class
@@ -506,7 +528,8 @@ def check(args: argparse.Namespace) -> None:
         print("\n".join(f"FAIL  {e}" for e in errors), file=sys.stderr)
         sys.exit(1)
     print(f"ok: {path.name} ({len(data)} entries, payload {len(payload)} files"
-          f"{', with the setup server' if have_setup else ', no setup server'}, overlay app {app_id}{OVERLAY_SUFFIX})")
+          f"{', with the setup server' if have_setup else ', no setup server'}"
+          f"{', with the remote grab helper' if have_proxy else ', no remote grab helper'}, overlay app {app_id}{OVERLAY_SUFFIX})")
 
 
 def main() -> None:
@@ -517,6 +540,8 @@ def main() -> None:
     b.add_argument("--aarch64", required=True)
     b.add_argument("--setup-armv7")
     b.add_argument("--setup-aarch64")
+    b.add_argument("--proxy-armv7")
+    b.add_argument("--proxy-aarch64")
     b.add_argument("--app-id", default=DEFAULT_APP_ID)
     b.add_argument("--version")
     b.add_argument("--out", default=str(ROOT / "target" / "ipk"))
@@ -527,6 +552,7 @@ def main() -> None:
     c.add_argument("--version")
     c.add_argument("--no-elf-check", action="store_true")
     c.add_argument("--require-setup", action="store_true", help="refuse a package without the setup server")
+    c.add_argument("--require-proxy", action="store_true", help="refuse a package without the remote grab helper")
     args = ap.parse_args()
     if args.cmd == "build":
         build(args)

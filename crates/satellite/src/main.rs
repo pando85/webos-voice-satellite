@@ -22,6 +22,7 @@ mod daemon;
 mod darken;
 mod evdev;
 mod firmware;
+mod key_grab;
 mod lg_voice;
 mod limits;
 mod logger;

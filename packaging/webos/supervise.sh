@@ -53,6 +53,9 @@ slog() {
 # LG's voice key back after a daemon exit, when the daemon left its state
 # file (a crash, a kill, a watchdog exit; a clean exit removes it itself).
 lg_restore() {
+    # The grab helper first (ADR 0016): it dies with the daemon, but one left
+    # anyway is killed before LG's key is given back.
+    stop_grab_helper >>"$LOG" 2>&1
     [ -f "$PREFIX/run/lg_voice_override" ] || return 0
     slog "the daemon left LG's voice key taken over: giving it back (ctl.sh restore-lg-voice)"
     if ! trusted; then

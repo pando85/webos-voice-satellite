@@ -27,6 +27,7 @@ mod caps;
 mod deadman;
 mod event;
 mod filter;
+mod serve;
 mod sys;
 
 use std::fs::File;
@@ -42,12 +43,17 @@ use deadman::{CHECK_EVERY, Cap, Heartbeat, STALL_LIMIT};
 use event::{ABS_X, ABS_Y, EV_ABS, EV_KEY, EV_SYN, EVENT_SIZE, Event, SYN_REPORT};
 use filter::{Action, Forwarder, KeyBits, MIC_KEY, Stats};
 
-const EXIT_REFUSED: i32 = 2;
+pub(crate) const EXIT_REFUSED: i32 = 2;
 const EXIT_WATCHDOG: i32 = 3;
 const EXIT_PANIC: i32 = 4;
-const EXIT_DEVICE_LOST: i32 = 5;
+pub(crate) const EXIT_DEVICE_LOST: i32 = 5;
+
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+const TARGET: &str = env!("REMOTE_PROXY_TARGET");
 
 const USAGE: &str = "usage:
+  remote-proxy serve       --target NAME [--source-prefix PREFIX] [--catch CODE]... [--check]
+  remote-proxy --version
   remote-proxy dry-run     --source NAME [--secs N]
   remote-proxy inject-test --target NAME [--secs N]
   remote-proxy grab        --source NAME --target NAME [--secs N]
@@ -197,12 +203,12 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
 }
 
 /// What the watchdog and the panic hook release before `_exit`.
-struct Emergency {
-    target: Option<File>,
-    keys: Arc<KeyBits>,
+pub(crate) struct Emergency {
+    pub(crate) target: Option<File>,
+    pub(crate) keys: Arc<KeyBits>,
 }
 
-static EMERGENCY: OnceLock<Emergency> = OnceLock::new();
+pub(crate) static EMERGENCY: OnceLock<Emergency> = OnceLock::new();
 
 /// Releases the keys still down in the target (best effort) and ends the
 /// process at once; the kernel then releases the grab.
@@ -230,8 +236,8 @@ enum Wake {
 }
 
 /// The in-binary dead-man for one run.
-struct DeadMan {
-    cap: Cap,
+pub(crate) struct DeadMan {
+    cap: Option<Cap>,
     hb: Arc<Heartbeat>,
     sig: File,
     stdin_open: bool,
@@ -239,6 +245,12 @@ struct DeadMan {
 
 impl DeadMan {
     fn start(secs: u64) -> Result<Self, String> {
+        Self::start_with(Some(secs))
+    }
+
+    /// `secs`: the hard cap (test modes); `None` for `serve`, whose limits are
+    /// the watchdog, the parent link and the daemon's heartbeat (ADR 0016).
+    pub(crate) fn start_with(secs: Option<u64>) -> Result<Self, String> {
         sys::ignore_tty_stops();
         if sys::stdin_tty_foreground() == Some(false) {
             return Err(
@@ -250,7 +262,9 @@ impl DeadMan {
         }
         let now = Instant::now();
         let sig = sys::signal_fd().map_err(|e| format!("signalfd: {e}"))?;
-        sys::alarm(Cap::alarm_secs(secs));
+        if let Some(secs) = secs {
+            sys::alarm(Cap::alarm_secs(secs));
+        }
         let hb = Heartbeat::new(now);
         hb.beat();
         deadman::spawn_watchdog(Arc::clone(&hb), STALL_LIMIT, CHECK_EVERY, |age| {
@@ -263,13 +277,19 @@ impl DeadMan {
         std::panic::set_hook(Box::new(|info| {
             emergency_exit(EXIT_PANIC, &format!("panic: {info}"));
         }));
-        println!(
-            "dead-man: cap {secs} s (alarm at {} s), watchdog {} ms, exit on SIGHUP/SIGINT/SIGTERM, stdin EOF or q",
-            Cap::alarm_secs(secs),
-            STALL_LIMIT.as_millis()
-        );
+        match secs {
+            Some(secs) => eprintln!(
+                "dead-man: cap {secs} s (alarm at {} s), watchdog {} ms, exit on SIGHUP/SIGINT/SIGTERM, stdin EOF or q",
+                Cap::alarm_secs(secs),
+                STALL_LIMIT.as_millis()
+            ),
+            None => eprintln!(
+                "dead-man: no cap, watchdog {} ms, exit on SIGHUP/SIGINT/SIGTERM or stdin EOF",
+                STALL_LIMIT.as_millis()
+            ),
+        }
         Ok(Self {
-            cap: Cap::new(now, secs),
+            cap: secs.map(|s| Cap::new(now, s)),
             hb,
             sig,
             stdin_open: true,
@@ -278,45 +298,48 @@ impl DeadMan {
 
     /// Waits up to 200 ms for the source (if any), a signal or stdin.
     fn wait(&mut self, source: Option<RawFd>) -> Wake {
+        let sources: Vec<RawFd> = source.into_iter().collect();
+        match self.wait_fds(&sources) {
+            Err(r) => Wake::Stop(r),
+            Ok(r) if r.first().copied().unwrap_or(false) => Wake::Source,
+            Ok(_) => Wake::Tick,
+        }
+    }
+
+    /// Waits up to 200 ms for any of `sources`, a signal or stdin; beats the
+    /// heartbeat. `Ok`: which sources are readable; `Err`: why to stop.
+    pub(crate) fn wait_fds(&mut self, sources: &[RawFd]) -> Result<Vec<bool>, String> {
         let mut fds = vec![self.sig.as_raw_fd()];
         if self.stdin_open {
             fds.push(0);
         }
-        if let Some(s) = source {
-            fds.push(s);
-        }
-        let ready = match sys::poll_readable(&fds, 200) {
-            Ok(r) => r,
-            Err(e) => return Wake::Stop(format!("poll failed: {e}")),
-        };
+        let first_source = fds.len();
+        fds.extend_from_slice(sources);
+        let ready = sys::poll_readable(&fds, 200).map_err(|e| format!("poll failed: {e}"))?;
         self.hb.beat();
-        if self.cap.expired(Instant::now()) {
-            return Wake::Stop("cap reached".into());
+        if self.cap.is_some_and(|c| c.expired(Instant::now())) {
+            return Err("cap reached".into());
         }
         if ready[0] {
-            return match sys::read_signal(&self.sig) {
-                Ok(n) => Wake::Stop(format!("signal {n}")),
-                Err(e) => Wake::Stop(format!("signalfd read: {e}")),
-            };
+            return Err(match sys::read_signal(&self.sig) {
+                Ok(n) => format!("signal {n}"),
+                Err(e) => format!("signalfd read: {e}"),
+            });
         }
         if self.stdin_open && ready[1] {
             let mut buf = [0u8; 256];
             match io::stdin().lock().read(&mut buf) {
-                Ok(0) => return Wake::Stop("stdin end of file".into()),
-                Ok(n) if buf[..n].contains(&b'q') => return Wake::Stop("q on stdin".into()),
+                Ok(0) => return Err("stdin end of file".into()),
+                Ok(n) if buf[..n].contains(&b'q') => return Err("q on stdin".into()),
                 Ok(_) => {}
-                Err(e) => return Wake::Stop(format!("stdin: {e}")),
+                Err(e) => return Err(format!("stdin: {e}")),
             }
         }
-        if source.is_some() && *ready.last().unwrap_or(&false) {
-            Wake::Source
-        } else {
-            Wake::Tick
-        }
+        Ok(ready[first_source..].to_vec())
     }
 }
 
-fn open_read(dev: &Path) -> Result<File, String> {
+pub(crate) fn open_read(dev: &Path) -> Result<File, String> {
     File::options()
         .read(true)
         .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
@@ -324,7 +347,7 @@ fn open_read(dev: &Path) -> Result<File, String> {
         .map_err(|e| format!("open {}: {e}", dev.display()))
 }
 
-fn open_write(dev: &Path) -> Result<File, String> {
+pub(crate) fn open_write(dev: &Path) -> Result<File, String> {
     File::options()
         .write(true)
         .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
@@ -333,7 +356,7 @@ fn open_write(dev: &Path) -> Result<File, String> {
 }
 
 /// Reads the available events; `Err` when the node went away.
-fn read_events(f: &File, out: &mut Vec<Event>) -> Result<(), String> {
+pub(crate) fn read_events(f: &File, out: &mut Vec<Event>) -> Result<(), String> {
     let mut buf = vec![0u8; 64 * EVENT_SIZE];
     let mut r: &File = f;
     match r.read(&mut buf) {
@@ -348,7 +371,7 @@ fn read_events(f: &File, out: &mut Vec<Event>) -> Result<(), String> {
     }
 }
 
-fn now_realtime() -> Duration {
+pub(crate) fn now_realtime() -> Duration {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -359,7 +382,7 @@ fn sys_root() -> PathBuf {
 }
 
 /// Reads a node's capabilities with `EVIOCGBIT` on an open fd (any mode).
-fn read_caps(root: &Path, node: &Node, f: &File) -> Result<Caps, String> {
+pub(crate) fn read_caps(root: &Path, node: &Node, f: &File) -> Result<Caps, String> {
     let get = |ev: u16| {
         sys::ev_bits(f, ev)
             .map(|b| caps::codes(&b))
@@ -407,7 +430,7 @@ fn log_abs(label: &str, f: &File, axes: &[u16]) -> Result<Vec<sys::AbsInfo>, Str
 }
 
 /// Same range, fuzz, flat and resolution (the current value may differ).
-fn same_ranges(a: &[sys::AbsInfo], b: &[sys::AbsInfo]) -> bool {
+pub(crate) fn same_ranges(a: &[sys::AbsInfo], b: &[sys::AbsInfo]) -> bool {
     a.len() == b.len()
         && a.iter().zip(b).all(|(x, y)| {
             (x.minimum, x.maximum, x.fuzz, x.flat, x.resolution)
@@ -611,7 +634,7 @@ fn grab(a: &Args) -> Result<i32, String> {
                                 break 'run e;
                             }
                         }
-                        Action::Mic { value, time } => {
+                        Action::Caught { value, time, .. } => {
                             mics += 1;
                             log_mic(start, value, time, &mut pressed);
                             #[cfg(debug_assertions)]
@@ -917,6 +940,14 @@ fn clone_probe(a: &Args) -> Result<i32, String> {
 
 fn run() -> Result<i32, String> {
     let argv: Vec<String> = std::env::args().skip(1).collect();
+    match argv.first().map(String::as_str) {
+        Some("--version" | "-V") => {
+            println!("remote-proxy {VERSION} ({TARGET})");
+            return Ok(0);
+        }
+        Some("serve") => return serve::serve(&argv[1..]),
+        _ => {}
+    }
     let a = parse_args(&argv)?;
     match a.mode {
         Mode::DryRun => dry_run(&a),

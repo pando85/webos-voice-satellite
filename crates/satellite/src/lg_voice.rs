@@ -94,6 +94,9 @@ pub(crate) enum KeyOwner {
     Lg,
     /// The in-memory override is in place (`ignore`): ours.
     Ours,
+    /// The override is in place and the input grab of ADR 0016 runs: the key
+    /// never reaches LG's compositor (the override is the safety net).
+    OursGrab,
     /// A restore could not be confirmed (the state file is kept).
     Unknown,
 }
@@ -104,6 +107,7 @@ impl KeyOwner {
         match self {
             Self::Lg => "lg",
             Self::Ours => "ours (configd)",
+            Self::OursGrab => "ours (grab + configd)",
             Self::Unknown => "unknown",
         }
     }
