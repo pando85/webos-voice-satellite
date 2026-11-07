@@ -6,6 +6,8 @@ Research tasks and implementation work are tracked in GitHub Issues. This roadma
 
 ## Current focus (owner, 2026-11-03)
 
+- **Pending items after 0.6.0 (2026-11-07 close-out):** the owner acceptance test of the mic-key grab on c3-a, c3-b's grab allow-list entry, the installer-mode security check, and the mid-term and HA audio follow-ups are listed with owners and prerequisites in [next steps](next-steps.md).
+
 - **Mid-term plan (proposal, 2026-11-07):** wake word operating point, false-wake labels, per-run diagnostics, a paired raw-replay evaluation, household recordings, then any front-end change (two microphones, AGC, NS per stage) only on evidence: [mid-term plan](mid-term-plan.md). Server side: [homelab `docs/voice-assistant/audio-pipeline-plan.md`](https://github.com/pando85/homelab/blob/master/docs/voice-assistant/audio-pipeline-plan.md). Owner decisions are listed in its section 5.
 
 - **Always-on operation is the current focus:** listening and playback when the remote powers the TV off or the screen is off, plus autostart. Design: [always-on](../design/always-on.md). Procedure: [D5 plan](../discovery/c3-a/D5-plan.md). Autostart: [autostart design](../design/autostart.md).
