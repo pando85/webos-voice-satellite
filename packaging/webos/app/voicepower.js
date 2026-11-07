@@ -402,7 +402,9 @@
   // and `mic_button` of `ctl.sh status --json`. The mic button shows what
   // runs: on only while the satellite holds the button (LG's voice key taken
   // over); `mic_button_active` false with "ptt" configured means the takeover
-  // failed, and `mic_button_error` says why.
+  // failed, and `mic_button_error` says why. A fourth row, the on-screen
+  // assistant ([overlay] enabled, on by default, ADR 0014), from
+  // `overlay_enabled`.
   // The daemon reads them at start only, so `ctl.sh config aec|music on|off`
   // rewrites the config and restarts it. TV app only: the phone page does not
   // offer them (a restart ends the phone session), so REQUEST has no entry.
@@ -418,10 +420,12 @@
     { id: 'music', label: 'Music', key: 'music_enabled', action: 'music',
       sub: 'Lets Home Assistant or Music Assistant play music on this TV. Experimental.' },
     { id: 'mic', label: 'Remote mic button \u2192 Home Assistant', key: 'mic_button', action: 'mic-button',
-      sub: 'Replaces LG\'s voice assistant on the mic button while on. LG\'s toast "not supported" may appear.' }
+      sub: 'Replaces LG\'s voice assistant on the mic button while on. LG\'s toast "not supported" may appear.' },
+    { id: 'overlay', label: 'On-screen assistant', key: 'overlay_enabled', action: 'overlay',
+      sub: 'Shows listening, what you said and the answer in a small panel over the picture. No sound.' }
   ];
 
-  function soundIndex(id) { return id === 'mic' ? 2 : (id === 'music' ? 1 : 0); }
+  function soundIndex(id) { return { music: 1, mic: 2, overlay: 3 }[id] || 0; }
 
   // The value of a row from the status: a boolean, or undefined when this
   // version does not report it. The mic button is on only while it runs.
@@ -448,6 +452,11 @@
   }
 
   function soundConfirm(id, turningOn) {
+    if (id === 'overlay') {
+      return turningOn
+        ? 'Turn on the on-screen assistant? During a voice request a small panel at the bottom of the screen shows that the satellite listens, what it understood and the answer, then hides itself. It never takes the remote and plays no sound. ' + RESTART
+        : 'Turn off the on-screen assistant? Voice requests then show nothing on the screen. ' + RESTART;
+    }
     if (id === 'mic') {
       return turningOn
         ? 'Turn on the remote mic button? Holding the mic button on the Magic Remote then talks to Home Assistant, and LG\'s voice assistant no longer opens from that button (LG may show "This function is not supported"). The satellite gives the button back to LG when this is turned off, when the satellite stops, and at every TV restart. ' + RESTART

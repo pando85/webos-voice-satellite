@@ -1,9 +1,11 @@
 //! HA's config switches, `aec_enabled`, `music_enabled`
-//! ([ADR 0012](../../../docs/decisions/0012-config-switches-in-ha.md)) and
+//! ([ADR 0012](../../../docs/decisions/0012-config-switches-in-ha.md)),
 //! `remote_mic_button` (the Magic Remote's mic button, `[remote] mic_button`
-//! "ptt" or "off", added the same way: docs/design/remote-mic-button.md).
+//! "ptt" or "off", added the same way: docs/design/remote-mic-button.md) and
+//! `overlay_enabled` (the on-screen assistant, `[overlay] enabled`, the same
+//! way: docs/design/assistant-overlay.md).
 //!
-//! Flipping one in Home Assistant runs `ctl.sh config aec|music|mic-button on|off`
+//! Flipping one in Home Assistant runs `ctl.sh config aec|music|mic-button|overlay on|off`
 //! detached: that command rewrites the one config key, checks the config,
 //! restarts this daemon (which ends this process) and puts the previous
 //! config back if the new one does not start. The daemon never edits the
@@ -57,6 +59,8 @@ pub(crate) const AEC_ID: &str = "aec_enabled";
 pub(crate) const MUSIC_ID: &str = "music_enabled";
 /// Object id of the remote mic button switch (on: `mic_button = "ptt"`).
 pub(crate) const MIC_BUTTON_ID: &str = "remote_mic_button";
+/// Object id of the on-screen assistant switch (`[overlay] enabled`).
+pub(crate) const OVERLAY_ID: &str = "overlay_enabled";
 /// After this long a still running `ctl.sh` is logged (a stop, a start and a
 /// rollback with another start take about 40 s in the worst case). It is not
 /// killed (it may be between two config files) and stays in flight until it
@@ -84,10 +88,17 @@ pub(crate) enum Setting {
     Music,
     /// `[remote] mic_button` (on: `"ptt"`, off: `"off"`).
     MicButton,
+    /// `[overlay] enabled`.
+    Overlay,
 }
 
 /// Every setting, in the order of the entities.
-const ALL: [Setting; 3] = [Setting::Aec, Setting::Music, Setting::MicButton];
+const ALL: [Setting; 4] = [
+    Setting::Aec,
+    Setting::Music,
+    Setting::MicButton,
+    Setting::Overlay,
+];
 
 impl Setting {
     /// The setting of an object id, for exactly the known ids.
@@ -96,6 +107,7 @@ impl Setting {
             AEC_ID => Some(Self::Aec),
             MUSIC_ID => Some(Self::Music),
             MIC_BUTTON_ID => Some(Self::MicButton),
+            OVERLAY_ID => Some(Self::Overlay),
             _ => None,
         }
     }
@@ -105,6 +117,7 @@ impl Setting {
             Self::Aec => AEC_ID,
             Self::Music => MUSIC_ID,
             Self::MicButton => MIC_BUTTON_ID,
+            Self::Overlay => OVERLAY_ID,
         }
     }
 
@@ -114,6 +127,7 @@ impl Setting {
             Self::Aec => "aec",
             Self::Music => "music",
             Self::MicButton => "mic-button",
+            Self::Overlay => "overlay",
         }
     }
 }
@@ -136,6 +150,11 @@ pub(crate) fn entities() -> Vec<SwitchEntity> {
         sw(AEC_ID, "Echo cancellation", "mdi:waveform"),
         sw(MUSIC_ID, "Music playback", "mdi:music"),
         sw(MIC_BUTTON_ID, "Remote mic button", "mdi:remote"),
+        sw(
+            OVERLAY_ID,
+            "On-screen assistant",
+            "mdi:message-text-outline",
+        ),
     ]
 }
 
@@ -300,6 +319,8 @@ pub(crate) struct ConfigSwitches {
     mic_button: bool,
     /// The feature runs (LG's voice key taken over): what HA's switch shows.
     mic_button_active: bool,
+    /// `[overlay] enabled` in the config this process started with.
+    overlay: bool,
     in_flight: Arc<AtomicBool>,
     slow_after: Duration,
 }
@@ -315,7 +336,7 @@ impl ConfigSwitches {
         let ctl = prefix.join("bin").join("ctl.sh");
         if !ctl.is_file() {
             log::info!(
-                "config switches: {} not found; the aec_enabled, music_enabled and remote_mic_button switches are not offered",
+                "config switches: {} not found; the aec_enabled, music_enabled, remote_mic_button and overlay_enabled switches are not offered",
                 ctl.display()
             );
             return None;
@@ -329,6 +350,7 @@ impl ConfigSwitches {
             music: settings.music.enabled,
             mic_button: settings.remote.ptt(),
             mic_button_active: false,
+            overlay: settings.overlay.enabled,
             in_flight: Arc::new(AtomicBool::new(false)),
             slow_after: SLOW_AFTER,
         })
@@ -358,6 +380,7 @@ impl ConfigSwitches {
             music,
             mic_button: false,
             mic_button_active: false,
+            overlay: true,
             in_flight: Arc::new(AtomicBool::new(false)),
             slow_after: SLOW_AFTER,
         }
@@ -394,6 +417,7 @@ impl ConfigSwitches {
             Setting::Aec => self.aec,
             Setting::Music => self.music,
             Setting::MicButton => self.mic_button_active,
+            Setting::Overlay => self.overlay,
         }
     }
 
@@ -577,6 +601,10 @@ mod tests {
             Setting::from_object_id("remote_mic_button"),
             Some(Setting::MicButton)
         );
+        assert_eq!(
+            Setting::from_object_id("overlay_enabled"),
+            Some(Setting::Overlay)
+        );
         for id in [
             "",
             "aec",
@@ -588,6 +616,8 @@ mod tests {
             "../aec_enabled",
             "remote_ptt_enabled",
             "mic-button",
+            "overlay",
+            "overlay_enabled\n",
         ] {
             assert_eq!(Setting::from_object_id(id), None, "{id:?}");
         }
@@ -606,6 +636,14 @@ mod tests {
         assert_eq!(
             ctl_args(Setting::MicButton, false),
             ["config", "mic-button", "off"]
+        );
+        assert_eq!(
+            ctl_args(Setting::Overlay, true),
+            ["config", "overlay", "on"]
+        );
+        assert_eq!(
+            ctl_args(Setting::Overlay, false),
+            ["config", "overlay", "off"]
         );
         // The object ids map back to their own words.
         for s in ALL {
@@ -627,8 +665,9 @@ mod tests {
     fn entities_are_config_switches_with_the_known_ids() {
         let e = entities();
         let ids: Vec<_> = e.iter().map(|s| s.object_id.as_str()).collect();
-        assert_eq!(ids, [AEC_ID, MUSIC_ID, MIC_BUTTON_ID]);
+        assert_eq!(ids, [AEC_ID, MUSIC_ID, MIC_BUTTON_ID, OVERLAY_ID]);
         assert_eq!(e[2].name, "Remote mic button");
+        assert_eq!(e[3].name, "On-screen assistant");
         assert!(e.iter().all(|s| s.entity_category == EntityCategory::Config
             && !s.name.is_empty()
             && s.icon.starts_with("mdi:")));
@@ -740,6 +779,10 @@ mod tests {
                 AppCommand::SetSwitch {
                     object_id: MIC_BUTTON_ID.into(),
                     state: Some(false)
+                },
+                AppCommand::SetSwitch {
+                    object_id: OVERLAY_ID.into(),
+                    state: Some(true)
                 },
             ]
         );

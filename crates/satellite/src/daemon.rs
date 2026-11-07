@@ -42,6 +42,7 @@ use crate::darken::{self, Action, Darkener};
 use crate::firmware::{self, Model, Verdict};
 use crate::lg_voice::{self, KeyOwner, LunaSend, Takeover};
 use crate::music::{End, Music};
+use crate::overlay::{self, Overlay};
 use crate::player::{Done, Kind, Player, redact_url};
 use crate::power::{self, PowerUpdate};
 use crate::remote_mic::StreamEvent;
@@ -582,6 +583,10 @@ struct Daemon {
     lg_takeover: Option<Takeover<LunaSend>>,
     /// The mic button as `run/voice.json` reports it.
     mic_status: Option<MicButtonStatus>,
+    /// The on-screen assistant overlay (`[overlay] enabled`) and the task
+    /// that starts its app (`None` without `luna-send` or when it is off).
+    overlay: Overlay,
+    overlay_tx: Option<overlay::Sender>,
 }
 
 impl Daemon {
@@ -1021,6 +1026,23 @@ impl Daemon {
     }
 
     /// Follows whether speech-to-text audio streams (see `stt_streaming`).
+    /// Hands a changed overlay frame to its app, while the TV shows a
+    /// picture (power state `Active`, or not known): the overlay never
+    /// starts an app on a dark screen or in standby.
+    fn publish_overlay(&mut self) {
+        let Some(frame) = self.overlay.take() else {
+            return;
+        };
+        let state = self.last_power.as_ref().and_then(|p| p.state.as_deref());
+        match (&self.overlay_tx, state) {
+            (Some(tx), None | Some("Active")) => tx.send(frame),
+            (Some(_), Some(other)) => {
+                log::debug!("overlay: not shown while the TV is in {other}");
+            }
+            (None, _) => {}
+        }
+    }
+
     fn track_stt(&mut self, ev: &AppEvent) {
         match ev {
             AppEvent::StartStreaming { wake_word, .. } => self.stt_streaming = !wake_word,
@@ -1411,6 +1433,8 @@ impl Daemon {
             return;
         }
         self.track_stt(&ev);
+        self.overlay.on_event(&ev, now);
+        self.publish_overlay();
         self.remote_on_event(&ev).await;
         // A command for a TV control entity.
         let tv_out = self.tv.as_mut().and_then(|tv| tv.on_event(&ev));
@@ -1527,6 +1551,8 @@ impl Daemon {
                 if let Some(kind) = self.player.stop_reply() {
                     self.send_finished(kind, false).await;
                 }
+                self.overlay.on_playback_end(now);
+                self.publish_overlay();
             }
             AppEvent::MediaStop => self.on_media_stop().await,
             AppEvent::Music(cmd) => self.on_music(cmd).await,
@@ -1699,6 +1725,8 @@ impl Daemon {
         if done.kind == Kind::Tts {
             let audio = done.result.as_ref().ok().map(|s| s.audio);
             Self::log_line(self.runs.playback_done(now, audio));
+            self.overlay.on_playback_end(now);
+            self.publish_overlay();
         }
         self.send_finished(done.kind, success).await;
         self.alarm_poll().await;
@@ -1713,6 +1741,25 @@ fn status_version(v: &Verdict) -> &str {
         | Verdict::NotVerified { info: i, .. } => i.version.as_str(),
         _ => "?",
     }
+}
+
+/// Starts the overlay's sender with `[overlay] enabled` where `luna-send`
+/// is found (`power.luna_send`, like the power watch; never on a PC).
+fn start_overlay(settings: &Settings) -> Option<overlay::Sender> {
+    let o = &settings.overlay;
+    if !o.enabled {
+        log::info!("overlay: off (overlay.enabled = false)");
+        return None;
+    }
+    let Some(luna) = power::find_binary(&settings.power.luna_send) else {
+        log::info!(
+            "overlay: {} not found; no on-screen assistant (normal off the TV)",
+            settings.power.luna_send.display()
+        );
+        return None;
+    };
+    log::info!("overlay: on (app {})", o.app_id);
+    Some(overlay::Sender::spawn(luna, o.app_id.clone()))
 }
 
 /// Object id of the diagnostic text sensor "LG voice key".
@@ -2117,6 +2164,7 @@ pub(crate) async fn run(mut settings: Settings, triggers: TestTriggers) -> Resul
     };
     let mut player = Player::new(settings.sink.clone(), volume_gain.clone(), done_tx);
     player.set_fetch_loopback(triggers.fetch_loopback);
+    let overlay_tx = start_overlay(&settings);
     let mut d = Daemon {
         cmd_tx,
         shared: Arc::clone(&shared),
@@ -2172,6 +2220,8 @@ pub(crate) async fn run(mut settings: Settings, triggers: TestTriggers) -> Resul
         stt_streaming: false,
         lg_takeover,
         mic_status: Some(mic_status),
+        overlay: Overlay::new(overlay_tx.is_some(), Instant::now()),
+        overlay_tx,
     };
     d.publish_voice_status();
     d.publish_timers().await;
@@ -2261,6 +2311,8 @@ pub(crate) async fn run(mut settings: Settings, triggers: TestTriggers) -> Resul
                 d.alarm_poll().await;
                 d.publish_timers().await;
                 d.poll_compat_triggers().await;
+                d.overlay.on_tick(Instant::now());
+                d.publish_overlay();
             }
             () = tick_opt(ptt_timer.as_mut()) => d.ptt("--ptt-every").await,
             () = tick_opt(pairing_poll.as_mut()) => d.poll_pairing().await,
@@ -2639,6 +2691,8 @@ mod tests {
             stt_streaming: false,
             lg_takeover: None,
             mic_status: None,
+            overlay: Overlay::new(true, Instant::now()),
+            overlay_tx: None,
         };
         (d, cmd_rx)
     }
@@ -3731,6 +3785,89 @@ esac"#,
             "{v}"
         );
         d.music.take().unwrap().shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The overlay end to end in the daemon: the frames of a wake word run
+    /// reach `luna-send` as SAM launches of the overlay app, with the texts
+    /// in the parameters, in order; nothing is started while the TV is dark.
+    #[tokio::test]
+    async fn overlay_frames_reach_the_app_through_luna_send() {
+        let dir = test_dir("overlay");
+        let (mut d, _rx) = test_daemon(&dir, RemoteOff::Normal, false);
+        let fake = dir.join("luna-send");
+        let out = dir.join("launches");
+        crate::testutil::write_script(
+            &fake,
+            &format!(
+                "printf '%s %s\\n' \"$5\" \"$6\" >> '{}'\necho '{{\"returnValue\":true}}'",
+                out.display()
+            ),
+        );
+        d.overlay_tx = Some(overlay::Sender::spawn(fake, "io.example.overlay".into()));
+        let lines = |n: usize| {
+            let out = out.clone();
+            async move {
+                for _ in 0..300 {
+                    let t = std::fs::read_to_string(&out).unwrap_or_default();
+                    if t.lines().count() >= n {
+                        return t;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                std::fs::read_to_string(&out).unwrap_or_default()
+            }
+        };
+        // The idle wake word stage shows nothing.
+        d.on_event(AppEvent::StartStreaming {
+            wake_word: true,
+            conversation_id: None,
+            push_to_talk: false,
+        })
+        .await;
+        d.on_event(AppEvent::WakeWordDetected).await;
+        let t = lines(1).await;
+        assert!(
+            t.starts_with(r#"luna://com.webos.applicationManager/launch {"id":"io.example.overlay","params":{"overlay":1,"seq":1,"stage":"listening","heard":"","answer":"","error":null}}"#),
+            "{t}"
+        );
+        d.on_event(AppEvent::Transcript("qué hora es".into())).await;
+        let t = lines(2).await;
+        assert!(
+            t.lines()
+                .nth(1)
+                .unwrap()
+                .contains(r#""stage":"thinking","heard":"qué hora es""#),
+            "{t}"
+        );
+        d.on_event(AppEvent::IntentEnd {
+            speech: "Son las \"diez\".".into(),
+            continue_conversation: false,
+        })
+        .await;
+        d.on_event(AppEvent::RunEnd).await;
+        let t = lines(3).await;
+        assert!(
+            t.lines()
+                .nth(2)
+                .unwrap()
+                .contains(r#""stage":"done","heard":"qué hora es","answer":"Son las \"diez\".""#),
+            "{t}"
+        );
+        // A dark screen: the next run is not shown.
+        d.last_power = Some(PowerUpdate {
+            state: Some("Screen Off".into()),
+            processing: None,
+            reason: None,
+            on_off: None,
+        });
+        d.on_event(AppEvent::WakeWordDetected).await;
+        // The resend after a cold start (COLD_SETTLE) repeats the done frame
+        // of run 1 at most; nothing of run 2 is sent.
+        tokio::time::sleep(overlay::COLD_SETTLE + Duration::from_millis(300)).await;
+        let t = std::fs::read_to_string(&out).unwrap();
+        assert!(!t.contains(r#""seq":2"#), "{t}");
+        assert!(t.lines().count() <= 4, "{t}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

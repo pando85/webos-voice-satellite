@@ -43,9 +43,10 @@
 #                     reply-volume (N = 0 to 100) are the satellite's own
 #                     settings, written to etc/ and picked up by the running
 #                     daemon within a second. The daemon never does this
-#   config aec on|off | music on|off | mic-button on|off
+#   config aec on|off | music on|off | mic-button on|off | overlay on|off
 #                     [aec] and [music] enabled, [remote] mic_button (on:
-#                     "ptt", off: "off"); the daemon reads them at start:
+#                     "ptt", off: "off"), [overlay] enabled (the on-screen
+#                     assistant); the daemon reads them at start:
 #                     rewrites only that line of etc/config.toml (checked with
 #                     --check-config first, never installed when the check
 #                     fails) and restarts a running daemon, which ends a
@@ -88,7 +89,7 @@ here=$(cd "$(dirname "$0")" && pwd)
 . "$here/lib.sh"
 
 usage() {
-    sed -n '2,84p' "$0" >&2
+    sed -n '2,85p' "$0" >&2
     exit 2
 }
 
@@ -149,6 +150,94 @@ write_hook() {
     mv -f "$HOOK.new.$$" "$HOOK"
 }
 
+# --- the overlay app (docs/design/assistant-overlay.md, ADR 0014) ------------
+# A second web app, <app id>.overlay, shipped as payload/overlay.ipk: SAM
+# registers a second app of one package only after it restarts (EXP-024), so
+# it is installed as its own package through appinstalld, the way the
+# Homebrew Channel installs (tv/appinstall.sh). Its result is a note only: the
+# daemon runs without it (it logs that the overlay app did not start).
+OVERLAY_SUMS=$P/overlay.sums
+
+overlay_id() { [ -n "$APPDIR" ] && echo "$(basename "$APPDIR").overlay"; }
+overlay_dir() { echo "$(dirname "$APPDIR")/$(overlay_id)"; }
+
+# One appinstalld call (install IPK | remove ID), waits for the end state.
+# Status 0 when done.
+appinstall() {
+    lsp=${WEBOS_SAT_LUNA_SEND_PUB:-luna-send-pub}
+    command -v "$lsp" >/dev/null 2>&1 || { echo "no $lsp"; return 1; }
+    case $1 in
+    install)
+        uri=luna://com.webos.appInstallService/dev/install
+        params="{\"id\":\"com.ares.defaultName\",\"ipkUrl\":\"$2\",\"subscribe\":true}"
+        ok='installed|"statusValue": ?30[^0-9]'
+        ;;
+    *)
+        uri=luna://com.webos.appInstallService/dev/remove
+        params="{\"id\":\"$2\",\"subscribe\":true}"
+        ok='"statusValue": ?31[^0-9]'
+        ;;
+    esac
+    fifo=${TMPDIR:-/tmp}/webos-satellite-appinstall.$$
+    rm -f "$fifo"
+    mkfifo "$fifo" || { echo "cannot make a fifo"; return 1; }
+    "$lsp" -w 60000 -i "$uri" "$params" </dev/null >"$fifo" 2>/dev/null &
+    lp=$!
+    res=$(grep -m 1 -E -e "$ok" -e 'failed|"returnValue": ?false|"errorCode"' "$fifo") || res=
+    kill -TERM "$lp" 2>/dev/null || true
+    wait "$lp" 2>/dev/null || true
+    rm -f "$fifo"
+    if [ -z "$res" ]; then
+        echo "no answer from appinstalld"
+        return 1
+    fi
+    if printf '%s' "$res" | grep -Eq 'failed|"returnValue": ?false|"errorCode"'; then
+        printf '%s\n' "$res" | tr -c 'A-Za-z0-9 ._:,"{}-' '?' | cut -c1-160
+        return 1
+    fi
+    return 0
+}
+
+# Installs or updates the overlay app when the package's overlay.ipk differs
+# from the one installed last (or its app directory is gone).
+overlay_sync() {
+    [ -n "$APPDIR" ] && [ -f "$PAYLOAD/overlay.ipk" ] || return 0
+    want=$(sed -n 's/^\([0-9a-f]\{64\}\)  overlay\.ipk$/\1/p' "$PAYLOAD/SHA256SUMS" 2>/dev/null | head -n 1)
+    have=
+    [ ! -f "$OVERLAY_SUMS" ] || read -r have <"$OVERLAY_SUMS" || true
+    if [ -n "$want" ] && [ "$want" = "$have" ] && [ -f "$(overlay_dir)/appinfo.json" ]; then
+        return 0
+    fi
+    # appinstalld gets its own copy (it may move or delete the file).
+    tmp=${TMPDIR:-/tmp}/webos-satellite-overlay.$$.ipk
+    if ! cp "$PAYLOAD/overlay.ipk" "$tmp" 2>/dev/null; then
+        note "overlay app: cannot copy the package; not installed"
+        return 0
+    fi
+    chmod 644 "$tmp" 2>/dev/null || true
+    if why=$(appinstall install "$tmp"); then
+        echo "$want" >"$OVERLAY_SUMS.new.$$" && mv -f "$OVERLAY_SUMS.new.$$" "$OVERLAY_SUMS"
+        note "overlay app $(overlay_id) installed"
+    else
+        rm -f "$OVERLAY_SUMS"
+        note "overlay app: not installed ($why); the satellite works without the on-screen assistant"
+    fi
+    rm -f "$tmp"
+}
+
+overlay_app_present() { [ -n "$APPDIR" ] && [ -f "$(overlay_dir)/appinfo.json" ]; }
+
+# Removes the overlay app (uninstall, purge).
+overlay_remove() {
+    rm -f "$OVERLAY_SUMS"
+    [ -n "$APPDIR" ] && [ -d "$(overlay_dir)" ] || return 0
+    if why=$(appinstall remove "$(overlay_id)"); then
+        note "overlay app $(overlay_id) removed"
+    else
+        note "overlay app: not removed ($why); remove $(overlay_id) with the Homebrew Channel"
+    fi
+}
+
 cmd_install() {
     cfg=
     psk=
@@ -169,6 +258,7 @@ cmd_install() {
     if [ "$force" -eq 0 ] && [ -z "$cfg" ] && [ -z "$psk" ] && installed &&
         cmp -s "$PAYLOAD/SHA256SUMS" "$P/package.sums"; then
         note "already up to date ($(cat "$P/VERSION" 2>/dev/null || echo unknown)); nothing to do (--force reinstalls)"
+        overlay_sync
         return 0
     fi
     stop_setup_server
@@ -212,6 +302,7 @@ cmd_install() {
         note "boot hook refreshed: $HOOK"
     fi
     note "installed $(cat "$P/VERSION" 2>/dev/null || echo "(no version)") under $P"
+    overlay_sync
     if [ "$was_running" -eq 1 ]; then
         sh "$P/bin/start.sh" --supervise
     fi
@@ -354,6 +445,7 @@ cmd_uninstall() {
     [ -f "$P/$MARKER" ] || die "$P is not installed"
     locked
     remove_hook_and_stop
+    overlay_remove
     rm -rf "${P:?}/bin" "${P:?}/run" "${P:?}/out"
     rm -f "$P/VERSION" "$P/package.sums" "$P/app-dir"
     note "removed the boot hook and the daemon; kept config, key and logs in $P/etc and $P/log"
@@ -369,6 +461,7 @@ cmd_purge() {
         [ -f "$P/$MARKER" ] || die "$P exists but is not a webos-satellite install; not removing it"
         stop_daemon 10
         lg_restore_after_stop
+        overlay_remove
         cd /
         rm -rf "$P"
     fi
@@ -411,6 +504,9 @@ s/^[[:space:]]*$2[[:space:]]*=[[:space:]]*\"\\{0,1\\}\\([^\"#[:space:]]*\\).*/\\
 # (default off, ADR 0010). The daemon reads both at start only.
 aec_enabled_json() { if [ "$(cfg_section_value aec enabled)" = false ]; then printf false; else printf true; fi; }
 music_enabled_json() { if [ "$(cfg_section_value music enabled)" = true ]; then printf true; else printf false; fi; }
+# [overlay] enabled (the on-screen assistant, docs/design/assistant-overlay.md):
+# on unless the key says false (the daemon's default).
+overlay_enabled_json() { if [ "$(cfg_section_value overlay enabled)" = false ]; then printf false; else printf true; fi; }
 # [remote] mic_button (the Magic Remote's mic button, ADR 0013 proposed): off
 # unless it says ptt.
 # Who handles the Magic Remote's mic button (ADR 0013): what a running
@@ -574,6 +670,7 @@ cmd_status() {
         esac
         mic_error=$(sed -n 's/.*"mic_button_error"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$RUN_DIR/voice.json" 2>/dev/null | head -n 1 | tr -c 'A-Za-z0-9 ._:;,()/=+-' ' ' | cut -c1-200)
     fi
+    overlay_on=$(overlay_enabled_json)
     if [ "$json" -eq 0 ]; then
         note "package: ${pkg_version:-none} ($PAYLOAD)"
         note "installed: $is_inst ${inst_version:+$inst_version }in $P${build:+ ($build)}"
@@ -608,6 +705,8 @@ cmd_status() {
             note "remote mic button NOT running${mic_error:+: $mic_error}"
         fi
         note "LG voice key: $lg_voice_key (ctl.sh restore-lg-voice gives it back to LG)"
+        if overlay_app_present; then ova="app installed"; else ova="app NOT installed: ctl.sh install"; fi
+        note "on-screen assistant: $(on_off "$overlay_on") (config; ctl.sh config overlay on|off), $ova"
         return 0
     fi
     printf '{"package_version":%s,' "$(json_str "$pkg_version")"
@@ -627,6 +726,7 @@ cmd_status() {
     printf '"aec_enabled":%s,"music_enabled":%s,' "$aec_on" "$music_on"
     printf '"mic_button":%s,"mic_button_active":%s,"mic_button_error":%s,"lg_voice_key":%s,' \
         "$(json_str "$mic_button")" "$mic_active" "$( [ -n "$mic_error" ] && json_str "$mic_error" || printf null)" "$(json_str "$lg_voice_key")"
+    printf '"overlay_enabled":%s,"overlay_app":%s,' "$overlay_on" "$(json_bool overlay_app_present)"
     printf '"pairing_window_s":%s,' "$(json_str "$(cfg_value window_s | sed 's/[^0-9]//g')")"
     printf '"pairing":%s,"ha":%s,' "$(pairing_json)" "$(ha_json)"
     printf '"prefix":%s,"log":[' "$(json_str "$P")"
@@ -1194,6 +1294,8 @@ cfg_state() {
     "music "*" music=[on"*) echo on ;;
     "mic-button "*" remote=[mic_button=off"*) echo off ;;
     "mic-button "*" remote=[mic_button=ptt"*) echo on ;;
+    "overlay "*" overlay=[off]"*) echo off ;;
+    "overlay "*" overlay=[on"*) echo on ;;
     *) echo "" ;;
     esac
 }
@@ -1444,6 +1546,7 @@ cmd_config() {
     [ $# -eq 2 ] || usage
     case "$1 $2" in
     "aec on" | "aec off" | "music on" | "music off" | "mic-button on" | "mic-button off") ;;
+    "overlay on" | "overlay off") ;;
     *) usage ;;
     esac
     need_root

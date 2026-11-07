@@ -32,6 +32,8 @@ jobs:
         run: sh packaging/webos/tests/setup.sh
       - name: Status app smoke test
         run: node packaging/webos/tests/app_smoke.js
+      - name: Assistant overlay app (model and page, fake webOS runtime)
+        run: node packaging/webos/tests/overlay.js
   build-tv:
     runs-on: ubuntu-latest
     needs: lint-test

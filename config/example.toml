@@ -431,3 +431,20 @@ max_hold_s = 15
 tap_ms = 300
 # Fixed gain on the remote microphone in dB (-20 to 30); no echo canceller.
 gain_db = 0.0
+
+[overlay]
+# The on-screen assistant overlay (design: docs/design/assistant-overlay.md,
+# ADR 0014): a small transparent panel at the bottom of the screen that shows
+# "listening", what speech-to-text heard, "thinking" and the reply text over
+# whatever is on screen, and hides itself a few seconds after the run. It is
+# a second app of the package (a "topui" window that never takes the remote
+# from the app in front and plays no sound), started with luna-send, so it
+# needs luna-send (as the power watch does) and is only shown while the TV is
+# on (power state Active). The texts are shown only, never logged.
+# On by default. The TV app's Sound screen, the HA switch "On-screen
+# assistant" (overlay_enabled) and `ctl.sh config overlay on|off` change this
+# key and restart.
+enabled = true
+# The overlay app's id (the package's overlay app; change only with a
+# package built with another app id).
+app_id = "io.github.pando85.voicesatellite.overlay"

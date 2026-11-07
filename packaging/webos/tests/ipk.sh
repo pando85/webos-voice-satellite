@@ -37,6 +37,34 @@ WEBOS_SAT_SETUP_DIR=$T/setup
 export WEBOS_SAT_PREFIX WEBOS_SAT_INITD WEBOS_SAT_LOCK WEBOS_SAT_KILL_SWITCH WEBOS_SAT_SETUP_DIR
 export WEBOS_SAT_ALLOW_NONROOT=1 WEBOS_SAT_TEST_ANY_TRIPLE=1 WEBOS_SAT_UNAME_M=aarch64
 CTL="sh $APP/payload/ctl.sh"
+OV=$APPS/$ID.overlay
+# A fake appinstalld behind luna-send-pub (-w MS -i URI PARAMS): dev/install
+# unpacks the ipk into the fake root as the TV's installer lays it out and
+# answers "installed"; dev/remove deletes the app directory. Each call is
+# logged to $T/appinstall.calls.
+cat >"$T/luna-send-pub" <<FAKEPUB
+#!/bin/sh
+uri=\$4
+params=\$5
+echo "\$uri \$params" >>"$T/appinstall.calls"
+case \$uri in
+*/dev/install)
+    ipk=\$(echo "\$params" | sed -n 's/.*"ipkUrl":"\\([^"]*\\)".*/\\1/p')
+    d=\$(mktemp -d "$T/fakeinst.XXXXXX")
+    (cd "\$d" && ar x "\$ipk" && tar -xzf data.tar.gz -C "$T/root") && echo '{"details":{"state":"installed"},"statusValue":30}'
+    rm -rf "\$d"
+    ;;
+*/dev/remove)
+    id=\$(echo "\$params" | sed -n 's/.*"id":"\\([^"]*\\)".*/\\1/p')
+    rm -rf "$APPS/\$id"
+    echo '{"statusValue": 31}'
+    ;;
+esac
+exec sleep 30
+FAKEPUB
+chmod 755 "$T/luna-send-pub"
+export WEBOS_SAT_LUNA_SEND_PUB=$T/luna-send-pub
+installs() { grep -c "/dev/install" "$T/appinstall.calls" 2>/dev/null || true; }
 fails=0
 cleanup() {
     pkill -f "$S/bin/autostart.sh" 2>/dev/null || true
@@ -196,6 +224,11 @@ check "install: does not start the daemon" '! json "s[\"running\"]"'
 check "install: the setup server comes from the aarch64 build (uname aarch64), mode 0700, answers --version" 'cmp -s "$S/bin/webos-satellite-setup" "$T/s64-one" && [ "$(stat -c %a "$S/bin/webos-satellite-setup")" = 700 ] && "$S/bin/webos-satellite-setup" --version | grep -q "^webos-satellite-setup "'
 check "install: no temporary setup file, no session directory, no setup process" '[ ! -e "$S/bin/.webos-satellite-setup.new" ] && [ ! -e "$T/setup" ] && [ "$(setup_servers)" = 0 ]'
 mac1=$(grep '^mac_seed' "$S/etc/config.toml")
+check "install: the overlay app is installed through appinstalld (its own package, overlay window), status says so" '[ "$(installs)" = 1 ] && python3 -c "
+import json, sys
+a = json.load(open(sys.argv[1]))
+sys.exit(0 if a[\"id\"] == sys.argv[2] and a[\"defaultWindowType\"] == \"overlay\" and a[\"transparent\"] is True else 1)" "$OV/appinfo.json" "$ID.overlay" && [ -f "$OV/overlay.js" ] && json "s[\"overlay_app\"] is True and s[\"overlay_enabled\"] is True" && grep -q "overlay app $ID.overlay installed" "$T/out"'
+check "install: the overlay ipk was a copy (the payload keeps its own, no copy left in TMPDIR)" '[ -f "$APP/payload/overlay.ipk" ] && ! ls "${TMPDIR:-/tmp}"/webos-satellite-overlay.*.ipk >/dev/null 2>&1'
 
 # A host-runnable config (file mic, null sink, plaintext on 127.0.0.1) and a
 # key file, as an owner would set them with --config and --psk-file.
@@ -334,8 +367,16 @@ check "update: restarted with the new build (new pid, one daemon, one supervisor
 check "update: installed binary is the new one" 'cmp -s "$S/bin/webos-satellite" "$T/a64-two" && [ "$(cat "$S/VERSION")" = 0.0.2 ] && ! json "s[\"update_pending\"]"'
 check "update: config and key unchanged" '[ "$(sha256sum <"$S/etc/config.toml")" = "$cfg_sum" ] && [ "$(sha256sum <"$S/etc/noise_psk")" = "$psk_sum" ]'
 check "update: boot hook refreshed and still on" 'grep -q "^PREFIX=$S\$" "$H"'
+check "update: the changed overlay app is installed again" '[ "$(installs)" = 2 ] && grep -q "\"version\": \"0.0.2\"" "$OV/appinfo.json"'
 out=$($CTL install 2>&1)
-check "a second install of the same payload does nothing (no restart)" 'echo "$out" | grep -q "already up to date" && [ "$(running_pid)" = "$pid_v2" ]'
+check "a second install of the same payload does nothing (no restart, no overlay install)" 'echo "$out" | grep -q "already up to date" && [ "$(running_pid)" = "$pid_v2" ] && [ "$(installs)" = 2 ]'
+rm -rf "$OV"
+out=$($CTL install 2>&1)
+check "an overlay app removed by hand comes back at the next install, without a restart" '[ "$(installs)" = 3 ] && [ -f "$OV/appinfo.json" ] && [ "$(running_pid)" = "$pid_v2" ]'
+rm -rf "$OV"
+out=$(WEBOS_SAT_LUNA_SEND_PUB=$T/no-such-tool $CTL install 2>&1) && rc=0 || rc=$?
+check "no luna-send-pub: install still succeeds, the overlay app is reported missing" '[ "$rc" -eq 0 ] && echo "$out" | grep -q "overlay app: not installed (no $T/no-such-tool)" && json "s[\"overlay_app\"] is False"'
+$CTL install >/dev/null 2>&1
 $CTL install --force >/dev/null
 check "install --force reinstalls and restarts" '[ -n "$(running_pid)" ] && [ "$(running_pid)" != "$pid_v2" ] && [ "$(daemons)" = 1 ]'
 
@@ -376,6 +417,7 @@ $CTL start >/dev/null
 $CTL setup start >/dev/null 2>&1
 $CTL uninstall >/dev/null
 check "uninstall: hook gone, daemon and setup session stopped, binaries removed" '[ ! -e "$H" ] && [ "$(daemons)" = 0 ] && [ ! -e "$S/bin" ] && [ "$(setup_servers)" = 0 ] && [ ! -e "$T/setup" ]'
+check "uninstall: the overlay app is removed through appinstalld" '[ ! -e "$OV" ] && grep -q "/dev/remove {\"id\":\"$ID.overlay\"" "$T/appinstall.calls"'
 check "uninstall: config, key and logs kept" '[ "$(sha256sum <"$S/etc/config.toml")" = "$cfg_sum" ] && [ -f "$S/etc/noise_psk" ] && [ -f "$S/log/webos-satellite.log" ]'
 check "status after uninstall: not installed" 'json "s[\"installed\"] is False"'
 $CTL install >/dev/null

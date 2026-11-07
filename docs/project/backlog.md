@@ -187,3 +187,10 @@ Items not in the ranked list stay in the backlog without a priority or a phase: 
 - **Steps:** P1 to P12 in the [design, section 16](../design/phone-setup.md#16-implementation-steps): P2, P3, P4 (and P1, P8) can run in parallel with the TV app redesign; P5 and P7 are serial with it; P10 is the security review gate; P11 is the deploy to c3-a with the owner's single phone scan.
 - **Evidence needed:** EXP-012 (to be written in P1): inbound reachability of a random high port, the firewall state, the app's web engine, exec polling cost, token persistence in logs; then the on-TV run with a phone, and the review gate in [design section 13.2](../design/phone-setup.md#132-security-review-gate-backlog-3-before-the-040-release).
 - **Dependencies:** [ADR 0008](../decisions/0008-user-initiated-lg-settings.md), [Voice and power screen](../design/voice-and-power-screen.md), [packaging](../design/packaging.md), the TV app redesign.
+
+## 16. On-screen assistant overlay
+
+- **Status:** **built on the host, not released** (owner request 2026-11-07: "go with the full version"). Design: [assistant overlay](../design/assistant-overlay.md); decision: [ADR 0014](../decisions/0014-assistant-overlay.md) (proposed); evidence: [EXP-024](../experiments/EXP-024-assistant-overlay-window.md) (c3-a: `overlay` window, own package, launch and relaunch, cost, no parameters in logs).
+- **Scope:** a small transparent panel over whatever plays that shows listening, what was heard, thinking, the answer and errors for every voice run (wake word, mic button, follow-ups), Spanish first, hidden a few seconds after the run; `[overlay] enabled` on by default, in the TV app's Sound screen and as the HA switch "On-screen assistant".
+- **Next:** release and deploy (`ctl.sh install` installs the overlay app), then the owner's visual and remote check ([design, section 10](../design/assistant-overlay.md#10-the-owners-visual-check)); c3-b; whether remote keys reach the overlay while it shows.
+

@@ -273,7 +273,7 @@ const STATUS = { uid: 0, installed: true, installed_version: '0.4.0', package_ve
   pid: 42, supervised: true, autostart: true, disabled: false, crashloop: false, mic_off: false, firmware: 'firmware 03.30.74',
   firmware_ok: true, key: 'paired', name: 'webos-satellite-test', port: '6053', prefix: '/var/lib/webos-satellite',
   machine: 'aarch64', build: '', log: [], remote_off: 'normal', aec_enabled: true, music_enabled: false,
-  mic_button: 'off', mic_button_active: false, mic_button_error: null, lg_voice_key: 'lg' };
+  mic_button: 'off', mic_button_active: false, mic_button_error: null, lg_voice_key: 'lg', overlay_enabled: true, overlay_app: true };
 // What the fake ctl.sh answers: `tv` is the tv-settings reply, `setReply(cmd)` the reply of a set command.
 const fake = { tv: state({}), setReply: null, tvFails: false };
 const T = load({
@@ -281,7 +281,7 @@ const T = load({
     if (args === 'status --json') return JSON.stringify(STATUS) + '\n';
     if (args === 'tv-settings --json') return fake.tvFails ? 'ctl.sh: broken\n' : JSON.stringify(fake.tv) + '\n';
     if (args === 'setup status --json') return '{"schema":1,"state":"none","reason":"","port":null,"expires_in_s":null,"peer":null,"peer_other_subnet":null,"pending":null,"last_result":null}\n';
-    if (/^config (aec|music|mic-button) /.test(args)) return fake.soundReply(args);
+    if (/^config (aec|music|mic-button|overlay) /.test(args)) return fake.soundReply(args);
     if (/^set /.test(args)) return fake.setReply(args);
     return 'webos-satellite: done\n';
   },
@@ -289,7 +289,7 @@ const T = load({
 const { byId, doc, settle, advance, execs, key, click, calls } = T;
 const indexHtml = require('fs').readFileSync(require('path').join(__dirname, '..', 'app', 'index.html'), 'utf8');
 check('index.html row sub-lines are the voicepower.js ones', VP.ROWS.every((r) => indexHtml.indexOf('<span class="vr-sub">' + r.sub + '</span>') > 0));
-const CTL_ALLOWED = /^sh '\/media\/developer\/apps\/usr\/palm\/applications\/io\.github\.pando85\.voicesatellite\/payload\/ctl\.sh' (status --json|tv-settings --json|setup status --json|set always-ready (on|off)|set hi-lg (on|off)|set remote-off (normal|keep)|config (aec|music|mic-button) (on|off)) 2>&1$/;
+const CTL_ALLOWED = /^sh '\/media\/developer\/apps\/usr\/palm\/applications\/io\.github\.pando85\.voicesatellite\/payload\/ctl\.sh' (status --json|tv-settings --json|setup status --json|set always-ready (on|off)|set hi-lg (on|off)|set remote-off (normal|keep)|config (aec|music|mic-button|overlay) (on|off)) 2>&1$/;
 const press = async (id) => { click(id); await settle(); };
 const word = (r) => byId[`v-${r}-state`].textContent;
 const sets = () => execs().filter((c) => c !== 'tv-settings --json' && c !== 'status --json');
@@ -535,7 +535,7 @@ const nextTick = () => T.timers.filter((t) => t.live && t.interval && t.ms === 1
   const SR = VP.soundRows;
   check('sound rows before a status say Checking... and cannot be pressed', SR(null).every((r) => r.word === 'Checking...' && !r.can));
   check('sound rows from an older status without the fields: Not known, not pressable, says to update', SR({ installed: true }).every((r) => r.word === 'Not known' && !r.can && /Apply the update/.test(r.warn)));
-  const sr = SR({ aec_enabled: true, music_enabled: false, mic_button: 'off', mic_button_active: false });
+  const sr = SR({ aec_enabled: true, music_enabled: false, mic_button: 'off', mic_button_active: false, overlay_enabled: true });
   check('sound rows: echo cancellation On turns off, music Off turns on, both with two presses',
     sr[0].word === 'On' && sr[0].checked === 'true' && sr[0].cmd === 'config aec off' && sr[1].word === 'Off' && sr[1].checked === 'false' && sr[1].cmd === 'config music on'
     && sr.every((r) => r.can && r.confirm === r.warn + VP.CONFIRM_TAIL && /restarts the voice service/.test(r.warn)));
@@ -543,6 +543,17 @@ const nextTick = () => T.timers.filter((t) => t.live && t.interval && t.ms === 1
     /^Turn off echo cancellation\?/.test(sr[0].warn) && /little more CPU/.test(VP.soundConfirm('aec', true))
     && /^Turn on music\?/.test(sr[1].warn) && /encrypted connection, never from the TV itself/.test(sr[1].warn) && /Experimental/.test(sr[1].warn)
     && /only replies, announcements and timer alarms/.test(VP.soundConfirm('music', false)));
+  check('sound rows: the on-screen assistant is On (the default) and turns off with config overlay off',
+    sr[3].word === 'On' && sr[3].checked === 'true' && sr[3].cmd === 'config overlay off' && sr[3].can
+    && /^Turn off the on-screen assistant\?/.test(sr[3].warn) && /restarts the voice service/.test(sr[3].warn));
+  const ovOff = SR({ aec_enabled: true, music_enabled: false, mic_button: 'off', mic_button_active: false, overlay_enabled: false })[3];
+  check('on-screen assistant off: Off, turns on; the confirm says it never takes the remote and plays no sound',
+    ovOff.word === 'Off' && ovOff.cmd === 'config overlay on' && /never takes the remote and plays no sound/.test(ovOff.warn));
+  check('on-screen assistant from an older status without the field: Not known, not pressable',
+    SR({ aec_enabled: true, music_enabled: false, mic_button: 'off', mic_button_active: false })[3].word === 'Not known'
+    && !SR({ aec_enabled: true, music_enabled: false, mic_button: 'off', mic_button_active: false })[3].can);
+  check('sound result: the on-screen assistant', VP.soundResult('overlay', { schema: 1, setting: 'overlay', requested: 'off', before: 'on', after: 'off', result: 'applied', daemon: 'restarted', error: '' })[0]
+    === 'On-screen assistant is now Off. The voice service restarted.' && VP.soundIndex('overlay') === 3 && VP.soundIndex('aec') === 0);
   check('sound rows: the mic button row is Off and turns on (config mic-button on, two presses)',
     sr[2].word === 'Off' && sr[2].checked === 'false' && sr[2].cmd === 'config mic-button on' && sr[2].can);
   const micOn = SR({ aec_enabled: true, music_enabled: false, mic_button: 'ptt', mic_button_active: true, lg_voice_key: 'ours (configd)' })[2];
@@ -592,7 +603,7 @@ const nextTick = () => T.timers.filter((t) => t.live && t.interval && t.ms === 1
   // The fake ctl.sh for `config aec|music on|off`: what it answers and whether it changes the status.
   const sound = { mode: 'applied' };
   fake.soundReply = (args) => {
-    const m = /^config (aec|music|mic-button) (on|off)$/.exec(args);
+    const m = /^config (aec|music|mic-button|overlay) (on|off)$/.exec(args);
     if (m[1] === 'mic-button') {
       // The daemon takes LG's key at its restart: sound.mic says how that goes.
       const before = STATUS.mic_button === 'ptt' && STATUS.mic_button_active ? 'on' : 'off';
@@ -627,10 +638,14 @@ const nextTick = () => T.timers.filter((t) => t.live && t.interval && t.ms === 1
   key(40);
   const toMic = doc.activeElement === byId['s-row-mic'];
   key(40);
-  const noWrap = doc.activeElement === byId['s-row-mic'];
+  const toOverlay = doc.activeElement === byId['s-row-overlay'] && byId['s-warning'].textContent === sr[3].warn;
+  key(40);
+  const noWrap = doc.activeElement === byId['s-row-overlay'];
   key(38);
   key(38);
-  check('Sound focus: Down to Music (its text on the right), to the mic button, no wrap, Up back', downOk && toMic && noWrap && doc.activeElement === byId['s-row-aec']);
+  key(38);
+  check('Sound focus: Down to Music (its text on the right), to the mic button, to the on-screen assistant, no wrap, Up back',
+    downOk && toMic && toOverlay && noWrap && doc.activeElement === byId['s-row-aec']);
   calls.length = 0;
   await press('s-row-aec');
   check('first OK arms the row, shows the confirm text in it, sends nothing', execs().length === 0 && sword('aec') === 'Press OK again'
@@ -690,6 +705,17 @@ const nextTick = () => T.timers.filter((t) => t.live && t.interval && t.ms === 1
   check('the retry works: On', sword('mic') === 'On');
   await press('s-row-mic'); await press('s-row-mic');
   await settle();
+  // The on-screen assistant: off and on again, two presses each.
+  byId['s-row-overlay'].focus();
+  await press('s-row-overlay');
+  check('on-screen assistant off is armed with its own confirm text', byId['s-overlay-confirm-text'].textContent === sr[3].confirm && execs().filter((c) => /^config overlay/.test(c)).length === 0);
+  await press('s-row-overlay');
+  await settle();
+  check('on-screen assistant off: config overlay off sent, Off, the result line', execs().filter((c) => /^config overlay/.test(c)).join() === 'config overlay off'
+    && sword('overlay') === 'Off' && byId['s-msg'].textContent === 'On-screen assistant is now Off. The voice service restarted.');
+  await press('s-row-overlay'); await press('s-row-overlay');
+  await settle();
+  check('on-screen assistant on again: On', sword('overlay') === 'On' && execs().filter((c) => /^config overlay/.test(c)).join() === 'config overlay off,config overlay on');
   byId['s-row-aec'].focus();
   key(461);
   await settle();

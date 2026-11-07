@@ -114,6 +114,7 @@ test-packaging:
 	sh $(PKG)/tests/setup.sh
 	node $(PKG)/tests/app_smoke.js
 	node $(PKG)/tests/app_matrix.js
+	node $(PKG)/tests/overlay.js
 
 # The package lifecycle (opt-in: it builds several .ipk files with gzip -9 in
 # Python, about 1 minute of one core each). Before a release or when touching

@@ -455,6 +455,21 @@ done
 cq config remote-ptt on >/dev/null 2>&1 && rc=0 || rc=$?
 check "config remote-ptt: not a setting, exit 2" '[ "$rc" -eq 2 ]'
 
+# The on-screen assistant: [overlay] enabled, on unless it says false.
+check "status: the overlay is on by default (no [overlay] table)" 'cq status --json | grep -q "\"overlay_enabled\":true,\"overlay_app\":false," && cq status 2>/dev/null | grep -q "on-screen assistant: on" && qsum | grep -q " overlay=\[on app="'
+cp "$QC" "$T/before-ov.toml"
+out=$(cqc config overlay off 2>/dev/null) && rc=0 || rc=$?
+check "overlay off: applied, [overlay] appended with enabled = false, nothing else changed" '[ "$rc" -eq 0 ] && echo "$out" | grep -q "\"setting\":\"overlay\",\"requested\":\"off\",\"before\":\"on\",\"after\":\"off\",\"result\":\"applied\"" && tail -n 2 "$QC" | tr "\n" "|" | grep -q "^\[overlay\]|enabled = false|\$" && [ "$(diff "$T/before-ov.toml" "$QC" | grep -c "^[<>]")" -eq 3 ]'
+check "overlay off: the daemon reads it, status says so, history line" 'qsum | grep -q " overlay=\[off\]" && cq status --json | grep -q "\"overlay_enabled\":false," && grep -q " overlay result from=on to=off read=off outcome=applied source=ctl\$" "$Q/etc/tv-settings.log"'
+out=$(cqc config overlay off 2>/dev/null) && rc=0 || rc=$?
+check "overlay off again: already" '[ "$rc" -eq 0 ] && echo "$out" | grep -q "\"result\":\"already\""'
+out=$(cqc config overlay on 2>/dev/null) && rc=0 || rc=$?
+check "overlay on: the same line now says true" '[ "$rc" -eq 0 ] && echo "$out" | grep -q "\"before\":\"off\",\"after\":\"on\",\"result\":\"applied\"" && sed -n "/^\[overlay\]\$/{n;p;}" "$QC" | grep -qx "enabled = true" && qsum | grep -q " overlay=\[on app="'
+for bad in yes true ""; do
+    cq config overlay "$bad" >/dev/null 2>&1 && rc=0 || rc=$?
+    check "config overlay '$bad': usage, exit 2" '[ "$rc" -eq 2 ]'
+done
+
 # Tables that are not there: appended at the end (also after a last line without a newline).
 grep -v "^\[music\]\$\|^# music comment\$\|^enabled = false  # keep this comment\$\|^duck_db = -12.0\$" "$T/base.toml" |
     sed -e '/^\[aec\]$/,/^delay_ms/d' | sed -e '$!b' -e '/^$/d' >"$T/bare.toml"

@@ -26,6 +26,7 @@ mod lg_voice;
 mod limits;
 mod logger;
 mod music;
+mod overlay;
 mod player;
 mod power;
 mod remote_mic;

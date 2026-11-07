@@ -1,0 +1,53 @@
+/*
+ * The assistant overlay (docs/design/assistant-overlay.md): one small panel
+ * at the bottom centre of a transparent window, over whatever plays. Drawn
+ * for 1920x1080; overlay.js scales the stage for another window width.
+ * Colours are the TV app's "Calm dark" tokens. No CSS animation: a 60 fps
+ * animation kept the web runtime at about a third of a core on c3-a
+ * (EXP-024), so overlay.js moves the bars and dots in steps, 5 times a
+ * second, and only while listening or thinking.
+ */
+:root {
+  --o-panel: rgba(10, 13, 16, 0.84); --o-line: rgba(168, 190, 255, 0.28);
+  --o-fg: #EEF2F5; --o-muted: #B5C0CB; --o-accent: #A8BEFF; --o-bad: #FF8C82; --o-ok: #63D3A3;
+  --o-font: "LG Smart UI", "Museo Sans", "Roboto", "Noto Sans", "DejaVu Sans", sans-serif;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; width: 100%; height: 100%; overflow: hidden; background: transparent; }
+[hidden] { display: none !important; }
+
+.stage {
+  position: absolute; left: 0; top: 0; width: 1920px; height: 1080px;
+  transform-origin: 0 0; pointer-events: none;
+  font-family: var(--o-font); color: var(--o-fg);
+}
+.panel {
+  position: absolute; left: 50%; bottom: 72px; width: 1120px; margin-left: -560px;
+  display: flex; align-items: center; gap: 28px;
+  padding: 26px 36px; border-radius: 30px;
+  background: var(--o-panel); border: 2px solid var(--o-line);
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.45);
+  opacity: 0; transform: translateY(24px);
+  transition: opacity 220ms ease-out, transform 220ms ease-out;
+}
+.panel.in { opacity: 1; transform: translateY(0); }
+.panel.out { opacity: 0; transform: translateY(24px); transition-duration: 300ms; }
+
+.icon { flex: 0 0 76px; height: 76px; border-radius: 38px; display: flex; align-items: center; justify-content: center; background: rgba(168, 190, 255, 0.14); color: var(--o-accent); }
+.icon > * { display: none; }
+.icon svg { width: 40px; height: 40px; }
+.t-listening .bars, .t-thinking .dots, .t-answer .mark, .t-done .mark, .t-error .warn { display: flex; }
+.t-error .icon { background: rgba(255, 140, 130, 0.16); color: var(--o-bad); }
+
+.bars { align-items: center; gap: 6px; height: 44px; }
+.bars i { display: block; width: 7px; height: 44px; border-radius: 4px; background: currentColor; transform: scaleY(0.3); }
+
+.dots { gap: 9px; }
+.dots i { display: block; width: 12px; height: 12px; border-radius: 6px; background: currentColor; opacity: 0.3; }
+.dots i.on { opacity: 1; }
+
+.texts { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 6px; }
+.heard { font-size: 30px; line-height: 1.3; color: var(--o-muted); font-style: italic; overflow: hidden; max-height: 78px; }
+.status { font-size: 36px; line-height: 1.25; font-weight: 600; }
+.t-error .status { color: var(--o-bad); }
+.answer { font-size: 36px; line-height: 1.3; overflow: hidden; max-height: 141px; }

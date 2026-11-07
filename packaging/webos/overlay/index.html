@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<title>Voice Satellite overlay</title>
+<link rel="stylesheet" href="overlay.css">
+</head>
+<body>
+<div id="stage" class="stage">
+  <div id="panel" class="panel" hidden aria-live="polite">
+    <div id="icon" class="icon">
+      <span class="bars"><i id="b0"></i><i id="b1"></i><i id="b2"></i><i id="b3"></i><i id="b4"></i></span>
+      <span class="dots"><i id="d0"></i><i id="d1"></i><i id="d2"></i></span>
+      <svg class="mark" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg>
+      <svg class="warn" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v6M12 16.5v.5"/></svg>
+    </div>
+    <div class="texts">
+      <div id="heard" class="heard" hidden></div>
+      <div id="status" class="status" hidden></div>
+      <div id="answer" class="answer" hidden></div>
+    </div>
+  </div>
+</div>
+<script src="model.js"></script>
+<script src="overlay.js"></script>
+</body>
+</html>

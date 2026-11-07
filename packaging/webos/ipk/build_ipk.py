@@ -20,7 +20,13 @@ usage:
                      [--require-setup]
 
 The phone setup server (webos-satellite-setup, ADR 0009) goes in as two more
-builds, both or neither. `check` accepts a package with both or with none;
+builds, both or neither.
+
+The assistant overlay (docs/design/assistant-overlay.md, ADR 0014) is a second
+web app, `<id>.overlay`, with an `overlay` window. It is built as its own
+single-app ipk and shipped as payload/overlay.ipk: SAM does not register a
+second app of one package until it restarts (EXP-024, c3-a), so `ctl.sh
+install` hands that ipk to appinstalld itself. `check` accepts a package with both or with none;
 --require-setup (a release) refuses one without.
 """
 
@@ -56,6 +62,10 @@ PAYLOAD_SCRIPTS = [
     "status.sh", "stop.sh", "supervise.sh", "uninstall.sh",
 ]
 APP_FILES = ["index.html", "app.js", "voicepower.js", "style.css", "qrcodegen.js", "QRCODEGEN-LICENSE.txt"]
+# The overlay app (packaging/webos/overlay/), its id suffix and window.
+OVERLAY_FILES = ["index.html", "model.js", "overlay.js", "overlay.css"]
+OVERLAY_SUFFIX = ".overlay"
+OVERLAY_TITLE = "Voice Satellite overlay"
 ID_RE = re.compile(r"^[a-z0-9][a-z0-9.+-]+$")  # LG appinfo.json rules; ares-cli's check
 VERSION_RE = re.compile(r"^(0|[1-9]\d{0,8})\.(0|[1-9]\d{0,8})\.(0|[1-9]\d{0,8})$")
 FORBIDDEN_PREFIXES = ("com.palm", "com.webos", "com.lge", "com.palmdts")
@@ -189,6 +199,71 @@ def elf_check(path: Path, arch: str) -> None:
         die(f"{path} is not an {arch} ELF executable")
 
 
+def package(app_id: str, version: str, app: dict[str, tuple[bytes, int]], mtime: int, description: str) -> bytes:
+    """One single-app ipk: `app` maps file names in the app directory
+    (`payload/...` allowed) to (data, mode)."""
+    appdir = f"usr/palm/applications/{app_id}"
+    pkgdir = f"usr/palm/packages/{app_id}"
+    entries: list[tuple[str, bytes | None, int]] = []
+    dirs = ["usr", "usr/palm", "usr/palm/applications", appdir]
+    if any(n.startswith("payload/") for n in app):
+        dirs.append(f"{appdir}/payload")
+    for d in dirs + ["usr/palm/packages", pkgdir]:
+        entries.append((d + "/", None, 0o755))
+    for name, (data, mode) in app.items():
+        entries.append((f"{appdir}/{name}", data, mode))
+    packageinfo = {"app": app_id, "id": app_id, "version": version}
+    entries.append((f"{pkgdir}/packageinfo.json",
+                    (json.dumps(packageinfo, indent=2) + "\n").encode(), 0o644))
+    for name, _, _ in entries:
+        if len(name) > 99:
+            die(f"path too long for a plain ustar name: {name}")
+
+    installed_size = sum(len(d) for _, d, _ in entries if d is not None)
+    control = (f"Package: {app_id}\nVersion: {version}\nSection: misc\nPriority: optional\n"
+               f"Architecture: all\nInstalled-Size: {installed_size}\n"
+               f"Maintainer: N/A <nobody@example.com>\nLicense: {LICENSE_ID}\nDescription: {description}\n"
+               f"webOS-Package-Format-Version: 2\nwebOS-Packager-Version: x.y.x\n")
+    return ar([("debian-binary", b"2.0\n"),
+               ("control.tar.gz", tar_gz([("control", control.encode(), 0o644)], mtime)),
+               ("data.tar.gz", tar_gz(entries, mtime))], mtime)
+
+
+def overlay_package(app_id: str, version: str, mtime: int) -> bytes:
+    """The overlay app's ipk (id `<app_id>.overlay`)."""
+    ov_id = app_id + OVERLAY_SUFFIX
+    appinfo = {
+        "id": ov_id,
+        "version": version,
+        "vendor": "webos-voice-satellite",
+        "type": "web",
+        "main": "index.html",
+        "title": OVERLAY_TITLE,
+        "appDescription": "On-screen assistant of " + TITLE + " (started by the satellite)",
+        "icon": "icon.png",
+        "iconColor": "#1f6fb2",
+        # EXP-024 (c3-a, webOS 8.3): "overlay" starts as a window over the app
+        # in front (that app stays the foreground app); "topui" is refused
+        # ("Unsupported Application Type").
+        "defaultWindowType": "overlay",
+        "transparent": True,
+        "noSplashOnLaunch": True,
+        "spinnerOnLaunch": False,
+        # Not in the launcher, not in Recents.
+        "visible": False,
+        "class": {"hidden": True},
+        "disableBackHistoryAPI": True,
+    }
+    app: dict[str, tuple[bytes, int]] = {
+        "appinfo.json": ((json.dumps(appinfo, indent=2) + "\n").encode(), 0o644),
+        "icon.png": (icon(80), 0o644),
+    }
+    for name in OVERLAY_FILES:
+        app[name] = ((PKG / "overlay" / name).read_bytes(), 0o644)
+    app["LICENSE"] = ((ROOT / "LICENSE").read_bytes(), 0o644)
+    return package(ov_id, version, app, mtime, "On-screen assistant overlay of webos-satellite")
+
+
 def build(args: argparse.Namespace) -> Path:
     app_id, version = args.app_id, args.version or workspace_version()
     check_id_version(app_id, version)
@@ -220,6 +295,7 @@ def build(args: argparse.Namespace) -> Path:
     for arch, path in setup_bins.items():
         payload[f"webos-satellite-setup-{arch}"] = (path.read_bytes(), 0o755)
     payload["VERSION"] = (f"{version}\n".encode(), 0o644)
+    payload["overlay.ipk"] = (overlay_package(app_id, version, mtime), 0o644)
     sums = "".join(f"{hashlib.sha256(data).hexdigest()}  {name}\n"
                    for name, (data, _) in sorted(payload.items()))
     payload["SHA256SUMS"] = (sums.encode(), 0o644)
@@ -251,29 +327,7 @@ def build(args: argparse.Namespace) -> Path:
     for name, entry in payload.items():
         app[f"payload/{name}"] = entry
 
-    appdir = f"usr/palm/applications/{app_id}"
-    pkgdir = f"usr/palm/packages/{app_id}"
-    entries: list[tuple[str, bytes | None, int]] = []
-    for d in ["usr", "usr/palm", "usr/palm/applications", appdir, f"{appdir}/payload",
-              "usr/palm/packages", pkgdir]:
-        entries.append((d + "/", None, 0o755))
-    for name, (data, mode) in app.items():
-        entries.append((f"{appdir}/{name}", data, mode))
-    packageinfo = {"app": app_id, "id": app_id, "version": version}
-    entries.append((f"{pkgdir}/packageinfo.json",
-                    (json.dumps(packageinfo, indent=2) + "\n").encode(), 0o644))
-    for name, _, _ in entries:
-        if len(name) > 99:
-            die(f"path too long for a plain ustar name: {name}")
-
-    installed_size = sum(len(d) for _, d, _ in entries if d is not None)
-    control = (f"Package: {app_id}\nVersion: {version}\nSection: misc\nPriority: optional\n"
-               f"Architecture: all\nInstalled-Size: {installed_size}\n"
-               f"Maintainer: N/A <nobody@example.com>\nLicense: {LICENSE_ID}\nDescription: {DESCRIPTION}\n"
-               f"webOS-Package-Format-Version: 2\nwebOS-Packager-Version: x.y.x\n")
-    blob = ar([("debian-binary", b"2.0\n"),
-               ("control.tar.gz", tar_gz([("control", control.encode(), 0o644)], mtime)),
-               ("data.tar.gz", tar_gz(entries, mtime))], mtime)
+    blob = package(app_id, version, app, mtime, DESCRIPTION)
 
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -312,6 +366,39 @@ def untar(blob: bytes) -> dict[str, tuple[tarfile.TarInfo, bytes | None]]:
             data = tar.extractfile(info).read() if info.isfile() else None
             out[info.name] = (info, data)
     return out
+
+
+def check_overlay(blob: bytes, ov_id: str, version: str) -> list[str]:
+    """Problems of the embedded overlay ipk (empty when it is fine)."""
+    errors: list[str] = []
+    try:
+        m = dict(ar_members(blob))
+        ctrl = untar(m["control.tar.gz"])
+        fields = dict(line.split(": ", 1) for line in ctrl["control"][1].decode().splitlines() if line)
+        data = untar(m["data.tar.gz"])
+    except Exception as e:  # noqa: BLE001 - any parse failure is a check failure
+        return [f"not an ipk ({e.__class__.__name__})"]
+    if fields.get("Package") != ov_id or fields.get("Version") != version:
+        errors.append(f"Package/Version {fields.get('Package')} {fields.get('Version')}")
+    appdir = f"usr/palm/applications/{ov_id}"
+    apps = {n.split("/")[3] for n in data if n.startswith("usr/palm/applications/") and n.count("/") >= 3}
+    if apps != {ov_id}:
+        errors.append(f"application directories {sorted(apps)}")
+        return errors
+    for name, (info, _) in data.items():
+        if name.startswith("/") or ".." in name.split("/") or info.uid != 0 or info.mode & 0o022:
+            errors.append(f"unsafe entry {name}")
+    appinfo = json.loads(data[f"{appdir}/appinfo.json"][1])
+    want = {"id": ov_id, "version": version, "type": "web", "main": "index.html",
+            "defaultWindowType": "overlay", "transparent": True, "noSplashOnLaunch": True,
+            "spinnerOnLaunch": False, "disableBackHistoryAPI": True}
+    for k, v in want.items():
+        if appinfo.get(k) != v:
+            errors.append(f"appinfo {k} is {appinfo.get(k)!r}, not {v!r}")
+    for name in OVERLAY_FILES + ["icon.png", "LICENSE"]:
+        if f"{appdir}/{name}" not in data:
+            errors.append(f"lacks {name}")
+    return errors
 
 
 def check(args: argparse.Namespace) -> None:
@@ -382,7 +469,8 @@ def check(args: argparse.Namespace) -> None:
     payload = {n[len(appdir) + 9:]: d for n, (_, d) in data.items()
                if n.startswith(f"{appdir}/payload/") and d is not None}
     expected = set(PAYLOAD_SCRIPTS) | {"webos-satellite.hook", "config.default.toml", "VERSION",
-                                       "SHA256SUMS", "webos-satellite-armv7", "webos-satellite-aarch64"}
+                                       "SHA256SUMS", "webos-satellite-armv7", "webos-satellite-aarch64",
+                                       "overlay.ipk"}
     have_setup = [n for n in SETUP_NAMES if n in payload]
     need(len(have_setup) in (0, len(SETUP_NAMES)), f"only one build of the setup server: {have_setup}")
     need(have_setup or not args.require_setup, "the phone setup server is not in the package (--require-setup)")
@@ -409,6 +497,8 @@ def check(args: argparse.Namespace) -> None:
                 need(blob[:4] == b"\x7fELF" and blob[4] == want_class
                      and struct.unpack("<H", blob[18:20])[0] == want_machine, f"{name} is not {arch} ELF")
     need(b"@PREFIX@" in (payload.get("webos-satellite.hook") or b""), "hook template lacks @PREFIX@")
+    for e in check_overlay(payload.get("overlay.ipk") or b"", app_id + OVERLAY_SUFFIX, version):
+        errors.append(f"payload/overlay.ipk: {e}")
     secret = re.compile(rb"^\s*noise_psk\s*=", re.M)
     need(not secret.search(payload.get("config.default.toml") or b""), "default config holds an inline key")
 
@@ -416,7 +506,7 @@ def check(args: argparse.Namespace) -> None:
         print("\n".join(f"FAIL  {e}" for e in errors), file=sys.stderr)
         sys.exit(1)
     print(f"ok: {path.name} ({len(data)} entries, payload {len(payload)} files"
-          f"{', with the setup server' if have_setup else ', no setup server'})")
+          f"{', with the setup server' if have_setup else ', no setup server'}, overlay app {app_id}{OVERLAY_SUFFIX})")
 
 
 def main() -> None:

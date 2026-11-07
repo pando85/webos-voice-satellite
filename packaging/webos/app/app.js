@@ -31,9 +31,10 @@
     // Voice and power screen: one read and six fixed changes, no typed text.
     'tv-settings --json', 'set always-ready on', 'set always-ready off', 'set hi-lg on', 'set hi-lg off',
     'set remote-off normal', 'set remote-off keep',
-    // Sound screen: three config keys; each change restarts the daemon.
+    // Sound screen: four config keys; each change restarts the daemon.
     'config aec on', 'config aec off', 'config music on', 'config music off',
     'config mic-button on', 'config mic-button off',
+    'config overlay on', 'config overlay off',
     // Phone setup (ADR 0009): start, the poll (also the heartbeat), stop.
     'setup start', 'setup status --json', 'setup stop'];
   var ANSWER_RE = /^setup answer [0-9a-f]{8} (allow|refuse)$/;
@@ -152,7 +153,7 @@
   var FOCUS = {
     home: ['h-notice-btn', 'h-mic', 'h-voice', 'h-sound', 'h-ha', 'h-diag'],
     voice: ['v-row-ar', 'v-row-hl', 'v-row-keep', 'v-refresh', 'v-hint-btn'],
-    sound: ['s-row-aec', 's-row-music', 's-row-mic'],
+    sound: ['s-row-aec', 's-row-music', 's-row-mic', 's-row-overlay'],
     ha: ['a-pair', 'a-phone', 'a-reset', 'a-endphone'],
     setup: ['q-done', 'q-again'],
     diag: ['d-check', 'd-report', 'd-ack', 'd-more'],
@@ -797,7 +798,8 @@
   var SROWS = [
     { id: 'aec', btn: 's-row-aec', state: 's-aec-state', sw: 's-aec-sw', confirm: 's-aec-confirm' },
     { id: 'music', btn: 's-row-music', state: 's-music-state', sw: 's-music-sw', confirm: 's-music-confirm' },
-    { id: 'mic', btn: 's-row-mic', state: 's-mic-state', sw: 's-mic-sw', confirm: 's-mic-confirm' }
+    { id: 'mic', btn: 's-row-mic', state: 's-mic-state', sw: 's-mic-sw', confirm: 's-mic-confirm' },
+    { id: 'overlay', btn: 's-row-overlay', state: 's-overlay-state', sw: 's-overlay-sw', confirm: 's-overlay-confirm' }
   ];
   var sArmed = null;    // id of the row waiting for the second press
   var sArmToken = 0;
