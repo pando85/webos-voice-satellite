@@ -13,7 +13,7 @@ Device rules from [AGENTS.md](../../AGENTS.md) still apply to every item: each r
 | # | Item | Who acts | Needs first | Follow |
 | --- | --- | --- | --- | --- |
 | 1 | 0.6.0 acceptance test of the mic-key grab on c3-a | owner, at the TV | 0.6.0 installed on c3-a, about 20 minutes, someone free to use the remote | [section 1](#1-060-owner-acceptance-test-on-c3-a), [ADR 0016](../decisions/0016-remote-key-grab.md#implementation-plan-if-accepted) |
-| 2 | Grab on c3-b (firmware `03.30.73`) | owner runs, agent prepares the record | c3-b unmuted in HA for the run; EXP-026 Part B2 and B3 on c3-b | [section 2](#2-c3-b-is-not-on-the-grab-allow-list) |
+| 2 | Grab on c3-b (firmware `03.30.73`, verified by owner decision 2026-11-08): the acceptance run | owner, at the TV | the next release installed on c3-b; c3-b unmuted in HA for the run; the same test as c3-a (section 1) | [section 2](#2-c3-b-grab-verified-by-owner-decision) |
 | 3 | Security hypothesis: does an app update reset the app directory to 0777? (not confirmed at 0.6.0) | agent, at the next app update | an app update the owner approves | [section 3](#3-security-follow-up-the-installer-and-the-app-directory-mode) |
 | 4 | ADR 0015 (silent key filter) | nobody now | only if the grab cannot work on some firmware | [section 4](#4-adr-0015-deferred-fallback) |
 | 5 | Remote-proxy features | owner decides, later | 0.6.0 accepted on the TV and soaked | [section 5](#5-future-remote-proxy-features) |
@@ -41,10 +41,10 @@ Steps:
 
 Pass: every step passes. Record the result as a short entry in the c3-a P4 log and the [c3-a record](../compatibility/c3-a.md), with counts and timings only. Fail: turn the feature off (the kernel releases the grab, ADR 0013's restore runs), or `ctl.sh restore-lg-voice`, or restart the TV; write down which step failed before changing anything. Two remotes in one household are a known unverified case (ADR 0016, risks).
 
-## 2. c3-b is not on the grab allow list
+## 2. c3-b: grab verified by owner decision
 
-- **State:** c3-b runs firmware `03.30.73`. The grab is enabled only on firmware where EXP-026 passed, and that is c3-a's `03.30.74` only ([verified models](../compatibility/verified-models.md), [ADR 0006](../decisions/0006-soft-firmware-policy-and-compatibility-reports.md)). On c3-b the feature runs as ADR 0013 describes: the configd override alone, so the toast shows.
-- **To enable it:** the owner runs EXP-026 Part B2 (grab test) and B3 (kill test) on c3-b ([EXP-026](../experiments/EXP-026-mic-key-grab-reinject.md)). If both pass, add the firmware to the allow-list table and record the result in the c3-b record. Part A (read-only) on c3-b comes first if it was not run.
+- **State (2026-11-08):** the owner declared c3-b's firmware `03.30.73` verified for the grab, by decision; it is on the same verified list as `03.30.74`, with the same status text ([ADR 0016 amendment](../decisions/0016-remote-key-grab.md#amendment-2026-11-08-c3-b-firmware-verified-by-owner-decision)). The evidence is the c3-b EXP-026 Part A read-only structural match (same devices, key bitmap and compositor as c3-a) plus the owner's decision; EXP-026 B2/B3 have not been run on c3-b. Any other firmware still runs as ADR 0013 describes (the configd override alone, so the toast shows).
+- **The owner's acceptance run on c3-b** is the same list as c3-a's (section 1), once the release with this change is installed; it supplies the on-target result for the c3-b record. Rollback, if the owner wants it: turn the mic button off on c3-b (nothing of the grab runs then), or remove the entry in a release.
 - **Prerequisite:** c3-b is still **muted by HA's switch**, so its microphone is closed. The acceptance steps that use the assistant need it unmuted, and only the owner decides when to change that.
 - **Also open:** the second-remote question (section 1).
 

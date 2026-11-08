@@ -298,7 +298,7 @@ Every control is also gated at run time by section 6. **Firmware guard (owner de
 
 ## 10. Safety
 
-1. **User-initiated only.** A setter runs only in response to an HA command on an entity the owner enabled. The daemon never changes volume, input, app or screen by itself. The only automatic action stays the existing, opt-in wake-and-darken on a remote power-off.
+1. **User-initiated only.** A setter runs only in response to an HA command on an entity the owner turned on. The daemon never changes volume, input, app or screen by itself. The only automatic action stays the existing, opt-in wake-and-darken on a remote power-off.
 2. **No silent settings writes.** v1 writes no TV setting. *(ADR 0008, 2026-11-05: the TV app may write Always Ready and LG hands-free on a user's press; the daemon and these entities never do.)* Volume and mute are the normal user controls (the TV keeps them as the remote would).
 3. **Read back every write** (section 6); a mismatch is reported, never retried with other parameters.
 4. **Never a write at startup**, not even a probe.

@@ -40,9 +40,16 @@ use tokio::time::timeout;
 use crate::config::{KeyGrab, RemoteSection};
 use crate::evdev::Key;
 
-/// Firmware versions where EXP-026 Part B (B2 grab, B3 kill test) passed,
-/// with the sibling that receives the re-sent events there.
-pub(crate) const VERIFIED_FIRMWARE: &[(&str, &str)] = &[("03.30.74", "LGE M-RCU - Builtin [2]")];
+/// Firmware versions the grab runs on (verified), with the sibling that
+/// receives the re-sent events there. Any other firmware is refused.
+pub(crate) const VERIFIED_FIRMWARE: &[(&str, &str)] = &[
+    // c3-a (LG C3 42): EXP-026 Part B (B2 grab, B3 kill test) passed.
+    ("03.30.74", "LGE M-RCU - Builtin [2]"),
+    // c3-b (LG C3 55): declared verified by the owner on 2026-11-08 (ADR
+    // 0016 amendment); basis EXP-026 Part A on c3-b (read-only: the same
+    // devices, key bitmap and compositor as c3-a). B2/B3 were not run there.
+    ("03.30.73", "LGE M-RCU - Builtin [2]"),
+];
 
 /// The remote's slots: every device whose name starts with this.
 pub(crate) const SOURCE_PREFIX: &str = "LGE M-RCU - Builtin [";
@@ -129,7 +136,7 @@ pub(crate) fn plan(
             .map(|(_, t)| (*t).to_owned())
     }) else {
         return Err(format!(
-            "firmware {} has not passed EXP-026 (the grab is verified on {})",
+            "firmware {} is not on the grab's list ({})",
             firmware.unwrap_or("unknown"),
             VERIFIED_FIRMWARE
                 .iter()
@@ -712,9 +719,16 @@ mod tests {
                 .windows(2)
                 .any(|w| w[0] == "--catch" && w[1] == "428")
         );
-        // other firmware: not verified
-        let e = plan(&r, Some("03.30.73"), Some(&d)).unwrap_err();
-        assert!(e.contains("03.30.73") && e.contains("03.30.74"), "{e}");
+        // c3-b's firmware: on the verified list (owner, 2026-11-08)
+        let c3b = plan(&r, Some("03.30.73"), Some(&d)).unwrap();
+        assert_eq!(c3b.target, "LGE M-RCU - Builtin [2]");
+        // any other firmware: refused
+        let e = plan(&r, Some("03.30.72"), Some(&d)).unwrap_err();
+        assert!(
+            e.contains("03.30.72") && e.contains("03.30.74") && e.contains("03.30.73"),
+            "{e}"
+        );
+        assert!(plan(&r, Some("33.31.75"), Some(&d)).is_err());
         assert!(plan(&r, None, Some(&d)).is_err());
         // a configured target never bypasses the firmware gate ...
         let r2 = RemoteSection {
@@ -722,9 +736,9 @@ mod tests {
             ..section()
         };
         assert!(
-            plan(&r2, Some("03.30.73"), Some(&d))
+            plan(&r2, Some("03.30.72"), Some(&d))
                 .unwrap_err()
-                .contains("has not passed EXP-026")
+                .contains("is not on the grab's list")
         );
         // ... and only chooses among the slots on a verified one
         assert_eq!(
@@ -929,6 +943,7 @@ mod tests {
             ..GrabStatus::default()
         };
         assert!(describe(&st).starts_with("on: event2 -> event4"));
+        assert!(!describe(&st).contains("verified"));
         for s in ["starting", "stopped"] {
             st.state = s;
             assert_eq!(describe(&st), s);

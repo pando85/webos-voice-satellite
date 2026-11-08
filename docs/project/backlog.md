@@ -198,11 +198,11 @@ Items not in the ranked list stay in the backlog without a priority or a phase: 
 ## 17. Remote key grab on any webOS TV
 
 - **Status:** **not started**, planned only, no dates (owner request 2026-11-08, widened the same day: "more generic. We will have to find a way, because if not the remote-proxy doesn't work there and we will see the notification when we click on mic button"). Roadmap: [Phase 5](roadmap.md#phase-5-second-tv-and-packaging).
-- **Why:** a firmware allowlist does not scale. On any TV not on the list the grab stays off and the mic button shows LG's "function not supported" toast ([ADR 0016](../decisions/0016-remote-key-grab.md) decision 6). The list is compiled into the daemon (`VERIFIED_FIRMWARE`, one entry: `03.30.74`), so each new firmware would need a release.
+- **Why:** a firmware allowlist does not scale. On any TV not on the list the grab stays off and the mic button shows LG's "function not supported" toast ([ADR 0016](../decisions/0016-remote-key-grab.md) decision 6). The list is compiled into the daemon (`VERIFIED_FIRMWARE`: `03.30.74` and `03.30.73`), so each new firmware would need a release.
 - **Goal:** the grab works, or fails safe, on any webOS TV without a release per firmware. A TV where it cannot run behaves exactly as today (the ADR 0013 override and the toast), never worse. The compatibility table and the shareable report below support this; they are not the mechanism.
 - **What exists today and what is new:**
   - Exists: discovery of the remote's slots by name (`LGE M-RCU - Builtin [n]`); the read-only `remote-proxy serve ... --check`, which compares capabilities and `ABS` ranges of the slots with the target's; refusal when a slot cannot be re-sent through the target; the four-layer dead-man; the status field `key_grab` with the reason.
-  - Still fixed in a table: the target slot per firmware (`[2]` on `03.30.74`), and the gate itself (a firmware not on the list never grabs).
+  - Still fixed in a table: the target slot per firmware (`[2]` on `03.30.74` and `03.30.73`), and the gate itself (a firmware not on the list never grabs).
   - New (everything in the sections below): target choice from structure, the live self-test, graduated trust, the fallback ladder, per-version research, the tier in the status, the shareable report.
 
 ### 17.1 Generic discovery

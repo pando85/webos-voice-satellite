@@ -38,9 +38,9 @@ Observations: **verified** for the status transitions, holders and `hw_params` a
 
 ## 3. Step 5b: Hands-free ("Hi LG")
 
-**Status: done 2026-11-01. One run, one power state (TV on), owner-enabled hands-free.**
+**Status: done 2026-11-01. One run, one power state (TV on), hands-free turned on by the owner.**
 
-**Method.** On 2026-11-01 the owner enabled LG hands-free voice recognition in Settings while a read-only watcher ran for 240 s. The watcher polled `/proc/asound/card*/pcm*/sub0/status` every 0.2 s and, on any change, dumped `hw_params` and scanned `/proc/*/fd` for `/dev/snd/pcm*` holders. Times are seconds since boot. Raw log: `devices/private/c3-a/D3/step5b-handsfree.txt` (gitignored, not committed).
+**Method.** On 2026-11-01 the owner turned on LG hands-free voice recognition in Settings while a read-only watcher ran for 240 s. The watcher polled `/proc/asound/card*/pcm*/sub0/status` every 0.2 s and, on any change, dumped `hw_params` and scanned `/proc/*/fd` for `/dev/snd/pcm*` holders. Times are seconds since boot. Raw log: `devices/private/c3-a/D3/step5b-handsfree.txt` (gitignored, not committed).
 
 **Observations.**
 
