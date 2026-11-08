@@ -195,7 +195,61 @@ Items not in the ranked list stay in the backlog without a priority or a phase: 
 - **Scope:** a small transparent panel over whatever plays that shows listening, what was heard, thinking, the answer and errors for every voice run (wake word, mic button, follow-ups), Spanish first, hidden a few seconds after the run; `[overlay] enabled`, off by default for the first release, in the TV app's Sound screen and as the HA switch "On-screen assistant".
 - **Next:** release and deploy (`ctl.sh install` installs the overlay app), then the owner's visual and remote check ([design, section 10](../design/assistant-overlay.md#10-the-owners-visual-check)); c3-b; whether remote keys reach the overlay while it shows.
 
-## 17. Remote key grab compatibility by firmware
+## 17. Remote key grab on any webOS TV
 
-- **Status:** **not started**, planned only (owner request 2026-11-08). Roadmap: [Phase 5](roadmap.md#phase-5-second-tv-and-packaging).
-- **Scope:** a compatibility table keyed by firmware (`verified`, `owner-enabled`, `unsupported`, `unknown`), a read-only, redacted one-command check built on the helper's `--check` that owners can run and share, structure-based gating instead of a fixed list (list kept as an override), criteria for enabling a firmware by default (full test, soak with no stuck keys, one owner-run session), the verdict shown in the TV app and the HA sensor, and reports filed as compatibility issues. See [ADR 0016](../decisions/0016-remote-key-grab.md).
+- **Status:** **not started**, planned only, no dates (owner request 2026-11-08, widened the same day: "more generic. We will have to find a way, because if not the remote-proxy doesn't work there and we will see the notification when we click on mic button"). Roadmap: [Phase 5](roadmap.md#phase-5-second-tv-and-packaging).
+- **Why:** a firmware allowlist does not scale. On any TV not on the list the grab stays off and the mic button shows LG's "function not supported" toast ([ADR 0016](../decisions/0016-remote-key-grab.md) decision 6). The list is compiled into the daemon (`VERIFIED_FIRMWARE`, one entry: `03.30.74`), so each new firmware would need a release.
+- **Goal:** the grab works, or fails safe, on any webOS TV without a release per firmware. A TV where it cannot run behaves exactly as today (the ADR 0013 override and the toast), never worse. The compatibility table and the shareable report below support this; they are not the mechanism.
+- **What exists today and what is new:**
+  - Exists: discovery of the remote's slots by name (`LGE M-RCU - Builtin [n]`); the read-only `remote-proxy serve ... --check`, which compares capabilities and `ABS` ranges of the slots with the target's; refusal when a slot cannot be re-sent through the target; the four-layer dead-man; the status field `key_grab` with the reason.
+  - Still fixed in a table: the target slot per firmware (`[2]` on `03.30.74`), and the gate itself (a firmware not on the list never grabs).
+  - New (everything in the sections below): target choice from structure, the live self-test, graduated trust, the fallback ladder, per-version research, the tier in the status, the shareable report.
+
+### 17.1 Generic discovery
+
+- **Choose from structure, not firmware name.** Find the remote's slots by name and by the capability fingerprint (`EVIOCGBIT`, `EVIOCGABS`). The target is an idle sibling with identical capabilities. The per-version differences ([ADR 0016](../decisions/0016-remote-key-grab.md): `[2]` on webOS 8.3, `[1]` on webOS 10 and later, where re-sending through `[2]` made Back exit apps) should fall out of the discovery, not be written down per firmware. Whether "idle" and "the Back quirk" can be told apart by structure alone is part of the research (17.5); if not, a small per-generation hint may stay as a hint, never as a gate.
+- **Refuse on any ambiguity:** no identical sibling, several candidates, another reader already on the target, a different key set, a remote slot that cannot be re-sent through the target, or the daemon's key device not among the sources. It refuses rather than guesses (the helper already refuses the last two).
+
+### 17.2 Live self-test instead of a firmware gate
+
+- **When:** at enable time, before the first grab, the helper runs a short loopback test: a harmless synthetic event written into the chosen sibling and seen by a second reader. It shows that re-injection into that node works on this TV, as EXP-026 B1 did by hand ([EXP-026](../experiments/EXP-026-mic-key-grab-reinject.md)).
+- **No key press and no effect on the TV.** The event must leave the TV's UI untouched. EXP-026 B1key shows why this needs care: a Right arrow written into `[2]` moved the highlight, and an `ABS` frame equal to the current value is dropped by the input core. The event to use (for example a no-op `EV_MSC` scan code, or an event no handler maps) is itself something to verify on a TV before it ships.
+- **What it proves, and what it does not.** It proves the node accepts writes and delivers them to other readers. It does not prove that LG's compositor takes events from that node. EXP-026 B1key and B2 showed that it does on c3-a; on another TV that is the part the loopback cannot see.
+- **Open question:** whether a compositor-side check is possible without reading LG internals and without signalling any LG process (AGENTS.md allows nothing beyond the ADR 0013 and 0016 exceptions). Not assumed to work. If it does not, tier 1 below rests on the loopback plus structure, and the owner-run test (tier 2) is what proves the compositor side.
+- **Failed test:** the grab stays off, the reason is reported, and the daemon uses the existing ADR 0013 override.
+
+### 17.3 Graduated trust instead of an allowlist
+
+| Tier | Condition | Behaviour and label |
+| --- | --- | --- |
+| 1 | Structure and loopback pass | Runs when the owner turns on the mic button, with the dead-man active; marked "not verified on this firmware" |
+| 2 | The owner-run test is recorded (mic presses, kill test, Home, volume, number keys; as in the [ADR 0016 acceptance](../decisions/0016-remote-key-grab.md#implementation-plan-if-accepted)) | The firmware is marked verified in the [compatibility table](../compatibility/README.md) |
+| 3, default on | Verified firmware versions across more than one model and webOS generation | Enabled by default; until then it stays opt-in through the mic button option |
+
+- The allowlist becomes a **deny list**: firmware known to break (for example one where the key no longer reaches evdev, as reported for webOS 11.2, or where the sibling misbehaves) is refused.
+- The status labels follow the soft firmware policy of [ADR 0006](../decisions/0006-soft-firmware-policy-and-compatibility-reports.md): a result is reported, never silently turned into support.
+
+### 17.4 Fallback ladder
+
+When the grab cannot run, in this order, each step chosen automatically and shown in the status:
+
+1. **The grab** (ADR 0016).
+2. **The silent key filter** of [ADR 0015](../decisions/0015-silent-mic-key-filter.md), only if it is still viable on that firmware (it is a deferred, unaccepted draft that runs code inside LG's compositor; it would need its own acceptance and checks first).
+3. **The ADR 0013 configd override with the toast** (today's behaviour).
+4. **LG's own assistant** if everything fails (the override cannot be set): the mic button does what LG made it do.
+
+### 17.5 Research tasks to remove the unknowns
+
+Each is a bounded question, read-only first, with sources labelled `documented`, `observed-on-other-device` or `verified-on-target`:
+
+- What actually differs across webOS 6, 7, 8, 9 and 10 in the remote's input devices (slot count and names, capabilities, `ABS` ranges, which slot `lginput2` writes to, sibling behaviour). Sources: the community tools' device dumps ([interception research, section 6](../research/mic-button-key-interception.md#6-community-tools)), owner reports through the compatibility form, passive reads as in EXP-026 Part A.
+- Whether any firmware exposes the remote differently (a single device, other names, a voice key that does not reach evdev).
+- Whether the key can be dropped upstream of the compositor on some versions (for example before `lginput2` writes it), without hooking LG's services; the interception research ranks those routes low, so this is a check, not a plan.
+
+### 17.6 Visibility
+
+The TV app's mic row and the Home Assistant sensor show the tier and the reason: "verified", "not verified, running", "fallback: toast", "fallback: LG assistant", with why (for example "no identical sibling", "loopback failed", "firmware on the deny list"). It extends the existing `key_grab` status field.
+
+### 17.7 Sharing results
+
+A read-only, redacted compatibility report, built on `--check` and the existing report flow (TV app QR code or `ctl.sh report`, then the [compatibility issue form](../../.github/ISSUE_TEMPLATE/compatibility-report.yml)). It lists firmware and model, the remote's input devices and their capability fingerprint, whether an identical sibling exists, whether another process holds the devices, the self-test result and the tier. No serial numbers, MAC addresses or other identifiers; it writes nothing and presses nothing. Other owners file it; verified rows go into the compatibility table.
