@@ -2,6 +2,11 @@
 
 Releases of the webOS voice satellite package (`io.github.pando85.voicesatellite`). Earlier versions (0.1.0 to 0.5.1) are described in the git history and in the install records ([c3-a](docs/discovery/c3-a/P4-permanent-install.md), [c3-b](docs/discovery/c3-b/P4-permanent-install.md)).
 
+## 0.6.1 (2026-11-08)
+
+- Remote key grab verified on firmware `03.30.73` (c3-b), by owner decision (2026-11-08; commit `c5dc2a7`, [ADR 0016](docs/decisions/0016-remote-key-grab.md)), next to `03.30.74` (c3-a). Other firmware is still refused: the grab stays off there and the configd override alone is used.
+- Still off by default: nothing of the grab runs unless `[remote] mic_button = "ptt"`.
+
 ## 0.6.0 (2026-11-07)
 
 - **Remote key grab ([ADR 0016](docs/decisions/0016-remote-key-grab.md)).** With the mic button feature on (`[remote] mic_button = "ptt"`), a helper (`bin/remote-proxy`, new in the package) takes an exclusive grab of the Magic Remote's input device and re-sends every event except the mic key into an idle sibling device, so LG's toast and LG's assistant do not react to the mic key. It runs under ADR 0016's four-layer dead-man and releases the grab and every held key on feature off, stop, crash and uninstall. ADR 0013's in-memory configd override stays as the safety net.
