@@ -6,6 +6,7 @@ Releases of the webOS voice satellite package (`io.github.pando85.voicesatellite
 
 - Remote key grab verified on firmware `03.30.73` (c3-b), by owner decision (2026-11-08; commit `c5dc2a7`, [ADR 0016](docs/decisions/0016-remote-key-grab.md)), next to `03.30.74` (c3-a). Other firmware is still refused: the grab stays off there and the configd override alone is used.
 - Still off by default: nothing of the grab runs unless `[remote] mic_button = "ptt"`.
+- Package sha256 `a7b367e9211fb8bcda2e0f07d9f04b3a89c2a7b083ddc0c412ef2194b30f43cf`. Installed on c3-b on 2026-11-08 with the owner's mic button on, so the grab started there (`key_grab` `on`, `lg_voice_key` `ours (grab + configd)`, no WARN or ERROR; [c3-b P4](docs/discovery/c3-b/P4-permanent-install.md#update-to-061-2026-11-08-key-grab-started)). **Not installed on c3-a:** unreachable (no ping, no SSH) at 00:25Z and 06:39Z; c3-a stays on 0.6.0.
 
 ## 0.6.0 (2026-11-07)
 
