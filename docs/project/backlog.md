@@ -195,3 +195,7 @@ Items not in the ranked list stay in the backlog without a priority or a phase: 
 - **Scope:** a small transparent panel over whatever plays that shows listening, what was heard, thinking, the answer and errors for every voice run (wake word, mic button, follow-ups), Spanish first, hidden a few seconds after the run; `[overlay] enabled`, off by default for the first release, in the TV app's Sound screen and as the HA switch "On-screen assistant".
 - **Next:** release and deploy (`ctl.sh install` installs the overlay app), then the owner's visual and remote check ([design, section 10](../design/assistant-overlay.md#10-the-owners-visual-check)); c3-b; whether remote keys reach the overlay while it shows.
 
+## 17. Remote key grab compatibility by firmware
+
+- **Status:** **not started**, planned only (owner request 2026-11-08). Roadmap: [Phase 5](roadmap.md#phase-5-second-tv-and-packaging).
+- **Scope:** a compatibility table keyed by firmware (`verified`, `owner-enabled`, `unsupported`, `unknown`), a read-only, redacted one-command check built on the helper's `--check` that owners can run and share, structure-based gating instead of a fixed list (list kept as an override), criteria for enabling a firmware by default (full test, soak with no stuck keys, one owner-run session), the verdict shown in the TV app and the HA sensor, and reports filed as compatibility issues. See [ADR 0016](../decisions/0016-remote-key-grab.md).
