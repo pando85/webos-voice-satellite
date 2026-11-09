@@ -392,6 +392,8 @@ Notes:
 
 Actions are pinned to commit SHAs with the version in a comment. Update them deliberately.
 
+Releases are cut only from `main` and tagged `vX.Y.Z` (annotated, on the version-bump commit); see the Release policy in [AGENTS.md](../AGENTS.md#release-policy).
+
 ## Quality gates before a PR
 
 ```sh

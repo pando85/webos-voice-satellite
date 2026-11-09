@@ -54,3 +54,11 @@ Use the optional [REA reverse-engineering tool](https://github.com/morluto/rea) 
 - Include tests for tooling where feasible; `sh -n tools/probe/probe.sh` and `python3 tools/check_docs.py` are initial checks.
 - Keep repository content in English. Never commit generated dumps, tokens, recordings, firmware, or third-party binaries.
 - If blocked on hardware, provide a precise experiment for the user/agent; do not claim the feature works.
+
+## Release policy
+
+- **A release exists only in `main`.** Cut a release only from a commit that is in `main` and pushed to `origin`. Branches are for work in progress; never call a build from an unmerged branch a release.
+- The version bump (`Cargo.toml`, and the package version it drives), the `CHANGELOG.md` heading and the release commit land on `main` before any build, install or deploy to a TV is called a release. A deploy from a branch for an experiment must say so ("experimental build from branch X, not a release") in its record.
+- Every release has an **annotated tag `vX.Y.Z`** (for example `v0.6.2`) on the version-bump commit (`version X.Y.Z: ...`), with the version and the CHANGELOG one-line summary as the message. Create it and push it together with `main` (`git push origin main vX.Y.Z`, explicit tag names, never `--tags` or a force push). CI does not key off tags today, so the tag is the release marker.
+- Verify before reporting a release: `git branch --contains vX.Y.Z` lists `main`, and `git rev-parse origin/main main` is one hash.
+- Deploying to a TV still needs the owner's authorization per run (see [Device safety and privacy](#device-safety-and-privacy)); the release policy does not grant it.
