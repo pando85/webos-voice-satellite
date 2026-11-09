@@ -11,7 +11,7 @@ Labels follow [AGENTS.md](../../AGENTS.md): `documented`, `observed-on-other-dev
 
 **In scope (v1, owner 2026-11-04):**
 
-1. Screen off and on, and a power-off that keeps the satellite running (section 4).
+1. Screen off and on, and a power-off that keeps the satellite running (section 4): since the owner's amendment of 2026-11-09 ([ADR 0005, amendment 2026-11-09](../decisions/0005-tv-control-entities.md#amendment-2026-11-09-decision-4-a-real-power-off-from-ha)) this includes LG's own power-off into `Active Standby` when Always Ready is on.
 2. TV volume (set, step) and TV mute.
 3. Input (source) selection.
 4. App launch.
@@ -21,7 +21,7 @@ Labels follow [AGENTS.md](../../AGENTS.md): `documented`, `observed-on-other-dev
 **Non-goals (v1):**
 
 - No toasts, notifications or on-screen indicators (owner 2026-11-04). No controllable status LED exists (research 2026-11-04).
-- No real power-off into LG standby or Suspend from HA (section 4). No Wake-on-LAN from the satellite: a TV in Suspend cannot run it. Waking from Suspend stays HA's job (its `wake_on_lan` integration), outside this project.
+- ~~No real power-off into LG standby or Suspend from HA (section 4).~~ **Changed 2026-11-09 (owner, [ADR 0005, amendment 2026-11-09](../decisions/0005-tv-control-entities.md#amendment-2026-11-09-decision-4-a-real-power-off-from-ha)):** HA's turn off may end in LG's `Active Standby` (Always Ready on, the satellite keeps listening, replies silent); never in `Suspend` (section 4.2). No Wake-on-LAN from the satellite: a TV in Suspend cannot run it. Waking from Suspend stays HA's job (its `wake_on_lan` integration), outside this project.
 - No TV settings writes: no picture or sound mode, no sound output change, no Quick Start+, energy saving or auto-off changes. The daemon's existing rule stands ([always-on section 7](always-on.md#7-exposing-power-options-in-the-ui-design)). **Exception (owner 2026-11-05, [ADR 0008](../decisions/0008-user-initiated-lg-settings.md)):** the TV app, not the daemon and not HA, may change Always Ready and LG hands-free on an explicit press ([Voice and power screen](voice-and-power-screen.md)); HA gets two read-only sensors for them.
 - ~~No TV `media_player` entity~~ Changed the same day by [ADR 0007](../decisions/0007-tv-media-player.md): a second, control-only media player "TV" is added (section 3.5). The satellite's own media player keeps meaning "reply volume" (owner 2026-11-04).
 - No channel control, no playback control (play/pause), no remote-key injection beyond the existing power key path.
@@ -54,7 +54,7 @@ All entities belong to the satellite's existing ESPHome device. Object ids are s
 | TV | `media_player` | `tv_media_player` | control only: volume set and step, mute, turn on and off (section 3.5) | `[tv_control] media_player` and any of its controls | on (ADR 0007) | none |
 | TV screen | `switch` | `tv_screen` | on = picture on, off = `Screen Off` | `[tv_control] screen` | on | none |
 | Turn on TV | `button` | `tv_turn_on` | stateless | `[tv_control] power_on` | on | none |
-| TV power (keep listening) | `switch` | `tv_power` | on = picture on, off = looks off but listening (section 4) | `[tv_control] power_off` | **off (opt-in)** | none |
+| TV power | `switch` | `tv_power` | on = picture on, off = the remote's power key (section 4: `Active Standby` in "Turn off normally" with Always Ready on, `Screen Off` in "Keep listening"); the name was "TV power (keep listening)" before 2026-11-09, the object id is unchanged | `[tv_control] power_off` | **off (opt-in)** | none |
 | TV volume | `number` | `tv_volume` | 0 to `maxVolume` read from the TV (**60** on c3-b, read 2026-11-04; an earlier draft said 100), step 1, slider, **no unit** (LG volume steps, not percent); the slider ends at `maxVolume`, or at the optional `volume_limit` when that is lower | `[tv_control] volume` | on (EXP-010 Part A passed on c3-b; recommended, section 9) | none |
 | TV volume up / TV volume down | `button` | `tv_volume_up`, `tv_volume_down` | one TV step each | `[tv_control] volume` | as `tv_volume` | none |
 | TV mute | `switch` | `tv_mute` | on = muted | `[tv_control] mute` | on (EXP-010 Part A passed on c3-b) | none |
@@ -100,14 +100,14 @@ States are the settled `state` (and `processing` while in transition) of the exi
 | --- | --- | --- | --- | --- | --- |
 | `tv_screen` | on; off command: `turnOffScreen` | off; on command: `turnOnScreen` | missing; refused | last settled state kept; commands refused (tvpowerd answers "busy", D6) | daemon frozen |
 | `tv_turn_on` | no-op, logged | `turnOnScreen` | `powerOn {"reason":"remoteKey"}` after the 1.5 s key block | refused | daemon frozen |
-| `tv_power` (if listed and enabled) | on; off command: section 4 | off; on command: `turnOnScreen` | off; on command: `powerOn` as above | kept; refused | daemon frozen |
+| `tv_power` (if listed and enabled) | on; off command: the power key, section 4 (missing state while its preconditions fail) | off; on command: `turnOnScreen` | off; on command: `powerOn` as above | kept; refused | daemon frozen |
 | `tv_volume`, buttons, `tv_mute` | read and set | read and set (verified-on-target c3-b: volume and mute accepted and read back in `Screen Off`, EXP-010 A8) | missing; refused | kept; refused | daemon frozen |
 | `tv_input`, `tv_app` | read and set | read; set allowed. Launch in `Screen Off` kept the power state `Screen Off` (c3-b A8); whether the panel lights was **not looked at** | missing; refused | kept; refused | daemon frozen |
 | sensors | live | live | `tv_play_state` missing | live | daemon frozen |
 
 The TV media player (section 3.5) follows the same table: `off` in `Screen Off` and `Active Standby`, `on` or `playing` in `Active` and `Screen Saver`, held during a transition.
 
-Why refuse in `Active Standby`: the audio DSP input gain is near zero there ([D6 variant C](../discovery/c3-b/D6-poweroff-screenoff.md#variant-c-why-active-standby-is-silent)), nothing else is tested in that state, and the remote itself does not act there except the power key. After a resume from Suspend (the daemon's G2 detection) every getter is read again before any state is sent.
+Why refuse in `Active Standby`: the satellite itself keeps running and listening there with Always Ready on (D5, c3-b; the reason HA's turn off may now end there, section 4), but the audio DSP input gain is near zero there ([D6 variant C](../discovery/c3-b/D6-poweroff-screenoff.md#variant-c-why-active-standby-is-silent)), nothing else is tested in that state, and the remote itself does not act there except the power key. After a resume from Suspend (the daemon's G2 detection) every getter is read again before any state is sent.
 
 ### 3.5 The TV media player (ADR 0007)
 
@@ -123,7 +123,7 @@ Owner decision 2026-11-04 ([ADR 0007](../decisions/0007-tv-media-player.md)), af
 | `VOLUME_STEP` | 1024 | `volume` | `master/volumeUp` / `volumeDown`: one TV step, as the remote and the step buttons; up refused at the cap; 4 per second |
 | `VOLUME_MUTE` | 8 | `mute` | `apiadapter/audio/setMute`, read back |
 | `TURN_ON` | 128 | `power_on` | as the `tv_turn_on` button: `turnOnScreen` from `Screen Off`, `powerOn` from `Active Standby`, nothing when lit |
-| `TURN_OFF` | 256 | `screen` or `power_off` | `power_off` enabled **and** the select on "Keep listening (screen off)": the power-off of section 4 with all of its preconditions (a refusal stays a refusal, no fallback); otherwise `turnOffScreen`. Nothing in `Screen Off` or `Active Standby` |
+| `TURN_OFF` | 256 | `screen` or `power_off` | **Since 2026-11-09 ([ADR 0005, amendment 2026-11-09](../decisions/0005-tv-control-entities.md#amendment-2026-11-09-decision-4-a-real-power-off-from-ha)):** the remote's power key when the preconditions of section 4.2 hold, with or without `power_off`: "Turn off normally" with Always Ready on ends in `Active Standby`, "Keep listening" in `Screen Off`. In "Turn off normally" Always Ready is read again first (section 4.2); off or unknown: `turnOffScreen` instead, announced at `info` with the reason only when the screen off is actually sent (needs `screen`; otherwise, or when the screen off is refused, a refusal). Any other refusal stays a refusal, no fallback. Nothing in `Screen Off` or `Active Standby`. One `info` line names the route: `tv_media_player: turn off: reading Always Ready before the power key`, then `tv_media_player: turn off: the remote's power key (...)` or `tv_media_player: turn off: the screen off instead of the power key (...)`. Before: the key only with `power_off` and "Keep listening", otherwise `turnOffScreen` |
 
 Never offered: `PLAY_MEDIA`, `MEDIA_ANNOUNCE`, `BROWSE_MEDIA`, `MEDIA_ENQUEUE`, `PLAY`, `PAUSE`, `STOP`, `SELECT_SOURCE`. It advertises **no audio format**, so HA 2026.10.4's assist satellite keeps taking the TTS and announcement format from the satellite's player (the first `ANNOUNCEMENT` format of any player of the device), and announcements keep going through `VoiceAssistantAnnounceRequest`. HA's `media_player.play_media` on it is refused by HA (feature missing); a media URL that reaches the device anyway is ignored with a log line (`tv_media_player: media or announcement refused`).
 
@@ -175,16 +175,30 @@ Evidence:
 
 **Why not a plain `turnOffScreen` for power-off:** `Screen Off` keeps the running app's sound playing (LG: "Screen is turned off and only sound is played", [Energy Saving help](https://www.lg.com/au/support/product-help/CT20088015-1437132262154), documented for the menu entry). That is the right behaviour for the **screen** switch and the wrong one for "turn off the TV". Using the key path also keeps one behaviour for the remote and for HA.
 
-**Why not a real power-off:** with Always Ready off the TV suspends and the daemon is frozen (network down about 10 to 20 s after the key); with Always Ready on it stays in `Active Standby`, where replies are not audible ([D5](../discovery/c3-b/D5-results.md), [always-on 11](always-on.md#11-result-on-c3-b-2026-11-03)). Neither meets the owner's rule.
+**Why not a real power-off** (2026-11-04, **changed 2026-11-09**): with Always Ready off the TV suspends and the daemon is frozen (network down about 10 to 20 s after the key); with Always Ready on it stays in `Active Standby`, where replies are not audible ([D5](../discovery/c3-b/D5-results.md), [always-on 11](always-on.md#11-result-on-c3-b-2026-11-03)). Neither met the owner's rule of 2026-11-04.
+
+**The real power-off from HA (owner, 2026-11-09, [ADR 0005, amendment 2026-11-09](../decisions/0005-tv-control-entities.md#amendment-2026-11-09-decision-4-a-real-power-off-from-ha)):** the 2026-11-04 rule was outdated, because the satellite keeps working in `Active Standby` with Always Ready on: `verified-on-target` on c3-b (`03.30.73`, D5 R1b/R3/R4, 2026-11-03): daemon, HA link and microphone PCM up for 59 min 18 s, six full wake word chains; the installed 0.6.1 on c3-b (2026-11-08) and 0.6.0 on c3-a (`03.30.74`, 2026-11-07) started and passed the self-check in `Active Standby` ([c3-b P4](../discovery/c3-b/P4-permanent-install.md#update-to-061-2026-11-08-key-grab-started), [c3-a P4](../discovery/c3-a/P4-permanent-install.md#update-to-060-2026-11-07-remote-key-grab-off)). So in "Turn off normally" HA's turn off is now the remote's power key into `Active Standby` (red standby LED, app sound stops with LG's power-off, the satellite keeps listening), guarded by Always Ready (section 4.2). What stays: **replies, announcements and music are silent in `Active Standby`** (D5, [D6 variant C](../discovery/c3-b/D6-poweroff-screenoff.md#variant-c-why-active-standby-is-silent), [voice and power screen](voice-and-power-screen.md) cell P2), exactly as after the remote's own key in this mode; a reply or music that is playing when the turn off arrives is cut by the standby (open question 8). Not run on a TV yet: [EXP-010 Part C](../experiments/EXP-010-tv-control-setters.md#part-c-ha-turn-off-as-a-real-power-off-adr-0005-decision-4-amended-2026-11-09).
 
 ### 4.2 Conditions for the power-off (all must hold, checked before the key is sent)
 
-1. `[tv_control] power_off = true` (config, default false). Otherwise `tv_power` is not listed.
-2. The select "When the TV is turned off with the remote" is on "Keep listening (screen off)" (the always-on mode is enabled). Otherwise `tv_power` reports missing state and refuses.
-3. The power watch runs and the settled state is `Active` or `Screen Saver`. The key is a toggle: sent from `Screen Off` it is a "second press" and wakes the TV lit ([D6 S1](../discovery/c3-b/D6-poweroff-screenoff.md#s-second-press-and-the-power-key-in-screen-off)), so it is never sent there; an off command in `Screen Off` or `Active Standby` is a no-op.
-4. The darkener would act: kill switch absent, not in its cooldown (20 s), hourly budget left (10 per hour). The HA power-off counts against the same budget. If the darkener would refuse, the daemon refuses the power-off instead of sending a key that ends in LG standby or Suspend.
+Revised 2026-11-09 ([ADR 0005, amendment 2026-11-09](../decisions/0005-tv-control-entities.md#amendment-2026-11-09-decision-4-a-real-power-off-from-ha)). The same checks serve the TV media player's turn off and the `tv_power` switch (`Controller::power_off_check`, which also returns the route).
 
-**Residual risk (labelled):** if the wake fails after the key was sent (for example `powerOn` refused twice and the toggle-key fallback also fails), the TV ends where LG puts it: `Active Standby` with Always Ready on, `Suspend` with it off. The margin before `Request Suspend` was about 2 s in one D6 run (A4) and held in the 4 section 13 runs; on other units or firmware it is unknown. The power-state sensor then shows the real state, and the satellite logs it. This is the same risk the remote key already carries in this mode.
+1. ~~`[tv_control] power_off = true`~~ No longer a condition: `power_off` (default false) only lists the `tv_power` switch. The media player's turn off uses the key without it.
+2. The daemon has reported its view (the select, the kill switch, the darkener's verdict) at least once, and the firmware guard does not block setters.
+3. The power watch runs and the settled state is `Active` or `Screen Saver`. The key is a toggle: sent from `Screen Off` it is a "second press" and wakes the TV lit ([D6 S1](../discovery/c3-b/D6-poweroff-screenoff.md#s-second-press-and-the-power-key-in-screen-off)), so it is never sent there; an off command in `Screen Off` or `Active Standby` is a no-op.
+4. The kill switch is absent (as it blocks the darkener).
+5. Per the select "When the TV is turned off with the remote":
+   - **"Keep listening (screen off)":** the darkener would act: not in its cooldown (20 s), hourly budget left (10 per hour). The HA power-off counts against the same budget. If the darkener would refuse, the power-off is refused instead of sending a key that ends in LG standby or Suspend. Always Ready is not checked (the darkener wakes the TV before the suspend; verified with Always Ready off, D6 and EXP-010 B7).
+   - **"Turn off normally":** Always Ready on: `lifeOnScreenMode` `alwaysReady` or `allEnabled` (both verified-on-target as keeping the satellite running, D5 R1b and R4), **read again right before the key** with the `lg_always_ready` sensor's getter (`settingsservice/getSystemSettings`, read-only, no new endpoint; the reply updates the sensor as the 60 s poll does). The decision uses that fresh value; a failed read or no answer within 2 s (`ALWAYS_READY_FRESH`, a late reply included) counts as unknown; a read already in flight when the command came is not used, a new read follows it within the same 2 s. The cached value only drives the `tv_power` state. Off (`off`, `none`), unknown (`lg_settings = false`, a failed read) or another word: no key; the media player falls back to `turnOffScreen` and logs why at `info`, `tv_power` refuses and shows a missing state. The key here counts against the global 30 per minute (it has no darkener budget).
+6. One key at a time: after a key, further power commands (the media player's turn on and off, `tv_power` on and off) are refused at `info` until the TV leaves the lit power class it was sent from (a transition, `Screen Off` or standby; `Active` to `Screen Saver` does not count), or for 10 s (`KEY_HOLD`). The luna reply comes before the state changes, and a second key in that gap would toggle the TV back on; the key reaches `Active Standby` in about 3 to 4 s (D5). A key the TV refused does not hold.
+
+`tv_power` on is a turn on as the media player's (`turnOnScreen` or `powerOn`), not gated by these conditions.
+
+Any refusal other than the Always Ready one stays a refusal for the media player too (no screen-off fallback).
+
+**Residual risk in "Turn off normally" (labelled):** Always Ready is read right before the key, so only a change in the 2 s window between the read and LG's power-off would be missed (hypothesis that this is negligible; not tested). If it happened, the TV suspends and the satellite freezes until the remote or WoL wakes it (the same as the remote's key). Whether a key right after a settle hits tvpowerd's 1.5 s key block (seen for `powerOn`, D6) is not known.
+
+**Residual risk in "Keep listening" (labelled):** if the wake fails after the key was sent (for example `powerOn` refused twice and the toggle-key fallback also fails), the TV ends where LG puts it: `Active Standby` with Always Ready on, `Suspend` with it off. The margin before `Request Suspend` was about 2 s in one D6 run (A4) and held in the 4 section 13 runs; on other units or firmware it is unknown. The power-state sensor then shows the real state, and the satellite logs it. This is the same risk the remote key already carries in this mode.
 
 ### 4.3 The way back
 
@@ -269,7 +283,7 @@ New section in `config/example.toml` (design; not added until the implementation
 enabled = true        # master switch; off by itself without luna-send (PC)
 screen = true         # tv_screen switch
 power_on = true       # tv_turn_on button
-power_off = false     # tv_power switch: opt-in, needs the "Keep listening" mode
+power_off = false     # tv_power switch: opt-in; the media player's turn off does not need it
 volume = true         # tv_volume, tv_volume_up/down (EXP-010 Part A passed on c3-b)
 # volume_limit = 40   # optional cap on the TV volume HA may set; unset = the TV's maxVolume
 mute = true           # tv_mute (passed on c3-b)
@@ -286,7 +300,7 @@ follow_firmware_guard = false  # owner decision 2026-11-04: TV control is not ga
 | --- | --- | --- |
 | `enabled` | true | Read-only state is harmless and makes the controls discoverable; the per-control flags gate every write |
 | `screen`, `power_on` | true | Their calls are verified on c3-b (D5, D6, section 13), they keep the satellite running, and any remote key undoes them |
-| `power_off` | **false** | Owner decision: opt-in, and only in the always-on mode. Costs: TV stays running dark (power draw not measured), LG's OLED care at power-off may not run, a brief panel flash, a second remote press takes about 5 s ([always-on 12.2](always-on.md#122-the-setting-to-expose-app-and-ha-ui)) |
+| `power_off` | **false** | Lists the `tv_power` switch only (since 2026-11-09 the media player's turn off sends the key without it; section 4.2). Owner decision of 2026-11-04: opt-in. Costs: TV stays running dark (power draw not measured), LG's OLED care at power-off may not run, a brief panel flash, a second remote press takes about 5 s ([always-on 12.2](always-on.md#122-the-setting-to-expose-app-and-ha-ui)) |
 | `volume`, `mute`, `input`, `apps` | **true** (owner, 2026-11-04, after EXP-010 Part A passed for all four on c3-b `03.30.73`) | The setters worked, read back and restored. The evidence is c3-b only; c3-a (`03.30.74`) is untested and each control is still checked per TV at startup and switched off when its getter, its declaration or a write fails (section 6). The optional `volume_limit` cap is available. Two caveats: volume and mute were tested on `external_arc` only, and input only on a disconnected HDMI input |
 | `volume_limit` | unset (no cap below `maxVolume`) | Section 7. The first default (40) blocked real use on c3-a (volume 89) |
 | `app_limit` | 30 | Keeps the select usable in HA and in voice |
@@ -307,6 +321,7 @@ Every control is also gated at run time by section 6. **Firmware guard (owner de
 | Action | Risk | Reversal |
 | --- | --- | --- |
 | Screen off | Low. The TV stays running: more power than standby (not measured), and if left dark for days LG's power-off OLED care does not run | `tv_screen` on, `tv_turn_on`, any remote key |
+| Power-off ("Turn off normally", Always Ready on) | Low to medium. LG's own power-off into `Active Standby`, as the remote; replies and music silent until the TV is on again; `Suspend` only if Always Ready changed between the fresh read and the key (section 4.2) | `tv_turn_on` (`powerOn` from settled `Active Standby`; HA path unit-tested only, EXP-010 B11 partial), the remote; WoL from Suspend |
 | Power-off (keep listening) | Medium. As screen off plus a 0.3 to 0.7 s panel flash (indirect, [D6](../discovery/c3-b/D6-poweroff-screenoff.md)); if the wake fails, LG standby or Suspend (section 4.2) | `tv_turn_on`, the remote; WoL from Suspend |
 | Power-on | Low. Lights the panel in a room that may be dark | screen off or the remote |
 | Volume set and step | Low to medium: loudness, optionally capped by `volume_limit` | set it back; the remote |
@@ -353,12 +368,13 @@ Following [AGENTS.md](../../AGENTS.md) (keep capture, playback, power lifecycle 
 ## 14. Open questions
 
 1. Still open after EXP-010 Part A (c3-b): volume and mute on the TV speaker output (A5, not authorized); whether an on-screen volume bar or mute icon appears; switching to a **connected** source; whether an app launch or volume change in `Screen Off` lights the panel (only the power state was read); behaviour with content playing; every setter on c3-a.
-2. Whether an HA power-off with an app playing stops its sound (EXP-010 B10, not run).
+2. Whether an HA power-off with an app playing stops its sound (EXP-010 B10, not run). In "Turn off normally" LG's own power-off is expected to stop it as the remote does (hypothesis; EXP-010 Part C C4).
 3. Partly answered (EXP-010 Part B): HA 2026.10.4 shows `unknown` for a switch, number and select before their first state, and a daemon restart relists the same entities. Not seen on HA: a live change from a value to missing, and an option list that changed.
 4. Which Assist intents act on buttons, numbers and selects on the owner's HA (section 11).
 5. ~~Whether TV control should follow the firmware guard~~ Decided 2026-11-04 (owner): it does not; a warning is logged (section 9).
 6. c3-a (`03.30.74`): mute, volume down and the getters (through HA) verified; screen, input, app launch and power-off untested there.
 7. Findings of EXP-010 Part B, **fixed on the PC 2026-11-04, to re-check on the TVs** (section 15): the volume subscription without a flag (kept and confirmed by a pushed line, else polling), the `launch` declaration check (SAM file), `volume_limit` (optional, no cap by default), the refresh button's result line.
+8. (2026-11-09) A satellite reply, announcement or music that plays when HA's turn off arrives is cut by `Active Standby` (silent there). Whether to delay the key until the reply ends is open; no delay mechanism is built. Typical case: "apaga la tele" spoken to the satellite, whose spoken confirmation races the key.
 
 ## 15. Implementation status (2026-11-04)
 

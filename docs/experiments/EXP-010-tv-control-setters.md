@@ -1,6 +1,6 @@
 # EXP-010 — TV control setters on c3-b (screen, volume, mute, input, app, power)
 
-**Status:** Part A RUN on c3-b, 2026-11-04 (owner's go the same day, "can be run now"); step A5 skipped (not authorized). **Part B RUN 2026-11-04** with daemon 0.2.0: on **c3-b** the disruptive controls (screen, input, app, power-off in the "Keep listening" mode) through a PC-side aioesphomeapi client (no HA entry), on **c3-a** the non-disruptive subset through the owner's HA 2026.10.4 on the permanent install. B10 and B11 not run; see [Part B results](#part-b-results-2026-11-04).
+**Status:** Part A RUN on c3-b, 2026-11-04 (owner's go the same day, "can be run now"); step A5 skipped (not authorized). **Part B RUN 2026-11-04** with daemon 0.2.0: on **c3-b** the disruptive controls (screen, input, app, power-off in the "Keep listening" mode) through a PC-side aioesphomeapi client (no HA entry), on **c3-a** the non-disruptive subset through the owner's HA 2026.10.4 on the permanent install. B10 and B11 not run; see [Part B results](#part-b-results-2026-11-04). **Part C written 2026-11-09, NOT RUN** (HA turn off as a real power-off, [ADR 0005 amendment](../decisions/0005-tv-control-entities.md#amendment-2026-11-09-decision-4-a-real-power-off-from-ha)); needs a build with the change on c3-b and the owner's authorization; see [Part C](#part-c-ha-turn-off-as-a-real-power-off-adr-0005-decision-4-amended-2026-11-09).
 **Date:** written and Part A run 2026-11-04.
 **Device alias / model / firmware / webOS / architecture:** c3-b, LG C3 55 inch, firmware `03.30.73`, webOS TV 8.3.0, aarch64 kernel with 32-bit userland. **Not c3-a** (c3-a is in daily use; a separate go is needed after c3-b passes).
 **Power and playback state:** `Active` or `Screen Saver` on the home app, nothing playing, at the start of every step; `Screen Off` and `Active Standby` only where a step says so.
@@ -169,6 +169,46 @@ Subscriptions (first reply): `audio/master/getVolume {"subscribe":true}` is a re
 6. `tv_input` and `tv_app` flip together: launching an app makes `tv_input` `Other` and `tv_app` the app, as designed.
 
 **Restored and left behind.** c3-a: volume 89, mute off, input `HDMI 1`, screen on, `Active`; the only change is the 0.2.0 install (P4). c3-b: volume 3, mute off, home app, power state `Active` after the runs and back to `Screen Saver` by itself within about 4 min, as in Part A; the temporary daemon, its config, key and logs removed from `/tmp`, no process left, no sink input. dmesg showed no oops, BUG or call trace on either TV (matched by grep only; no ASoC or debugfs path read). Raw outputs are in the gitignored `devices/private/*/EXP-010/`.
+
+## Part C: HA turn off as a real power-off (ADR 0005 decision 4, amended 2026-11-09)
+
+**Status:** written 2026-11-09, **NOT RUN**. Nothing in this part has been run on a TV; the behaviour is covered by PC unit tests only (`webos-tv-control`, `media_player_turn_off_is_the_power_key_when_safe_else_the_screen` and neighbours).
+
+**Question.** With the select "When the TV is turned off with the remote" on "Turn off normally" and Always Ready on, does HA's turn off of the TV media player send the remote's power key, end in `Active Standby` (red standby LED, app sound stopped) with the satellite still listening, and does HA's turn on bring the TV back to `Active`? Falsified by: no key sent, a `Request Suspend` or `Suspend`, the daemon or HA link down in `Active Standby`, or turn on not reaching `Active`.
+
+**Scope and approval.** c3-b only (firmware `03.30.73`), with the owner's explicit go for this run: power-state changes, no TV setting written, no sound beyond the owner's own voice command in C3. c3-a is out of scope (its TV power paths are untested and it is the owner's active display). A build with the change must be installed or run from `/tmp` first; that install is a separate authorization (P4 rules).
+
+**Prerequisites.**
+
+- The [D6 gate](../discovery/c3-b/D6-poweroff-screenoff.md#procedure) and the Part A prerequisites above (nobody watching, raw output only to the gitignored `devices/private/c3-b/EXP-010/`, no debugfs or ASoC reads).
+- Read-only baseline: `ctl.sh status` (version with this change, HA connected, `remote_off` `normal`, no kill switch, microphone listening), the HA sensor "Always Ready" (`lg_always_ready`) reads **On** or **On with wallpaper** (and `lifeOnScreenMode` by the read-only `settingsservice/getSystemSettings` call of [EXP-011](EXP-011-lg-settings-toggle.md) if the sensor is missing), power state `Active` or `Screen Saver`, Quick Start+ as the owner set it. If Always Ready is off, **stop**: the run would test the fallback only (C5).
+- A way back known to work: the remote; `tvpower/power/powerOn {"reason":"remoteKey"}` from `Active Standby` (D6); WoL from the PC as in D5 (only if `wolwowlOnOff` is as recorded there).
+- A PC-side tail of the daemon log and the power-state subscription (stamped), and a stamped `ping` every second.
+
+**Steps.**
+
+| Step | Action | Expected signals |
+| --- | --- | --- |
+| C1 | HA: `media_player.turn_off` on the TV media player (or the text "apaga la tele del hall" through `conversation/process`, as in [design section 4](../design/tv-control.md#4-power-off-which-state-and-the-way-back)) from `Active` or `Screen Saver` | Daemon log, in order: `tv_media_player: turn off`; `tv_media_player: turn off: reading Always Ready before the power key` (one `getSystemSettings` read, answered within 2 s); `tv_media_player: turn off: the remote's power key ("Turn off normally" and Always Ready on: the TV goes to Active Standby, ...)`; `power: power key accepted`; `remote power-off: request (reason remoteKey, ...)`; `remote power-off: standby N ms after the request; nothing to do (turn off normally)`. Power state: `Request Power Off` then settled **`Active Standby` within about 3 to 4 s** of the key (D5 R1b: +3 to +4 s), **no `Request Suspend`** for 60 s. Owner looks: picture off, **red standby LED on**, the foreground app's sound stops. HA: media player `off`, "TV power state" `Active Standby` |
+| C2 | Observe 5 min in `Active Standby` (read-only) | Same daemon pid, HA link up, `pcm0c`/`pcm3c` `RUNNING`, `listening` on, 0 ping losses, `suspend_stats/success` unchanged; no WARN or ERROR |
+| C3 | Owner says the wake word and a command with no spoken result needed (for example a light), within 2 m of the TV | HA runs the full chain (wake word, STT transcript, intent, the light changes). The TTS reply is **expected to be silent** (D5, D6 variant C); that is not a failure of this step |
+| C4 | HA: `media_player.turn_on` on the TV media player | Log `tv_turn_on: powerOn from standby`, `powerOn` sent at least 1.5 s after the settle (one retry after `Keyblock1.5second` is allowed), state **`Active` within about 5 s**; media player `on`; volume level back. This also covers EXP-010 B11's way back from a settled `Active Standby` |
+| C4b | Within 1 s of C1's key, before the power state changes, a second `media_player.turn_off` (or `turn_on`) | `tv_media_player: refused: a power key was sent ... ms ago and the TV has not changed power state yet`; no second key; the TV still ends in `Active Standby` |
+| C5 (optional, separate go) | Fallback: set `[tv_control] lg_settings = false` (a config change on the TV and a restart, no LG setting written), then C1 | Log `tv_media_player: turn off: the screen off instead of the power key (Always Ready is not known ...)`, `turnOffScreen`, state `Screen Off`, no power key. Restore `lg_settings = true` and restart |
+| C6 (optional) | Regression in "Keep listening": select "Keep listening (screen off)" in HA, `power_off` still false, then C1 | Log `... the remote's power key ("Keep listening": ...)`, then the wake and darken lines; `Screen Off` 5 to 13 s after the key (EXP-010 B7). Select back to "Turn off normally" |
+| C7 (optional, separate go) | C1 with an app playing at low volume | Whether the sound stops with the standby (design open question 2, B10) |
+
+**Failure interpretation.**
+
+| Outcome | Meaning | Action |
+| --- | --- | --- |
+| `Request Suspend` or `Suspend` after C1 | Always Ready was not on although the sensor said so (stale value, or a value that does not keep the TV awake on this firmware) | Stop. Wake with the remote or WoL; record the sensor value and `lifeOnScreenMode`; the guard needs a fresh read |
+| No key, a `refused` line | A precondition failed (the line names it) | Record; fix the setup or the code; no retry with other parameters |
+| Screen off instead of the key | Always Ready read as off or unknown (or the read did not answer within 2 s: log `did not answer within 2 s`) | Record the sensor value and the read's timing; check `lg_settings` |
+| `Active Standby` but the HA link or the PCM drops | The D5 result does not hold for the installed build | Stop; turn on; this blocks the amendment's behaviour on this unit |
+| C4 does not reach `Active` | The HA way back from settled `Active Standby` fails | Turn on with the remote; record the `powerOn` replies |
+
+**Rollback.** HA turn on (C4), the remote, or WoL from `Suspend`. Restore any config change of C5 and the select of C6. If the behaviour is unwanted, reinstall 0.6.1 (old mapping: a screen off unless `power_off` and "Keep listening"). End state: `Active` or `Screen Saver`, the select as the owner had it, nothing of the run left on the TV.
 
 ## Rollback and cleanup
 

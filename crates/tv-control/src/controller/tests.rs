@@ -684,7 +684,7 @@ fn env(keep: bool, kill: bool, darkener: Result<(), &str>) -> PowerOffEnv {
 #[test]
 fn power_off_sends_the_key_when_every_condition_holds() {
     let mut r = Rig::boot(all_on(), Tv::new());
-    assert_eq!(r.c.power_off_check(), Ok(()));
+    assert_eq!(r.c.power_off_check(), Ok(PowerOffRoute::KeepListening));
     r.cmd(sw_cmd(e::TV_POWER, false), 1000);
     assert_eq!(r.sets.len(), 1);
     assert_eq!(r.sets[0].1, setters::URI_POWER_KEY);
@@ -698,7 +698,7 @@ fn power_off_sends_the_key_when_every_condition_holds() {
     // Screen Saver works like Active.
     let mut r = Rig::boot(all_on(), Tv::new());
     r.power("ScreenSaver", false, 100);
-    assert_eq!(r.c.power_off_check(), Ok(()));
+    assert_eq!(r.c.power_off_check(), Ok(PowerOffRoute::KeepListening));
 }
 
 #[test]
@@ -706,14 +706,11 @@ fn power_off_precondition_matrix() {
     // Each precondition on its own, every other one holding.
     let cases: [(&str, Config, PowerOffEnv, &str, PowerOffRefusal); 9] = [
         (
-            "power_off = false (config)",
-            Config {
-                power_off: false,
-                ..all_on()
-            },
-            env(true, false, Ok(())),
+            "Turn off normally with Always Ready off (the fake TV's value)",
+            all_on(),
+            env(false, false, Err("not keep listening")),
             "Active",
-            PowerOffRefusal::NotEnabled,
+            PowerOffRefusal::AlwaysReadyOff,
         ),
         (
             "firmware guard",
@@ -726,11 +723,14 @@ fn power_off_precondition_matrix() {
             PowerOffRefusal::SettersBlocked("firmware".into()),
         ),
         (
-            "select not on Keep listening",
-            all_on(),
-            env(false, false, Ok(())),
+            "Turn off normally with the LG settings sensors off (Always Ready unknown)",
+            Config {
+                lg_settings: false,
+                ..all_on()
+            },
+            env(false, false, Err("not keep listening")),
             "Active",
-            PowerOffRefusal::NotKeepListening,
+            PowerOffRefusal::AlwaysReadyUnknown,
         ),
         (
             "kill switch",
@@ -801,12 +801,97 @@ fn power_off_precondition_matrix() {
     // The daemon has not said anything yet: nothing is allowed.
     let mut c = Controller::new(all_on());
     c.on_power("Active", false, Instant::now());
-    assert_eq!(c.power_off_check(), Err(PowerOffRefusal::NotKeepListening));
+    assert_eq!(c.power_off_check(), Err(PowerOffRefusal::NotReady));
+    // The daemon's first view, even if it equals the default, counts.
+    c.set_env(PowerOffEnv::default());
+    assert_eq!(
+        c.power_off_check(),
+        Err(PowerOffRefusal::AlwaysReadyUnknown)
+    );
+}
+
+/// A fake TV with Always Ready on (`alwaysReady` or `allEnabled`).
+fn tv_always_ready(word: &str) -> Tv {
+    Tv {
+        always_ready: always_ready_reply(word),
+        ..Tv::new()
+    }
+}
+
+/// A rig on "Turn off normally" (the darkener would not act in that mode).
+fn boot_normal(cfg: Config, tv: Tv) -> Rig {
+    let mut r = Rig::boot(cfg, tv);
+    let fx = r.c.set_env(env(false, false, Err("not keep listening")));
+    r.run(fx);
+    r
 }
 
 #[test]
-fn the_power_switch_reads_unknown_and_refuses_both_ways_without_the_conditions() {
-    // B6: the select on "Turn off normally".
+fn power_off_in_normal_mode_needs_always_ready_on() {
+    for word in ["alwaysReady", "allEnabled"] {
+        let r = boot_normal(all_on(), tv_always_ready(word));
+        assert_eq!(r.c.power_off_check(), Ok(PowerOffRoute::Standby), "{word}");
+    }
+    for (word, want) in [
+        ("off", PowerOffRefusal::AlwaysReadyOff),
+        ("none", PowerOffRefusal::AlwaysReadyOff),
+        ("lifeOnScreen", PowerOffRefusal::AlwaysReadyUnknown),
+    ] {
+        let r = boot_normal(all_on(), tv_always_ready(word));
+        assert_eq!(r.c.power_off_check(), Err(want.clone()), "{word}");
+        assert!(want.screen_off_instead());
+    }
+    // A failed Always Ready read: unknown.
+    let mut tv = Tv::new();
+    tv.always_ready = r#"{"returnValue":false,"errorText":"x"}"#.to_owned();
+    let r = boot_normal(all_on(), tv);
+    assert_eq!(
+        r.c.power_off_check(),
+        Err(PowerOffRefusal::AlwaysReadyUnknown)
+    );
+    // Always Ready does not matter in the keep-listening mode (the darkener
+    // wakes the TV before LG's suspend, P3 of the voice and power screen).
+    let r = Rig::boot(all_on(), Tv::new());
+    assert_eq!(r.c.power_off_check(), Ok(PowerOffRoute::KeepListening));
+    // Other refusals are never a reason for the screen-off fallback.
+    for why in [
+        PowerOffRefusal::NotReady,
+        PowerOffRefusal::SettersBlocked("x".into()),
+        PowerOffRefusal::PowerStateUnknown,
+        PowerOffRefusal::Transition,
+        PowerOffRefusal::WrongState,
+        PowerOffRefusal::KillSwitch,
+        PowerOffRefusal::Darkener("cooldown".into()),
+    ] {
+        assert!(!why.screen_off_instead(), "{why}");
+    }
+}
+
+#[test]
+fn the_power_switch_in_normal_mode_with_always_ready_on() {
+    let mut r = boot_normal(all_on(), tv_always_ready("alwaysReady"));
+    assert_eq!(r.sw(e::TV_POWER), Some(true));
+    r.cmd(sw_cmd(e::TV_POWER, false), 1000);
+    assert_eq!(r.set_names(), ["power key"]);
+    assert!(r.logged("Active Standby"));
+    r.set_reply(OK, 1050)
+        .power("ActiveStandby", true, 1100)
+        .power("ActiveStandby", false, 4000);
+    assert_eq!(r.sw(e::TV_POWER), Some(false));
+    // On again: powerOn after the key block.
+    r.cmd(sw_cmd(e::TV_POWER, true), 4100).tick(5600);
+    assert_eq!(r.set_names(), ["power key", "powerOn"]);
+    // Always Ready off: no fallback for the switch (that is tv_screen).
+    let mut r = boot_normal(all_on(), Tv::new());
+    assert_eq!(r.sw(e::TV_POWER), None);
+    r.cmd(sw_cmd(e::TV_POWER, false), 1000);
+    assert!(r.sets.is_empty());
+    assert!(r.logged("Always Ready is off"));
+}
+
+#[test]
+fn the_power_switch_reads_unknown_and_refuses_off_without_the_conditions() {
+    // B6: the select on "Turn off normally" and Always Ready off.
     let mut r = Rig::boot(all_on(), Tv::new());
     let fx = r.c.set_env(env(false, false, Err("not keep listening")));
     r.run(fx);
@@ -814,7 +899,9 @@ fn the_power_switch_reads_unknown_and_refuses_both_ways_without_the_conditions()
     r.cmd(sw_cmd(e::TV_POWER, false), 1000)
         .cmd(sw_cmd(e::TV_POWER, true), 1100);
     assert!(r.sets.is_empty());
-    // The kill switch (B9), also from Screen Off: the way back is tv_turn_on.
+    // The kill switch (B9) refuses the off key. On is a turn on, as the
+    // media player's and tv_turn_on: not gated by the power-off conditions
+    // (2026-11-09 review).
     let mut r = Rig::boot(all_on(), Tv::new());
     let fx = r.c.set_env(env(true, true, Ok(())));
     r.run(fx);
@@ -823,9 +910,7 @@ fn the_power_switch_reads_unknown_and_refuses_both_ways_without_the_conditions()
     assert!(r.sets.is_empty());
     r.power("ScreenOff", false, 2000)
         .cmd(sw_cmd(e::TV_POWER, true), 3000);
-    assert!(r.sets.is_empty(), "tv_power refuses the way back too");
-    r.cmd(btn(e::TV_TURN_ON), 4000);
-    assert_eq!(r.set_names(), ["turnOnScreen"]);
+    assert_eq!(r.set_names(), ["turnOnScreen"], "the way back is not gated");
     // The conditions come back: the state is shown again.
     let fx = r.c.set_env(env(true, false, Ok(())));
     r.run(fx);
@@ -2088,49 +2173,351 @@ fn media_player_volume_follows_the_volume_limit() {
 }
 
 #[test]
-fn media_player_turn_off_is_the_power_off_in_the_always_on_mode_else_the_screen() {
-    // power_off enabled and the always-on mode selected: the remote's key.
-    let mut r = Rig::boot(all_on(), Tv::new());
-    r.cmd(mp(MediaAction::TurnOff), 1000);
-    assert_eq!(r.set_names(), ["power key"]);
-    // power_off enabled but the select is on "Turn off normally": screen off.
-    let mut r = Rig::boot(all_on(), Tv::new());
-    let fx = r.c.set_env(env(false, false, Ok(())));
-    r.run(fx);
-    r.cmd(mp(MediaAction::TurnOff), 1000);
-    assert_eq!(r.set_names(), ["turnOffScreen"]);
-    // power_off disabled (the default): screen off.
-    let mut r = Rig::boot(
+fn media_player_turn_off_is_the_power_key_when_safe_else_the_screen() {
+    // Keep listening: the remote's key, power_off enabled or not (the
+    // satellite wakes the TV and darkens it).
+    for power_off in [true, false] {
+        let mut r = Rig::boot(
+            Config {
+                power_off,
+                ..all_on()
+            },
+            Tv::new(),
+        );
+        r.cmd(mp(MediaAction::TurnOff), 1000);
+        assert_eq!(r.set_names(), ["power key"], "power_off = {power_off}");
+        assert!(r.logged("tv_media_player: turn off: the remote's power key (\"Keep listening\""));
+    }
+    // Turn off normally with Always Ready on (both values), power_off off
+    // (the default): the key, into LG's Active Standby.
+    for word in ["alwaysReady", "allEnabled"] {
+        let mut r = boot_normal(
+            Config {
+                power_off: false,
+                ..all_on()
+            },
+            tv_always_ready(word),
+        );
+        r.cmd(mp(MediaAction::TurnOff), 1000);
+        assert_eq!(r.set_names(), ["power key"], "{word}");
+        assert_eq!(r.sets[0].1, setters::URI_POWER_KEY);
+        assert!(r.logged("the TV goes to Active Standby"));
+        r.set_reply(OK, 1050)
+            .power("ActiveStandby", true, 1100)
+            .power("ActiveStandby", false, 4000);
+        assert_eq!(r.media().power, MediaPower::Off);
+        // Already off: nothing; turn on is powerOn after the key block.
+        r.cmd(mp(MediaAction::TurnOff), 4100);
+        assert_eq!(r.sets.len(), 1, "already off");
+        r.cmd(mp(MediaAction::TurnOn), 4200).tick(5600);
+        assert_eq!(r.set_names(), ["power key", "powerOn"]);
+    }
+    // Turn off normally, Always Ready off (the fake TV's value) or unknown:
+    // the screen off, with the reason in the log.
+    for (cfg, why) in [
+        (all_on(), "Always Ready is off"),
+        (
+            Config {
+                lg_settings: false,
+                ..all_on()
+            },
+            "Always Ready is not known",
+        ),
+    ] {
+        let mut r = boot_normal(cfg, Tv::new());
+        r.cmd(mp(MediaAction::TurnOff), 1000);
+        assert_eq!(r.set_names(), ["turnOffScreen"], "{why}");
+        assert!(r.logged("the screen off instead of the power key"));
+        assert!(r.logged(why));
+        r.set_reply(OK, 1050).power("ScreenOff", false, 1100);
+        assert_eq!(r.media().power, MediaPower::Off);
+        // Already off: nothing; turn on wakes the screen as the button does.
+        r.cmd(mp(MediaAction::TurnOff), 3000);
+        assert_eq!(r.sets.len(), 1);
+        r.cmd(mp(MediaAction::TurnOn), 4000);
+        assert_eq!(r.set_names(), ["turnOffScreen", "turnOnScreen"]);
+        assert_eq!(r.own_wakes, 1);
+    }
+    // Always Ready off and the screen control off: refused, no key.
+    let mut r = boot_normal(
         Config {
-            power_off: false,
+            screen: false,
+            power_off: true,
             ..all_on()
         },
         Tv::new(),
     );
     r.cmd(mp(MediaAction::TurnOff), 1000);
-    assert_eq!(r.set_names(), ["turnOffScreen"]);
-    r.set_reply(OK, 1050).power("ScreenOff", false, 1100);
-    assert_eq!(r.media().power, MediaPower::Off);
-    // Already off: nothing; turn on wakes the screen as the button does.
-    r.cmd(mp(MediaAction::TurnOff), 3000);
-    assert_eq!(r.sets.len(), 1);
-    r.cmd(mp(MediaAction::TurnOn), 4000);
-    assert_eq!(r.set_names(), ["turnOffScreen", "turnOnScreen"]);
-    assert_eq!(r.own_wakes, 1);
-    // From Active Standby: powerOn after the key block.
-    r.set_reply(OK, 4050).power("ActiveStandby", false, 5000);
-    r.cmd(mp(MediaAction::TurnOff), 5100);
-    assert_eq!(r.sets.len(), 2, "already off");
-    r.cmd(mp(MediaAction::TurnOn), 5200).tick(6600);
-    assert_eq!(r.sets[2].1, setters::URI_POWER_ON);
-    // In the always-on mode, a darkener that would refuse refuses the
-    // power-off (no silent fallback to the screen).
-    let mut r = Rig::boot(all_on(), Tv::new());
-    let fx = r.c.set_env(env(true, false, Err("cooldown")));
-    r.run(fx);
-    r.cmd(mp(MediaAction::TurnOff), 1000);
     assert!(r.sets.is_empty());
     assert!(r.logged("refused"));
+    // From Active Standby (whoever turned it off): nothing; turn on works.
+    let mut r = Rig::boot(all_on(), Tv::new());
+    r.power("ActiveStandby", false, 1000)
+        .cmd(mp(MediaAction::TurnOff), 1100);
+    assert!(r.sets.is_empty(), "already off");
+    r.cmd(mp(MediaAction::TurnOn), 1200).tick(2600);
+    assert_eq!(r.sets[0].1, setters::URI_POWER_ON);
+}
+
+#[test]
+fn media_player_turn_off_gates_refuse_without_a_screen_fallback() {
+    // A refusal that is not about Always Ready stays a refusal: no key and
+    // no turnOffScreen.
+    let blocked = Config {
+        setters_blocked: Some("firmware".into()),
+        ..all_on()
+    };
+    let cases: [(&str, Config, PowerOffEnv, bool, &str); 5] = [
+        (
+            "keep listening, darkener cooldown",
+            all_on(),
+            env(true, false, Err("cooldown")),
+            false,
+            "cooldown",
+        ),
+        (
+            "keep listening, kill switch",
+            all_on(),
+            env(true, true, Ok(())),
+            false,
+            "kill switch",
+        ),
+        (
+            "normal, kill switch",
+            all_on(),
+            env(false, true, Err("not keep listening")),
+            false,
+            "kill switch",
+        ),
+        (
+            "normal, firmware guard",
+            blocked,
+            env(false, false, Err("not keep listening")),
+            false,
+            "setters are off",
+        ),
+        (
+            "normal, transition in progress",
+            all_on(),
+            env(false, false, Err("not keep listening")),
+            true,
+            "changing power state",
+        ),
+    ];
+    for (name, cfg, e, transition, why) in cases {
+        let mut r = Rig::boot(cfg, tv_always_ready("alwaysReady"));
+        let fx = r.c.set_env(e);
+        r.run(fx);
+        if transition {
+            r.power("Active", true, 100);
+        }
+        r.cmd(mp(MediaAction::TurnOff), 1000).tick(2000);
+        assert!(r.sets.is_empty(), "{name}: {:?}", r.set_names());
+        assert!(r.logged(why), "{name}");
+    }
+    // One key at a time (also before its reply).
+    let mut r = boot_normal(all_on(), tv_always_ready("alwaysReady"));
+    r.cmd(mp(MediaAction::TurnOff), 1000)
+        .cmd(mp(MediaAction::TurnOff), 1100);
+    assert_eq!(r.set_names(), ["power key"]);
+    assert!(r.logged("a power key was sent"));
+}
+
+#[test]
+fn a_second_key_is_held_until_the_tv_reacts_or_the_hold_ends() {
+    // The key's reply comes before the power state changes: a second key in
+    // that gap would toggle the TV back on.
+    let mut r = boot_normal(all_on(), tv_always_ready("alwaysReady"));
+    r.cmd(mp(MediaAction::TurnOff), 1000).set_reply(OK, 1050);
+    for c in [
+        mp(MediaAction::TurnOff),
+        mp(MediaAction::TurnOn),
+        sw_cmd(e::TV_POWER, false),
+        sw_cmd(e::TV_POWER, true),
+    ] {
+        r.cmd(c, 1300);
+    }
+    assert_eq!(r.set_names(), ["power key"]);
+    assert!(
+        r.logs
+            .iter()
+            .any(|(l, m)| *l == Level::Info && m.contains("refused: a power key was sent"))
+    );
+    // The TV reacts: the hold ends; back on from the settled standby.
+    r.power("ActiveStandby", true, 1400)
+        .power("ActiveStandby", false, 4000)
+        .cmd(mp(MediaAction::TurnOn), 4100)
+        .tick(5600);
+    assert_eq!(r.set_names(), ["power key", "powerOn"]);
+    // The TV never reacts (a lost key): allowed again after KEY_HOLD.
+    let mut r = boot_normal(all_on(), tv_always_ready("alwaysReady"));
+    r.cmd(mp(MediaAction::TurnOff), 1000).set_reply(OK, 1050);
+    r.cmd(mp(MediaAction::TurnOff), 10_900);
+    assert_eq!(r.sets.len(), 1, "still held");
+    r.cmd(mp(MediaAction::TurnOff), 11_000);
+    assert_eq!(r.set_names(), ["power key", "power key"]);
+    // A change within the lit class (Active to Screen Saver) before the TV
+    // reacts keeps the hold: a second key would still toggle the TV on.
+    let mut r = boot_normal(all_on(), tv_always_ready("alwaysReady"));
+    r.cmd(mp(MediaAction::TurnOff), 1000)
+        .set_reply(OK, 1050)
+        .power("ScreenSaver", false, 1200)
+        .cmd(mp(MediaAction::TurnOff), 1300)
+        .cmd(sw_cmd(e::TV_POWER, false), 1400);
+    assert_eq!(r.set_names(), ["power key"]);
+    assert!(r.logged("refused: a power key was sent"));
+    // A key the TV refused does not hold.
+    let mut r = boot_normal(all_on(), tv_always_ready("alwaysReady"));
+    r.cmd(mp(MediaAction::TurnOff), 1000)
+        .set_reply(r#"{"returnValue":false,"errorText":"x"}"#, 1050)
+        .cmd(mp(MediaAction::TurnOff), 1300);
+    assert_eq!(r.set_names(), ["power key", "power key"]);
+}
+
+#[test]
+fn turn_off_decides_on_a_fresh_always_ready_read() {
+    // Cached On (boot), the setting is now off: the fresh read wins, no key.
+    let mut r = boot_normal(all_on(), tv_always_ready("alwaysReady"));
+    assert_eq!(r.c.power_off_check(), Ok(PowerOffRoute::Standby));
+    r.tv.always_ready = always_ready_reply("off");
+    let reads = r.reads.len();
+    r.cmd(mp(MediaAction::TurnOff), 1000);
+    assert_eq!(r.reads.len(), reads + 1, "one read before the key");
+    assert_eq!(r.reads[reads].0, Topic::AlwaysReady);
+    assert_eq!(r.set_names(), ["turnOffScreen"]);
+    assert!(r.logged("Always Ready is off"));
+    assert_eq!(
+        r.text(e::LG_ALWAYS_READY).as_deref(),
+        Some("Off"),
+        "the sensor's cache is updated as by the poll"
+    );
+    // The same for tv_power: refused, no fallback.
+    let mut r = boot_normal(all_on(), tv_always_ready("alwaysReady"));
+    r.tv.always_ready = always_ready_reply("off");
+    r.cmd(sw_cmd(e::TV_POWER, false), 1000);
+    assert!(r.sets.is_empty());
+    // Cached Off, now on: the key.
+    let mut r = boot_normal(all_on(), Tv::new());
+    r.tv.always_ready = always_ready_reply("alwaysReady");
+    r.cmd(mp(MediaAction::TurnOff), 1000);
+    assert_eq!(r.set_names(), ["power key"]);
+    // A failed read: unknown, the screen off.
+    let mut r = boot_normal(all_on(), tv_always_ready("alwaysReady"));
+    r.tv.always_ready = r#"{"returnValue":false,"errorText":"x"}"#.to_owned();
+    r.cmd(mp(MediaAction::TurnOff), 1000);
+    assert_eq!(r.set_names(), ["turnOffScreen"]);
+    assert!(r.logged("Always Ready is not known"));
+    // No answer within ALWAYS_READY_FRESH: unknown, the screen off; other
+    // power commands wait meanwhile.
+    let mut r = boot_normal(all_on(), tv_always_ready("alwaysReady"));
+    let fx = r.c.on_command(mp(MediaAction::TurnOff), ms(r.t0, 1000));
+    assert!(fx.iter().any(|f| matches!(
+        f,
+        Effect::Call {
+            purpose: Purpose::Read(Topic::AlwaysReady),
+            ..
+        }
+    )));
+    // (The read is never answered.)
+    r.cmd(sw_cmd(e::TV_POWER, false), 1500);
+    assert!(r.logged("waiting for the Always Ready read"));
+    r.tick(2900);
+    assert!(r.sets.is_empty(), "still waiting");
+    r.tick(3000);
+    assert_eq!(r.set_names(), ["turnOffScreen"]);
+    assert!(r.logged("did not answer within 2 s"));
+    // A reply after the deadline (before the next tick) counts as no
+    // answer, even if it says on.
+    let mut r = boot_normal(all_on(), tv_always_ready("alwaysReady"));
+    let _ = r.c.on_command(mp(MediaAction::TurnOff), ms(r.t0, 1000));
+    let fx = r.c.on_reply(
+        Purpose::Read(Topic::AlwaysReady),
+        Ok(always_ready_reply("alwaysReady")),
+        ms(r.t0, 3100),
+    );
+    r.run(fx);
+    assert_eq!(r.set_names(), ["turnOffScreen"]);
+    assert!(r.logged("did not answer within 2 s"));
+    // Keep listening does not read Always Ready.
+    let mut r = Rig::boot(all_on(), Tv::new());
+    let reads = r.reads.len();
+    r.cmd(mp(MediaAction::TurnOff), 1000);
+    assert_eq!(r.reads.len(), reads);
+    assert_eq!(r.set_names(), ["power key"]);
+}
+
+#[test]
+fn a_read_issued_before_the_turn_off_is_not_taken_as_fresh() {
+    let mut r = boot_normal(all_on(), tv_always_ready("alwaysReady"));
+    // A refresh read is in flight (not answered yet) when the turn off comes.
+    let fx = r.c.refresh_lg_settings(ms(r.t0, 900));
+    assert!(fx.iter().any(|f| matches!(
+        f,
+        Effect::Call {
+            purpose: Purpose::Read(Topic::AlwaysReady),
+            ..
+        }
+    )));
+    let fx = r.c.on_command(mp(MediaAction::TurnOff), ms(r.t0, 1000));
+    assert!(
+        !fx.iter().any(|f| matches!(f, Effect::Call { .. })),
+        "no second read while one is in flight"
+    );
+    // The setting changes; the old read answers with the old value: no key,
+    // a new read instead, whose answer decides.
+    r.tv.always_ready = always_ready_reply("off");
+    let fx = r.c.on_reply(
+        Purpose::Read(Topic::AlwaysReady),
+        Ok(always_ready_reply("alwaysReady")),
+        ms(r.t0, 1100),
+    );
+    assert!(fx.iter().any(|f| matches!(
+        f,
+        Effect::Call {
+            purpose: Purpose::Read(Topic::AlwaysReady),
+            ..
+        }
+    )));
+    r.run(fx);
+    assert_eq!(r.set_names(), ["turnOffScreen"]);
+    assert!(r.logged("Always Ready is off"));
+}
+
+#[test]
+fn the_fallback_is_announced_only_when_the_screen_off_is_sent() {
+    // Always Ready off, but the TV is in a transition: a refusal, and no
+    // "screen off instead" line.
+    let mut r = boot_normal(all_on(), Tv::new());
+    r.power("Active", true, 100)
+        .cmd(mp(MediaAction::TurnOff), 1000);
+    assert!(r.sets.is_empty());
+    assert!(!r.logged("instead of the power key"));
+    assert!(
+        r.logged("refused: the TV is changing power state"),
+        "the real reason, not Always Ready"
+    );
+    // The screen control busy: refused too, not announced.
+    let mut r = boot_normal(all_on(), Tv::new());
+    r.cmd(sw_cmd(e::TV_SCREEN, false), 900)
+        .cmd(mp(MediaAction::TurnOff), 1000);
+    assert_eq!(r.set_names(), ["turnOffScreen"]);
+    assert!(!r.logged("instead of the power key"));
+}
+
+#[test]
+fn the_power_switch_turns_on_without_always_ready() {
+    for word in ["off", "lifeOnScreen"] {
+        let mut r = boot_normal(all_on(), tv_always_ready(word));
+        assert_eq!(r.sw(e::TV_POWER), None, "the off conditions fail");
+        r.power("ScreenOff", false, 1000)
+            .cmd(sw_cmd(e::TV_POWER, true), 2000);
+        assert_eq!(r.set_names(), ["turnOnScreen"], "{word}");
+        let mut r = boot_normal(all_on(), tv_always_ready(word));
+        r.power("ActiveStandby", false, 1000)
+            .cmd(sw_cmd(e::TV_POWER, true), 1100)
+            .tick(2600);
+        assert_eq!(r.set_names(), ["powerOn"], "{word}");
+    }
 }
 
 #[test]
@@ -2188,8 +2575,12 @@ fn media_player_logs_no_title_or_label() {
 #[test]
 fn power_off_refusal_texts_are_readable() {
     for (r, text) in [
-        (PowerOffRefusal::NotEnabled, "not enabled"),
-        (PowerOffRefusal::NotKeepListening, "Keep listening"),
+        (PowerOffRefusal::NotReady, "not known yet"),
+        (PowerOffRefusal::AlwaysReadyOff, "suspend the TV"),
+        (
+            PowerOffRefusal::AlwaysReadyUnknown,
+            "Always Ready is not known",
+        ),
         (PowerOffRefusal::KillSwitch, "kill switch"),
         (PowerOffRefusal::WrongState, "Active or Screen Saver"),
         (PowerOffRefusal::Darkener("cooldown".into()), "cooldown"),

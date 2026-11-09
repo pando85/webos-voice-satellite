@@ -214,12 +214,15 @@ cooldown_s = 20            # minimum time between two of them
 enabled = true            # master switch
 screen = true             # switch "TV screen": off = Screen Off (the satellite keeps listening)
 power_on = true           # button "Turn on TV": Screen Off or Active Standby to on
-# Switch "TV power (keep listening)": Home Assistant can turn the TV off, but
-# only while the select "When the TV is turned off with the remote" is on
-# "Keep listening (screen off)" and the wake-and-darken machine would act (no
-# kill switch, cooldown and hourly budget of [power] apply). The TV then stays
-# on with a dark screen: more power than standby, LG's OLED care at power-off
-# may not run, a brief panel flash. Opt-in; not listed when false.
+# Switch "TV power": off sends the remote's power key, as the media player's
+# turn off below does (ADR 0005 decision 4, amended 2026-11-09). With the
+# select "When the TV is turned off with the remote" on "Turn off normally" it
+# needs Always Ready on (lg_settings below) and the TV goes to Active Standby:
+# the satellite keeps listening, replies are silent there. On "Keep listening
+# (screen off)" the wake-and-darken machine must be willing (cooldown and
+# hourly budget of [power]) and the TV stays on with a dark screen: more power
+# than standby, LG's OLED care at power-off may not run, a brief panel flash.
+# Never with the kill switch present. Opt-in; not listed when false.
 power_off = false
 # On by default: the setters passed EXP-010 Part A on c3-b (firmware
 # 03.30.73, 2026-11-04) and each control is checked per TV at startup (c3-a is
@@ -239,8 +242,10 @@ play_state = false        # sensor "TV play state"
 # so HA's own voice intents work on it once you give it an alias ("turn down
 # the TV volume", "mute the TV", "turn off the TV"). Volume (share of the TV's
 # maxVolume), up/down (one TV step), mute, turn on (as "Turn on TV") and turn
-# off (the power-off above when it is on and the select is on "Keep listening",
-# otherwise the screen off) follow the switches above. It plays nothing: no
+# off follow the switches above. Turn off (offered with screen or power_off) is
+# the remote's power key with the conditions of "TV power", even when
+# power_off is false; with "Turn off normally" and Always Ready off or unknown
+# it is the screen off instead (the app's sound keeps playing). It plays nothing: no
 # TTS, announcements or media go to it. Reads the play state every 10 s while
 # the TV is lit to show "playing". The satellite's own media player (the reply
 # volume) is a separate entity and does not change.

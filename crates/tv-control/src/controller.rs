@@ -16,8 +16,11 @@
 //! - **Power state gates** (design section 3.4): `Active Standby` and
 //!   transitions refuse everything, `Screen Off` allows volume, mute, input
 //!   and app, `Suspend` never reaches the daemon.
-//! - **Power-off** only with every precondition of design section 4.2
-//!   ([`Controller::power_off_check`]).
+//! - **Power-off** (the remote's power key) only with every precondition of
+//!   design section 4.2 ([`Controller::power_off_check`]): in the "Turn off
+//!   normally" mode only with Always Ready on (else the TV would suspend and
+//!   freeze the satellite), in the "Keep listening" mode only when the
+//!   darkener would act.
 //! - **Limits** ([`crate::limits`]) and the `volume_limit` cap.
 
 use std::collections::{HashMap, HashSet};
@@ -57,6 +60,16 @@ pub const REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 /// Poll interval of the two LG settings sensors (Always Ready, LG
 /// hands-free): two short read-only calls a minute.
 pub const POLL_LG_SETTINGS: Duration = Duration::from_secs(60);
+/// After a power key, further power keys and `tv_power` commands are held
+/// until the power state moves away from the state the key was sent in, or
+/// this long. The key is a toggle and its luna reply comes before the power
+/// state changes: a second key in that gap would turn the TV back on. The
+/// remote's key reaches `Active Standby` about 3 to 4 s after the key (D5
+/// R1b, c3-b), so 10 s leaves a margin without blocking a later command.
+pub const KEY_HOLD: Duration = Duration::from_secs(10);
+/// How long a turn off in "Turn off normally" waits for the fresh Always
+/// Ready read before it treats the setting as unknown (screen off instead).
+pub const ALWAYS_READY_FRESH: Duration = Duration::from_secs(2);
 
 /// Which lists and controls are on, and the guards that are decided outside.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,7 +79,10 @@ pub struct Config {
     pub screen: bool,
     /// `tv_turn_on`.
     pub power_on: bool,
-    /// `tv_power` (opt-in).
+    /// The `tv_power` switch (opt-in). The TV media player's turn off does
+    /// not need it: it sends the power key whenever
+    /// [`Controller::power_off_check`] passes (ADR 0005 decision 4 as
+    /// amended on 2026-11-09).
     pub power_off: bool,
     /// `tv_volume` and the step buttons.
     pub volume: bool,
@@ -130,12 +146,15 @@ impl Default for Config {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PowerOffEnv {
     /// The select "When the TV is turned off with the remote" is on "Keep
-    /// listening (screen off)".
+    /// listening (screen off)": the power key ends in `Screen Off` (wake and
+    /// darken). Otherwise ("Turn off normally") it ends in LG's own
+    /// power-off.
     pub keep_listening: bool,
     /// The kill switch file is present.
     pub kill_switch: bool,
     /// Whether the wake-and-darken machine would act now: `Err(reason)` when
-    /// it would refuse (cooldown, hourly budget, ...).
+    /// it would refuse (cooldown, hourly budget, ...). Only asked in the
+    /// "Keep listening" mode.
     pub darkener: Result<(), String>,
 }
 
@@ -150,15 +169,31 @@ impl Default for PowerOffEnv {
     }
 }
 
+/// Where the remote's power key leaves the TV (design section 4.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PowerOffRoute {
+    /// "Turn off normally" with Always Ready on: LG's own power-off into
+    /// `Active Standby` (red standby LED). The satellite keeps listening
+    /// (D5, c3-b); replies and music are not audible there.
+    Standby,
+    /// "Keep listening (screen off)": the darkener wakes the TV and turns
+    /// the screen off, so the satellite keeps listening and replying.
+    KeepListening,
+}
+
 /// Why a power-off is refused (the first failing precondition).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PowerOffRefusal {
-    /// `[tv_control] power_off` is false.
-    NotEnabled,
+    /// The daemon has not reported the mode, kill switch and darkener yet.
+    NotReady,
     /// Setters are blocked (firmware guard).
     SettersBlocked(String),
-    /// The always-on select is not on "Keep listening".
-    NotKeepListening,
+    /// "Turn off normally" and Always Ready is off: the key would end in
+    /// `Suspend`, which freezes the satellite (D5).
+    AlwaysReadyOff,
+    /// "Turn off normally" and Always Ready is not known (the LG settings
+    /// sensors are off, the read failed, or an unknown value).
+    AlwaysReadyUnknown,
     /// The power state is not known yet.
     PowerStateUnknown,
     /// A power transition is in progress.
@@ -175,10 +210,13 @@ pub enum PowerOffRefusal {
 impl fmt::Display for PowerOffRefusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::NotEnabled => f.write_str("power_off is not enabled in [tv_control]"),
+            Self::NotReady => f.write_str("the power-off conditions are not known yet"),
             Self::SettersBlocked(w) => write!(f, "TV control setters are off ({w})"),
-            Self::NotKeepListening => f.write_str(
-                "\"When the TV is turned off with the remote\" is not on \"Keep listening\"",
+            Self::AlwaysReadyOff => f.write_str(
+                "Always Ready is off: the power key would suspend the TV and freeze the satellite",
+            ),
+            Self::AlwaysReadyUnknown => f.write_str(
+                "Always Ready is not known (the LG settings sensors are off or could not be read)",
             ),
             Self::PowerStateUnknown => f.write_str("the TV power state is not known"),
             Self::Transition => f.write_str("the TV is changing power state"),
@@ -186,6 +224,15 @@ impl fmt::Display for PowerOffRefusal {
             Self::KillSwitch => f.write_str("the kill switch is present"),
             Self::Darkener(w) => write!(f, "wake-and-darken would not act ({w})"),
         }
+    }
+}
+
+impl PowerOffRefusal {
+    /// The power key is unsafe or unknown in this state, but the screen off
+    /// is fine: the TV media player's turn off falls back to it.
+    #[must_use]
+    pub fn screen_off_instead(&self) -> bool {
+        matches!(self, Self::AlwaysReadyOff | Self::AlwaysReadyUnknown)
     }
 }
 
@@ -219,6 +266,20 @@ impl PowerState {
             _ => Self::Other,
         }
     }
+}
+
+/// A turn off waiting for a fresh Always Ready read.
+#[derive(Debug, Clone, Copy)]
+struct PendingOff {
+    /// The entity the command came from.
+    id: &'static str,
+    /// When the command came.
+    at: Instant,
+    /// When the read counts as unanswered.
+    deadline: Instant,
+    /// An Always Ready read issued before the command was still in flight:
+    /// its reply is not fresh, a new read follows it.
+    stale_inflight: bool,
 }
 
 /// The power state as the availability rules see it.
@@ -534,6 +595,12 @@ pub enum ControlStatus {
 pub struct Controller {
     cfg: Config,
     env: PowerOffEnv,
+    /// The daemon called [`Controller::set_env`] at least once.
+    env_known: bool,
+    /// A power key was sent: (hold until, the power class it was sent in).
+    key_hold: Option<(Instant, Pwr)>,
+    /// A turn off waiting for the fresh Always Ready read.
+    pending_off: Option<PendingOff>,
     declared: HashMap<Setter, Declared>,
     ready: bool,
 
@@ -641,6 +708,9 @@ impl Controller {
         Self {
             cfg,
             env: PowerOffEnv::default(),
+            env_known: false,
+            key_hold: None,
+            pending_off: None,
             declared: HashMap::new(),
             ready: false,
             power: None,
@@ -697,9 +767,10 @@ impl Controller {
     /// select, the kill switch or the darkener's verdict may have changed
     /// (about once a second). Returns the state changes.
     pub fn set_env(&mut self, env: PowerOffEnv) -> Vec<Effect> {
-        if env == self.env {
+        if self.env_known && env == self.env {
             return Vec::new();
         }
+        self.env_known = true;
         self.env = env;
         self.sync()
     }
@@ -804,7 +875,7 @@ impl Controller {
         if self.cfg.power_off {
             add(
                 ent::TV_POWER,
-                "TV power (keep listening)",
+                "TV power",
                 "mdi:power",
                 Category::None,
                 Kind::Switch,
@@ -1205,16 +1276,24 @@ impl Controller {
     // ----- power-off preconditions --------------------------------------
 
     /// Preconditions that hold regardless of the current power state
-    /// (design section 4.2, items 1, 2 and 4, plus the firmware guard).
-    fn power_gates(&self) -> Result<(), PowerOffRefusal> {
-        if !self.cfg.power_off {
-            return Err(PowerOffRefusal::NotEnabled);
+    /// (design section 4.2), and the route the key takes, with the cached
+    /// Always Ready value. The `power_off` flag only lists the `tv_power`
+    /// switch and is not a precondition.
+    fn power_gates(&self) -> Result<PowerOffRoute, PowerOffRefusal> {
+        let route = self.base_gates()?;
+        if route == PowerOffRoute::Standby {
+            Self::always_ready_gate(self.always_ready.as_ref())?;
+        }
+        Ok(route)
+    }
+
+    /// Every power-state-independent precondition except Always Ready.
+    fn base_gates(&self) -> Result<PowerOffRoute, PowerOffRefusal> {
+        if !self.env_known {
+            return Err(PowerOffRefusal::NotReady);
         }
         if let Some(why) = &self.cfg.setters_blocked {
             return Err(PowerOffRefusal::SettersBlocked(why.clone()));
-        }
-        if !self.env.keep_listening {
-            return Err(PowerOffRefusal::NotKeepListening);
         }
         if self.power.is_none() {
             return Err(PowerOffRefusal::PowerStateUnknown);
@@ -1222,28 +1301,69 @@ impl Controller {
         if self.env.kill_switch {
             return Err(PowerOffRefusal::KillSwitch);
         }
-        if let Err(why) = &self.env.darkener {
-            return Err(PowerOffRefusal::Darkener(why.clone()));
+        if self.env.keep_listening {
+            if let Err(why) = &self.env.darkener {
+                return Err(PowerOffRefusal::Darkener(why.clone()));
+            }
+            return Ok(PowerOffRoute::KeepListening);
         }
-        Ok(())
+        Ok(PowerOffRoute::Standby)
     }
 
-    /// All of the design's power-off preconditions (section 4.2): enabled in
-    /// the config, the always-on select on "Keep listening", the power state
-    /// settled `Active` or `Screen Saver`, the kill switch absent and the
-    /// darkener willing (cooldown and hourly budget). Plus the firmware
-    /// guard. The key is a toggle, so it is never sent otherwise.
-    ///
-    /// # Errors
-    ///
-    /// The first precondition that fails.
-    pub fn power_off_check(&self) -> Result<(), PowerOffRefusal> {
-        self.power_gates()?;
+    /// "Turn off normally": LG's own power-off. With Always Ready on the TV
+    /// stays in Active Standby and the satellite keeps running (D5, c3-b,
+    /// `alwaysReady` and `allEnabled`); with it off the TV suspends 7 to 15 s
+    /// later and the satellite freezes.
+    fn always_ready_gate(ar: Option<&luna::AlwaysReady>) -> Result<(), PowerOffRefusal> {
+        match ar {
+            Some(luna::AlwaysReady::On | luna::AlwaysReady::OnWithWallpaper) => Ok(()),
+            Some(luna::AlwaysReady::Off) => Err(PowerOffRefusal::AlwaysReadyOff),
+            Some(luna::AlwaysReady::Other(_)) | None => Err(PowerOffRefusal::AlwaysReadyUnknown),
+        }
+    }
+
+    /// The key is a toggle: only from a settled `Active` or `Screen Saver`.
+    fn lit_gate(&self) -> Result<(), PowerOffRefusal> {
         match self.class() {
             Pwr::Lit => Ok(()),
             Pwr::Transition => Err(PowerOffRefusal::Transition),
             Pwr::Unknown => Err(PowerOffRefusal::PowerStateUnknown),
             _ => Err(PowerOffRefusal::WrongState),
+        }
+    }
+
+    /// All of the design's power-off preconditions (section 4.2), with the
+    /// cached Always Ready value: the daemon's view known, the firmware
+    /// guard, the power state settled `Active` or `Screen Saver`, the kill
+    /// switch absent, and per mode: in "Keep listening" the darkener willing
+    /// (cooldown and hourly budget), in "Turn off normally" Always Ready on.
+    /// Returns where the key leaves the TV. A command in "Turn off normally"
+    /// does not send the key on the cached value: it reads Always Ready
+    /// again first and decides on the fresh value.
+    ///
+    /// # Errors
+    ///
+    /// The first precondition that fails.
+    pub fn power_off_check(&self) -> Result<PowerOffRoute, PowerOffRefusal> {
+        let route = self.power_gates()?;
+        self.lit_gate()?;
+        Ok(route)
+    }
+
+    /// Why a power command must wait: a turn off is waiting for its Always
+    /// Ready read, or a key was sent and the TV has not moved yet.
+    fn key_held(&self, now: Instant) -> Option<String> {
+        if self.pending_off.is_some() {
+            return Some("a turn off is waiting for the Always Ready read".to_owned());
+        }
+        match self.key_hold {
+            Some((until, _)) if now < until => Some(format!(
+                "a power key was sent {} ms ago and the TV has not changed power state yet",
+                KEY_HOLD
+                    .saturating_sub(until.saturating_duration_since(now))
+                    .as_millis()
+            )),
+            _ => None,
         }
     }
 
@@ -1465,6 +1585,12 @@ impl Controller {
             self.settled_at = Some(now);
         }
         let after = self.class();
+        if self.key_hold.is_some_and(|(_, from)| after != from) {
+            // The TV reacted to the key (left the lit class, for example
+            // into a transition): the toggle is no longer ambiguous. A change
+            // within the class (Active to Screen Saver) does not count.
+            self.key_hold = None;
+        }
         let mut out = Vec::new();
         // Back from standby (or first known): values may have changed, read now.
         if self.ready
@@ -1597,6 +1723,9 @@ impl Controller {
         }
         out.extend(self.refresh_progress(topic, failed));
         out.extend(self.evaluate_check(topic, now));
+        if topic == Topic::AlwaysReady {
+            out.extend(self.always_ready_answered(now));
+        }
         out.extend(self.sync());
         out
     }
@@ -1984,8 +2113,9 @@ impl Controller {
     /// share to `maxVolume` steps (rounded; `volume_limit` clamps as for the
     /// number); volume up and down are one TV step each (as the remote and
     /// the step buttons); turn on is the `tv_turn_on` button; turn off is the
-    /// opt-in power-off (`power_off` enabled and the always-on mode
-    /// selected, with all of its preconditions) or else the screen off.
+    /// remote's power key when [`Controller::power_off_check`] passes (ADR
+    /// 0005 decision 4 as amended on 2026-11-09), the screen off when only
+    /// Always Ready stands in the way, and a refusal otherwise.
     fn cmd_media(&mut self, action: MediaAction, now: Instant) -> Vec<Effect> {
         let id = ent::TV_MEDIA_PLAYER;
         let mut out = vec![log(Level::Info, format!("{id}: {}", action.name()))];
@@ -2003,19 +2133,173 @@ impl Controller {
             MediaAction::VolumeUp if f.volume_step => self.cmd_volume_step(true, now),
             MediaAction::VolumeDown if f.volume_step => self.cmd_volume_step(false, now),
             MediaAction::Mute(m) if f.mute => self.cmd_mute(m, now),
-            MediaAction::TurnOn if f.turn_on => self.cmd_turn_on(now),
+            MediaAction::TurnOn if f.turn_on => match self.key_held(now) {
+                Some(why) => self.refuse(id, &why),
+                None => self.cmd_turn_on(now),
+            },
             MediaAction::TurnOff if f.turn_off => match self.class() {
                 Pwr::Dark | Pwr::Standby => self.noop(id, "the TV is already off"),
-                _ if self.cfg.power_off && self.env.keep_listening => self.cmd_power(false, now),
-                _ if self.cfg.screen => self.cmd_screen(false, now),
-                _ => self.refuse(
-                    id,
-                    "turn off needs the always-on mode for the power-off, or the screen control",
-                ),
+                _ => self.media_turn_off(now),
             },
             _ => self.refuse(id, "not enabled in [tv_control]"),
         });
         out
+    }
+
+    /// The TV media player's turn off from a lit (or not yet settled) TV.
+    fn media_turn_off(&mut self, now: Instant) -> Vec<Effect> {
+        let id = ent::TV_MEDIA_PLAYER;
+        if let Some(why) = self.key_held(now) {
+            return self.refuse(id, &why);
+        }
+        self.start_off(id, now)
+    }
+
+    /// The power key for a turn off (media player or `tv_power`): the gates
+    /// that do not depend on Always Ready, then in "Turn off normally" a
+    /// fresh read of Always Ready (the getter of the 60 s poll; the cached
+    /// value can be a minute old) and the decision on its reply
+    /// ([`Self::finish_off`]), or on unknown after [`ALWAYS_READY_FRESH`].
+    fn start_off(&mut self, id: &'static str, now: Instant) -> Vec<Effect> {
+        let route = match self.base_gates().and_then(|r| self.lit_gate().map(|()| r)) {
+            Ok(r) => r,
+            Err(why) => return self.off_refused(id, &why, now),
+        };
+        if route == PowerOffRoute::Standby && self.cfg.lg_settings {
+            // A read already in flight was issued before this command: its
+            // reply is not used for the decision; a new read follows it.
+            let stale_inflight = self.reads_inflight.contains(&Topic::AlwaysReady);
+            self.pending_off = Some(PendingOff {
+                id,
+                at: now,
+                deadline: now + ALWAYS_READY_FRESH,
+                stale_inflight,
+            });
+            let mut out = vec![log(
+                Level::Info,
+                format!("{id}: turn off: reading Always Ready before the power key"),
+            )];
+            if !stale_inflight {
+                out.push(self.read_call(Topic::AlwaysReady));
+            }
+            return out;
+        }
+        let cached = self.always_ready.clone();
+        self.finish_off(id, cached.as_ref(), now)
+    }
+
+    /// An Always Ready read answered (or failed) while a turn off may wait
+    /// for it: a reply to a read issued before the command is not fresh (a
+    /// new read follows, within the same deadline); a reply after the
+    /// deadline counts as no answer; otherwise the decision is made on it.
+    fn always_ready_answered(&mut self, now: Instant) -> Vec<Effect> {
+        let Some(p) = self.pending_off else {
+            return Vec::new();
+        };
+        if now >= p.deadline {
+            self.pending_off = None;
+            return self.always_ready_timed_out(p.id, now);
+        }
+        if p.stale_inflight {
+            self.pending_off = Some(PendingOff {
+                stale_inflight: false,
+                ..p
+            });
+            return vec![self.read_call(Topic::AlwaysReady)];
+        }
+        self.pending_off = None;
+        // Decided on the fresh value (a failed read left it unknown).
+        let fresh = self.always_ready.clone();
+        self.finish_off(p.id, fresh.as_ref(), now.max(p.at))
+    }
+
+    /// The fresh Always Ready read did not answer in time: unknown.
+    fn always_ready_timed_out(&mut self, id: &'static str, now: Instant) -> Vec<Effect> {
+        let mut out = vec![log(
+            Level::Info,
+            format!(
+                "{id}: turn off: the Always Ready read did not answer within {} s; treated as unknown",
+                ALWAYS_READY_FRESH.as_secs()
+            ),
+        )];
+        out.extend(self.finish_off(id, None, now));
+        out
+    }
+
+    /// Decides a turn off on an Always Ready value (fresh, or `None` for
+    /// unknown) and every other precondition as they are now.
+    fn finish_off(
+        &mut self,
+        id: &'static str,
+        ar: Option<&luna::AlwaysReady>,
+        now: Instant,
+    ) -> Vec<Effect> {
+        let checked = self.base_gates().and_then(|route| {
+            self.lit_gate()?;
+            if route == PowerOffRoute::Standby {
+                Self::always_ready_gate(ar)?;
+            }
+            Ok(route)
+        });
+        match checked {
+            Ok(route) => self.power_key(id, route, now),
+            Err(why) => self.off_refused(id, &why, now),
+        }
+    }
+
+    /// A refused power key: the media player falls back to the screen off
+    /// when only Always Ready is in the way (announced only if the screen
+    /// off is actually sent); anything else is a refusal.
+    fn off_refused(
+        &mut self,
+        id: &'static str,
+        why: &PowerOffRefusal,
+        now: Instant,
+    ) -> Vec<Effect> {
+        if id == ent::TV_MEDIA_PLAYER && why.screen_off_instead() && self.cfg.screen {
+            let fx = self.cmd_screen(false, now);
+            if fx.iter().any(|f| matches!(f, Effect::Call { .. })) {
+                let mut out = vec![log(
+                    Level::Info,
+                    format!("{id}: turn off: the screen off instead of the power key ({why})"),
+                )];
+                out.extend(fx);
+                return out;
+            }
+            let mut out = self.refuse(id, &why.to_string());
+            out.extend(fx);
+            return out;
+        }
+        self.refuse(id, &why.to_string())
+    }
+
+    /// Sends the remote's power key after [`Controller::power_off_check`]
+    /// passed, with one info line naming the route.
+    fn power_key(&mut self, id: &'static str, route: PowerOffRoute, now: Instant) -> Vec<Effect> {
+        // The keep-listening route is bounded by the darkener's cooldown and
+        // hourly budget; LG's own power-off has no such budget, so it counts
+        // against the global one.
+        let counted = route == PowerOffRoute::Standby;
+        if let Err(why) = self.limiter.acquire(Control::Power, now, false, counted) {
+            return self.refuse(id, why);
+        }
+        self.key_hold = Some((now + KEY_HOLD, self.class()));
+        let what = match route {
+            PowerOffRoute::Standby => {
+                "the remote's power key (\"Turn off normally\" and Always Ready on: the TV goes to Active Standby, the satellite keeps listening, replies are silent there)"
+            }
+            PowerOffRoute::KeepListening => {
+                "the remote's power key (\"Keep listening\": the satellite wakes the TV and turns the screen off)"
+            }
+        };
+        vec![
+            log(Level::Info, format!("{id}: turn off: {what}")),
+            Self::call(
+                Action::PowerKey,
+                setters::URI_POWER_KEY,
+                setters::PAYLOAD_EMPTY.to_owned(),
+            ),
+        ]
     }
 
     fn cmd_screen(&mut self, on: bool, now: Instant) -> Vec<Effect> {
@@ -2097,31 +2381,17 @@ impl Controller {
         }
     }
 
+    /// The `tv_power` switch: off is the same power key as the media
+    /// player's turn off (same preconditions, fresh Always Ready read and
+    /// routes), with no screen-off fallback (that is `tv_screen`); on is the
+    /// media player's turn on (no power-off gate, Always Ready included).
     fn cmd_power(&mut self, on: bool, now: Instant) -> Vec<Effect> {
         let id = ent::TV_POWER;
-        if let Err(why) = self.power_gates() {
-            return self.refuse(id, &why.to_string());
+        if let Some(why) = self.key_held(now) {
+            return self.refuse(id, &why);
         }
         match (self.class(), on) {
-            (Pwr::Lit, false) => {
-                if let Err(why) = self.power_off_check() {
-                    return self.refuse(id, &why.to_string());
-                }
-                if let Err(why) = self.limiter.acquire(Control::Power, now, false, false) {
-                    return self.refuse(id, why);
-                }
-                vec![
-                    log(
-                        Level::Info,
-                        "tv_power: power-off requested (the remote's power key; the satellite wakes the TV and turns the screen off)",
-                    ),
-                    Self::call(
-                        Action::PowerKey,
-                        setters::URI_POWER_KEY,
-                        setters::PAYLOAD_EMPTY.to_owned(),
-                    ),
-                ]
-            }
+            (Pwr::Lit, false) => self.start_off(id, now),
             (Pwr::Dark, true) => self.wake_screen(id, now),
             (Pwr::Standby, true) => self.wake_standby(id, now),
             (Pwr::Lit, true) => self.noop(id, "the TV is on"),
@@ -2417,6 +2687,10 @@ impl Controller {
                 if self.check.as_ref().is_some_and(|c| c.control == control) {
                     self.check = None;
                 }
+                if matches!(action, Action::PowerKey) {
+                    // No key reached the TV: nothing to wait for.
+                    self.key_hold = None;
+                }
                 let mut out = vec![log(
                     Level::Warn,
                     format!("{}: {} failed: {e}", control.name(), action.name()),
@@ -2515,6 +2789,13 @@ impl Controller {
                     c.issued = true;
                 }
                 out.push(self.read_call(c.topic));
+            }
+        }
+        // A turn off whose Always Ready read did not answer in time.
+        if let Some(p) = self.pending_off {
+            if now >= p.deadline {
+                self.pending_off = None;
+                out.extend(self.always_ready_timed_out(p.id, now));
             }
         }
         // Deferred powerOn.

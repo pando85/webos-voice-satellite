@@ -395,8 +395,9 @@ pub(crate) struct TvControlSection {
     pub(crate) screen: bool,
     /// `tv_turn_on` button.
     pub(crate) power_on: bool,
-    /// `tv_power` switch: Home Assistant can turn the TV off in the "Keep
-    /// listening (screen off)" mode only. Opt-in.
+    /// `tv_power` switch: the remote's power key from Home Assistant, as the
+    /// media player's turn off (ADR 0005 decision 4, amended 2026-11-09).
+    /// Opt-in; the media player's turn off does not need it.
     pub(crate) power_off: bool,
     /// `tv_volume` and the volume step buttons.
     pub(crate) volume: bool,
@@ -419,7 +420,8 @@ pub(crate) struct TvControlSection {
     /// `tv_media_player`: the TV as a media player in Home Assistant (ADR
     /// 0007), so HA's own volume, mute and turn on/off voice intents work.
     /// Its features follow `volume`, `mute`, `power_on` and `screen` or
-    /// `power_off`; it polls the play state (every 10 s while the TV is lit)
+    /// `power_off` (turn off is the remote's power key when it is safe, see
+    /// ADR 0005 decision 4 as amended, else the screen off); it polls the play state (every 10 s while the TV is lit)
     /// to show `playing`. The satellite's own media player (the reply
     /// volume) is a different entity and is unchanged.
     pub(crate) media_player: bool,
@@ -1683,7 +1685,7 @@ impl Settings {
         }
         if t.power_off {
             w.push(
-                "tv_control.power_off = true: Home Assistant can turn the TV off, which leaves it running with a dark screen (more power than standby, LG's OLED care may not run); it works only while \"When the TV is turned off with the remote\" is on \"Keep listening\""
+                "tv_control.power_off = true: the switch \"TV power\" sends the remote's power key; with \"Turn off normally\" the TV goes to Active Standby (only while Always Ready is on; replies are silent there), with \"Keep listening\" it ends with a dark screen (more power than standby, LG's OLED care may not run)"
                     .to_owned(),
             );
         }

@@ -1329,8 +1329,11 @@ impl Daemon {
         }
     }
 
-    /// What the power-off of `tv_power` needs from the daemon (design
-    /// section 4.2): the select, the kill switch and the darkener's verdict.
+    /// What the power key of TV control (the media player's turn off and
+    /// `tv_power`) needs from the daemon (design section 4.2): the select,
+    /// the kill switch and the darkener's verdict (used only in the "Keep
+    /// listening" mode; in "Turn off normally" TV control checks Always
+    /// Ready itself).
     fn tv_env(&self) -> webos_tv_control::PowerOffEnv {
         webos_tv_control::PowerOffEnv {
             keep_listening: self.darkener.mode() == RemoteOff::KeepListening,

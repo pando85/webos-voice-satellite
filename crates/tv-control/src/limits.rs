@@ -1,8 +1,9 @@
 //! Rate limits of the setters (`docs/design/tv-control.md` section 7): one
 //! call in flight per control, volume steps at most 4 per second, input and
 //! app changes at most one per 2 s, and all setters together at most 30 per
-//! minute. The power-off path keeps its own limits (the darkener's cooldown
-//! and hourly budget) and is not counted here.
+//! minute. The power key in the "Keep listening" mode keeps its own limits
+//! (the darkener's cooldown and hourly budget) and is not counted here; in
+//! the "Turn off normally" mode it is counted.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};

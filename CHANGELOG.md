@@ -2,6 +2,12 @@
 
 Releases of the webOS voice satellite package (`io.github.pando85.voicesatellite`). Earlier versions (0.1.0 to 0.5.1) are described in the git history and in the install records ([c3-a](docs/discovery/c3-a/P4-permanent-install.md), [c3-b](docs/discovery/c3-b/P4-permanent-install.md)).
 
+## Unreleased
+
+- **Home Assistant's "turn off the TV" is a real power-off** ([ADR 0005 decision 4, amended 2026-11-09](docs/decisions/0005-tv-control-entities.md#amendment-2026-11-09-decision-4-a-real-power-off-from-ha), owner). The TV media player's turn off now sends the remote's power key without `[tv_control] power_off` (Always Ready is read again right before the key; a second power command is held until the TV reacts, at most 10 s): with "When the TV is turned off with the remote" on "Turn off normally" and Always Ready on, the TV goes to `Active Standby` (red standby LED, app sound stops) and the satellite keeps listening; replies, announcements and music are silent there, as after the remote's own key. With Always Ready off or unknown (the `lg_always_ready` sensor off or unreadable) it stays a screen off, logged at `info` with the reason, because the key would suspend the TV and freeze the satellite. "Keep listening" is unchanged in effect (key, then wake and darken to `Screen Off`) but no longer needs `power_off`. Other refusals (kill switch, firmware guard, transition, darkener budget) stay refusals.
+- The opt-in `tv_power` switch (same object id) uses the same key and checks, without the screen-off fallback; its on is now a plain turn on (no longer refused by the kill switch or Always Ready); its name is now "TV power".
+- Not run on a TV: [EXP-010 Part C](docs/experiments/EXP-010-tv-control-setters.md#part-c-ha-turn-off-as-a-real-power-off-adr-0005-decision-4-amended-2026-11-09) is the check on c3-b (owner authorization needed). c3-a's TV power paths are untested.
+
 ## 0.6.1 (2026-11-08)
 
 - Remote key grab verified on firmware `03.30.73` (c3-b), by owner decision (2026-11-08; commit `c5dc2a7`, [ADR 0016](docs/decisions/0016-remote-key-grab.md)), next to `03.30.74` (c3-a). Other firmware is still refused: the grab stays off there and the configd override alone is used.
