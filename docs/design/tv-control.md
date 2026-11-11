@@ -338,7 +338,7 @@ Voice works through HA, not through the satellite: the owner exposes the entitie
 - The media player "TV" (`tv_media_player`, section 3.5, [ADR 0007](../decisions/0007-tv-media-player.md)) is the target for HA's built-in volume (set, relative), mute and unmute, and turn on and off intents (HA 2026.10.4 source; the owner's HA not yet checked). Give it the alias, not the satellite's own media player (the reply volume).
 - `switch` entities (`tv_screen`, `tv_power`, `tv_mute`) work with HA's built-in turn on and turn off intents (documented for switches in HA's intents).
 - `button` entities (`tv_turn_on`, volume up and down): HA's turn-on intent presses buttons in recent versions (**hypothesis**, not re-read for 2026.10.4).
-- `number` and `select` (`tv_volume`, `tv_input`, `tv_app`): no built-in intent is known to set them (**hypothesis**). Options: HA scripts exposed to Assist ("set the TV volume to N"), custom sentences, or an LLM conversation agent that can call entity actions. The Kiwi pipeline's agent is a separate pending decision ([backlog #12](../project/backlog.md#12-conversation-agent-for-the-kiwi-pipeline)).
+- `number` and `select` (`tv_volume`, `tv_input`, `tv_app`): no built-in intent or Assist LLM tool sets them (read in HA 2026.11.0 source, 2026-11-11). Options: HA scripts exposed to Assist ("set the TV volume to N"), custom sentences, or an LLM conversation agent that can call entity actions. The Kiwi pipeline's agent is decided ([backlog #12](../project/backlog.md#12-conversation-agent-for-the-kiwi-pipeline)).
 - Which entities HA exposes to Assist by default when they first appear depends on HA's "expose new entities" setting (not checked on the owner's HA). The owner decides what is exposed.
 
 No HA change is made by this design.

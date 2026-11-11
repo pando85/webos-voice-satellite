@@ -124,6 +124,32 @@ Items not in the ranked list stay in the backlog without a priority or a phase: 
 ## 11. TV control from Home Assistant via the satellite
 
 - **Status:** **implemented in 0.2.0 and run on both TVs** (2026-11-04; [design section 15](../design/tv-control.md#15-implementation-status-2026-11-04)): on c3-a permanently (non-disruptive subset through the owner's HA) and on c3-b from `/tmp` (disruptive controls through an API client), [EXP-010 Part B](../experiments/EXP-010-tv-control-setters.md#part-b-results-2026-11-04). Fixed on the PC after Part B, to re-check on the TVs: the volume subscription (kept, confirmed by a push, else polls), the `launch` declaration check (SAM file), `volume_limit` (optional, unset by default), the refresh summary line. Open: B10 and B11, the disruptive controls on c3-a. Owner decisions of 2026-11-04 after Part A: volume, mute, input and apps are on by default, TV control is not gated by the firmware guard. **Later the same day ([ADR 0007](../decisions/0007-tv-media-player.md)):** a control-only TV media player "TV" (`tv_media_player`, on by default) is added next to the separate entities so HA's built-in Spanish volume, mute and turn on/off intents reach the TV ([P4](../discovery/c3-b/P4-sound-session.md)); implemented on the PC ([design section 3.5](../design/tv-control.md#35-the-tv-media-player-adr-0007)), to deploy and verify on both TVs and HA. Earlier: design done. Owner decisions in [ADR 0005](../decisions/0005-tv-control-entities.md): complement HA's `webostv`; v1 = power and screen, volume and mute, input, app launch (no toasts); separate entities, not a TV media player; power-off only into the keep-listening `Screen Off` state and only when that mode is enabled (opt-in); listening indicator as HA binary sensors only. Design: [TV control](../design/tv-control.md). Setter test procedure: [EXP-010](../experiments/EXP-010-tv-control-setters.md) on c3-b: Part A ran on 2026-11-04 and passed (screen, mute, volume set and step, input switch, app launch; A5 skipped); Part B ran the same day. Disruptive controls verified on c3-b (`03.30.73`) only; c3-a (`03.30.74`): mute, volume down and the entity list only. The text below is the original idea (2026-11-03), kept for context; its open questions on overlap and entity design are settled by ADR 0005.
+- **Voice app launch (homelab, 2026-11-11), TODO:**
+  - **Deployed in the owner's homelab (HA 2026.11.0, not in this repository):**
+    - Custom sentence `TvOpenApp` in `custom_sentences/es/tv_open_app.yaml`: "abre/pon/lanza/inicia {app}" and "quiero ver {app}", with an optional "[en la tele] [del {area}]". `{app}` is a closed list, because a matching custom sentence discards all built-in matches.
+    - `intent_script` in package `integrations/tv_open_app.yaml`.
+    - `script.tv_abrir_app` (queued, max 2), exposed to Assist for the LLM agent `conversation.fast`. It chooses the TV by the spoken area, else the satellite's `preferred_area_id`, else asks "¿En qué tele?". It turns the TV on if it is off and calls `select.select_option` on the `tv_app` select.
+    - Area aliases "salon" and "oficina" were added in HA.
+    - Labels: deployed and config-checked, and sentence matching was checked with HA's debug matcher (2026-11-11). **Not yet run by voice.** Turning on from Active Standby before a launch has not been run on a TV, and the 3 s delay after power-on is a guess.
+  - **TODO, owner first:** the first live voice tests:
+    - "abre YouTube" on c3-a;
+    - "abre Netflix en la tele del salón", which starts from the salón TV being off;
+    - a free-form phrase handled by the LLM;
+    - "abre la persiana", which must still reach the built-in intent.
+  - **TODO, app list and aliases:**
+    - Trim the `{app}` list to the apps the owner uses.
+    - Add aliases as extra `in:` forms in the sentence file only. The LLM maps names itself from the script's fixed app list.
+    - Aliases must not be common words ("música", "vídeos", "la tele"), or they hijack built-in intents. The homelab hassil test checks this.
+  - **TODO, Whisper resilience:**
+    - Measure how Whisper spells the app names: a local Piper → Whisper sweep with the production settings, then a short real-voice session under the Kivi data rules (local analysis, aggregates only).
+    - A/B test adding the app names to Whisper's `--initial-prompt`.
+    - Optional tier 2: a wildcard only for "abre/lanza … en la tele", with normalized (`slugify`) matching in the script.
+  - **TODO, "vuelve a lo de antes" (keep it simple):**
+    - One helper per TV. The script saves the current `tv_input` or `tv_app` before opening an app, unless the TV shows the app that voice itself opened.
+    - A "vuelve a lo de antes" intent and script restore it.
+    - Check first that c3-a's `tv_input` reads the HDMI input while HDMI is on screen. Switching to a **connected** input has not been run on either TV (EXP-010 covered only a disconnected HDMI on c3-b).
+    - Later only if missed: a read-only status sensor for the LLM, and "pon la entrada {input}".
+  - **TODO, homelab tests:** add a real HA `check_config` before pushing. The offline tests missed a `max: 1` schema error on a queued script, fixed in `d8e1a189c`.
 - **Idea:** the satellite already runs as root on the TV and holds an ESPHome API connection to Home Assistant. It could expose TV controls as HA entities:
   - power and screen on and off (the daemon already calls `tvpower` and `turnOffScreen` for the remote power-off feature, [always-on section 13](../design/always-on.md#13-implemented-in-the-daemon-010-and-checked-on-c3-b));
   - TV volume and mute;
@@ -147,12 +173,15 @@ Items not in the ranked list stay in the backlog without a priority or a phase: 
 
 ## 12. Conversation agent for the Kiwi pipeline
 
-- **Status:** **decision pending (owner)**, deferred to a future plan discussion (owner, 2026-11-04). No HA change made.
+- **Status:** **decided, and done by the owner in the homelab (2026-11-05): option B plus option C with Kiais `fast`.** (2026-11-11, verified on the owner's HA; see Facts.) Earlier status: decision pending (owner, 2026-11-04).
 - **Evidence so far (2026-11-05, homelab repository: [docs/voice-assistant](https://github.com/pando85/homelab/blob/master/docs/voice-assistant/experiments/conversation-agent-eval.md)):** measured against the Kiais gateway with synthetic Spanish phrases and a fake home. `fast`: 93 % pass on control phrases (100 % on state questions, follow-ups and live information, nothing invented), time to first speech p50 3.06 s and p95 3.7 s through the LLM, all served by one backend; `balanced` is about twice as slow with no accuracy gain; `advanced` is out on latency. Inferred: about 30 of 44 control phrases would be handled by HA's built-in intents (`prefer_local_intents`, option B) on the fake home. Recommendation: option C with Kiais `fast` plus option B; the privacy position and an HA integration that can reach Kiais are still open.
 - **Why:** the satellite works end to end with HA's built-in agent, but the owner's Kiwi pipeline has no working conversation agent, so free-form requests fail. The choice also decides how voice reaches TV-control numbers and selects ([TV control section 11](../design/tv-control.md#11-voice)).
-- **Facts (2026-11-04, owner's homelab, read by an agent):**
-  - Kiwi's Ollama agent fails: the in-cluster Ollama has no models loaded and answers 404 for `qwen2.5:3b`.
-  - The pipeline option `prefer_local_intents` exists on HA 2026.10.4 and is currently `false`.
+- **Facts (2026-11-11, read-only check of the owner's homelab repository and HA `.storage`; verified on the owner's HA):**
+  - The pipeline "Kiwi" uses `conversation.fast`, the core `llama_cpp` integration pointed at the homelab Kiais gateway (deployed 2026-11-05, per the homelab docs [kiais-integration.md](https://github.com/pando85/homelab/blob/master/docs/voice-assistant/kiais-integration.md) and [conversation-agent.md](https://github.com/pando85/homelab/blob/master/docs/voice-assistant/conversation-agent.md)), with `prefer_local_intents: true`. HA runs 2026.11.0. So option B and option C with Kiais `fast` are in place.
+  - (2026-11-11, not deployed) Voice app launch ("abre {app} [en la tele del {area}]") is being drafted in the homelab as a custom sentence, an `intent_script`, and an Assist-exposed script that calls the `tv_app` select.
+- **Facts as of 2026-11-04 (owner's homelab, read by an agent; historical, superseded by the 2026-11-11 facts above):**
+  - Kiwi's Ollama agent failed: the in-cluster Ollama had no models loaded and answered 404 for `qwen2.5:3b`.
+  - The pipeline option `prefer_local_intents` exists on HA 2026.10.4 and was `false` (as of 2026-11-04).
   - The homelab "Kiais" OpenAI-compatible gateway has a fast tier with a TTFT p50 of about 1.5 s, measured on **only 2 requests**; it is cloud-routed. HA's core `openai_conversation` integration has no base URL setting, so using it needs a custom or HACS integration.
   - Separate homelab issue: the HA pod was recreated 8 times in one day, and each recreation disconnected the satellite. This is not a satellite fault; it is tracked on the homelab side.
 - **Options:**
